@@ -254,6 +254,7 @@ CRITICAL REQUIREMENTS:
 - Provide clear, actionable feedback in comments (do not ask questions)
 - Review the full comment history to understand what feedback was already given and addressed
 - Do NOT repeat feedback that has already been addressed
+- Refer to AGENTS.md for more info if exists
 
 INSTRUCTIONS:
 1. Review the full comment history to understand previous feedback and responses
@@ -264,7 +265,8 @@ INSTRUCTIONS:
 6. Run linting locally to verify it passes (do NOT rely on CI/CD)
 7. Check code quality, best practices, and potential issues
 8. Only raise NEW issues not already covered in previous comments
-9. Make autonomous decisions about approval or requesting changes
+9. Readability and maintainability must be ensured
+10. Make autonomous decisions about approval or requesting changes
 
 After your review, provide your decision:
 
