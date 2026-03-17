@@ -1,0 +1,19 @@
+# Codepair Configuration File
+# This file configures the worker and reviewer agents
+
+[worker]
+# Model to use for the worker agent (optional)
+# Examples: "claude-3-5-sonnet", "claude-3-opus", "gpt-4", etc.
+# If not specified, uses the default model configured in the agent CLI
+# model = "claude-3-5-sonnet"
+
+# How often (in seconds) the worker checks for new issues
+poll_interval_secs = 60
+
+[reviewer]
+# Model to use for the reviewer agent (optional)
+# You can use a different model for reviewing than for implementation
+# model = "claude-3-opus"
+
+# How often (in seconds) the reviewer checks for merge requests to review
+poll_interval_secs = 120
