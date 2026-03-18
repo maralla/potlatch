@@ -45,8 +45,7 @@ struct Args {
     config: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::try_parse();
 
     let (git_repo_address, config_path) = match cli {
@@ -80,5 +79,5 @@ async fn main() -> Result<()> {
 
     info!("Starting Codepair for repository: {}", git_repo_address);
 
-    agents::run(git_repo_address, config).await
+    agents::run(git_repo_address, config)
 }

@@ -13,7 +13,7 @@ impl GitRepo {
     }
 
     pub fn exists(&self) -> bool {
-        Path::new(&self.path).exists()
+        Path::new(&self.path).join(".git").exists()
     }
 
     pub fn clone(&self, repo_url: &str) -> Result<()> {
@@ -73,35 +73,16 @@ impl GitRepo {
         Ok(branch)
     }
 
-    pub fn branch_exists(&self, branch_name: &str) -> Result<bool> {
-        debug!("Checking if branch {} exists", branch_name);
+    pub fn remote_branch_exists(&self, branch_name: &str) -> Result<bool> {
+        debug!("Checking if remote branch origin/{} exists", branch_name);
 
         let output = Command::new("git")
-            .args(["rev-parse", "--verify", branch_name])
+            .args(["rev-parse", "--verify", &format!("origin/{}", branch_name)])
             .current_dir(&self.path)
             .output()
-            .context("Failed to check branch existence")?;
+            .context("Failed to check remote branch existence")?;
 
         Ok(output.status.success())
-    }
-
-    pub fn checkout_branch(&self, branch_name: &str) -> Result<()> {
-        info!("Checking out existing branch {}", branch_name);
-
-        let output = Command::new("git")
-            .args(["checkout", branch_name])
-            .current_dir(&self.path)
-            .output()
-            .context("Failed to checkout branch")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "Git checkout failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        Ok(())
     }
 
     /// Checkout a branch and force-reset it to match the remote version.
@@ -152,6 +133,8 @@ impl GitRepo {
 
     /// Try merging a remote branch into the current branch.
     /// Returns Ok(true) on success, Ok(false) on conflict (aborts the merge).
+    /// Attempt to merge origin/<branch> into the current branch.
+    /// On conflict, aborts the merge and returns `Ok(false)`.
     pub fn try_merge(&self, branch: &str) -> Result<bool> {
         info!("Merging origin/{} into current branch", branch);
 
@@ -174,6 +157,21 @@ impl GitRepo {
         Ok(false)
     }
 
+    /// Merge origin/<branch> into the current branch, leaving conflict markers
+    /// in the working tree if there are conflicts (does NOT abort).
+    /// Returns `true` if merge succeeded cleanly, `false` if there are conflicts.
+    pub fn merge_no_abort(&self, branch: &str) -> Result<bool> {
+        info!("Merging origin/{} into current branch (no abort)", branch);
+
+        let output = Command::new("git")
+            .args(["merge", &format!("origin/{}", branch), "--no-edit"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to execute git merge")?;
+
+        Ok(output.status.success())
+    }
+
     pub fn rev_parse(&self, rev: &str) -> Result<String> {
         let output = Command::new("git")
             .args(["rev-parse", "--short", rev])
@@ -190,6 +188,79 @@ impl GitRepo {
             .output()
             .context("Failed to compute diff")?;
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    pub fn has_diff_against(&self, base_branch: &str) -> Result<bool> {
+        let output = Command::new("git")
+            .args(["diff", "--quiet", &format!("origin/{}...HEAD", base_branch)])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to check diff against base")?;
+        Ok(!output.status.success())
+    }
+
+    /// Returns true if the current working tree (committed + staged +
+    /// unstaged) differs from the given commit ref in any way.
+    pub fn has_changes_since(&self, base_ref: &str) -> Result<bool> {
+        // Check for committed changes beyond base_ref
+        let rev_output = Command::new("git")
+            .args(["rev-list", "--count", &format!("{}..HEAD", base_ref)])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to check for commits since base")?;
+        let commit_count: u64 = String::from_utf8_lossy(&rev_output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if commit_count > 0 {
+            return Ok(true);
+        }
+
+        // Check for staged changes
+        let staged = Command::new("git")
+            .args(["diff", "--cached", "--quiet"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to check staged changes")?;
+        if !staged.status.success() {
+            return Ok(true);
+        }
+
+        // Check for unstaged changes (working tree)
+        let unstaged = Command::new("git")
+            .args(["diff", "--quiet"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to check unstaged changes")?;
+        if !unstaged.status.success() {
+            return Ok(true);
+        }
+
+        // Check for untracked files
+        let untracked = Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to check untracked files")?;
+        let has_untracked = !String::from_utf8_lossy(&untracked.stdout).trim().is_empty();
+
+        Ok(has_untracked)
+    }
+
+    pub fn delete_remote_branch(&self, branch_name: &str) -> Result<()> {
+        info!("Deleting remote branch origin/{}", branch_name);
+        let output = Command::new("git")
+            .args(["push", "origin", "--delete", branch_name])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to delete remote branch")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Git push --delete failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     pub fn has_staged_changes(&self) -> Result<bool> {
@@ -240,7 +311,7 @@ impl GitRepo {
         info!("Pushing branch {}", branch);
 
         let output = Command::new("git")
-            .args(["push", "-u", "origin", branch])
+            .args(["push", "--force-with-lease", "-u", "origin", branch])
             .current_dir(&self.path)
             .output()
             .context("Failed to git push")?;
@@ -248,6 +319,57 @@ impl GitRepo {
         if !output.status.success() {
             anyhow::bail!(
                 "Git push failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn reset_hard(&self) -> Result<()> {
+        debug!("Resetting working directory in {}", self.path);
+
+        let output = Command::new("git")
+            .args(["reset", "--hard"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to git reset --hard")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Git reset --hard failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let output = Command::new("git")
+            .args(["clean", "-fd"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to git clean -fd")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Git clean failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn delete_local_branch(&self, branch_name: &str) -> Result<()> {
+        debug!("Deleting local branch {}", branch_name);
+
+        let output = Command::new("git")
+            .args(["branch", "-D", branch_name])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to delete branch")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Git branch -D failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }

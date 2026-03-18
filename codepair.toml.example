@@ -1,5 +1,5 @@
 # Codepair Configuration File
-# This file configures the worker and reviewer agents
+# This file configures the worker, reviewer, and PMO agents
 
 [worker]
 # Model to use for the worker agent (optional)
@@ -10,6 +10,9 @@
 # How often (in seconds) the worker checks for new issues
 poll_interval_secs = 60
 
+# Number of concurrent worker instances (each gets its own git repo)
+instances = 1
+
 [reviewer]
 # Model to use for the reviewer agent (optional)
 # You can use a different model for reviewing than for implementation
@@ -17,3 +20,17 @@ poll_interval_secs = 60
 
 # How often (in seconds) the reviewer checks for merge requests to review
 poll_interval_secs = 120
+
+# Number of concurrent reviewer instances
+instances = 1
+
+[pmo]
+# Model to use for the PMO (Project Management Office) agent (optional)
+# The PMO agent splits large issues into smaller, implementable sub-issues
+# model = "claude-3-5-sonnet"
+
+# How often (in seconds) the PMO checks for action-required issues
+poll_interval_secs = 180
+
+# Number of concurrent PMO instances
+instances = 1

@@ -5,3 +5,4 @@ Cargo.lock
 issue_*.md
 codepair.toml
 .codepair.toml
+todo.md

@@ -10,6 +10,8 @@ pub struct Config {
     pub worker: WorkerConfig,
     #[serde(default)]
     pub reviewer: ReviewerConfig,
+    #[serde(default)]
+    pub pmo: PmoConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +20,8 @@ pub struct WorkerConfig {
     pub model: Option<String>,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+    #[serde(default = "default_instances")]
+    pub instances: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +30,18 @@ pub struct ReviewerConfig {
     pub model: Option<String>,
     #[serde(default = "default_reviewer_poll_interval")]
     pub poll_interval_secs: u64,
+    #[serde(default = "default_instances")]
+    pub instances: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PmoConfig {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_pmo_poll_interval")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_instances")]
+    pub instances: usize,
 }
 
 fn default_poll_interval() -> u64 {
@@ -36,11 +52,20 @@ fn default_reviewer_poll_interval() -> u64 {
     120
 }
 
+fn default_pmo_poll_interval() -> u64 {
+    180
+}
+
+fn default_instances() -> usize {
+    1
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             model: None,
             poll_interval_secs: default_poll_interval(),
+            instances: default_instances(),
         }
     }
 }
@@ -50,6 +75,17 @@ impl Default for ReviewerConfig {
         Self {
             model: None,
             poll_interval_secs: default_reviewer_poll_interval(),
+            instances: default_instances(),
+        }
+    }
+}
+
+impl Default for PmoConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            poll_interval_secs: default_pmo_poll_interval(),
+            instances: default_instances(),
         }
     }
 }
@@ -108,8 +144,10 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.worker.poll_interval_secs, 60);
         assert_eq!(config.reviewer.poll_interval_secs, 120);
+        assert_eq!(config.pmo.poll_interval_secs, 180);
         assert!(config.worker.model.is_none());
         assert!(config.reviewer.model.is_none());
+        assert!(config.pmo.model.is_none());
     }
 
     #[test]
@@ -118,10 +156,17 @@ mod tests {
             worker: WorkerConfig {
                 model: Some("claude-3-5-sonnet".to_string()),
                 poll_interval_secs: 30,
+                instances: 3,
             },
             reviewer: ReviewerConfig {
                 model: Some("claude-3-opus".to_string()),
                 poll_interval_secs: 60,
+                instances: 2,
+            },
+            pmo: PmoConfig {
+                model: Some("claude-3-5-sonnet".to_string()),
+                poll_interval_secs: 90,
+                instances: 1,
             },
         };
 
@@ -130,5 +175,6 @@ mod tests {
 
         assert_eq!(parsed.worker.model, Some("claude-3-5-sonnet".to_string()));
         assert_eq!(parsed.reviewer.model, Some("claude-3-opus".to_string()));
+        assert_eq!(parsed.pmo.model, Some("claude-3-5-sonnet".to_string()));
     }
 }
