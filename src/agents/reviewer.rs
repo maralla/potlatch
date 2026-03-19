@@ -1,8 +1,6 @@
 use anyhow::Result;
 use rand::RngExt;
 use std::collections::HashSet;
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -13,7 +11,7 @@ use super::{claim, extract_project_name};
 use crate::agent::Agent;
 use crate::config::ReviewerConfig;
 use crate::git::GitRepo;
-use crate::gitlab::{GitLabClient, MergeRequest};
+use crate::gitlab::{self, GitLabClient, MergeRequest};
 
 fn interruptible_sleep(shutdown: &AtomicBool, duration: Duration) -> bool {
     let interval = Duration::from_millis(200);
@@ -47,8 +45,7 @@ pub fn run(
     let agent = Agent::new(reviewer_dir.clone(), config.model.clone(), shutdown.clone());
 
     let mut merged_mrs: HashSet<u64> = HashSet::new();
-    let mut claimed_mr_iid: Option<u64> =
-        try_resume_reviewer_state(&agent_id, &reviewer_dir, &gitlab);
+    let mut claimed_mr_iid: Option<u64> = find_claimed_mr(&agent_id, &gitlab);
 
     info!(
         "{}: Poll interval: {} seconds",
@@ -90,11 +87,9 @@ pub fn run(
     info!("{}: Shutting down, cleaning up...", agent_id);
     if let Some(mr_iid) = claimed_mr_iid {
         info!(
-            "{}: Releasing claim on MR !{} before shutdown",
+            "{}: Preserving claim on MR !{} for restart",
             agent_id, mr_iid
         );
-        let _ = claim::release_mr_claim(&gitlab, mr_iid, &agent_id);
-        clear_reviewer_state(&reviewer_dir);
     }
     let _ = git_repo.reset_hard();
     info!("{}: Stopped", agent_id);
@@ -123,23 +118,46 @@ fn reviewer_cycle(
     git_repo.checkout_remote_branch(&default_branch)?;
 
     // If we still hold a claim from a previous cycle, release it now.
-    // Mutual exclusivity during feedback is enforced by the
-    // `has_unresolved_comments` check below — other reviewers will skip
-    // MRs that still have open discussions.
-    if let Some(held_iid) = claimed_mr_iid.take() {
+    // Do not proceed to claim a new MR if the release fails.
+    if let Some(held_iid) = *claimed_mr_iid {
         info!(
             "{}: Releasing held claim on MR !{} from previous cycle",
             agent_id, held_iid
         );
-        let _ = claim::release_mr_claim(gitlab, held_iid, agent_id);
-        clear_reviewer_state(reviewer_dir);
+        match claim::release_mr_claim(gitlab, held_iid, agent_id) {
+            Ok(_) => {
+                *claimed_mr_iid = None;
+            }
+            Err(e) => {
+                warn!(
+                    "{}: Failed to release claim on MR !{}: {}, will retry next cycle",
+                    agent_id, held_iid, e
+                );
+                return Ok(());
+            }
+        }
     }
 
-    let mrs = gitlab.list_merge_requests()?;
+    let mut mrs = gitlab.list_merge_requests()?;
 
     if shutdown.load(Ordering::SeqCst) {
         return Ok(());
     }
+
+    // Sort MRs by the priority of their linked issue (lowest number first),
+    // then by MR IID ascending (oldest MR first) for tie-breaking.
+    let issues = gitlab.list_issues().unwrap_or_default();
+    let priority_map: std::collections::HashMap<u64, u8> =
+        issues.iter().map(|i| (i.iid, i.priority())).collect();
+    mrs.sort_by(|a, b| {
+        let pa = gitlab::issue_iid_from_branch(&a.source_branch)
+            .and_then(|iid| priority_map.get(&iid).copied())
+            .unwrap_or(gitlab::DEFAULT_PRIORITY);
+        let pb = gitlab::issue_iid_from_branch(&b.source_branch)
+            .and_then(|iid| priority_map.get(&iid).copied())
+            .unwrap_or(gitlab::DEFAULT_PRIORITY);
+        pa.cmp(&pb).then_with(|| a.iid.cmp(&b.iid))
+    });
 
     for mr in mrs {
         if shutdown.load(Ordering::SeqCst) {
@@ -174,18 +192,16 @@ fn reviewer_cycle(
         }
 
         *claimed_mr_iid = Some(mr.iid);
-        save_reviewer_state(reviewer_dir, mr.iid);
 
         info!("{}: Reviewing MR !{}: {}", agent_id, mr.iid, mr.title);
 
-        match review_merge_request(project_name, git_repo, gitlab, agent, &mr) {
+        match review_merge_request(project_name, reviewer_dir, git_repo, gitlab, agent, &mr) {
             Ok(approved) => {
                 if approved {
                     info!("{}: MR !{} approved and merged", agent_id, mr.iid);
                     merged_mrs.insert(mr.iid);
                     let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
                     *claimed_mr_iid = None;
-                    clear_reviewer_state(reviewer_dir);
                 } else {
                     info!(
                         "{}: MR !{} reviewed with feedback, releasing claim",
@@ -193,14 +209,12 @@ fn reviewer_cycle(
                     );
                     let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
                     *claimed_mr_iid = None;
-                    clear_reviewer_state(reviewer_dir);
                 }
             }
             Err(e) => {
                 error!("{}: Failed to review MR !{}: {}", agent_id, mr.iid, e);
                 let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
                 *claimed_mr_iid = None;
-                clear_reviewer_state(reviewer_dir);
                 if shutdown.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -247,11 +261,34 @@ fn has_unresolved_comments(gitlab: &GitLabClient, mr_iid: u64) -> bool {
 
 fn review_merge_request(
     project_name: &str,
+    reviewer_dir: &str,
     git_repo: &GitRepo,
     gitlab: &GitLabClient,
     agent: &Agent,
     mr: &MergeRequest,
 ) -> Result<bool> {
+    // Check if the MR links to an issue via description first, then branch name
+    let issue_iid = {
+        let re = regex::Regex::new(r"(?i)closes?\s+#(\d+)").ok();
+        re.and_then(|r| {
+            r.captures(&mr.description)
+                .and_then(|c| c.get(1)?.as_str().parse().ok())
+        })
+        .or_else(|| gitlab::issue_iid_from_branch(&mr.source_branch))
+    };
+
+    if issue_iid.is_none() {
+        warn!(
+            "MR !{} does not reference any issue, requesting fix",
+            mr.iid
+        );
+        gitlab.add_mr_discussion(
+            mr.iid,
+            "This MR does not reference an issue. Please link it to the relevant issue by using a branch name like `issue-N` or adding `Closes #N` in the MR description.",
+        )?;
+        return Ok(false);
+    }
+
     if has_bad_title_or_description(mr) {
         warn!(
             "MR !{} has a generic or missing title/description, requesting fix",
@@ -308,7 +345,7 @@ fn review_merge_request(
 
     let diff = git_repo.diff_against(&mr.target_branch)?;
 
-    let prompt = build_review_prompt(project_name, gitlab, mr, &diff)?;
+    let prompt = build_review_prompt(project_name, gitlab, mr, &diff, issue_iid, reviewer_dir)?;
 
     let agent_output = agent.run(&prompt)?;
 
@@ -316,6 +353,16 @@ fn review_merge_request(
 
     if agent_output.contains("APPROVE") && agent_output.contains("LGTM") {
         info!("MR !{} approved by reviewer", mr.iid);
+
+        // Re-check for unresolved discussions before merging — another reviewer
+        // or the worker may have left new comments during the review.
+        if has_unresolved_comments(gitlab, mr.iid) {
+            warn!(
+                "MR !{} approved but has unresolved discussions, skipping merge",
+                mr.iid
+            );
+            return Ok(false);
+        }
 
         match gitlab.merge_mr(mr.iid) {
             Ok(_) => {
@@ -350,6 +397,8 @@ fn build_review_prompt(
     gitlab: &GitLabClient,
     mr: &MergeRequest,
     diff: &str,
+    issue_iid: Option<u64>,
+    reviewer_dir: &str,
 ) -> Result<String> {
     let comments = gitlab.get_mr_comments(mr.iid).unwrap_or_default();
 
@@ -369,6 +418,14 @@ fn build_review_prompt(
         diff.to_string()
     };
 
+    let issue_context = if let Some(iid) = issue_iid {
+        build_issue_context(gitlab, iid)
+    } else {
+        String::new()
+    };
+
+    let agents_md = load_agents_md(reviewer_dir);
+
     let prompt = format!(
         r#"You are reviewing a merge request for a software project in a fully automated, non-interactive environment.
 
@@ -381,6 +438,9 @@ DESCRIPTION:
 
 SOURCE BRANCH: {}
 TARGET BRANCH: {}
+{}
+PROJECT RULES (AGENTS.md — STRICT COMPLIANCE REQUIRED):
+{}
 
 DIFF (changes against {}):
 {}
@@ -399,19 +459,19 @@ CRITICAL REQUIREMENTS:
 - Provide clear, actionable feedback in comments (do not ask questions)
 - Review the full comment history to understand what feedback was already given and addressed
 - Do NOT repeat feedback that has already been addressed
-- You **MUST** refer to AGENTS.md for more info if exists
 
 INSTRUCTIONS:
 1. Review the full comment history to understand previous feedback and responses
 2. The source branch has already been merged with the target branch locally - you are on the merged result
 3. Review the code changes in the DIFF section thoroughly
 4. Check if the implementation matches the stated goal
-5. Run tests locally to verify they pass (do NOT rely on CI/CD)
-6. Run linting locally to verify it passes (do NOT rely on CI/CD)
-7. Check code quality, best practices, and potential issues
-8. Only raise NEW issues not already covered in previous comments
-9. Readability and maintainability must be ensured
-10. Make autonomous decisions about approval or requesting changes
+5. COMPLETENESS CHECK (STRICT): Compare the DIFF against the LINKED ISSUE (title, description, and comments). Every requirement or item mentioned in the issue MUST be addressed in the implementation. If any part is missing or only partially implemented, list the missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.
+6. Run tests locally to verify they pass (do NOT rely on CI/CD)
+7. Run linting locally to verify it passes (do NOT rely on CI/CD)
+8. Check code quality, best practices, and potential issues
+9. Only raise NEW issues not already covered in previous comments
+10. Readability and maintainability must be ensured
+11. Make autonomous decisions about approval or requesting changes
 
 MR TITLE AND DESCRIPTION (STRICT — reject if violated):
 - The MR title MUST be a concise, meaningful summary of the code changes. Reject if the title is generic (e.g. "Implementation changes", "Update", "Fix"), just an issue number, or contains markdown formatting like ** or backticks.
@@ -431,6 +491,12 @@ TEST QUALITY (STRICT — reject if violated):
   * Tests that were mutated or weakened to make them pass (e.g. removing the core assertion, catching all exceptions and ignoring them, mocking the function under test itself)
   * Tests that test only a helper or stub but skip the main feature being implemented
 - Every test MUST exercise the actual production code path it claims to cover. If a test does not meaningfully verify the behavior described in the issue, reject it and ask for a real test.
+
+AGENTS.md COMPLIANCE (STRICT — reject if violated):
+- The PROJECT RULES (AGENTS.md) section above contains the project's mandatory conventions and standards.
+- You MUST check every code change in the DIFF against AGENTS.md rules. If the code violates any rule defined there (naming conventions, file structure, required patterns, forbidden patterns, testing requirements, etc.), you MUST reject and cite the specific rule being violated.
+- AGENTS.md rules take precedence over general best practices when they conflict.
+- If AGENTS.md specifies test locations, file naming, code style, or architecture patterns, verify the MR follows them exactly.
 
 FILE HYGIENE (STRICT — reject if violated):
 - Every file in the MR must be directly relevant to the final deliverable. Reject any file that is only useful during the development process but serves no purpose in the shipped result, such as scratch scripts, debug helpers, personal notes, TODO files, temporary test harnesses, or throwaway utilities.
@@ -459,12 +525,52 @@ Proceed with the review autonomously. Do not ask for any user input.
         mr.description,
         mr.source_branch,
         mr.target_branch,
+        issue_context,
+        agents_md,
         mr.target_branch,
         diff_text,
         comments_text
     );
 
     Ok(prompt)
+}
+
+fn load_agents_md(reviewer_dir: &str) -> String {
+    let path = std::path::Path::new(reviewer_dir).join("AGENTS.md");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => "No AGENTS.md found in the project.".to_string(),
+    }
+}
+
+fn build_issue_context(gitlab: &GitLabClient, issue_iid: u64) -> String {
+    let mut ctx = String::new();
+
+    match gitlab.get_issue(issue_iid) {
+        Ok(issue) => {
+            ctx.push_str(&format!(
+                "\nLINKED ISSUE #{}: {}\n\nISSUE DESCRIPTION:\n{}\n",
+                issue_iid, issue.title, issue.description
+            ));
+        }
+        Err(e) => {
+            warn!("Failed to fetch issue #{}: {}", issue_iid, e);
+            return String::new();
+        }
+    }
+
+    match gitlab.get_issue_comments(issue_iid) {
+        Ok(comments) if !comments.is_empty() => {
+            ctx.push_str("\nISSUE COMMENTS:\n");
+            for c in &comments {
+                ctx.push_str(&format!("- {}: {}\n", c.author, c.body));
+            }
+            ctx.push('\n');
+        }
+        _ => {}
+    }
+
+    ctx
 }
 
 const GENERIC_TITLES: &[&str] = &[
@@ -515,67 +621,40 @@ fn extract_review_feedback(agent_output: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Reviewer state persistence
+// Reviewer claim recovery
 // ---------------------------------------------------------------------------
 
-fn reviewer_state_path(reviewer_dir: &str) -> std::path::PathBuf {
-    Path::new(reviewer_dir).join("reviewer_state.json")
-}
-
-fn save_reviewer_state(reviewer_dir: &str, mr_iid: u64) {
-    let path = reviewer_state_path(reviewer_dir);
-    let json = format!("{{\"claimed_mr_iid\":{}}}", mr_iid);
-    if let Err(e) = fs::write(&path, json) {
-        warn!("Failed to save reviewer state: {}", e);
-    }
-}
-
-fn clear_reviewer_state(reviewer_dir: &str) {
-    let path = reviewer_state_path(reviewer_dir);
-    let _ = fs::remove_file(&path);
-}
-
-fn try_resume_reviewer_state(
-    agent_id: &str,
-    reviewer_dir: &str,
-    gitlab: &GitLabClient,
-) -> Option<u64> {
-    let path = reviewer_state_path(reviewer_dir);
-    let content = fs::read_to_string(&path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let mr_iid = v.get("claimed_mr_iid")?.as_u64()?;
-
-    // Verify the MR still exists, is open, and our claim label is still on it
+/// Scan all open MRs for this reviewer's claim label.
+/// The GitLab label is the single source of truth — no local state file needed.
+fn find_claimed_mr(agent_id: &str, gitlab: &GitLabClient) -> Option<u64> {
     let claim_label = format!("claimed:{}", agent_id);
-    match gitlab.get_merge_request(mr_iid) {
-        Ok(mr) => {
-            if mr.state != "opened" {
-                info!(
-                    "{}: Previously claimed MR !{} is {}, discarding state",
-                    agent_id, mr_iid, mr.state
-                );
-                clear_reviewer_state(reviewer_dir);
-                return None;
+
+    match gitlab.list_merge_requests() {
+        Ok(mrs) => {
+            for mr in &mrs {
+                if mr.state != "opened" {
+                    continue;
+                }
+                let has_claim = mr
+                    .labels
+                    .as_ref()
+                    .is_some_and(|l| l.contains(&claim_label));
+                if has_claim {
+                    info!(
+                        "{}: Found existing claim on MR !{}, will release next cycle",
+                        agent_id, mr.iid
+                    );
+                    return Some(mr.iid);
+                }
             }
-            let has_claim = mr.labels.as_ref().is_some_and(|l| l.contains(&claim_label));
-            if !has_claim {
-                info!(
-                    "{}: Claim label missing from MR !{}, discarding state",
-                    agent_id, mr_iid
-                );
-                clear_reviewer_state(reviewer_dir);
-                return None;
-            }
-            info!("{}: Resumed claim on MR !{}", agent_id, mr_iid);
-            Some(mr_iid)
         }
         Err(e) => {
             warn!(
-                "{}: Failed to verify MR !{}: {}, discarding state",
-                agent_id, mr_iid, e
+                "{}: Failed to scan MRs for existing claims: {}",
+                agent_id, e
             );
-            clear_reviewer_state(reviewer_dir);
-            None
         }
     }
+
+    None
 }

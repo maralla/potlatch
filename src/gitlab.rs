@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 use tracing::{debug, info};
 
+pub const PRIORITY_LABEL_PREFIX: &str = "priority::";
+pub const DEFAULT_PRIORITY: u8 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Issue {
     pub iid: u64,
@@ -11,7 +14,31 @@ pub struct Issue {
     pub labels: Vec<String>,
     pub state: String,
     #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
     pub updated_at: Option<String>,
+}
+
+impl Issue {
+    pub fn priority(&self) -> u8 {
+        priority_from_labels(&self.labels)
+    }
+}
+
+pub fn priority_from_labels(labels: &[String]) -> u8 {
+    for label in labels {
+        if let Some(num_str) = label.strip_prefix(PRIORITY_LABEL_PREFIX)
+            && let Ok(p) = num_str.parse::<u8>()
+            && (1..=3).contains(&p)
+        {
+            return p;
+        }
+    }
+    DEFAULT_PRIORITY
+}
+
+pub fn priority_label(priority: u8) -> String {
+    format!("{}{}", PRIORITY_LABEL_PREFIX, priority)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,8 +88,10 @@ impl GitLabClient {
             );
         }
 
-        let issues: Vec<Issue> =
+        let mut issues: Vec<Issue> =
             serde_json::from_slice(&output.stdout).context("Failed to parse issues JSON")?;
+
+        sort_issues_by_priority(&mut issues);
 
         Ok(issues)
     }
@@ -208,14 +237,17 @@ impl GitLabClient {
         debug!("Fetching merge requests from GitLab");
 
         let output = Command::new("glab")
-            .args(["mr", "list", "--output", "json"])
+            .args([
+                "api",
+                "projects/:id/merge_requests?state=opened&per_page=100",
+            ])
             .current_dir(&self.repo_path)
             .output()
-            .context("Failed to execute glab mr list")?;
+            .context("Failed to fetch merge requests via API")?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "glab mr list failed: {}",
+                "Failed to list merge requests: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -782,4 +814,24 @@ impl GitLabClient {
 
         Ok(comments)
     }
+}
+
+/// Sort issues by priority (lowest number = highest priority) then by
+/// `created_at` ascending (oldest first within the same priority level)
+/// to prevent starvation.
+pub fn sort_issues_by_priority(issues: &mut [Issue]) {
+    issues.sort_by(|a, b| {
+        let pa = a.priority();
+        let pb = b.priority();
+        pa.cmp(&pb).then_with(|| {
+            let ca = a.created_at.as_deref().unwrap_or("");
+            let cb = b.created_at.as_deref().unwrap_or("");
+            ca.cmp(cb)
+        })
+    });
+}
+
+/// Extract an issue IID from a branch name following the `issue-N` convention.
+pub fn issue_iid_from_branch(branch: &str) -> Option<u64> {
+    branch.strip_prefix("issue-")?.parse().ok()
 }

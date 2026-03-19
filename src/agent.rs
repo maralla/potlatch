@@ -23,6 +23,17 @@ impl Agent {
     }
 
     pub fn run(&self, prompt: &str) -> Result<String> {
+        self.run_with_cancel(prompt, None)
+    }
+
+    /// Run the agent with an optional cancellation callback. The callback is
+    /// invoked periodically (~every 5 seconds) while the agent is running.
+    /// If it returns `true`, the agent process is killed and an error is returned.
+    pub fn run_with_cancel(
+        &self,
+        prompt: &str,
+        cancel_check: Option<&dyn Fn() -> bool>,
+    ) -> Result<String> {
         if let Some(model) = &self.model {
             info!(
                 "Running agent with model: {}, prompt length: {} chars",
@@ -76,9 +87,11 @@ impl Agent {
             })
         });
 
-        // Poll for child exit while checking the shutdown flag, because the
-        // child `agent` process may handle SIGINT gracefully and not die
-        // immediately, leaving wait_with_output() blocking indefinitely.
+        // Poll for child exit while checking the shutdown flag and the
+        // optional cancel callback. The cancel_check is called every
+        // ~5 seconds to avoid excessive API calls.
+        let mut polls_since_cancel_check: u32 = 0;
+        const CANCEL_CHECK_INTERVAL: u32 = 25; // 25 * 200ms = 5s
         loop {
             match child.try_wait() {
                 Ok(Some(_status)) => break,
@@ -88,6 +101,18 @@ impl Agent {
                         let _ = child.kill();
                         let _ = child.wait();
                         anyhow::bail!("Agent interrupted by shutdown");
+                    }
+                    polls_since_cancel_check += 1;
+                    if polls_since_cancel_check >= CANCEL_CHECK_INTERVAL {
+                        polls_since_cancel_check = 0;
+                        if let Some(check) = cancel_check
+                            && check()
+                        {
+                            warn!("Cancel check triggered, killing agent child process");
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            anyhow::bail!("Agent cancelled by external condition");
+                        }
                     }
                     thread::sleep(Duration::from_millis(200));
                 }

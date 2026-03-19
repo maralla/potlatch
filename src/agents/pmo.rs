@@ -12,10 +12,11 @@ use super::{claim, extract_project_name};
 use crate::agent::Agent;
 use crate::config::PmoConfig;
 use crate::git::GitRepo;
-use crate::gitlab::{GitLabClient, Issue};
+use crate::gitlab::{self, GitLabClient, Issue};
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
+const PMO_PENDING_LABEL: &str = "pmo-pending";
 
 fn interruptible_sleep(shutdown: &AtomicBool, duration: Duration) -> bool {
     let interval = Duration::from_millis(200);
@@ -112,20 +113,45 @@ fn pmo_cycle(
 ) -> Result<()> {
     let default_branch = git_repo.get_default_branch()?;
     git_repo.fetch()?;
-    let _ = git_repo.reset_hard();
-    git_repo.checkout_remote_branch(&default_branch)?;
+    
+    // Ensure we're on the latest upstream — hard reset if checkout fails
+    if let Err(e) = git_repo.checkout_remote_branch(&default_branch) {
+        warn!(
+            "{}: Failed to checkout {}: {}, forcing reset",
+            agent_id, default_branch, e
+        );
+        let _ = git_repo.reset_hard();
+        git_repo.checkout_remote_branch(&default_branch)?;
+    }
 
-    // If we still hold a claim from a previous run, release it.
-    // PMO processing is idempotent — re-processing the issue is safe.
+    // If we still hold a claim from a previous run, decide what to do.
     if let Some(held_iid) = *claimed_issue_iid {
-        // Only release if not also a pending split (pending splits are handled below)
+        // Pending splits take priority — handled below
         let pending_file_check = pending_split_file(pmo_dir, agent_id);
         let has_pending = load_pending_split(&pending_file_check)?;
-        if has_pending.is_none() {
+        if has_pending.is_some() {
+            // Fall through to pending split handling
+        } else if let Ok(issue) = gitlab.get_issue(held_iid) {
+            if issue.labels.contains(&PMO_PENDING_LABEL.to_string()) {
+                // Still waiting for human clarification — keep the claim, skip processing
+                debug!(
+                    "{}: Issue #{} still pmo-pending, waiting for human input",
+                    agent_id, held_iid
+                );
+                // Don't release, don't process — just return and check again next cycle
+                return Ok(());
+            }
+            // No longer pending (human removed the label) — release claim so it
+            // can be re-processed as a fresh action-required issue.
             info!(
-                "{}: Releasing stale claim on issue #{} from previous run",
+                "{}: Releasing claim on issue #{} from previous run",
                 agent_id, held_iid
             );
+            let _ = claim::release_claim(gitlab, held_iid, agent_id);
+            *claimed_issue_iid = None;
+            clear_pmo_state(pmo_dir);
+        } else {
+            // Can't fetch issue — release to be safe
             let _ = claim::release_claim(gitlab, held_iid, agent_id);
             *claimed_issue_iid = None;
             clear_pmo_state(pmo_dir);
@@ -210,9 +236,27 @@ fn pmo_cycle(
             agent_id, issue.iid, issue.title
         );
 
-        match process_action_required_issue(agent_id, project_name, pmo_dir, gitlab, agent, issue, &issues) {
-            Ok(_) => {
+        match process_action_required_issue(
+            agent_id,
+            project_name,
+            pmo_dir,
+            gitlab,
+            agent,
+            issue,
+            &issues,
+        ) {
+            Ok(keep_claim) => {
                 info!("{}: Successfully processed issue #{}", agent_id, issue.iid);
+                if keep_claim {
+                    info!(
+                        "{}: Keeping claim on issue #{} (pmo-pending)",
+                        agent_id, issue.iid
+                    );
+                } else {
+                    claim::release_claim(gitlab, issue.iid, agent_id)?;
+                    *claimed_issue_iid = None;
+                    clear_pmo_state(pmo_dir);
+                }
             }
             Err(e) => {
                 error!(
@@ -222,12 +266,11 @@ fn pmo_cycle(
                 if shutdown.load(Ordering::SeqCst) {
                     return Ok(());
                 }
+                claim::release_claim(gitlab, issue.iid, agent_id)?;
+                *claimed_issue_iid = None;
+                clear_pmo_state(pmo_dir);
             }
         }
-
-        claim::release_claim(gitlab, issue.iid, agent_id)?;
-        *claimed_issue_iid = None;
-        clear_pmo_state(pmo_dir);
 
         break;
     }
@@ -236,6 +279,12 @@ fn pmo_cycle(
         info!("{}: No action-required issues found", agent_id);
     }
 
+    // Assign default priority to open issues that lack a priority label.
+    if shutdown.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    assign_default_priority(agent_id, &issues, gitlab);
+
     // Close stale pmo-processed issues that have not been picked up for over 1 hour.
     if shutdown.load(Ordering::SeqCst) {
         return Ok(());
@@ -243,6 +292,26 @@ fn pmo_cycle(
     close_stale_processed_issues(agent_id, &issues, gitlab);
 
     Ok(())
+}
+
+fn assign_default_priority(agent_id: &str, issues: &[Issue], gitlab: &GitLabClient) {
+    for issue in issues {
+        if issue.state != "opened" {
+            continue;
+        }
+        let has_priority = issue
+            .labels
+            .iter()
+            .any(|l| l.starts_with(gitlab::PRIORITY_LABEL_PREFIX));
+        if !has_priority {
+            let label = gitlab::priority_label(gitlab::DEFAULT_PRIORITY);
+            debug!(
+                "{}: Assigning default {} to issue #{}",
+                agent_id, label, issue.iid
+            );
+            let _ = gitlab.add_issue_label(issue.iid, &label);
+        }
+    }
 }
 
 const STALE_THRESHOLD_SECS: u64 = 3600; // 1 hour
@@ -349,6 +418,11 @@ fn should_process_issue(issue: &Issue) -> bool {
         return false;
     }
 
+    // Skip if PMO is waiting for human clarification
+    if issue.labels.contains(&PMO_PENDING_LABEL.to_string()) {
+        return false;
+    }
+
     // Skip drafts
     if issue.title.starts_with("[Draft]") || issue.title.starts_with("Draft:") {
         return false;
@@ -357,6 +431,8 @@ fn should_process_issue(issue: &Issue) -> bool {
     true
 }
 
+/// Returns `Ok(true)` if the PMO should keep its claim (pmo-pending / needs clarification).
+/// Returns `Ok(false)` if the claim can be released.
 fn process_action_required_issue(
     agent_id: &str,
     project_name: &str,
@@ -365,7 +441,7 @@ fn process_action_required_issue(
     agent: &Agent,
     issue: &Issue,
     all_issues: &[Issue],
-) -> Result<()> {
+) -> Result<bool> {
     // Get all comments to understand the context
     let comments = gitlab.get_issue_comments(issue.iid).unwrap_or_default();
 
@@ -380,11 +456,56 @@ fn process_action_required_issue(
     };
 
     let existing_issues_text = build_existing_issues_summary(issue.iid, all_issues);
+    let parent_priority = issue.priority();
 
-    let prompt = build_split_prompt(project_name, issue, &comments_text, &existing_issues_text)?;
+    let prompt = build_split_prompt(
+        project_name,
+        issue,
+        &comments_text,
+        &existing_issues_text,
+        parent_priority,
+    )?;
 
     let agent_output = agent.run(&prompt)?;
 
+    // --- NEEDS_CLARIFICATION: PMO itself cannot decide, ask human ---
+    if agent_output.contains("NEEDS_CLARIFICATION") {
+        let question = extract_clarification_question(&agent_output);
+        info!(
+            "PMO: Issue #{} needs human clarification, marking pmo-pending",
+            issue.iid
+        );
+        gitlab.add_issue_comment(
+            issue.iid,
+            &format!(
+                "**PMO needs clarification before proceeding:**\n\n{}\n\n\
+                 Please reply to this comment with the requested information. \
+                 Once clarified, remove the `pmo-pending` label to let the PMO retry.",
+                question
+            ),
+        )?;
+        gitlab.add_issue_label(issue.iid, PMO_PENDING_LABEL)?;
+        return Ok(true); // keep claim
+    }
+
+    // --- ALREADY_DONE: work is already implemented, close the issue ---
+    if agent_output.contains("ALREADY_DONE") {
+        let reason = extract_already_done_reason(&agent_output);
+        info!("PMO: Issue #{} is already implemented, closing", issue.iid);
+        gitlab.add_issue_comment(
+            issue.iid,
+            &format!(
+                "**PMO: Closing — this work is already implemented.**\n\n{}",
+                reason
+            ),
+        )?;
+        let _ = gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL);
+        let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
+        gitlab.close_issue(issue.iid)?;
+        return Ok(false);
+    }
+
+    // --- GUIDE_WORKER: single focused retry instruction ---
     if agent_output.contains("GUIDE_WORKER") {
         let guidance = extract_guidance(&agent_output);
         info!("PMO: Issue #{} needs guidance, not splitting", issue.iid);
@@ -394,7 +515,7 @@ fn process_action_required_issue(
         )?;
         gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
         let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
-        return Ok(());
+        return Ok(false);
     }
 
     if agent_output.contains("NO_SPLIT_NEEDED") {
@@ -410,10 +531,10 @@ fn process_action_required_issue(
         gitlab.add_issue_comment(issue.iid, &comment)?;
         gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
         let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
-        return Ok(());
+        return Ok(false);
     }
 
-    // Extract sub-issues from agent output
+    // --- SPLIT: create sub-issues, close the parent as a task container ---
     let sub_issues = extract_sub_issues(&agent_output);
 
     if sub_issues.is_empty() {
@@ -426,19 +547,19 @@ fn process_action_required_issue(
             "PMO Agent was unable to split this issue. Manual intervention may be required.",
         )?;
         gitlab.add_issue_label(issue.iid, PMO_PROCESSED_LABEL)?;
-        return Ok(());
+        return Ok(false);
     }
 
     let pending_file = pending_split_file(pmo_dir, agent_id);
     let pending_split = PendingSplit {
         parent_issue_iid: issue.iid,
         parent_issue_title: issue.title.clone(),
+        parent_priority: issue.priority(),
         sub_issues: sub_issues.clone(),
         created_issue_ids: Vec::new(),
     };
     save_pending_split(&pending_file, &pending_split)?;
 
-    // Create sub-issues
     match resume_split(&pending_file, gitlab, &pending_split) {
         Ok(_) => {
             info!(
@@ -449,12 +570,24 @@ fn process_action_required_issue(
         }
         Err(e) => {
             error!("{}: Failed to create all sub-issues: {}", agent_id, e);
-            // Keep the pending split file for retry
             return Err(e);
         }
     }
 
-    Ok(())
+    // Close the parent issue — it served as a task container, the real work
+    // is now tracked in the sub-issues.
+    info!(
+        "{}: Closing parent issue #{} (task container)",
+        agent_id, issue.iid
+    );
+    let _ = gitlab.add_issue_comment(
+        issue.iid,
+        "Closing this issue — it has been split into sub-issues above. \
+         The sub-issues now track the actual work.",
+    );
+    let _ = gitlab.close_issue(issue.iid);
+
+    Ok(false)
 }
 
 fn build_existing_issues_summary(current_iid: u64, all_issues: &[Issue]) -> String {
@@ -464,17 +597,11 @@ fn build_existing_issues_summary(current_iid: u64, all_issues: &[Issue]) -> Stri
             continue;
         }
         let in_progress = issue.labels.contains(&"in-progress".to_string())
-            || issue
-                .labels
-                .iter()
-                .any(|l| l.starts_with("claimed:"));
-        let status = if in_progress {
-            "IN-PROGRESS"
-        } else {
-            "OPEN"
-        };
+            || issue.labels.iter().any(|l| l.starts_with("claimed:"));
+        let status = if in_progress { "IN-PROGRESS" } else { "OPEN" };
+        let p = issue.priority();
         lines.push(format!(
-            "- #{} [{}]: {}",
+            "- #{} [{}] (priority {p}): {}",
             issue.iid, status, issue.title
         ));
     }
@@ -485,7 +612,13 @@ fn build_existing_issues_summary(current_iid: u64, all_issues: &[Issue]) -> Stri
     }
 }
 
-fn build_split_prompt(project_name: &str, issue: &Issue, comments: &str, existing_issues: &str) -> Result<String> {
+fn build_split_prompt(
+    project_name: &str,
+    issue: &Issue,
+    comments: &str,
+    existing_issues: &str,
+    parent_priority: u8,
+) -> Result<String> {
     let prompt = format!(
         r#"You are a Project Management Office (PMO) agent responsible for triaging issues that an automated worker agent could not implement.
 
@@ -513,19 +646,30 @@ CRITICAL REQUIREMENTS:
 - The worker agent has FULL ACCESS to shell commands (rm, mv, git, etc.) and all build/test tools
 - If the worker claimed it "cannot run commands" or "cannot delete files", that is WRONG — it CAN. Instruct it clearly.
 
-DECISION — choose ONE of the following:
+DECISION — choose EXACTLY ONE of the following:
 
-1. GUIDE_WORKER — The issue does NOT need splitting. The worker failed due to a misunderstanding, a missing instruction, or a solvable technical obstacle. Provide clear, specific instructions that will help the worker succeed on retry.
+1. GUIDE_WORKER — Use ONLY when ALL of these are true:
+   a) The issue describes a SINGLE, focused task (not a list of modules/files/components)
+   b) The worker failed due to a specific misunderstanding, wrong command, or simple technical obstacle
+   c) The fix is ONE clear action (e.g. "use flag X instead of Y", "the config file is at path Z")
+   If your guidance would enumerate 2+ independent modules, files, or components, you MUST choose SPLIT instead.
    Respond with:
    GUIDE_WORKER
    INSTRUCTIONS:
-   <Brief, actionable guidance — MAX 3-5 sentences. State the core action the worker must take. Do NOT repeat the issue description. Do NOT explain background or context the worker already has. Just tell it what to do differently.>
+   <Brief, actionable guidance — MAX 3-5 sentences. State the single core action the worker must take.>
 
-2. SPLIT — The issue is too large (estimated >500 lines of non-test code, or >1500 lines total including tests; auto-generated code does not count) and needs to be broken into smaller sub-issues.
+2. SPLIT — Use when ANY of these are true:
+   - The issue is a "task container" describing a broad goal (e.g. "add tests for module X", "refactor all Y", "check full code for Z") — these ALWAYS need splitting into concrete sub-tasks
+   - The issue involves work on 2+ independent modules, files, or components
+   - The issue is too large (estimated >500 lines of non-test code, or >1500 lines total including tests; auto-generated code does not count)
+   - The issue description or worker rejection lists multiple distinct things to do
+   - Your guidance would need to enumerate 2+ independent items
+   When splitting, the PARENT ISSUE will be CLOSED automatically as a task container. The sub-issues become the real tracked work.
    Respond with sub-issues in this format:
 
    SUB_ISSUE_1:
    TITLE: <concise title>
+   PRIORITY: <1, 2, or 3>
    DESCRIPTION:
    <Detailed description of what needs to be implemented>
    <Include acceptance criteria>
@@ -533,10 +677,33 @@ DECISION — choose ONE of the following:
 
    SUB_ISSUE_2:
    TITLE: <concise title>
+   PRIORITY: <1, 2, or 3>
    DESCRIPTION:
    <Detailed description>
 
    (continue for all sub-issues — each should target ~500 lines of non-test code, ~1500 total including tests; auto-generated code does not count)
+
+   PRIORITY LEVELS:
+   - 1 = Critical: blocking other work, security fix, core dependency that other sub-issues depend on
+   - 2 = High: important feature, depended on by lower-priority sub-issues
+   - 3 = Normal: independent work, enhancements, nice-to-haves
+   The parent issue has priority {parent_priority}. Sub-issues that are dependencies for others should get higher priority (lower number). Independent leaf tasks can inherit the parent priority or be lower.
+
+3. ALREADY_DONE — Use when the work described in the issue is ALREADY fully implemented in the codebase:
+   - The worker's output or your analysis shows the feature/tests/code already exists
+   - There is nothing left to implement — the issue is simply outdated or redundant
+   Respond with:
+   ALREADY_DONE
+   REASON: <Brief explanation of why this issue is already complete, referencing the existing code/files>
+
+4. NEEDS_CLARIFICATION — Use when you CANNOT make a decision because:
+   - The issue description is too vague to determine scope or intent
+   - The worker's rejection and the issue together don't give enough context to guide or split
+   - You need specific information from a human (e.g. which modules to cover, what the acceptance criteria are)
+   Respond with:
+   NEEDS_CLARIFICATION
+   QUESTION:
+   <Specific question(s) you need answered before you can guide or split this issue. Be precise about what information is missing.>
 
 DUPLICATE / OVERLAP RULES (STRICT):
 - Review the EXISTING OPEN ISSUES list above before creating any sub-issue.
@@ -549,10 +716,13 @@ INSTRUCTIONS:
 1. Read the original issue description carefully
 2. Read ALL comments — especially the worker's rejection reason
 3. Review the EXISTING OPEN ISSUES to understand what is already tracked
-4. Determine whether the issue needs splitting or the worker just needs guidance
-5. If the worker's failure was due to confusion, wrong assumptions, or simple obstacles, choose GUIDE_WORKER and provide clear instructions
-6. If the issue is genuinely too large, choose SPLIT and create focused sub-issues that do NOT overlap with existing ones
-7. NEVER respond with both GUIDE_WORKER and SPLIT — pick exactly one
+4. TASK CONTAINER TEST: Does the issue describe a broad goal that involves multiple independent pieces of work (e.g. "add tests for all modules", "refactor X across the codebase", "check code for Y")? If YES → SPLIT. The parent issue is just a container; the real work is in the sub-issues.
+5. GUIDANCE TEST: Is there ONE specific thing the worker misunderstood or did wrong? If YES → GUIDE_WORKER.
+6. ENUMERATION TEST: If your guidance would list 2+ independent modules, files, or components → SPLIT, not GUIDE_WORKER.
+7. CLARITY TEST: If you cannot determine what to do because the issue is too vague → NEEDS_CLARIFICATION.
+8. COMPLETION TEST: Does the worker's output or the comments indicate the work is already fully implemented in the codebase? If YES → ALREADY_DONE.
+9. Choose EXACTLY ONE of GUIDE_WORKER, SPLIT, ALREADY_DONE, or NEEDS_CLARIFICATION — never combine them.
+10. When in doubt between GUIDE_WORKER and SPLIT, prefer SPLIT — it's better to create focused sub-issues than to give the worker a laundry list.
 
 Proceed with analyzing the issue autonomously.
 "#,
@@ -562,6 +732,7 @@ Proceed with analyzing the issue autonomously.
         description = issue.description,
         comments = comments,
         existing = existing_issues,
+        parent_priority = parent_priority,
     );
 
     Ok(prompt)
@@ -571,12 +742,16 @@ Proceed with analyzing the issue autonomously.
 struct SubIssue {
     title: String,
     description: String,
+    #[serde(default)]
+    priority: Option<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingSplit {
     parent_issue_iid: u64,
     parent_issue_title: String,
+    #[serde(default)]
+    parent_priority: u8,
     sub_issues: Vec<SubIssue>,
     created_issue_ids: Vec<u64>,
 }
@@ -586,6 +761,28 @@ fn pending_split_file(pmo_dir: &str, agent_id: &str) -> String {
         .join(format!("{}_pending_split.json", agent_id))
         .to_string_lossy()
         .into_owned()
+}
+
+fn extract_already_done_reason(agent_output: &str) -> String {
+    if let Some(pos) = agent_output.find("REASON:") {
+        let rest = &agent_output[pos + 7..];
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "The work described in this issue is already fully implemented in the codebase.".to_string()
+}
+
+fn extract_clarification_question(agent_output: &str) -> String {
+    if let Some(pos) = agent_output.find("QUESTION:") {
+        let rest = &agent_output[pos + 9..];
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "The PMO agent could not determine how to proceed with this issue. Please provide more details about the expected scope and acceptance criteria.".to_string()
 }
 
 fn extract_guidance(agent_output: &str) -> String {
@@ -629,15 +826,14 @@ fn extract_sub_issues(agent_output: &str) -> Vec<SubIssue> {
         if line.starts_with("SUB_ISSUE_") && line.ends_with(':') {
             let mut title = String::new();
             let mut description = String::new();
+            let mut priority: Option<u8> = None;
             let mut in_description = false;
 
             i += 1;
 
-            // Parse title and description
             while i < lines.len() {
                 let current_line = lines[i].trim();
 
-                // Stop if we hit the next sub-issue
                 if current_line.starts_with("SUB_ISSUE_") && current_line.ends_with(':') {
                     break;
                 }
@@ -648,6 +844,18 @@ fn extract_sub_issues(agent_output: &str) -> Vec<SubIssue> {
                         .unwrap_or("")
                         .trim()
                         .to_string();
+                    in_description = false;
+                } else if current_line.starts_with("PRIORITY:") {
+                    if let Ok(p) = current_line
+                        .strip_prefix("PRIORITY:")
+                        .unwrap_or("")
+                        .trim()
+                        .parse::<u8>()
+                        && (1..=3).contains(&p)
+                    {
+                        priority = Some(p);
+                    }
+                    in_description = false;
                 } else if current_line.starts_with("DESCRIPTION:") {
                     in_description = true;
                 } else if in_description && !current_line.is_empty() {
@@ -661,7 +869,11 @@ fn extract_sub_issues(agent_output: &str) -> Vec<SubIssue> {
             }
 
             if !title.is_empty() && !description.is_empty() {
-                sub_issues.push(SubIssue { title, description });
+                sub_issues.push(SubIssue {
+                    title,
+                    description,
+                    priority,
+                });
             }
 
             continue;
@@ -804,12 +1016,21 @@ fn resume_split(pending_file: &str, gitlab: &GitLabClient, pending: &PendingSpli
                     "PMO: Created sub-issue #{}: {}",
                     sub_issue_iid, sub_issue_title
                 );
+
+                let p = sub_issue.priority.unwrap_or(pending.parent_priority);
+                if let Err(e) = gitlab.add_issue_label(sub_issue_iid, &gitlab::priority_label(p)) {
+                    warn!(
+                        "PMO: Failed to set priority label on #{}: {}",
+                        sub_issue_iid, e
+                    );
+                }
+
                 created_issue_ids.push(sub_issue_iid);
 
-                // Update the pending split file after each successful creation
                 let updated_pending = PendingSplit {
                     parent_issue_iid: pending.parent_issue_iid,
                     parent_issue_title: pending.parent_issue_title.clone(),
+                    parent_priority: pending.parent_priority,
                     sub_issues: pending.sub_issues.clone(),
                     created_issue_ids: created_issue_ids.clone(),
                 };
@@ -883,6 +1104,7 @@ mod tests {
             description: "Test".to_string(),
             labels: vec![ACTION_REQUIRED_LABEL.to_string()],
             state: "opened".to_string(),
+            created_at: None,
             updated_at: None,
         };
         assert!(should_process_issue(&issue));
@@ -899,6 +1121,13 @@ mod tests {
         issue.title = "[Draft] Test".to_string();
         issue.labels = vec![ACTION_REQUIRED_LABEL.to_string()];
         assert!(!should_process_issue(&issue));
+
+        issue.title = "Normal issue".to_string();
+        issue.labels = vec![
+            ACTION_REQUIRED_LABEL.to_string(),
+            PMO_PENDING_LABEL.to_string(),
+        ];
+        assert!(!should_process_issue(&issue));
     }
 
     #[test]
@@ -906,12 +1135,14 @@ mod tests {
         let output = r#"
 SUB_ISSUE_1:
 TITLE: Add authentication module
+PRIORITY: 1
 DESCRIPTION:
 Implement basic authentication with JWT tokens.
 Include login and logout endpoints.
 
 SUB_ISSUE_2:
 TITLE: Add user management
+PRIORITY: 2
 DESCRIPTION:
 Create user CRUD operations.
 Add role-based access control.
@@ -921,7 +1152,39 @@ Add role-based access control.
         assert_eq!(sub_issues.len(), 2);
         assert_eq!(sub_issues[0].title, "Add authentication module");
         assert!(sub_issues[0].description.contains("JWT tokens"));
+        assert_eq!(sub_issues[0].priority, Some(1));
         assert_eq!(sub_issues[1].title, "Add user management");
         assert!(sub_issues[1].description.contains("CRUD"));
+        assert_eq!(sub_issues[1].priority, Some(2));
+    }
+
+    #[test]
+    fn test_extract_sub_issues_without_priority() {
+        let output = r#"
+SUB_ISSUE_1:
+TITLE: Simple task
+DESCRIPTION:
+Do something simple.
+        "#;
+
+        let sub_issues = extract_sub_issues(output);
+        assert_eq!(sub_issues.len(), 1);
+        assert_eq!(sub_issues[0].priority, None);
+    }
+
+    #[test]
+    fn test_priority_from_labels() {
+        assert_eq!(
+            gitlab::priority_from_labels(&["priority::1".to_string()]),
+            1
+        );
+        assert_eq!(
+            gitlab::priority_from_labels(&["priority::2".to_string(), "in-progress".to_string()]),
+            2
+        );
+        assert_eq!(
+            gitlab::priority_from_labels(&["in-progress".to_string()]),
+            3
+        );
     }
 }

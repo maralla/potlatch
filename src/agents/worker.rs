@@ -58,8 +58,11 @@ pub fn run(
     let gitlab = GitLabClient::new(worker_dir.clone());
     let agent = Agent::new(worker_dir.clone(), config.model.clone(), shutdown.clone());
 
-    // Try to resume an existing session from a previous run
-    let mut active: Option<ActiveIssue> = try_resume_session(&agent_id, &sessions_dir, &gitlab);
+    // Try to resume an existing session from a previous run.
+    // If the session file is missing (e.g. hard kill), fall back to scanning
+    // GitLab issues for an orphaned claim label belonging to this worker.
+    let mut active: Option<ActiveIssue> = try_resume_session(&agent_id, &sessions_dir, &gitlab)
+        .or_else(|| find_claimed_issue(&agent_id, &gitlab));
     if let Some(ref a) = active {
         if let Some(mr_iid) = a.mr_iid {
             info!(
@@ -154,6 +157,22 @@ fn worker_cycle(
     if let Some(a) = &*active
         && let Some(mr_iid) = a.mr_iid
     {
+        // Check if the issue was closed externally (e.g. by PMO stale cleanup)
+        if let Ok(issue) = gitlab.get_issue(a.issue_iid)
+            && issue.state != "opened"
+        {
+            abandon_closed_issue(
+                agent_id,
+                a.issue_iid,
+                Some(mr_iid),
+                sessions_dir,
+                git_repo,
+                gitlab,
+            );
+            *active = None;
+            return Ok(());
+        }
+
         info!(
             "{}: Watching MR !{} for issue #{}",
             agent_id, mr_iid, a.issue_iid
@@ -166,6 +185,15 @@ fn worker_cycle(
                         "{}: MR !{} is {}, releasing issue #{}",
                         agent_id, mr_iid, mr.state, a.issue_iid
                     );
+                    let branch = format!("issue-{}", a.issue_iid);
+                    let default_branch =
+                        git_repo.get_default_branch().unwrap_or("main".to_string());
+                    let _ = git_repo.reset_hard();
+                    let _ = git_repo.checkout_remote_branch(&default_branch);
+                    let _ = git_repo.delete_local_branch(&branch);
+                    if mr.state == "merged" {
+                        let _ = git_repo.delete_remote_branch(&branch);
+                    }
                     let _ = claim::release_claim(gitlab, a.issue_iid, agent_id);
                     let _ = gitlab.remove_issue_label(a.issue_iid, WORKING_ON_LABEL);
                     cleanup_session_file(sessions_dir, a.issue_iid);
@@ -211,6 +239,16 @@ fn worker_cycle(
         && !a.mr_created
     {
         let issue_iid = a.issue_iid;
+
+        // Check if the issue was closed externally
+        if let Ok(issue) = gitlab.get_issue(issue_iid)
+            && issue.state != "opened"
+        {
+            abandon_closed_issue(agent_id, issue_iid, None, sessions_dir, git_repo, gitlab);
+            *active = None;
+            return Ok(());
+        }
+
         info!(
             "{}: Active issue #{} has no MR, re-attempting implementation",
             agent_id, issue_iid
@@ -427,6 +465,10 @@ fn should_skip_issue(issue: &Issue) -> bool {
         return true;
     }
 
+    if issue.labels.contains(&"pmo-pending".to_string()) {
+        return true;
+    }
+
     false
 }
 
@@ -509,7 +551,13 @@ fn process_issue(
         build_implementation_prompt(project_name, worker_dir, issue)?
     };
 
-    let agent_output = agent.run(&prompt)?;
+    let issue_iid_for_cancel = issue.iid;
+    let cancel_check = || {
+        gitlab
+            .get_issue(issue_iid_for_cancel)
+            .is_ok_and(|i| i.state != "opened")
+    };
+    let agent_output = agent.run_with_cancel(&prompt, Some(&cancel_check))?;
 
     if agent_output.contains("CANNOT_IMPLEMENT") {
         let reason = if agent_output.contains("NEEDS_SPLIT") {
@@ -537,7 +585,7 @@ fn process_issue(
             let _ = gitlab.close_mr(mr_iid);
         }
 
-        // Reset git to a clean state
+        // Reset git to a clean state — keep remote branch for potential retry
         let default_branch = git_repo.get_default_branch().unwrap_or("main".to_string());
         let _ = git_repo.reset_hard();
         let _ = git_repo.checkout_remote_branch(&default_branch);
@@ -691,6 +739,7 @@ CRITICAL REQUIREMENTS:
 - You MUST NOT say "I cannot run commands" or "please run this" — YOU run everything
 - You MUST NOT produce passive output suggesting a human take action — YOU take all actions
 - Do NOT run `git add`, `git commit`, or `git push` — the system handles staging, committing, and pushing automatically after you finish
+- Do NOT create merge requests or pull requests (e.g. via `glab mr create`, `gh pr create`, or any API call) — the system manages them automatically
 - Review ALL comments to understand the full conversation
 - Identify which feedback items still need to be addressed
 - Address all unresolved feedback autonomously
@@ -707,14 +756,18 @@ INSTRUCTIONS:
 6. After making changes, RUN tests and linters to verify everything passes. If the reviewer asked you to run tests or fix linting — you MUST actually execute those commands (e.g. `cargo test`, `cargo clippy`, `python -m pytest`, `npm test`, etc.) and fix any failures.
 7. If the reviewer asked you to delete, rename, or move files — do it directly with `rm`, `mv`, `mkdir`, etc.
 8. Ensure changes align with both the original requirements and reviewer feedback
-9. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), respond with:
+9. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
+   a) Adjust your implementation to reduce changed lines — simplify, remove unnecessary changes, trim scope — then re-run tests
+   b) If you cannot reasonably reduce the size, respond with CANNOT_RESOLVE so the issue is rejected and the problem is reported back
+   Do NOT try to split the issue yourself — that is handled by the PMO agent, not you.
+10. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), respond with:
    CANNOT_RESOLVE
    REASON: <explain concisely why this cannot be resolved autonomously and what input is needed>
-10. If the reviewer asked you to fix the MR title or description, include updated versions in your response:
-   MR_TITLE: <concise, descriptive title — no markdown formatting>
+11. If the reviewer asked you to fix the MR title or description, include updated versions in your response:
+   MR_TITLE: <SHORT title (max 8-10 words) stating the main feature or fix — no enumeration of details, no markdown>
    MR_DESCRIPTION:
    <full description with goal, implementation, and testing sections>
-11. After addressing feedback, provide a summary:
+12. After addressing feedback, provide a summary:
    CHANGES_SUMMARY: <A concise sentence summarizing the substance of the changes made — this will be used as the git commit message, so it must convey the main idea of what was changed>
 
 REMINDER: You are fully autonomous. Execute every command, test, and file operation yourself. Never output instructions for a human.
@@ -730,7 +783,12 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         all_comments_text
     );
 
-    let agent_output = agent.run(&prompt)?;
+    let cancel_check = || {
+        gitlab
+            .get_issue(issue_number)
+            .is_ok_and(|i| i.state != "opened")
+    };
+    let agent_output = agent.run_with_cancel(&prompt, Some(&cancel_check))?;
 
     if agent_output.contains("CANNOT_RESOLVE") {
         let reason = extract_cannot_resolve_reason(&agent_output);
@@ -990,6 +1048,53 @@ fn try_resume_session(
     None
 }
 
+/// Scan all open GitLab issues for this worker's claim label.
+/// Used as a fallback when the session file is missing (e.g. hard kill / crash).
+fn find_claimed_issue(agent_id: &str, gitlab: &GitLabClient) -> Option<ActiveIssue> {
+    let claim_label = format!("claimed:{}", agent_id);
+
+    let issues = match gitlab.list_issues() {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(
+                "{}: Failed to scan issues for orphaned claims: {}",
+                agent_id, e
+            );
+            return None;
+        }
+    };
+
+    for issue in &issues {
+        if issue.state != "opened" {
+            continue;
+        }
+        if !issue.labels.contains(&claim_label) {
+            continue;
+        }
+
+        let (mr_iid, mr_created) = match find_open_mr_for_issue(gitlab, issue.iid) {
+            Some(mr) => (Some(mr), true),
+            None => (None, false),
+        };
+
+        info!(
+            "{}: Found orphaned claim on issue #{} (MR: {}), adopting it",
+            agent_id,
+            issue.iid,
+            mr_iid.map_or("none".to_string(), |id| format!("!{}", id))
+        );
+
+        return Some(ActiveIssue {
+            issue_iid: issue.iid,
+            mr_iid,
+            branch_name: Some(format!("issue-{}", issue.iid)),
+            mr_created,
+        });
+    }
+
+    None
+}
+
 /// Try to adopt an orphaned session file (issue has no claim label from any worker).
 fn try_adopt_orphaned_session(
     agent_id: &str,
@@ -1097,6 +1202,37 @@ fn find_open_mr_for_issue(gitlab: &GitLabClient, issue_iid: u64) -> Option<u64> 
         }
     }
     None
+}
+
+/// Clean up everything when the issue we're working on has been closed externally.
+/// Closes any related MR, deletes branches, releases the claim, and removes session.
+fn abandon_closed_issue(
+    agent_id: &str,
+    issue_iid: u64,
+    mr_iid: Option<u64>,
+    sessions_dir: &str,
+    git_repo: &GitRepo,
+    gitlab: &GitLabClient,
+) {
+    info!(
+        "{}: Issue #{} was closed externally, abandoning work",
+        agent_id, issue_iid
+    );
+
+    if let Some(mr) = mr_iid {
+        let _ = gitlab.add_mr_comment(mr, "Closing this MR — the linked issue has been closed.");
+        let _ = gitlab.close_mr(mr);
+    }
+
+    let branch = format!("issue-{}", issue_iid);
+    let default_branch = git_repo.get_default_branch().unwrap_or("main".to_string());
+    let _ = git_repo.reset_hard();
+    let _ = git_repo.checkout_remote_branch(&default_branch);
+    let _ = git_repo.delete_local_branch(&branch);
+    let _ = git_repo.delete_remote_branch(&branch);
+    let _ = claim::release_claim(gitlab, issue_iid, agent_id);
+    let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+    cleanup_session_file(sessions_dir, issue_iid);
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,6 +1532,7 @@ fn get_common_requirements() -> &'static str {
 - You MUST NOT be passive — if a file needs deleting, delete it; if a test needs running, run it
 - Do NOT run `git add` or `git commit` — the system handles staging and committing automatically after you finish
 - Do NOT run `git push` — the system handles pushing automatically
+- Do NOT create merge requests or pull requests (e.g. via `glab mr create`, `gh pr create`, or any API call) — the system creates them automatically after you finish
 - If information is missing, document what's needed in your response (do not ask interactively)
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
 - Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed"#
@@ -1438,7 +1575,7 @@ fn get_scope_rules(is_continuation: bool) -> String {
 fn get_output_format() -> &'static str {
     r#"MANDATORY OUTPUT — you MUST include these EXACT markers at the end of your response:
 
-MR_TITLE: <A concise, descriptive title that conveys the main idea of the code changes — do NOT use markdown formatting, do NOT wrap in ** or backticks>
+MR_TITLE: <SHORT title (max 8-10 words) stating the main feature or fix. Focus on WHAT, not HOW or HOW MUCH. Good: "Add unit tests for BaseProcessor". Bad: "Restore MySQL reporting tests, remove unrelated test files, and add 8 edge case tests to achieve 100% coverage". No markdown, no **, no backticks.>
 
 MR_DESCRIPTION:
 ## Goal
@@ -1617,6 +1754,7 @@ mod tests {
             description: "Test".to_string(),
             labels: vec![],
             state: "opened".to_string(),
+            created_at: None,
             updated_at: None,
         };
         assert!(should_skip_issue(&issue));
@@ -1635,6 +1773,9 @@ mod tests {
         assert!(should_skip_issue(&issue));
 
         issue.labels = vec![PMO_PROCESSED_LABEL.to_string()];
+        assert!(should_skip_issue(&issue));
+
+        issue.labels = vec!["pmo-pending".to_string()];
         assert!(should_skip_issue(&issue));
 
         issue.labels = vec![];

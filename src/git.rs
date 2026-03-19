@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
-use tracing::{debug, info};
+use tracing::debug;
 
 pub struct GitRepo {
     pub path: String,
@@ -17,7 +17,7 @@ impl GitRepo {
     }
 
     pub fn clone(&self, repo_url: &str) -> Result<()> {
-        info!("Cloning repository {} to {}", repo_url, self.path);
+        debug!("Cloning repository {} to {}", repo_url, self.path);
 
         let output = Command::new("git")
             .args(["clone", repo_url, &self.path])
@@ -94,6 +94,7 @@ impl GitRepo {
         let output = Command::new("git")
             .args([
                 "checkout",
+                "--force",
                 "-B",
                 branch_name,
                 &format!("origin/{}", branch_name),
@@ -113,10 +114,10 @@ impl GitRepo {
     }
 
     pub fn create_branch_from(&self, branch_name: &str, base: &str) -> Result<()> {
-        info!("Creating branch {} from origin/{}", branch_name, base);
+        debug!("Creating branch {} from origin/{}", branch_name, base);
 
         let output = Command::new("git")
-            .args(["checkout", "-b", branch_name, &format!("origin/{}", base)])
+            .args(["checkout", "-B", branch_name, &format!("origin/{}", base)])
             .current_dir(&self.path)
             .output()
             .context("Failed to create branch from base")?;
@@ -136,7 +137,7 @@ impl GitRepo {
     /// Attempt to merge origin/<branch> into the current branch.
     /// On conflict, aborts the merge and returns `Ok(false)`.
     pub fn try_merge(&self, branch: &str) -> Result<bool> {
-        info!("Merging origin/{} into current branch", branch);
+        debug!("Merging origin/{} into current branch", branch);
 
         let output = Command::new("git")
             .args(["merge", &format!("origin/{}", branch), "--no-edit"])
@@ -161,7 +162,7 @@ impl GitRepo {
     /// in the working tree if there are conflicts (does NOT abort).
     /// Returns `true` if merge succeeded cleanly, `false` if there are conflicts.
     pub fn merge_no_abort(&self, branch: &str) -> Result<bool> {
-        info!("Merging origin/{} into current branch (no abort)", branch);
+        debug!("Merging origin/{} into current branch (no abort)", branch);
 
         let output = Command::new("git")
             .args(["merge", &format!("origin/{}", branch), "--no-edit"])
@@ -248,7 +249,7 @@ impl GitRepo {
     }
 
     pub fn delete_remote_branch(&self, branch_name: &str) -> Result<()> {
-        info!("Deleting remote branch origin/{}", branch_name);
+        debug!("Deleting remote branch origin/{}", branch_name);
         let output = Command::new("git")
             .args(["push", "origin", "--delete", branch_name])
             .current_dir(&self.path)
@@ -308,10 +309,10 @@ impl GitRepo {
     }
 
     pub fn push(&self, branch: &str) -> Result<()> {
-        info!("Pushing branch {}", branch);
+        debug!("Pushing branch {}", branch);
 
         let output = Command::new("git")
-            .args(["push", "--force-with-lease", "-u", "origin", branch])
+            .args(["push", "--force", "-u", "origin", branch])
             .current_dir(&self.path)
             .output()
             .context("Failed to git push")?;
