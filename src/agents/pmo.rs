@@ -12,7 +12,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-use super::{claim, extract_project_name, issue_in_scope, labels, pmo_cursor_ask};
+use super::{
+    claim, extract_project_name, extract_public_comment_block, issue_in_scope, labels, pmo_cursor_ask,
+};
 use crate::acp::workspace_read::read_text_file_under_workspace;
 use crate::agent::Agent;
 use crate::config::PmoConfig;
@@ -972,6 +974,10 @@ CRITICAL REQUIREMENTS:
 - If the worker claimed it "cannot run commands" or "cannot delete files", that is WRONG — it CAN. Instruct it clearly.
 - Before deciding GUIDE_WORKER or SPLIT, you MUST verify whether the issue is already implemented in the current project state when that is plausible from the issue, comments, or worker output. If the behavior/tests/code already exist, choose ALREADY_DONE so Codepair will close the issue and add a comment.
 - In your final reply for this turn, make the outcome obvious in plain text (markers below). Codepair parses your message; there is no separate tool call for handoff.
+- For any human-facing comment text that should be posted to GitLab, include a stable block:
+  PUBLIC_COMMENT_BEGIN
+  <only final public comment text; no progress/status/tool logs>
+  PUBLIC_COMMENT_END
 - **Plan mode:** Cursor may save the plan as a `.md` file under the repo. Codepair reads that file after the turn and treats its contents like assistant text for parsing. A structured UI plan **without** the plain-text formats below is **not** enough — the saved plan file (or streamed text) **must** include `GUIDE_WORKER`, `SPLIT` + `SUB_ISSUE_N` blocks, `ALREADY_DONE`, or `NEEDS_CLARIFICATION` as required. Do not stop after only using plan UI widgets, and do not wait for user confirmation — this run is fully automated.
 - When applicable, mirror structured intent clearly in prose so parsers can pick it up, e.g. state `decision`, `question` / clarification needs, `instructions` for worker guidance, `reason` for ALREADY_DONE, and numbered `SUB_ISSUE_N` blocks for SPLIT.
 - For SPLIT, describe each planned sub-issue using the human-readable `SUB_ISSUE_N / TITLE / PRIORITY / DESCRIPTION` blocks in your reply (include acceptance criteria in `DESCRIPTION`).
@@ -1149,6 +1155,9 @@ fn is_pmo_already_done_response(output: &AgentHandoff) -> bool {
 }
 
 fn extract_already_done_reason(agent_output: &AgentHandoff) -> String {
+    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        return block;
+    }
     if let Some(reason) = &agent_output.reason {
         let trimmed = reason.trim();
         if !trimmed.is_empty() {
@@ -1171,6 +1180,9 @@ fn extract_already_done_reason(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_clarification_question(agent_output: &AgentHandoff) -> String {
+    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        return block;
+    }
     if let Some(question) = &agent_output.question {
         let trimmed = question.trim();
         if !trimmed.is_empty() {
@@ -1194,6 +1206,9 @@ fn extract_clarification_question(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_guidance(agent_output: &AgentHandoff) -> String {
+    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        return block;
+    }
     let raw = if let Some(instructions) = &agent_output.instructions {
         let trimmed = instructions.trim();
         if !trimmed.is_empty() {

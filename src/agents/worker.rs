@@ -9,7 +9,10 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use super::{claim, extract_project_name, issue_in_scope, write_task_context_file};
+use super::{
+    claim, extract_project_name, extract_public_comment_block, issue_in_scope,
+    strip_public_comment_blocks, write_task_context_file,
+};
 use crate::agent::Agent;
 use crate::config::WorkerConfig;
 use crate::cursor_mcp_config;
@@ -1262,10 +1265,14 @@ INSTRUCTIONS:
 14. If the reviewer asked you to fix the MR title or description, include updated versions in your response:
    MR_TITLE: <SHORT title (max 8-10 words) stating the main feature or fix — no enumeration of details, no markdown. It must describe the overall MR, not just the latest incremental change. Do NOT change the title just because you made another follow-up commit; keep it stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.>
    MR_DESCRIPTION:
-   <full description with goal, implementation, and testing sections>
+   <full description with goal, implementation, and testing sections — NEVER include PUBLIC_COMMENT_BEGIN/END here; those markers are only for thread replies below>
 15. After addressing feedback, provide a summary:
    CHANGES_SUMMARY: <A concise sentence summarizing the substance of the changes made — this will be used as the git commit message, so it must convey the main idea of what was changed>
-16. Control whether GitLab should mark open review discussions as resolved after your reply:
+16. For any human-facing GitLab comment/reply text, include a stable block:
+   PUBLIC_COMMENT_BEGIN
+   <only the final comment text to post publicly; no progress updates, no tool/log output>
+   PUBLIC_COMMENT_END
+17. Control whether GitLab should mark open review discussions as resolved after your reply:
    - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
    - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not fix the comment (e.g. explaining why the current code already satisfies it, partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
    - If you omit this line: the system assumes `yes` when it detects resolving actions: new commits (including rebases) on the MR branch, the MR title/description or labels changed on GitLab, or the remote branch tip moved. It assumes `no` only when none of those happened and you made no code changes.
@@ -1401,8 +1408,9 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         unresolved_ids
     };
 
-    let reply_raw =
-        build_feedback_resolution_reply(&agent_output, has_new_changes, diff_highlights.as_deref());
+    let reply_raw = extract_public_comment_block(&agent_output.response).unwrap_or_else(|| {
+        build_feedback_resolution_reply(&agent_output, has_new_changes, diff_highlights.as_deref())
+    });
     let reply_body = strip_worker_reply_boilerplate(&reply_raw);
     let resolve_discussions =
         should_resolve_mr_feedback_discussions(&agent_output, implicit_resolve_discussions);
@@ -1909,6 +1917,9 @@ fn output_needs_split(agent_output: &AgentHandoff) -> bool {
 }
 
 fn extract_cannot_resolve_reason(agent_output: &AgentHandoff) -> String {
+    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        return block;
+    }
     if let Some(reason) = &agent_output.reason {
         let trimmed = reason.trim();
         if !trimmed.is_empty() {
@@ -1962,6 +1973,10 @@ fn extract_changes_summary(agent_output: &AgentHandoff) -> String {
 /// Strips leading `Resolved without code changes:` / `Addressed feedback:` from the posted reply.
 /// If there is no substantive text after that prefix, returns the original string unchanged.
 fn strip_worker_reply_boilerplate(text: &str) -> String {
+    if let Some(block) = extract_public_comment_block(text) {
+        return block;
+    }
+
     fn strip_diff_highlights_block(s: &str) -> String {
         let mut out: Vec<&str> = Vec::new();
         for line in s.lines() {
@@ -1983,18 +1998,22 @@ fn strip_worker_reply_boilerplate(text: &str) -> String {
                 return trimmed.to_string();
             }
             let cleaned = strip_diff_highlights_block(suffix);
-            return if cleaned.is_empty() {
-                suffix.to_string()
+            let base = if cleaned.is_empty() { suffix } else { &cleaned };
+            let sanitized = base.trim();
+            return if sanitized.is_empty() {
+                "Addressed the requested feedback.".to_string()
             } else {
-                cleaned
+                sanitized.to_string()
             };
         }
     }
     let cleaned = strip_diff_highlights_block(trimmed);
-    if cleaned.is_empty() {
-        trimmed.to_string()
+    let base = if cleaned.is_empty() { trimmed } else { &cleaned };
+    let sanitized = base.trim();
+    if sanitized.is_empty() {
+        "Addressed the requested feedback.".to_string()
     } else {
-        cleaned
+        sanitized.to_string()
     }
 }
 
@@ -2539,10 +2558,28 @@ MR_DESCRIPTION:
 ## Testing
 <What testing was done or should be done?>
 
-IMPORTANT: The MR_TITLE and MR_DESCRIPTION markers are REQUIRED. Without them, the system cannot create the merge request properly."#
+Stable alternative (preferred for parsing):
+MR_TITLE_BEGIN
+<title text>
+MR_TITLE_END
+MR_DESCRIPTION_BEGIN
+<full markdown description text>
+MR_DESCRIPTION_END
+
+IMPORTANT: The MR_TITLE and MR_DESCRIPTION markers are REQUIRED. Without them, the system cannot create the merge request properly.
+
+Do NOT put PUBLIC_COMMENT_BEGIN / PUBLIC_COMMENT_END inside MR_DESCRIPTION or MR_DESCRIPTION_BEGIN…END — those blocks are only for GitLab thread replies. The MR description must be plain documentation (goal, implementation, testing); reply text belongs in a separate PUBLIC_COMMENT block after the MR description.
+
+For any human-facing GitLab comment text (separate from the MR description), also include:
+PUBLIC_COMMENT_BEGIN
+<final public comment only; no progress/status logs>
+PUBLIC_COMMENT_END"#
 }
 
 fn extract_split_reason(agent_output: &AgentHandoff) -> String {
+    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        return block;
+    }
     if let Some(reason) = &agent_output.needs_split {
         let trimmed = reason.trim();
         if !trimmed.is_empty() {
@@ -2557,6 +2594,9 @@ fn extract_split_reason(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_clarification(agent_output: &AgentHandoff) -> String {
+    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        return block;
+    }
     if let Some(clarification) = &agent_output.needs_clarification {
         let trimmed = clarification.trim();
         if !trimmed.is_empty() {
@@ -2574,6 +2614,14 @@ fn extract_clarification(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_mr_title(agent_output: &AgentHandoff) -> String {
+    if let Some(block) =
+        extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
+    {
+        let cleaned = strip_markdown_formatting(block.trim());
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
     if let Some(title) = &agent_output.mr_title {
         let cleaned = strip_markdown_formatting(title.trim());
         if !cleaned.is_empty() {
@@ -2628,6 +2676,14 @@ fn extract_mr_title(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_explicit_mr_title(agent_output: &AgentHandoff) -> String {
+    if let Some(block) =
+        extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
+    {
+        let cleaned = strip_markdown_formatting(block.trim());
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
     if let Some(title) = &agent_output.mr_title {
         let cleaned = strip_markdown_formatting(title.trim());
         if !cleaned.is_empty() {
@@ -2659,8 +2715,22 @@ fn strip_markdown_formatting(s: &str) -> String {
     result.to_string()
 }
 
+fn extract_block_between_markers(text: &str, begin: &str, end: &str) -> Option<String> {
+    let start = text.find(begin)?;
+    let body_start = start + begin.len();
+    let rest = &text[body_start..];
+    let end_rel = rest.find(end)?;
+    let body = rest[..end_rel].trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
 fn sanitize_mr_description_text(s: &str) -> String {
-    let filtered: Vec<&str> = s
+    let stripped = strip_public_comment_blocks(s);
+    let filtered: Vec<&str> = stripped
         .lines()
         .filter(|line| {
             let t = line.trim_start();
@@ -2671,6 +2741,13 @@ fn sanitize_mr_description_text(s: &str) -> String {
 }
 
 fn extract_mr_description(agent_output: &AgentHandoff) -> String {
+    if let Some(block) = extract_block_between_markers(
+        &agent_output.response,
+        "MR_DESCRIPTION_BEGIN",
+        "MR_DESCRIPTION_END",
+    ) {
+        return sanitize_mr_description_text(&block);
+    }
     if let Some(description) = &agent_output.mr_description {
         let trimmed = description.trim();
         if !trimmed.is_empty() {
@@ -2713,6 +2790,13 @@ fn extract_mr_description(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_explicit_mr_description(agent_output: &AgentHandoff) -> String {
+    if let Some(block) = extract_block_between_markers(
+        &agent_output.response,
+        "MR_DESCRIPTION_BEGIN",
+        "MR_DESCRIPTION_END",
+    ) {
+        return sanitize_mr_description_text(&block);
+    }
     if let Some(description) = &agent_output.mr_description {
         let trimmed = description.trim();
         if !trimmed.is_empty() {
@@ -2919,6 +3003,21 @@ mod tests {
     }
 
     #[test]
+    fn strip_worker_reply_boilerplate_keeps_all_lines_after_prefix() {
+        let input = "Addressed feedback:\n\nI’ll run a full readonly review from local state.\nFixed null checks.\nError: S: [unavailable] Error";
+        assert_eq!(
+            strip_worker_reply_boilerplate(input),
+            "I’ll run a full readonly review from local state.\nFixed null checks.\nError: S: [unavailable] Error"
+        );
+    }
+
+    #[test]
+    fn strip_worker_reply_boilerplate_uses_public_comment_block() {
+        let input = "Addressed feedback:\n\nPUBLIC_COMMENT_BEGIN\nFinal reviewer reply.\nPUBLIC_COMMENT_END";
+        assert_eq!(strip_worker_reply_boilerplate(input), "Final reviewer reply.");
+    }
+
+    #[test]
     fn should_resolve_mr_feedback_discussions_defaults_follow_implicit_actions() {
         let out = AgentHandoff::default();
         assert!(!should_resolve_mr_feedback_discussions(&out, false));
@@ -2979,6 +3078,22 @@ mod tests {
     }
 
     #[test]
+    fn extract_mr_description_strips_public_comment_blocks() {
+        let output = AgentHandoff {
+            mr_description: Some(
+                "## Goal\npytest coverage.\nPUBLIC_COMMENT_BEGIN\nThanks for the review.\nPUBLIC_COMMENT_END\n## Testing\nuv run pytest"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let desc = extract_mr_description(&output);
+        assert!(!desc.contains("PUBLIC_COMMENT_BEGIN"), "{desc}");
+        assert!(!desc.contains("Thanks for the review"), "{desc}");
+        assert!(desc.contains("## Goal"), "{desc}");
+        assert!(desc.contains("uv run pytest"), "{desc}");
+    }
+
+    #[test]
     fn extract_explicit_mr_description_filters_control_markers() {
         let output = AgentHandoff {
             response:
@@ -2987,5 +3102,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(extract_explicit_mr_description(&output), "Summary line");
+    }
+
+    #[test]
+    fn extract_mr_title_prefers_block_markers() {
+        let output = AgentHandoff {
+            response: "MR_TITLE_BEGIN\nStable title\nMR_TITLE_END\nMR_TITLE: fallback".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_mr_title(&output), "Stable title");
+        assert_eq!(extract_explicit_mr_title(&output), "Stable title");
+    }
+
+    #[test]
+    fn extract_mr_description_prefers_block_markers() {
+        let output = AgentHandoff {
+            response:
+                "MR_DESCRIPTION_BEGIN\n## Goal\nA\nCHANGES_SUMMARY: noisy\nMR_DESCRIPTION_END\nMR_DESCRIPTION:\nB"
+                    .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_mr_description(&output), "## Goal\nA");
+        assert_eq!(extract_explicit_mr_description(&output), "## Goal\nA");
     }
 }

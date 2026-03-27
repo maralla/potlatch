@@ -29,6 +29,47 @@ pub fn extract_project_name(repo_url: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+/// Stable machine-readable block for public GitLab comments embedded in agent text output.
+/// Format:
+/// `PUBLIC_COMMENT_BEGIN`
+/// `<comment body>`
+/// `PUBLIC_COMMENT_END`
+pub(crate) fn extract_public_comment_block(text: &str) -> Option<String> {
+    const BEGIN: &str = "PUBLIC_COMMENT_BEGIN";
+    const END: &str = "PUBLIC_COMMENT_END";
+    let start = text.find(BEGIN)?;
+    let body_start = start + BEGIN.len();
+    let rest = &text[body_start..];
+    let end_rel = rest.find(END)?;
+    let body = rest[..end_rel].trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
+/// Removes every `PUBLIC_COMMENT_BEGIN` … `PUBLIC_COMMENT_END` region from `text`.
+/// MR descriptions must not contain these markers (they belong only in thread replies).
+pub(crate) fn strip_public_comment_blocks(text: &str) -> String {
+    const BEGIN: &str = "PUBLIC_COMMENT_BEGIN";
+    const END: &str = "PUBLIC_COMMENT_END";
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(BEGIN) {
+        out.push_str(&rest[..start]);
+        let after_begin = &rest[start + BEGIN.len()..];
+        if let Some(end_rel) = after_begin.find(END) {
+            rest = &after_begin[end_rel + END.len()..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 /// Writes `{work_dir}/.codepair-context/{file_name}`. `file_name` must be a single path segment
 /// (e.g. `pmo-issue-1.md`), not a nested path.
 pub(crate) fn write_task_context_file(
@@ -275,7 +316,7 @@ pub fn run(git_repo_address: String, config: Config) -> Result<()> {
 
 #[cfg(test)]
 mod scope_tests {
-    use super::{issue_in_scope, mr_in_scope};
+    use super::{extract_public_comment_block, issue_in_scope, mr_in_scope, strip_public_comment_blocks};
     use crate::gitlab::{Issue, MergeRequest};
 
     fn sample_issue(labels: Vec<&str>) -> Issue {
@@ -324,5 +365,35 @@ mod scope_tests {
 
         let ai_worker = sample_mr(Some(vec![super::labels::NEED_AI_WORKER]));
         assert!(mr_in_scope(&ai_worker, Some("other-scope")));
+    }
+
+    #[test]
+    fn extract_public_comment_block_reads_stable_markers() {
+        let text = "noise\nPUBLIC_COMMENT_BEGIN\nFinal public comment.\nPUBLIC_COMMENT_END\nmore";
+        assert_eq!(
+            extract_public_comment_block(text).as_deref(),
+            Some("Final public comment.")
+        );
+    }
+
+    #[test]
+    fn strip_public_comment_blocks_removes_one_block() {
+        let text = "Goal line\nPUBLIC_COMMENT_BEGIN\nThanks.\nPUBLIC_COMMENT_END\n## Testing\nx";
+        assert_eq!(
+            strip_public_comment_blocks(text),
+            "Goal line\n\n## Testing\nx"
+        );
+    }
+
+    #[test]
+    fn strip_public_comment_blocks_removes_multiple() {
+        let t = "A\nPUBLIC_COMMENT_BEGIN\n1\nPUBLIC_COMMENT_END\nB\nPUBLIC_COMMENT_BEGIN\n2\nPUBLIC_COMMENT_END\nC";
+        assert_eq!(strip_public_comment_blocks(t), "A\n\nB\n\nC");
+    }
+
+    #[test]
+    fn strip_public_comment_blocks_truncates_unclosed_begin() {
+        let t = "Keep\nPUBLIC_COMMENT_BEGIN\ndangling";
+        assert_eq!(strip_public_comment_blocks(t), "Keep");
     }
 }

@@ -1,13 +1,15 @@
 use anyhow::Result;
 use rand::RngExt;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use super::{claim, extract_project_name, mr_in_scope, write_task_context_file};
+use super::{
+    claim, extract_project_name, extract_public_comment_block, mr_in_scope, write_task_context_file,
+};
 use crate::agent::Agent;
 use crate::config::ReviewerConfig;
 use crate::cursor_mcp_config;
@@ -589,6 +591,12 @@ CRITICAL REQUIREMENTS:
 - Review the full comment history to understand what feedback was already given and addressed
 - Do NOT repeat feedback that has already been addressed
 
+GITLAB COMMENT STYLE (STRICT — for REQUEST_CHANGES and any posted feedback):
+- Do NOT start with a long paragraph of hollow praise or thanks that only restates the diff or issue number (e.g. listing routes, files, or "aligns with #N" without adding a review decision). That adds no value and wastes the reader's time.
+- Lead with what matters: **what must change before merge**, or **why you approve**. Use a direct lead-in such as `Request before merge:` or `Blocking:` when the MR must not merge until the item is addressed.
+- For description/title gaps, be concrete: say the MR description should state goal, approach, and verification commands (not only `Closes #N` or a one-liner).
+- Keep the public comment focused: one short optional line of genuine substance is OK, but **never** pad with a multi-sentence "thanks for the thorough coverage" preface that duplicates the diff.
+
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before starting the review. Treat it as authoritative project policy.
 2. Read the task context file above before starting the review.
@@ -647,6 +655,11 @@ FEEDBACK:
 - <specific issue 1>
 - <specific issue 2>
 - <etc>
+
+For any human-facing GitLab comment text, include a stable block (use the same style as above: no hollow opening paragraph; put the request first):
+PUBLIC_COMMENT_BEGIN
+<only final public comment text; no progress/status/tool logs>
+PUBLIC_COMMENT_END
 
 Proceed with the review autonomously. Do not ask for any user input.
 "#,
@@ -797,11 +810,24 @@ fn strip_review_boilerplate(text: &str) -> String {
 }
 
 fn normalize_review_comment_body(text: &str) -> String {
-    strip_review_boilerplate(&strip_request_changes_prefix(text))
+    let stripped = strip_review_boilerplate(&strip_request_changes_prefix(text));
+    stripped.trim().to_string()
 }
 
 fn extract_review_feedback(agent_output: &AgentHandoff) -> String {
+    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        let out = normalize_review_comment_body(block.trim());
+        if !out.is_empty() {
+            return out;
+        }
+    }
     if let Some(feedback) = &agent_output.feedback {
+        if let Some(block) = extract_public_comment_block(feedback) {
+            let out = normalize_review_comment_body(block.trim());
+            if !out.is_empty() {
+                return out;
+            }
+        }
         let trimmed = feedback.trim();
         if !trimmed.is_empty() {
             let out = normalize_review_comment_body(trimmed);
@@ -845,7 +871,19 @@ fn find_request_changes_ignore_case(haystack: &str) -> Option<usize> {
 }
 
 fn extract_fallback_review_feedback(agent_output: &AgentHandoff) -> Option<String> {
+    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        let trimmed = block.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
     if let Some(feedback) = &agent_output.feedback {
+        if let Some(block) = extract_public_comment_block(feedback) {
+            let trimmed = block.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
         let trimmed = feedback.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
@@ -994,6 +1032,20 @@ Ready for next assignment."#
         assert_eq!(
             extract_review_feedback(&output),
             "The MR title `x` is too generic."
+        );
+    }
+
+    #[test]
+    fn extract_review_feedback_prefers_public_comment_block() {
+        let output = AgentHandoff {
+            response:
+                "REQUEST_CHANGES\nPUBLIC_COMMENT_BEGIN\nPlease add one integration test.\nPUBLIC_COMMENT_END"
+                    .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_review_feedback(&output),
+            "Please add one integration test."
         );
     }
 
