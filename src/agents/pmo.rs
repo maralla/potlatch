@@ -974,7 +974,12 @@ CRITICAL REQUIREMENTS:
 - In your final reply for this turn, make the outcome obvious in plain text (markers below). Codepair parses your message; there is no separate tool call for handoff.
 - **Plan mode:** Cursor may save the plan as a `.md` file under the repo. Codepair reads that file after the turn and treats its contents like assistant text for parsing. A structured UI plan **without** the plain-text formats below is **not** enough — the saved plan file (or streamed text) **must** include `GUIDE_WORKER`, `SPLIT` + `SUB_ISSUE_N` blocks, `ALREADY_DONE`, or `NEEDS_CLARIFICATION` as required. Do not stop after only using plan UI widgets, and do not wait for user confirmation — this run is fully automated.
 - When applicable, mirror structured intent clearly in prose so parsers can pick it up, e.g. state `decision`, `question` / clarification needs, `instructions` for worker guidance, `reason` for ALREADY_DONE, and numbered `SUB_ISSUE_N` blocks for SPLIT.
-- For SPLIT, describe each planned sub-issue using the human-readable `SUB_ISSUE_N / TITLE / PRIORITY / DESCRIPTION` blocks in your reply (include acceptance criteria and dependencies in `DESCRIPTION` when relevant).
+- For SPLIT, describe each planned sub-issue using the human-readable `SUB_ISSUE_N / TITLE / PRIORITY / DESCRIPTION` blocks in your reply (include acceptance criteria in `DESCRIPTION`).
+- Dependency formatting rule for each `DESCRIPTION`:
+  - If a sub-issue has NO dependencies, do NOT mention dependencies at all.
+  - If it DOES depend on other sub-issues, include EXACTLY one single line in the description:
+    `Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2, ...`
+  - Do not use alternative labels like `Dependencies:` or prose variants.
 
 DECISION — choose EXACTLY ONE of the following:
 
@@ -1004,7 +1009,7 @@ DECISION — choose EXACTLY ONE of the following:
    DESCRIPTION:
    <Detailed description of what needs to be implemented>
    <Include acceptance criteria>
-   <Mention any dependencies on other sub-issues>
+   <If needed, include EXACTLY one line: Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2, ...>
 
    SUB_ISSUE_2:
    TITLE: <concise title>
@@ -1092,6 +1097,13 @@ struct PendingSplit {
     sub_issues: Vec<SubIssue>,
     created_issue_ids: Vec<u64>,
 }
+
+static ISSUE_DEPENDENCIES_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^\s*Issue\s+Dependencies\s*:\s*(.+?)\s*$")
+        .expect("Issue Dependencies line pattern")
+});
+static SUB_ISSUE_DEP_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^SUB_ISSUE_(\d+)$").expect("SUB_ISSUE dependency token"));
 
 /// `ALREADY_DONE` followed only by whitespace (including newlines), then `REASON:`.
 static PMO_ALREADY_DONE_RE: LazyLock<Regex> =
@@ -1560,6 +1572,49 @@ fn extract_sub_issues(agent_output: &AgentHandoff) -> Vec<SubIssue> {
     sub_issues
 }
 
+/// Rewrites `Issue Dependencies: SUB_ISSUE_N, ...` into real issue references where known.
+/// Unknown placeholders are kept unchanged so intent is not lost.
+fn resolve_dependency_placeholders_in_description(
+    description: &str,
+    created_issue_ids_by_sub_index: &[Option<u64>],
+) -> String {
+    let mut out = Vec::new();
+    for raw_line in description.lines() {
+        let line = raw_line.trim();
+        let Some(caps) = ISSUE_DEPENDENCIES_LINE_RE.captures(line) else {
+            out.push(raw_line.to_string());
+            continue;
+        };
+        let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let deps: Vec<String> = body
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|token| {
+                let Some(dep_caps) = SUB_ISSUE_DEP_TOKEN_RE.captures(token) else {
+                    return token.to_string();
+                };
+                let idx = dep_caps
+                    .get(1)
+                    .and_then(|m| m.as_str().parse::<usize>().ok())
+                    .and_then(|n| n.checked_sub(1));
+                match idx
+                    .and_then(|i| created_issue_ids_by_sub_index.get(i))
+                    .and_then(|x| *x)
+                {
+                    Some(iid) => format!("#{iid}"),
+                    None => token.to_string(),
+                }
+            })
+            .collect();
+        if deps.is_empty() {
+            continue;
+        }
+        out.push(format!("Issue Dependencies: {}", deps.join(", ")));
+    }
+    out.join("\n")
+}
+
 fn save_pending_split(path: &str, pending: &PendingSplit) -> Result<()> {
     let json = serde_json::to_string_pretty(pending)?;
     if let Some(parent) = std::path::Path::new(path).parent() {
@@ -1665,6 +1720,12 @@ fn resume_split(
     let mut created_issue_ids = pending.created_issue_ids.clone();
     let total_sub_issues = pending.sub_issues.len();
     let already_created = created_issue_ids.len();
+    let mut created_issue_ids_by_sub_index = vec![None; total_sub_issues];
+    for (i, iid) in created_issue_ids.iter().copied().enumerate() {
+        if i < created_issue_ids_by_sub_index.len() {
+            created_issue_ids_by_sub_index[i] = Some(iid);
+        }
+    }
 
     // Create remaining sub-issues
     for (index, sub_issue) in pending.sub_issues.iter().enumerate() {
@@ -1684,7 +1745,12 @@ fn resume_split(
             &sub_issue.title
         };
 
-        match gitlab.create_issue(&sub_issue_title, &sub_issue.description) {
+        let resolved_description = resolve_dependency_placeholders_in_description(
+            &sub_issue.description,
+            &created_issue_ids_by_sub_index,
+        );
+
+        match gitlab.create_issue(&sub_issue_title, &resolved_description) {
             Ok(sub_issue_iid) => {
                 info!(
                     "PMO: Created sub-issue #{}: {}",
@@ -1709,6 +1775,7 @@ fn resume_split(
                 }
 
                 created_issue_ids.push(sub_issue_iid);
+                created_issue_ids_by_sub_index[index] = Some(sub_issue_iid);
 
                 let updated_pending = PendingSplit {
                     parent_issue_iid: pending.parent_issue_iid,
@@ -1950,6 +2017,22 @@ Body here.
         let sub_issues = extract_sub_issues(&output);
         assert_eq!(sub_issues.len(), 1);
         assert_eq!(sub_issues[0].title, "From instructions");
+    }
+
+    #[test]
+    fn test_resolve_dependency_placeholders_in_description() {
+        let desc = "Build feature.\nIssue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2\nDone.";
+        let ids = vec![Some(101), Some(102)];
+        let out = resolve_dependency_placeholders_in_description(desc, &ids);
+        assert!(out.contains("Issue Dependencies: #101, #102"), "{out}");
+    }
+
+    #[test]
+    fn test_resolve_dependency_placeholders_keeps_unknown_tokens() {
+        let desc = "Issue Dependencies: SUB_ISSUE_3, external-task";
+        let ids = vec![Some(101), None];
+        let out = resolve_dependency_placeholders_in_description(desc, &ids);
+        assert_eq!(out, "Issue Dependencies: SUB_ISSUE_3, external-task");
     }
 
     #[test]
