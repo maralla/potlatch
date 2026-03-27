@@ -594,12 +594,12 @@ CRITICAL REQUIREMENTS:
 GITLAB COMMENT STYLE (STRICT — for REQUEST_CHANGES and any posted feedback):
 - Do NOT start with a long paragraph of hollow praise or thanks that only restates the diff or issue number (e.g. listing routes, files, or "aligns with #N" without adding a review decision). That adds no value and wastes the reader's time.
 - Lead with what matters: **what must change before merge**, or **why you approve**. Use a direct lead-in such as `Request before merge:` or `Blocking:` when the MR must not merge until the item is addressed.
-- For description/title gaps, be concrete: say the MR description should state goal, approach, and verification commands (not only `Closes #N` or a one-liner).
+- Only request MR description updates after you have read the full `## MR description` section in the task context file (including everything after any `Closes #N` line). Do **not** treat an opening `Closes #N` as “description is only the closing line” when the rest of that section documents the work. If it already states goal, implementation approach, and verification, do not ask to expand the description.
 - Keep the public comment focused: one short optional line of genuine substance is OK, but **never** pad with a multi-sentence "thanks for the thorough coverage" preface that duplicates the diff.
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before starting the review. Treat it as authoritative project policy.
-2. Read the task context file above before starting the review.
+2. Read the task context file above before starting the review. For description quality, rely on the full text under `## MR description` there (do not judge from the MR title line alone).
 3. Review the full comment history to understand previous feedback and responses
 4. The source branch has already been merged with the target branch locally - you are on the merged result
 5. Use the local git checkout to inspect the actual code changes yourself. You are in the merged result already, so run commands like `git diff origin/{}`..., `git diff --stat origin/{}`..., `git diff --name-only origin/{}`..., and read the changed files directly instead of relying only on the summaries above.
@@ -615,7 +615,7 @@ INSTRUCTIONS:
 
 MR TITLE AND DESCRIPTION (STRICT — reject if violated):
 - The MR title MUST be a concise, meaningful summary of the code changes. Reject if the title is generic (e.g. "Implementation changes", "Update", "Fix"), just an issue number, or contains markdown formatting like ** or backticks.
-- The MR description MUST explain the goal, implementation approach, and testing. Reject if the description is empty, a single generic sentence (e.g. "Implementation completed."), or does not describe the actual changes.
+- The MR description MUST explain the goal, implementation approach, and testing. Judge using the full `## MR description` text in the task context file (not the MR title line alone). Reject only if that text is empty, a single generic sentence (e.g. "Implementation completed."), or does not describe the actual changes. If it includes substantive detail (sections like Goal / Implementation / Testing, or equivalent prose), it satisfies this requirement even when the first line is only `Closes #N` or similar.
 - When rejecting for poor title/description, tell the worker exactly what is wrong and ask it to provide a proper MR_TITLE and MR_DESCRIPTION in its response.
 
 CHANGE SIZE LIMITS (reject if exceeded):
