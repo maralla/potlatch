@@ -17,6 +17,7 @@ use crate::mcp_coord::AgentHandoff;
 use crate::mcp_coord::CoordinatorHandle;
 
 const REVIEWER_APPROVED_LABEL: &str = "reviewer-approved";
+const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
 
 enum ReviewOutcome {
     Merged,
@@ -200,6 +201,11 @@ fn reviewer_cycle(
     let priority_map: std::collections::HashMap<u64, u8> =
         issues.iter().map(|i| (i.iid, i.priority())).collect();
     mrs.sort_by(|a, b| {
+        let aa = mr_has_label(a, NEED_AI_WORKER_LABEL);
+        let bb = mr_has_label(b, NEED_AI_WORKER_LABEL);
+        if aa != bb {
+            return bb.cmp(&aa);
+        }
         let pa = gitlab::issue_iid_from_branch(&a.source_branch)
             .and_then(|iid| priority_map.get(&iid).copied())
             .unwrap_or(gitlab::DEFAULT_PRIORITY);
@@ -350,6 +356,7 @@ fn review_merge_request(
     agent: &Agent,
     mr: &MergeRequest,
 ) -> Result<ReviewOutcome> {
+    let is_need_ai_worker_mr = mr_has_label(mr, NEED_AI_WORKER_LABEL);
     // Check if the MR links to an issue via description first, then branch name
     let issue_iid = {
         let re = regex::Regex::new(r"(?i)closes?\s+#(\d+)").ok();
@@ -360,7 +367,7 @@ fn review_merge_request(
         .or_else(|| gitlab::issue_iid_from_branch(&mr.source_branch))
     };
 
-    if issue_iid.is_none() {
+    if issue_iid.is_none() && !is_need_ai_worker_mr {
         warn!(
             "MR !{} does not reference any issue, requesting fix",
             mr.iid
@@ -430,6 +437,7 @@ fn review_merge_request(
         &diff_stat,
         &changed_files,
         issue_iid,
+        is_need_ai_worker_mr,
         sessions_dir,
     )?;
 
@@ -498,6 +506,7 @@ fn build_review_prompt(
     diff_stat: &str,
     changed_files: &[String],
     issue_iid: Option<u64>,
+    is_need_ai_worker_mr: bool,
     sessions_dir: &str,
 ) -> Result<String> {
     let comments = gitlab.get_mr_comments(mr.iid).unwrap_or_default();
@@ -551,6 +560,11 @@ fn build_review_prompt(
         ),
     )?;
 
+    let completeness_line = if is_need_ai_worker_mr {
+        "8. COMPLETENESS CHECK (STRICT): For `need-ai-worker` MRs, evaluate completeness against the MR title, MR description, diff, and comment history (do not require linked issue context). If scope implied by those sources is missing or partial, list missing items and REQUEST_CHANGES.".to_string()
+    } else {
+        "8. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the LINKED ISSUE (title, description, and comments). Every requirement or item mentioned in the issue MUST be addressed in the implementation. If any part is missing or only partially implemented, list the missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.".to_string()
+    };
     let prompt = format!(
         r#"You are reviewing a merge request for a software project in a fully automated, non-interactive environment.
 
@@ -583,7 +597,7 @@ INSTRUCTIONS:
 5. Use the local git checkout to inspect the actual code changes yourself. You are in the merged result already, so run commands like `git diff origin/{}`..., `git diff --stat origin/{}`..., `git diff --name-only origin/{}`..., and read the changed files directly instead of relying only on the summaries above.
 6. Review the code changes thoroughly using the local repository state
 7. Check if the implementation matches the stated goal
-8. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the LINKED ISSUE (title, description, and comments). Every requirement or item mentioned in the issue MUST be addressed in the implementation. If any part is missing or only partially implemented, list the missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.
+{}
 9. Run tests locally to verify they pass (do NOT rely on CI/CD)
 10. Run linting locally to verify it passes (do NOT rely on CI/CD)
 11. Check code quality, best practices, and potential issues
@@ -642,6 +656,7 @@ Proceed with the review autonomously. Do not ask for any user input.
         mr.source_branch,
         mr.target_branch,
         context_path,
+        completeness_line,
         mr.target_branch,
         mr.target_branch,
         mr.target_branch

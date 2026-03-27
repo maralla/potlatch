@@ -80,6 +80,13 @@ pub(crate) fn issue_in_scope(issue: &Issue, scope_label: Option<&str>) -> bool {
 
 /// When `scope_label` is `Some`, the merge request must include that label (exact match).
 pub(crate) fn mr_in_scope(mr: &MergeRequest, scope_label: Option<&str>) -> bool {
+    if mr
+        .labels
+        .as_ref()
+        .is_some_and(|labels| labels.iter().any(|x| x == labels::NEED_AI_WORKER))
+    {
+        return true;
+    }
     match scope_label {
         None => true,
         Some(l) => mr
@@ -314,5 +321,8 @@ mod scope_tests {
 
         let no_labels = sample_mr(None);
         assert!(!mr_in_scope(&no_labels, Some("codepair")));
+
+        let ai_worker = sample_mr(Some(vec![super::labels::NEED_AI_WORKER]));
+        assert!(mr_in_scope(&ai_worker, Some("other-scope")));
     }
 }

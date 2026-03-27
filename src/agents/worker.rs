@@ -21,6 +21,7 @@ const WORKING_ON_LABEL: &str = "in-progress";
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
 const PMO_PENDING_LABEL: &str = "pmo-pending";
+const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
 /// Human/workflow pause: worker skips the issue (no close) and releases its hold until removed.
 const WORKER_PENDING_LABEL: &str = "pending";
 
@@ -441,7 +442,7 @@ fn worker_cycle(
                     return Ok(());
                 }
 
-                match handle_mr_comments(state, agent, &mr) {
+                match handle_mr_comments(state, agent, &mr, Some(a.issue_iid), false) {
                     Ok(true) => {
                         info!(
                             "{}: Issue #{} abandoned, MR !{} closed",
@@ -597,6 +598,11 @@ fn worker_cycle(
     }
 
     // No orphaned sessions — poll for new issues
+    if try_handle_need_ai_worker_mr(state, agent, shutdown, scope_label)? {
+        return Ok(());
+    }
+
+    // No labeled MR work — poll for new issues
     info!("{}: Polling for new issues...", &state.agent_id);
     let issues = state.glab.list_issues()?;
 
@@ -701,6 +707,64 @@ fn worker_cycle(
     }
 
     Ok(())
+}
+
+fn mr_has_label(mr: &crate::gitlab::MergeRequest, label: &str) -> bool {
+    mr.labels
+        .as_ref()
+        .is_some_and(|ls| ls.iter().any(|l| l.eq_ignore_ascii_case(label)))
+}
+
+/// Handle open MRs labeled `need-ai-worker` as worker tasks:
+/// claim MR directly, address unresolved discussions, then release claim.
+fn try_handle_need_ai_worker_mr(
+    state: &AgentState,
+    agent: &Agent,
+    shutdown: &AtomicBool,
+    scope_label: Option<&str>,
+) -> Result<bool> {
+    let mut mrs = state.glab.list_merge_requests()?;
+    mrs.sort_by_key(|mr| mr.iid);
+    for mr in mrs {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        if mr.state != "opened" {
+            continue;
+        }
+        if !mr_has_label(&mr, NEED_AI_WORKER_LABEL) {
+            continue;
+        }
+        if !super::mr_in_scope(&mr, scope_label) {
+            continue;
+        }
+        if claim::is_mr_claimed(&mr.labels) {
+            continue;
+        }
+        let unresolved = state.glab.get_unresolved_discussion_ids(mr.iid)?;
+        if unresolved.is_empty() {
+            continue;
+        }
+        if !claim::try_claim_mr(&state.glab, mr.iid, &state.agent_id, shutdown)? {
+            continue;
+        }
+        if shutdown.load(Ordering::SeqCst) {
+            let _ = claim::release_mr_claim(&state.glab, mr.iid, &state.agent_id);
+            return Ok(false);
+        }
+        info!(
+            "{}: Handling labeled MR !{} (`{}`) with {} unresolved discussion(s)",
+            &state.agent_id,
+            mr.iid,
+            NEED_AI_WORKER_LABEL,
+            unresolved.len()
+        );
+        let result = handle_mr_comments(state, agent, &mr, None, true);
+        let _ = claim::release_mr_claim(&state.glab, mr.iid, &state.agent_id);
+        result?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn should_skip_issue(issue: &Issue) -> bool {
@@ -1048,11 +1112,13 @@ fn handle_mr_comments(
     state: &AgentState,
     agent: &Agent,
     mr: &crate::gitlab::MergeRequest,
+    linked_issue_iid: Option<u64>,
+    comments_only_mode: bool,
 ) -> Result<bool> {
     let latest_mr = state.glab.get_merge_request(mr.iid)?;
     let unresolved_ids = state.glab.get_unresolved_discussion_ids(latest_mr.iid)?;
 
-    if unresolved_ids.is_empty() && !latest_mr.has_conflicts {
+    if unresolved_ids.is_empty() && (comments_only_mode || !latest_mr.has_conflicts) {
         return Ok(false);
     }
 
@@ -1113,9 +1179,14 @@ fn handle_mr_comments(
         );
     }
 
-    let issue_number = extract_issue_number_from_branch(&latest_mr.source_branch)?;
-    let issue_context = load_issue_context(&state.glab, issue_number)?;
-    let implementation_summary = state.load_implementation_summary(issue_number);
+    let issue_number = linked_issue_iid.or_else(|| extract_issue_number_from_branch(&latest_mr.source_branch).ok());
+    let issue_context = issue_number
+        .map(|n| load_issue_context(&state.glab, n))
+        .transpose()?
+        .unwrap_or_else(|| "No linked issue context available for this MR.".to_string());
+    let implementation_summary = issue_number
+        .map(|n| state.load_implementation_summary(n))
+        .unwrap_or_else(|| "No previous implementation summary available.".to_string());
 
     let comment_lines = comments
         .iter()
@@ -1206,13 +1277,17 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         &state.project_name, latest_mr.iid, latest_mr.title, combined_context_path
     );
 
-    let cancel_check = || {
-        state
-            .glab
-            .get_issue(issue_number)
-            .is_ok_and(|i| i.state != "opened")
+    let agent_output = if let Some(issue_number) = issue_number {
+        let cancel_check = || {
+            state
+                .glab
+                .get_issue(issue_number)
+                .is_ok_and(|i| i.state != "opened")
+        };
+        agent.run_with_cancel(&prompt, Some(&cancel_check), None)?
+    } else {
+        agent.run_with_cancel(&prompt, None, None)?
     };
-    let agent_output = agent.run_with_cancel(&prompt, Some(&cancel_check), None)?;
 
     if output_signals_cannot_resolve(&agent_output) {
         let reason = extract_cannot_resolve_reason(&agent_output);
@@ -1221,7 +1296,18 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
             latest_mr.iid, reason
         );
 
-        abandon_mr(state, &latest_mr, issue_number, &reason)?;
+        if let Some(issue_number) = issue_number {
+            abandon_mr(state, &latest_mr, issue_number, &reason)?;
+        } else {
+            state.glab.add_mr_comment(
+                latest_mr.iid,
+                &format!(
+                    "Cannot resolve this MR feedback autonomously:\n\n{}",
+                    reason
+                ),
+            )?;
+            let _ = state.glab.close_mr(latest_mr.iid);
+        }
 
         return Ok(true);
     }
@@ -1267,7 +1353,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         state.git_repo.add_all()?;
         let summary_for_commit = extract_changes_summary(&agent_output);
         if state.git_repo.has_staged_changes()? {
-            let commit_msg = build_commit_message(&summary_for_commit, issue_number);
+            let commit_msg = build_commit_message(&summary_for_commit, issue_number.unwrap_or(0));
             state.git_repo.commit(&commit_msg)?;
         }
     }
@@ -1876,6 +1962,17 @@ fn extract_changes_summary(agent_output: &AgentHandoff) -> String {
 /// Strips leading `Resolved without code changes:` / `Addressed feedback:` from the posted reply.
 /// If there is no substantive text after that prefix, returns the original string unchanged.
 fn strip_worker_reply_boilerplate(text: &str) -> String {
+    fn strip_diff_highlights_block(s: &str) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        for line in s.lines() {
+            if line.trim().eq_ignore_ascii_case("Diff highlights:") {
+                break;
+            }
+            out.push(line);
+        }
+        out.join("\n").trim().to_string()
+    }
+
     let trimmed = text.trim();
     const PREFIXES: &[&[u8]] = &[b"resolved without code changes:", b"addressed feedback:"];
     for prefix in PREFIXES {
@@ -1885,10 +1982,20 @@ fn strip_worker_reply_boilerplate(text: &str) -> String {
             if suffix.is_empty() {
                 return trimmed.to_string();
             }
-            return suffix.to_string();
+            let cleaned = strip_diff_highlights_block(suffix);
+            return if cleaned.is_empty() {
+                suffix.to_string()
+            } else {
+                cleaned
+            };
         }
     }
-    trimmed.to_string()
+    let cleaned = strip_diff_highlights_block(trimmed);
+    if cleaned.is_empty() {
+        trimmed.to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Parses `MARK_DISCUSSIONS_RESOLVED: yes|no` from the agent response (case-insensitive value).
@@ -2552,18 +2659,29 @@ fn strip_markdown_formatting(s: &str) -> String {
     result.to_string()
 }
 
+fn sanitize_mr_description_text(s: &str) -> String {
+    let filtered: Vec<&str> = s
+        .lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            !t.starts_with("CHANGES_SUMMARY:") && !t.starts_with("MARK_DISCUSSIONS_RESOLVED:")
+        })
+        .collect();
+    filtered.join("\n").trim().to_string()
+}
+
 fn extract_mr_description(agent_output: &AgentHandoff) -> String {
     if let Some(description) = &agent_output.mr_description {
         let trimmed = description.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return sanitize_mr_description_text(trimmed);
         }
     }
     if let Some(pos) = agent_output.response.find("MR_DESCRIPTION:") {
         let desc_section = &agent_output.response[pos + 15..];
         let trimmed = desc_section.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return sanitize_mr_description_text(trimmed);
         }
     }
 
@@ -2571,7 +2689,7 @@ fn extract_mr_description(agent_output: &AgentHandoff) -> String {
         let summary = &agent_output.response[pos + 23..];
         let trimmed = summary.trim();
         if !trimmed.is_empty() {
-            return format!("## Implementation\n\n{}", trimmed);
+            return sanitize_mr_description_text(&format!("## Implementation\n\n{}", trimmed));
         }
     }
 
@@ -2588,7 +2706,7 @@ fn extract_mr_description(agent_output: &AgentHandoff) -> String {
         .filter(|l| !l.trim().is_empty())
         .collect();
     if !last_chunk.is_empty() {
-        return format!("## Summary\n\n{}", last_chunk.join("\n"));
+        return sanitize_mr_description_text(&format!("## Summary\n\n{}", last_chunk.join("\n")));
     }
 
     "Implementation completed.".to_string()
@@ -2598,14 +2716,14 @@ fn extract_explicit_mr_description(agent_output: &AgentHandoff) -> String {
     if let Some(description) = &agent_output.mr_description {
         let trimmed = description.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return sanitize_mr_description_text(trimmed);
         }
     }
     if let Some(pos) = agent_output.response.find("MR_DESCRIPTION:") {
         let desc_section = &agent_output.response[pos + 15..];
         let trimmed = desc_section.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return sanitize_mr_description_text(trimmed);
         }
     }
     "Implementation completed.".to_string()
@@ -2842,5 +2960,32 @@ mod tests {
         b.title = "Old".into();
         b.labels = Some(vec!["a".into(), "b".into()]);
         assert!(merge_request_surface_changed(&a, &b));
+    }
+
+    #[test]
+    fn extract_mr_description_filters_control_markers() {
+        let output = AgentHandoff {
+            mr_description: Some(
+                "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\n## Testing\ncargo test"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let desc = extract_mr_description(&output);
+        assert!(!desc.contains("CHANGES_SUMMARY:"), "{desc}");
+        assert!(!desc.contains("MARK_DISCUSSIONS_RESOLVED:"), "{desc}");
+        assert!(desc.contains("## Goal"), "{desc}");
+        assert!(desc.contains("## Testing"), "{desc}");
+    }
+
+    #[test]
+    fn extract_explicit_mr_description_filters_control_markers() {
+        let output = AgentHandoff {
+            response:
+                "MR_DESCRIPTION:\nSummary line\nCHANGES_SUMMARY: x\nMARK_DISCUSSIONS_RESOLVED: yes\n"
+                    .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_explicit_mr_description(&output), "Summary line");
     }
 }
