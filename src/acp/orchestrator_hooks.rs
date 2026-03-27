@@ -7,15 +7,17 @@
 //! Tracks [session modes](https://agentclientprotocol.com/protocol/session-modes) from
 //! `session/new` (`modes`) and `current_mode_update` notifications (for future `session/set_mode`).
 //!
-//! ## Plans (standard ACP vs Cursor)
+//! ## Plans (Cursor plan mode)
 //!
-//! - Standard [`session/update` plan entries](https://agentclientprotocol.com/protocol/agent-plan)
-//!   are notifications only; the client replaces its view of the plan and the turn continues until
-//!   `session/prompt` completes ([prompt turn](https://agentclientprotocol.com/protocol/prompt-turn)).
-//! - Cursor’s CLI additionally sends **extension RPCs** such as [`cursor/create_plan` and
+//! - Cursor’s CLI sends **extension RPCs** such as [`cursor/create_plan` and
 //!   `cursor/ask_question`](https://cursor.com/docs/cli/acp) that expect a client response; a
 //!   headless client must answer or plan mode can block waiting for approval.
+//! - In **plan** mode, `session/update` may carry `tool_call_update` text such as
+//!   `Plan saved to file://…`. Codepair records those absolute paths on [`AgentHandoff::cursor_plan_paths`];
+//!   the PMO role reads the files from the git workspace and merges their contents into the text it
+//!   parses (split markers, sub-issues, etc.).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +39,8 @@ pub struct StreamTextHooks {
     cursor_ask_question_handler: Mutex<Option<Arc<dyn CursorAskQuestionHandler>>>,
     /// Git clone root for ACP [`fs/read_text_file`](https://agentclientprotocol.com/protocol/file-system.md).
     workspace_root: Option<PathBuf>,
+    /// Plan-mode `tool_call_update` paths (`Plan saved to file://…`), taken into [`AgentHandoff`] for PMO.
+    cursor_plan_paths: Mutex<Vec<String>>,
 }
 
 impl StreamTextHooks {
@@ -47,6 +51,7 @@ impl StreamTextHooks {
             session_modes: Mutex::new(None),
             cursor_ask_question_handler: Mutex::new(None),
             workspace_root: None,
+            cursor_plan_paths: Mutex::new(Vec::new()),
         }
     }
 
@@ -58,6 +63,7 @@ impl StreamTextHooks {
             session_modes: Mutex::new(None),
             cursor_ask_question_handler: Mutex::new(None),
             workspace_root: Some(workspace_root),
+            cursor_plan_paths: Mutex::new(Vec::new()),
         }
     }
 
@@ -101,6 +107,7 @@ impl StreamTextHooks {
 
     pub fn clear(&self) {
         self.buffer.lock().unwrap().clear();
+        self.cursor_plan_paths.lock().unwrap().clear();
     }
 
     /// Install or clear a [`CursorAskQuestionHandler`] for `cursor/ask_question`.
@@ -113,6 +120,10 @@ impl StreamTextHooks {
 
     pub fn take_text(&self) -> String {
         std::mem::take(&mut *self.buffer.lock().unwrap())
+    }
+
+    pub(crate) fn take_cursor_plan_paths(&self) -> Vec<String> {
+        std::mem::take(&mut *self.cursor_plan_paths.lock().unwrap())
     }
 
     /// Seed from `session/new` result [`crate::acp::types::NewSessionResult::modes`].
@@ -139,6 +150,38 @@ impl StreamTextHooks {
     pub(crate) fn sync_tracked_current_mode(&self, mode_id: &str) {
         self.apply_current_mode_update(mode_id.to_string());
     }
+
+    fn session_current_mode_is_plan(&self) -> bool {
+        self.session_modes
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.current_mode_id.eq_ignore_ascii_case("plan"))
+    }
+
+    /// When the session is in **plan** mode, record absolute paths from `tool_call_update` text
+    /// (`Plan saved to file://…`). PMO reads these files after the prompt completes.
+    fn record_cursor_saved_plan_paths(&self, params: &Value) {
+        if !self.session_current_mode_is_plan() {
+            return;
+        }
+
+        let Some(update) = params.get("update") else {
+            return;
+        };
+
+        let paths = plan_saved_paths_from_tool_call_update(update);
+        if paths.is_empty() {
+            return;
+        }
+
+        let mut g = self.cursor_plan_paths.lock().unwrap();
+        for p in paths {
+            if !g.contains(&p) {
+                g.push(p);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +192,10 @@ impl StreamTextHooks {
 
     fn session_modes_snapshot(&self) -> Option<SessionModeStateBrief> {
         self.session_modes.lock().unwrap().clone()
+    }
+
+    fn cursor_plan_paths_snapshot(&self) -> Vec<String> {
+        self.cursor_plan_paths.lock().unwrap().clone()
     }
 }
 
@@ -201,55 +248,118 @@ pub fn extract_available_slash_command_names(params: &Value) -> Option<Vec<Strin
     Some(names)
 }
 
-/// Parses `session/update` when the agent is in **plan** mode: structured todo entries, not
-/// `agent_message_chunk`. Without this, plan-only turns leave an empty handoff `response`.
-pub fn extract_plan_update_text(params: &Value) -> Option<String> {
-    let update = params.get("update")?;
-    let kind = update
+/// Decodes `%HH` sequences in a `file:` path segment (UTF-8, lossy on invalid sequences).
+fn percent_decode_uri_path(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h = &b[i + 1..i + 3];
+            if h[0].is_ascii_hexdigit()
+                && h[1].is_ascii_hexdigit()
+                && let Ok(v) = u8::from_str_radix(std::str::from_utf8(h).unwrap_or(""), 16)
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Converts a `file:` URI to an absolute path string suitable for [`read_text_file_under_workspace`].
+fn file_uri_to_absolute_path_str(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let path_part = if rest.starts_with('/') {
+        rest
+    } else {
+        rest.find('/').map(|i| &rest[i..])?
+    };
+    if path_part.is_empty() {
+        return None;
+    }
+    Some(percent_decode_uri_path(path_part))
+}
+
+/// Collects every `text` string nested under a `tool_call_update` payload (Cursor plan mode).
+fn collect_tool_call_update_texts(update: &Value, out: &mut Vec<String>) {
+    match update {
+        Value::Object(map) => {
+            if let Some(Value::String(t)) = map.get("text")
+                && !t.is_empty()
+            {
+                out.push(t.clone());
+            }
+            for child in map.values() {
+                collect_tool_call_update_texts(child, out);
+            }
+        }
+        Value::Array(arr) => {
+            for x in arr {
+                collect_tool_call_update_texts(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn session_update_kind(update: &Value) -> Option<&str> {
+    update
         .get("sessionUpdate")
         .or_else(|| update.get("session_update"))
-        .and_then(|v| v.as_str())?;
-    if !kind.eq_ignore_ascii_case("plan") {
-        return None;
+        .and_then(|v| v.as_str())
+}
+
+fn is_tool_call_update(update: &Value) -> bool {
+    session_update_kind(update).is_some_and(|k| {
+        let norm: String = k
+            .chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        norm == "toolcallupdate"
+    })
+}
+
+/// Returns absolute filesystem paths from "Plan saved to file://…" lines (deduped).
+fn plan_saved_paths_from_tool_call_update(update: &Value) -> Vec<String> {
+    if !is_tool_call_update(update) {
+        return Vec::new();
     }
-    let entries = update.get("entries").and_then(|e| e.as_array())?;
-    if entries.is_empty() {
-        return None;
-    }
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("=== Plan update (from agent plan mode) ===".into());
-    for e in entries {
-        let text = e
-            .get("content")
-            .or_else(|| e.get("title"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if text.is_empty() {
+
+    let mut texts = Vec::new();
+    collect_tool_call_update_texts(update, &mut texts);
+
+    let mut seen = HashSet::<String>::new();
+    let mut paths = Vec::new();
+
+    for t in texts {
+        let lower = t.to_ascii_lowercase();
+        if !lower.contains("plan saved") || !t.contains("file://") {
             continue;
         }
-        let status = e
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let priority = e
-            .get("priority")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let status_pri = match (status.is_empty(), priority.is_empty()) {
-            (true, true) => String::new(),
-            (false, true) => format!("[{status}] "),
-            (true, false) => format!("[{priority}] "),
-            (false, false) => format!("[{status}; {priority}] "),
+
+        let Some(start) = t.find("file://") else {
+            continue;
         };
-        lines.push(format!("- {status_pri}{text}"));
+
+        let tail: String = t[start..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '"' && *c != ')')
+            .collect();
+
+        if let Some(p) = file_uri_to_absolute_path_str(&tail)
+            && seen.insert(p.clone())
+        {
+            paths.push(p);
+        }
     }
-    if lines.len() <= 1 {
-        return None;
-    }
-    Some(lines.join("\n"))
+
+    paths
 }
 
 /// Parses `session/update` for [`current_mode_update`](https://agentclientprotocol.com/protocol/session-modes).
@@ -287,6 +397,7 @@ impl AcpHooks for StreamTextHooks {
         if method != "session/update" {
             return;
         }
+
         if let Some(names) = extract_available_slash_command_names(params) {
             debug!(
                 target: "codepair::acp_slash",
@@ -296,6 +407,7 @@ impl AcpHooks for StreamTextHooks {
             *self.available_slash_command_names.lock().unwrap() = names;
             return;
         }
+
         if let Some(mode_id) = extract_current_mode_update(params) {
             debug!(
                 target: "codepair::acp_modes",
@@ -305,18 +417,9 @@ impl AcpHooks for StreamTextHooks {
             self.apply_current_mode_update(mode_id);
             return;
         }
-        if let Some(t) = extract_plan_update_text(params) {
-            let mut buf = self.buffer.lock().unwrap();
-            if !buf.is_empty() && !buf.ends_with('\n') {
-                buf.push('\n');
-            }
-            if !buf.is_empty() {
-                buf.push('\n');
-            }
-            buf.push_str(&t);
-            buf.push('\n');
-            return;
-        }
+
+        self.record_cursor_saved_plan_paths(params);
+
         if let Some(t) = extract_agent_message_chunk_text(params) {
             self.buffer.lock().unwrap().push_str(&t);
         }
@@ -431,9 +534,9 @@ mod tests {
     }
 
     #[test]
-    fn extracts_plan_update_entries() {
-        let params = json!({
-            "sessionId": "s1",
+    fn hooks_do_not_record_acp_plan_entries_in_buffer() {
+        let h = StreamTextHooks::new();
+        let plan = json!({
             "update": {
                 "sessionUpdate": "plan",
                 "entries": [
@@ -442,14 +545,12 @@ mod tests {
                 ]
             }
         });
-        let t = extract_plan_update_text(&params).expect("plan text");
-        assert!(t.contains("Plan update"));
-        assert!(t.contains("Read context"));
-        assert!(t.contains("Ship decision"));
+        h.on_agent_notification("session/update", &plan);
+        assert!(h.take_text().is_empty());
     }
 
     #[test]
-    fn hooks_append_plan_updates_to_buffer() {
+    fn hooks_chunk_after_plan_entries_only_keeps_chunk_text() {
         let h = StreamTextHooks::new();
         let plan = json!({
             "update": {
@@ -466,7 +567,7 @@ mod tests {
         });
         h.on_agent_notification("session/update", &chunk);
         let out = h.take_text();
-        assert!(out.contains("Step one"), "{}", out);
+        assert!(!out.contains("Step one"), "{}", out);
         assert!(out.contains("DECISION"));
     }
 
@@ -483,5 +584,124 @@ mod tests {
         h.on_agent_notification("session/update", &params);
         assert_eq!(h.take_text(), "aa");
         assert!(h.take_text().is_empty());
+    }
+
+    #[test]
+    fn plan_mode_tool_call_update_records_plan_file_path() {
+        use crate::acp::types::{SessionModeEntry, SessionModeStateBrief};
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join(format!("codepair-plan-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".cursor/plans")).unwrap();
+        let plan_path = tmp.join(".cursor/plans/PMO.plan.md");
+        fs::write(&plan_path, "DECISION: SPLIT\nSUB_ISSUE_1 TITLE: A\n").unwrap();
+        let ws = fs::canonicalize(&tmp).unwrap();
+        let file_url = format!("file://{}", plan_path.display());
+
+        let h = StreamTextHooks::with_workspace(ws);
+        h.seed_session_modes(&SessionModeStateBrief {
+            current_mode_id: "plan".into(),
+            available_modes: vec![SessionModeEntry {
+                id: "plan".into(),
+                name: None,
+                description: None,
+            }],
+        });
+        let params = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tool_x",
+                "status": "in_progress",
+                "content": [{
+                    "type": "content",
+                    "content": { "type": "text", "text": format!("Plan saved to {file_url}") }
+                }]
+            }
+        });
+        h.on_agent_notification("session/update", &params);
+        assert!(h.take_text().is_empty());
+        let paths = h.cursor_plan_paths_snapshot();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("PMO.plan.md"), "{paths:?}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn plan_file_injection_skipped_when_not_in_plan_mode() {
+        use crate::acp::types::{SessionModeEntry, SessionModeStateBrief};
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join(format!("codepair-plan-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".cursor/plans")).unwrap();
+        let plan_path = tmp.join(".cursor/plans/x.plan.md");
+        fs::write(&plan_path, "SECRET").unwrap();
+        let ws = fs::canonicalize(&tmp).unwrap();
+        let file_url = format!("file://{}", plan_path.display());
+
+        let h = StreamTextHooks::with_workspace(ws);
+        h.seed_session_modes(&SessionModeStateBrief {
+            current_mode_id: "code".into(),
+            available_modes: vec![SessionModeEntry {
+                id: "code".into(),
+                name: None,
+                description: None,
+            }],
+        });
+        let params = json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "content": [{
+                    "type": "content",
+                    "content": { "type": "text", "text": format!("Plan saved to {file_url}") }
+                }]
+            }
+        });
+        h.on_agent_notification("session/update", &params);
+        assert!(h.take_text().is_empty());
+        assert!(h.cursor_plan_paths_snapshot().is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn percent_encoded_file_uri_decodes_for_plan_read() {
+        use crate::acp::types::{SessionModeEntry, SessionModeStateBrief};
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join(format!("codepair-plan-pct-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".cursor/plans")).unwrap();
+        let plan_path = tmp.join(".cursor/plans/PMO Issue.plan.md");
+        fs::write(&plan_path, "FROM_ENCODED_PATH").unwrap();
+        let ws = fs::canonicalize(&tmp).unwrap();
+        let enc = ws.join(".cursor/plans/PMO%20Issue.plan.md");
+        let file_url = format!("file://{}", enc.display());
+
+        let h = StreamTextHooks::with_workspace(ws);
+        h.seed_session_modes(&SessionModeStateBrief {
+            current_mode_id: "plan".into(),
+            available_modes: vec![SessionModeEntry {
+                id: "plan".into(),
+                name: None,
+                description: None,
+            }],
+        });
+        let params = json!({
+            "update": {
+                "sessionUpdate": "toolCallUpdate",
+                "content": [{
+                    "type": "content",
+                    "content": { "type": "text", "text": format!("Plan saved to {file_url}") }
+                }]
+            }
+        });
+        h.on_agent_notification("session/update", &params);
+        assert!(h.take_text().is_empty());
+        let paths = h.cursor_plan_paths_snapshot();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].contains("PMO Issue.plan.md"), "{paths:?}");
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

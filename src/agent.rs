@@ -652,8 +652,11 @@ fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> Agent
         response = s.to_string();
     }
 
+    let cursor_plan_paths = hooks.take_cursor_plan_paths();
+
     AgentHandoff {
         response,
+        cursor_plan_paths,
         ..Default::default()
     }
 }

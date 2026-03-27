@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use super::{claim, extract_project_name, issue_in_scope, labels, pmo_cursor_ask};
+use crate::acp::workspace_read::read_text_file_under_workspace;
 use crate::agent::Agent;
 use crate::config::PmoConfig;
 use crate::cursor_mcp_config;
@@ -691,7 +692,11 @@ fn process_action_required_issue(
         } else {
             None
         };
-    let agent_output = agent.run_with_cancel(&prompt, None, ask_handler)?;
+
+    let agent_output = pmo_apply_cursor_plan_files(
+        &state.working_dir,
+        agent.run_with_cancel(&prompt, None, ask_handler)?,
+    );
 
     // --- NEEDS_CLARIFICATION: PMO itself cannot decide, ask human ---
     if pmo_needs_clarification(&agent_output) {
@@ -967,7 +972,7 @@ CRITICAL REQUIREMENTS:
 - If the worker claimed it "cannot run commands" or "cannot delete files", that is WRONG — it CAN. Instruct it clearly.
 - Before deciding GUIDE_WORKER or SPLIT, you MUST verify whether the issue is already implemented in the current project state when that is plausible from the issue, comments, or worker output. If the behavior/tests/code already exist, choose ALREADY_DONE so Codepair will close the issue and add a comment.
 - In your final reply for this turn, make the outcome obvious in plain text (markers below). Codepair parses your message; there is no separate tool call for handoff.
-- **Plan mode (Cursor `session/update` plan entries) is not sufficient by itself.** If the UI builds a structured plan with tasks/entries, Codepair may record that text, but it **cannot** create sub-issues or apply a decision from plan widgets alone. You **must** still output the full plain-text formats below (`GUIDE_WORKER`, `SPLIT` + `SUB_ISSUE_N` blocks, `ALREADY_DONE`, or `NEEDS_CLARIFICATION`) as normal assistant text in the **same** turn. Do not stop after only emitting plan entries, and do not wait for user confirmation — this run is fully automated.
+- **Plan mode:** Cursor may save the plan as a `.md` file under the repo. Codepair reads that file after the turn and treats its contents like assistant text for parsing. A structured UI plan **without** the plain-text formats below is **not** enough — the saved plan file (or streamed text) **must** include `GUIDE_WORKER`, `SPLIT` + `SUB_ISSUE_N` blocks, `ALREADY_DONE`, or `NEEDS_CLARIFICATION` as required. Do not stop after only using plan UI widgets, and do not wait for user confirmation — this run is fully automated.
 - When applicable, mirror structured intent clearly in prose so parsers can pick it up, e.g. state `decision`, `question` / clarification needs, `instructions` for worker guidance, `reason` for ALREADY_DONE, and numbered `SUB_ISSUE_N` blocks for SPLIT.
 - For SPLIT, describe each planned sub-issue using the human-readable `SUB_ISSUE_N / TITLE / PRIORITY / DESCRIPTION` blocks in your reply (include acceptance criteria and dependencies in `DESCRIPTION` when relevant).
 
@@ -1212,6 +1217,40 @@ fn extract_guidance(agent_output: &AgentHandoff) -> String {
     } else {
         raw
     }
+}
+
+/// Append contents of [`AgentHandoff::cursor_plan_paths`] (Cursor plan-mode `tool_call_update`) into
+/// `handoff.response` so triage markers and `extract_sub_issues` see the plan file text.
+fn pmo_apply_cursor_plan_files(working_dir: &str, mut handoff: AgentHandoff) -> AgentHandoff {
+    if handoff.cursor_plan_paths.is_empty() {
+        return handoff;
+    }
+
+    let root = path::Path::new(working_dir);
+    for plan_path in std::mem::take(&mut handoff.cursor_plan_paths) {
+        match read_text_file_under_workspace(root, &plan_path) {
+            Ok(body) => {
+                if !handoff.response.is_empty() {
+                    handoff.response.push_str("\n\n");
+                }
+
+                handoff.response.push_str("=== PMO Cursor plan file ===\n");
+                handoff.response.push_str(body.trim_end());
+                handoff.response.push('\n');
+            }
+
+            Err(e) => {
+                warn!(
+                    target: "codepair::pmo_plan_file",
+                    path = %plan_path,
+                    err = %e,
+                    "PMO could not read Cursor plan file from tool_call_update"
+                );
+            }
+        }
+    }
+
+    handoff
 }
 
 fn combined_pmo_handoff_text(h: &AgentHandoff) -> String {
@@ -1640,19 +1679,9 @@ fn resume_split(
         }
 
         let sub_issue_title = if sub_issue.title.is_empty() {
-            format!(
-                "{} (Part {}/{})",
-                pending.parent_issue_title,
-                index + 1,
-                total_sub_issues
-            )
+            &pending.parent_issue_title
         } else {
-            format!(
-                "{} (Part {}/{})",
-                sub_issue.title,
-                index + 1,
-                total_sub_issues
-            )
+            &sub_issue.title
         };
 
         match gitlab.create_issue(&sub_issue_title, &sub_issue.description) {
@@ -1964,6 +1993,28 @@ Body here.
         assert!(!pmo_needs_clarification(&output));
         assert!(!pmo_guides_worker(&output));
         assert!(!pmo_no_split_needed(&output));
+    }
+
+    #[test]
+    fn pmo_apply_cursor_plan_files_merges_markdown_into_response() {
+        let tmp =
+            std::env::temp_dir().join(format!("codepair-pmo-plan-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("plans")).unwrap();
+        let f = tmp.join("plans/triage.md");
+        std::fs::write(&f, "SUB_ISSUE_1 TITLE: x\n").unwrap();
+        let root = std::fs::canonicalize(&tmp).unwrap();
+        let abs = std::fs::canonicalize(&f)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut h = AgentHandoff::default();
+        h.cursor_plan_paths.push(abs);
+        let out = super::pmo_apply_cursor_plan_files(&root.to_string_lossy(), h);
+        assert!(out.response.contains("PMO Cursor plan file"));
+        assert!(out.response.contains("SUB_ISSUE_1"));
+        assert!(out.cursor_plan_paths.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

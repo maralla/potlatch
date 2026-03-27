@@ -64,6 +64,9 @@ pub struct AgentHandoff {
     pub lgtm: Option<String>,
     #[serde(default)]
     pub sub_issues: Vec<HandoffSubIssue>,
+    /// Absolute paths from Cursor plan-mode `tool_call_update` ("Plan saved to file://…"); PMO reads these files after ACP.
+    #[serde(default)]
+    pub cursor_plan_paths: Vec<String>,
 }
 
 struct AgentSlot {
@@ -331,6 +334,7 @@ fn handoff_from_tool_call(msg: &Value) -> AgentHandoff {
         question: string_arg(msg, "/params/arguments/question"),
         lgtm: string_arg(msg, "/params/arguments/lgtm"),
         sub_issues: sub_issues_arg(msg),
+        cursor_plan_paths: Vec::new(),
     }
 }
 
