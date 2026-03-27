@@ -1,5 +1,7 @@
 pub mod claim;
+pub mod labels;
 pub mod pmo;
+pub mod pmo_cursor_ask;
 pub mod reviewer;
 pub mod worker;
 
@@ -16,6 +18,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::git::GitRepo;
+use crate::gitlab::{Issue, MergeRequest};
 
 pub fn extract_project_name(repo_url: &str) -> Result<String> {
     let parts: Vec<&str> = repo_url.trim_end_matches('/').split('/').collect();
@@ -24,6 +27,26 @@ pub fn extract_project_name(repo_url: &str) -> Result<String> {
         .context("Invalid repository URL")?
         .trim_end_matches(".git");
     Ok(name.to_string())
+}
+
+/// Writes `{work_dir}/.codepair-context/{file_name}`. `file_name` must be a single path segment
+/// (e.g. `pmo-issue-1.md`), not a nested path.
+pub(crate) fn write_task_context_file(
+    work_dir: &str,
+    file_name: &str,
+    content: &str,
+) -> Result<String> {
+    anyhow::ensure!(
+        !file_name.contains('/') && !file_name.contains('\\') && !file_name.is_empty(),
+        "task context file_name must be a simple file name, got {:?}",
+        file_name
+    );
+    let base = Path::new(work_dir);
+    std::fs::create_dir_all(&base).context("Failed to create task context directory")?;
+    let path = base.join(file_name);
+    std::fs::write(&path, content).context("Failed to write task context file")?;
+    let abs = std::fs::canonicalize(&path).unwrap_or(path);
+    Ok(abs.to_string_lossy().into_owned())
 }
 
 fn agent_dir(base_dir: &str, project_name: &str, agent_id: &str) -> String {
@@ -47,6 +70,25 @@ fn work_dir(base_dir: &str, project_name: &str, agent_id: &str) -> String {
 
 /// Shared directory for session state files. All workers read/write here
 /// so that any worker can pick up orphaned sessions on restart.
+/// When `scope_label` is `Some`, the issue must include that label (exact match against GitLab).
+pub(crate) fn issue_in_scope(issue: &Issue, scope_label: Option<&str>) -> bool {
+    match scope_label {
+        None => true,
+        Some(l) => issue.labels.iter().any(|x| x == l),
+    }
+}
+
+/// When `scope_label` is `Some`, the merge request must include that label (exact match).
+pub(crate) fn mr_in_scope(mr: &MergeRequest, scope_label: Option<&str>) -> bool {
+    match scope_label {
+        None => true,
+        Some(l) => mr
+            .labels
+            .as_ref()
+            .is_some_and(|labels| labels.iter().any(|x| x == l)),
+    }
+}
+
 fn sessions_dir(base_dir: &str, project_name: &str) -> String {
     let dir = std::path::Path::new(base_dir)
         .join(format!("{}-sessions", project_name))
@@ -105,9 +147,32 @@ pub fn run(git_repo_address: String, config: Config) -> Result<()> {
         .to_string_lossy()
         .into_owned();
 
+    let project_name = extract_project_name(&git_repo_address)?;
+
     prepare_repos(&base_dir, &git_repo_address, &config)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    let mcp_coordinator = if config.mcp.enabled {
+        let (coord, mcp_port) = crate::mcp_http::spawn_http_mcp_server(Arc::clone(&shutdown))
+            .context("Failed to start MCP HTTP coordinator")?;
+        let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_port);
+        info!("MCP coordinator at {}", mcp_url);
+        crate::cursor_mcp_config::ensure_for_all_agent_workspaces(
+            &base_dir,
+            &project_name,
+            &config,
+            &mcp_url,
+        )
+        .context("Failed to write .cursor/mcp.json in agent workspaces")?;
+        Some(coord)
+    } else {
+        info!(
+            "MCP HTTP coordinator disabled (default). Tasks use ACP only. \
+             Enable MCP with [mcp] enabled = true in codepair.toml."
+        );
+        None
+    };
 
     flag::register(SIGINT, Arc::clone(&shutdown)).context("Failed to register SIGINT handler")?;
     flag::register(SIGTERM, Arc::clone(&shutdown)).context("Failed to register SIGTERM handler")?;
@@ -119,14 +184,18 @@ pub fn run(git_repo_address: String, config: Config) -> Result<()> {
         .context("Failed to register conditional shutdown")?;
 
     let mut handles = Vec::new();
+    let scope_label = config.scope_label.clone();
 
     for i in 0..config.worker.instances {
         let repo = git_repo_address.clone();
         let worker_config = config.worker.clone();
         let shutdown = shutdown.clone();
         let base = base_dir.clone();
+        let coord = mcp_coordinator.clone();
+        let scope_label = scope_label.clone();
         handles.push(thread::spawn(move || {
-            if let Err(e) = worker::run(repo, worker_config, i, shutdown, base) {
+            if let Err(e) = worker::run(repo, worker_config, i, shutdown, base, coord, scope_label)
+            {
                 error!("Worker-{} error: {}", i, e);
             }
         }));
@@ -137,8 +206,12 @@ pub fn run(git_repo_address: String, config: Config) -> Result<()> {
         let reviewer_config = config.reviewer.clone();
         let shutdown = shutdown.clone();
         let base = base_dir.clone();
+        let coord = mcp_coordinator.clone();
+        let scope_label = scope_label.clone();
         handles.push(thread::spawn(move || {
-            if let Err(e) = reviewer::run(repo, reviewer_config, i, shutdown, base) {
+            if let Err(e) =
+                reviewer::run(repo, reviewer_config, i, shutdown, base, coord, scope_label)
+            {
                 error!("Reviewer-{} error: {}", i, e);
             }
         }));
@@ -149,8 +222,10 @@ pub fn run(git_repo_address: String, config: Config) -> Result<()> {
         let pmo_config = config.pmo.clone();
         let shutdown = shutdown.clone();
         let base = base_dir.clone();
+        let coord = mcp_coordinator.clone();
+        let scope_label = scope_label.clone();
         handles.push(thread::spawn(move || {
-            if let Err(e) = pmo::run(repo, pmo_config, i, shutdown, base) {
+            if let Err(e) = pmo::run(repo, pmo_config, i, shutdown, base, coord, scope_label) {
                 error!("PMO-{} error: {}", i, e);
             }
         }));
@@ -189,4 +264,55 @@ pub fn run(git_repo_address: String, config: Config) -> Result<()> {
     info!("All agents stopped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::{issue_in_scope, mr_in_scope};
+    use crate::gitlab::{Issue, MergeRequest};
+
+    fn sample_issue(labels: Vec<&str>) -> Issue {
+        Issue {
+            iid: 1,
+            title: "t".to_string(),
+            description: "".to_string(),
+            labels: labels.into_iter().map(String::from).collect(),
+            state: "opened".to_string(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn sample_mr(labels: Option<Vec<&str>>) -> MergeRequest {
+        MergeRequest {
+            iid: 1,
+            title: "t".to_string(),
+            description: "".to_string(),
+            source_branch: "issue-1".to_string(),
+            target_branch: "main".to_string(),
+            state: "opened".to_string(),
+            sha: None,
+            labels: labels.map(|v| v.into_iter().map(String::from).collect()),
+            has_conflicts: false,
+        }
+    }
+
+    #[test]
+    fn issue_in_scope_respects_label() {
+        let issue = sample_issue(vec!["codepair", "bug"]);
+        assert!(issue_in_scope(&issue, None));
+        assert!(issue_in_scope(&issue, Some("codepair")));
+        assert!(!issue_in_scope(&issue, Some("other")));
+    }
+
+    #[test]
+    fn mr_in_scope_respects_label() {
+        let mr = sample_mr(Some(vec!["codepair"]));
+        assert!(mr_in_scope(&mr, None));
+        assert!(mr_in_scope(&mr, Some("codepair")));
+        assert!(!mr_in_scope(&mr, Some("other")));
+
+        let no_labels = sample_mr(None);
+        assert!(!mr_in_scope(&no_labels, Some("codepair")));
+    }
 }

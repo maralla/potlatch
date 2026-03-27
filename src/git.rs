@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub struct GitRepo {
     pub path: String,
@@ -10,6 +10,18 @@ pub struct GitRepo {
 impl GitRepo {
     pub fn new(path: String) -> Self {
         Self { path }
+    }
+
+    /// Re-copy Codepair `mcp.json` from the agent container into this repo (filesystem only).
+    fn sync_codepair_mcp_mirror(&self) {
+        if let Err(e) =
+            crate::cursor_mcp_config::sync_mcp_into_repo_from_container(Path::new(&self.path))
+        {
+            warn!(
+                "Could not sync .cursor/mcp.json into {} from agent container: {}",
+                self.path, e
+            );
+        }
     }
 
     pub fn exists(&self) -> bool {
@@ -110,6 +122,7 @@ impl GitRepo {
             );
         }
 
+        self.sync_codepair_mcp_mirror();
         Ok(())
     }
 
@@ -129,6 +142,7 @@ impl GitRepo {
             );
         }
 
+        self.sync_codepair_mcp_mirror();
         Ok(())
     }
 
@@ -182,12 +196,43 @@ impl GitRepo {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    pub fn diff_against(&self, base_branch: &str) -> Result<String> {
+    pub fn diff_stat_against(&self, base_branch: &str) -> Result<String> {
         let output = Command::new("git")
-            .args(["diff", &format!("origin/{}...HEAD", base_branch)])
+            .args(["diff", "--stat", &format!("origin/{}...HEAD", base_branch)])
             .current_dir(&self.path)
             .output()
-            .context("Failed to compute diff")?;
+            .context("Failed to compute diff stat")?;
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    pub fn changed_files_against(&self, base_branch: &str) -> Result<Vec<String>> {
+        let output = Command::new("git")
+            .args([
+                "diff",
+                "--name-only",
+                &format!("origin/{}...HEAD", base_branch),
+            ])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to compute changed files")?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    pub fn diff_patch_against(&self, base_branch: &str) -> Result<String> {
+        let output = Command::new("git")
+            .args([
+                "diff",
+                "--no-color",
+                &format!("origin/{}...HEAD", base_branch),
+            ])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to compute diff patch against base")?;
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
@@ -248,6 +293,29 @@ impl GitRepo {
         Ok(has_untracked)
     }
 
+    pub fn diff_shortstat_since(&self, base_ref: &str) -> Result<String> {
+        let output = Command::new("git")
+            .args(["diff", "--shortstat", &format!("{}..HEAD", base_ref)])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to compute short diff stat since base")?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    pub fn changed_files_since(&self, base_ref: &str) -> Result<Vec<String>> {
+        let output = Command::new("git")
+            .args(["diff", "--name-only", &format!("{}..HEAD", base_ref)])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to list changed files since base")?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
     pub fn delete_remote_branch(&self, branch_name: &str) -> Result<()> {
         debug!("Deleting remote branch origin/{}", branch_name);
         let output = Command::new("git")
@@ -275,8 +343,9 @@ impl GitRepo {
     }
 
     pub fn add_all(&self) -> Result<()> {
+        // Exclude Codepair-generated task context (PMO/worker/reviewer prompts) from commits.
         let output = Command::new("git")
-            .args(["add", "."])
+            .args(["add", "--", ".", ":(exclude).codepair-context"])
             .current_dir(&self.path)
             .output()
             .context("Failed to git add")?;
@@ -355,6 +424,8 @@ impl GitRepo {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+
+        self.sync_codepair_mcp_mirror();
 
         Ok(())
     }

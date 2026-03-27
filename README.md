@@ -6,13 +6,14 @@ A CLI-Based AI Agent Pair System that orchestrates AI agents to automatically im
 
 Codepair runs two AI agents in parallel in a fully automated, non-interactive mode:
 - **Worker Agent**: Fetches issues, implements features, and creates merge requests autonomously
-- **Reviewer Agent**: Reviews merge requests and merges them when approved
+- **Reviewer Agent**: Reviews merge requests and either merges them automatically or leaves an approval comment, depending on config
 
 Both agents operate without requiring any user input, making autonomous decisions based on the code and project documentation.
 
 ## Prerequisites
 
-2. **Cursor Agent CLI** - The `agent` command must be available
+1. **Rust toolchain** (`cargo`, stable) — to build Codepair from source
+2. **Cursor Agent CLI** — The `agent` command on your `PATH` is **Cursor’s agent CLI**. Codepair keeps **one** long-lived **`agent acp`** subprocess per role (optional **`--model`** first, then **`--print`**, **`--trust`**, **`--force`**, **`--approve-mcps`**). On the first task it runs **`initialize`**, then **`authenticate`** with **`cursor_login`** when Cursor advertises it (per [Cursor ACP](https://cursor.com/docs/cli/acp); use **`agent login`** or **`CURSOR_API_KEY`** / **`CURSOR_AUTH_TOKEN`**), then **`session/new`**; on **each later task** it calls **`session/close`** (best effort) then **`session/new`** again on the **same** stdio link, sends **`session/prompt`**, and leaves the child running so the next task still gets a **clean session** (no prior in-agent chat; workflow continuity stays in Codepair’s own state files). Model selection follows [ACP Session Config Options](https://agentclientprotocol.com/protocol/session-config-options): if **`configOptions`** includes a model selector and your id is in **`options`**, Codepair calls **`session/set_config_option`**; otherwise it tries experimental **`session/set_model`**. Completions come from streamed **`session/update`** chunks (including [slash-command](https://agentclientprotocol.com/protocol/slash-commands) and [session mode](https://agentclientprotocol.com/protocol/session-modes) updates). Codepair tracks **`modes`** / **`configOptions`** and logs at **`RUST_LOG=debug`** (`codepair::acp_modes`). For unattended runs it also answers **`session/request_permission`** by selecting an **`optionId`** from the agent’s **`options`** list (preferring **`allow_always`**, then **`allow_once`**) and auto-approves **`cursor/create_plan`** [ACP extensions](https://cursor.com/docs/cli/acp). For **`cursor/ask_question`**, worker and reviewer use a simple automatic reply; the **PMO** (when **`cursor_ask_via_gitlab`** is enabled) posts the question on the GitLab issue, sets **`pmo-pending`**, and waits for a **direct thread reply** on that note (`RUST_LOG=debug`: **`codepair::acp_cursor`**). The **reviewer** requests **`ask`** and the **PMO** **`plan`** only when advertised; otherwise the agent default mode stays. **By default** Codepair does **not** start its MCP HTTP server and does **not** write `.cursor/mcp.json`. To enable the optional Codepair MCP endpoint and generated config for extra MCP tools, set **`[mcp] enabled = true`** in `codepair.toml`.
 3. **GitLab CLI** (`glab`) - For GitLab operations
 4. **Git** - For repository operations
 
@@ -47,16 +48,17 @@ First, generate an example config file:
 codepair init-config
 ```
 
-This creates `codepair.toml`. Edit it to configure models and polling intervals:
+This creates `codepair.toml`. Edit it to configure models, polling intervals, and reviewer merge behavior:
 
 ```toml
 [worker]
-model = "claude-3-5-sonnet"
+model = "composer-2"
 poll_interval_secs = 60
 
 [reviewer]
-model = "claude-3-opus"
+model = "gpt-5.3-codex"
 poll_interval_secs = 120
+merge_when_approved = true
 ```
 
 Then run with the config:
@@ -79,8 +81,11 @@ The command will:
 2. Skips issues that are:
    - Marked as `[Draft]`
    - Have `do-not-implement` label
+   - Have the `pending` label (human pause — issue stays open; see Labels)
    - Already have `in-progress` label
 3. For each issue:
+   - Looks for an open merge request whose description contains `Closes #<issue>` (case-insensitive) before falling back to branch `issue-<number>`
+   - If a linked MR is already merged, closes the issue and moves on
    - Checks if an MR already exists for this issue (from session file or GitLab)
    - If MR exists: skips implementation and continues tracking the MR
    - If no MR: proceeds with implementation
@@ -95,12 +100,14 @@ The command will:
    - Generates MR title summarizing the changes
    - Creates detailed MR description with Goal, Implementation, and Testing sections
    - Creates merge request with meaningful title and description
-4. Tracks active merge requests and monitors for reviewer feedback
+4. If the `pending` label is added while the worker holds an issue, it releases its claim and stops watching the MR (no issue close). When `pending` is removed, the worker can claim again and resume from the linked MR if present.
+5. Tracks active merge requests and monitors for reviewer feedback
    - Checks for new comments on active MRs
    - Automatically addresses reviewer feedback
    - Makes necessary code changes based on comments
    - Pushes updates and adds summary comment
-5. Saves session summaries to `issue_<number>.md` files with MR information
+6. When an active MR merges, closes the linked issue (best effort if GitLab did not already).
+7. Saves session summaries to `issue_<number>.md` files with MR information
 
 **Key Features**: 
 - The worker never asks for user input. It makes all decisions autonomously based on the issue description and project documentation.
@@ -117,7 +124,7 @@ The command will:
    - Checks if implementation matches requirements
    - Verifies tests and lints pass
    - Makes autonomous decisions:
-     - Approves and merges if everything is good
+     - Approves and merges if everything is good, or leaves an approval comment and `reviewer-approved` label when `merge_when_approved = false`
      - Adds clear, actionable feedback if changes are needed (no questions)
 3. Re-reviews MRs when they are updated (after worker addresses feedback)
 4. Treats each review as fresh (no memory of previous reviews)
@@ -128,8 +135,9 @@ The command will:
 
 ## Labels
 
-The Worker uses the following label:
-- `in-progress` - Indicates an issue is currently being worked on
+The Worker uses the following labels:
+- `in-progress` — the worker is actively implementing or tracking an MR for this issue
+- `pending` — pauses the worker: it skips the issue in the queue, releases claim/session, and stops MR watch, without closing the issue. Remove `pending` when work should continue.
 
 To prevent implementation, add:
 - `do-not-implement` label to issues
@@ -151,17 +159,14 @@ You can specify different AI models for worker and reviewer agents:
 
 ```toml
 [worker]
-model = "claude-3-5-sonnet"  # Fast, efficient for implementation
+model = "composer-2"  # Must match an id from `agent --list-models`
 
 [reviewer]
-model = "claude-3-opus"      # More thorough for code review
+model = "gpt-5.3-codex"      # e.g. a different model for review
+merge_when_approved = true   # Set to false to comment approval without merging
 ```
 
-Supported models depend on your `agent` CLI configuration. Common options:
-- `claude-3-5-sonnet` - Fast and capable
-- `claude-3-opus` - Most capable, slower
-- `gpt-4` - OpenAI's GPT-4
-- Or any model supported by your agent CLI
+Use **`agent --list-models`** (or the values listed under the model entry in **`configOptions`** when the agent sends them) for valid ids. Codepair passes **`--model`** on the CLI and, after **`session/new`**, prefers **`session/set_config_option`** with **`configId`** set to the advertised model option’s **`id`** and **`value`** set to your id—only when that value appears in the option’s **`options`** array, per the [spec](https://agentclientprotocol.com/protocol/session-config-options). If there is no matching advertised option, or the call fails, Codepair falls back to **`session/set_model`**.
 
 ### Polling Intervals
 
@@ -173,11 +178,22 @@ poll_interval_secs = 60      # Check for new issues every 60 seconds
 
 [reviewer]
 poll_interval_secs = 120     # Check for MRs every 120 seconds
+merge_when_approved = true   # Auto-merge approved MRs
 ```
 
 Default values:
 - Worker: 60 seconds
 - Reviewer: 120 seconds
+
+### Scope label
+
+Optional top-level `scope_label` (default **empty** = no scoping; all open issues and MRs are eligible). When non-empty, worker, reviewer, and PMO only consider items that carry that GitLab label (trimmed, exact match). The worker and PMO filter **issues**; the reviewer filters **merge requests**.
+
+When scoping is enabled, merge requests created by the worker and sub-issues created by the PMO automatically receive `scope_label`.
+
+```toml
+scope_label = "codepair"
+```
 
 ## License
 

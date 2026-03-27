@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use tracing::{debug, info};
+use std::sync::LazyLock;
+use std::thread;
+use std::time::Duration;
+use tracing::{debug, info, warn};
 
 pub const PRIORITY_LABEL_PREFIX: &str = "priority::";
 pub const DEFAULT_PRIORITY: u8 = 3;
@@ -55,16 +59,113 @@ pub struct MergeRequest {
     pub has_conflicts: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct MergeRequestChangesSnapshot {
+    pub files: Vec<String>,
+    pub patch: String,
+    pub overflow: bool,
+    pub base_sha: Option<String>,
+    pub start_sha: Option<String>,
+    pub head_sha: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
     pub id: u64,
     pub body: String,
     pub author: String,
     pub discussion_id: String,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub location_details: Option<String>,
 }
 
+impl Comment {
+    pub fn format_for_prompt(&self) -> String {
+        if let Some(location) = &self.location {
+            if let Some(details) = &self.location_details {
+                format!(
+                    "- {} [{} | {}] (discussion {}): {}",
+                    self.author, location, details, self.discussion_id, self.body
+                )
+            } else {
+                format!(
+                    "- {} [{}] (discussion {}): {}",
+                    self.author, location, self.discussion_id, self.body
+                )
+            }
+        } else {
+            format!(
+                "- {} (discussion {}): {}",
+                self.author, self.discussion_id, self.body
+            )
+        }
+    }
+}
+
+/// Issue note with fields needed to resolve **thread replies** (GitLab discussion).
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueThreadNote {
+    pub id: u64,
+    pub body: String,
+    #[serde(default)]
+    pub system: bool,
+    #[serde(default)]
+    pub discussion_id: Option<String>,
+    author: IssueThreadNoteAuthor,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct IssueThreadNoteAuthor {
+    #[serde(default)]
+    username: String,
+}
+
+impl IssueThreadNote {
+    pub fn author_username(&self) -> &str {
+        self.author.username.as_str()
+    }
+}
+
+fn issue_thread_notes_as_comments(notes: Vec<IssueThreadNote>) -> Vec<Comment> {
+    notes
+        .into_iter()
+        .map(|n| {
+            let author = n.author_username().to_string();
+            Comment {
+                id: n.id,
+                body: n.body,
+                author,
+                discussion_id: format!("issue_{}", n.id),
+                location: None,
+                location_details: None,
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone)]
 pub struct GitLabClient {
     repo_path: String,
+}
+
+/// Returns `true` when the glab/API error string suggests a transient problem worth retrying.
+fn mr_label_api_error_should_retry(err_msg: &str) -> bool {
+    let m = err_msg.to_lowercase();
+    // Permanent client / validation errors — repeating the request is unlikely to help.
+    if m.contains("http 401")
+        || m.contains("http 403")
+        || m.contains("http 404")
+        || m.contains("http 400")
+        || m.contains("http 405")
+        || m.contains("http 422")
+        || m.contains("unauthorized")
+        || m.contains("not found")
+    {
+        return false;
+    }
+    true
 }
 
 impl GitLabClient {
@@ -74,22 +175,39 @@ impl GitLabClient {
 
     pub fn list_issues(&self) -> Result<Vec<Issue>> {
         debug!("Fetching issues from GitLab");
+        const PER_PAGE: usize = 100;
+        let mut page = 1usize;
+        let mut issues = Vec::new();
 
-        let output = Command::new("glab")
-            .args(["issue", "list", "--output", "json"])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to execute glab issue list")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "glab issue list failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+        loop {
+            let endpoint = format!(
+                "projects/:id/issues?state=opened&per_page={}&page={}",
+                PER_PAGE, page
             );
-        }
+            let output = Command::new("glab")
+                .args(["api", &endpoint])
+                .current_dir(&self.repo_path)
+                .output()
+                .context("Failed to execute glab api for issue list")?;
 
-        let mut issues: Vec<Issue> =
-            serde_json::from_slice(&output.stdout).context("Failed to parse issues JSON")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "glab api issue list failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            let batch: Vec<Issue> =
+                serde_json::from_slice(&output.stdout).context("Failed to parse issues JSON")?;
+
+            let batch_len = batch.len();
+            issues.extend(batch);
+
+            if batch_len < PER_PAGE {
+                break;
+            }
+            page += 1;
+        }
 
         sort_issues_by_priority(&mut issues);
 
@@ -281,6 +399,85 @@ impl GitLabClient {
         Ok(mr)
     }
 
+    /// Fetches the exact MR diff payload as produced by GitLab for this MR.
+    /// This is preferred for agent context because it matches the MR view.
+    pub fn get_merge_request_changes(&self, iid: u64) -> Result<MergeRequestChangesSnapshot> {
+        debug!("Fetching merge request !{} changes", iid);
+
+        let endpoint = format!("projects/:id/merge_requests/{}/changes", iid);
+        let output = Command::new("glab")
+            .args(["api", &endpoint])
+            .current_dir(&self.repo_path)
+            .output()
+            .context("Failed to execute glab api for MR changes")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "glab api MR changes failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).context("Failed to parse MR changes JSON")?;
+        Ok(Self::parse_mr_changes_payload(&payload))
+    }
+
+    fn parse_mr_changes_payload(payload: &serde_json::Value) -> MergeRequestChangesSnapshot {
+        let overflow = payload["overflow"].as_bool().unwrap_or(false);
+        let changes = payload["changes"].as_array().cloned().unwrap_or_default();
+
+        let mut files = Vec::new();
+        let mut patch_parts = Vec::new();
+        for change in changes {
+            let new_path = change["new_path"].as_str().unwrap_or("").trim();
+            let old_path = change["old_path"].as_str().unwrap_or("").trim();
+            let file_label = match (old_path.is_empty(), new_path.is_empty()) {
+                (false, false) if old_path != new_path => format!("{} -> {}", old_path, new_path),
+                (_, false) => new_path.to_string(),
+                (false, _) => old_path.to_string(),
+                _ => "(unknown path)".to_string(),
+            };
+            files.push(file_label);
+
+            let diff = change["diff"].as_str().unwrap_or("").trim_end();
+            let old_header = if old_path.is_empty() {
+                "dev/null"
+            } else {
+                old_path
+            };
+            let new_header = if new_path.is_empty() {
+                "dev/null"
+            } else {
+                new_path
+            };
+            let section = if diff.is_empty() {
+                format!("diff --git a/{old_header} b/{new_header}\n")
+            } else {
+                format!("diff --git a/{old_header} b/{new_header}\n{diff}\n")
+            };
+            patch_parts.push(section);
+        }
+
+        MergeRequestChangesSnapshot {
+            files,
+            patch: patch_parts.join("\n"),
+            overflow,
+            base_sha: payload
+                .pointer("/diff_refs/base_sha")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            start_sha: payload
+                .pointer("/diff_refs/start_sha")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            head_sha: payload
+                .pointer("/diff_refs/head_sha")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        }
+    }
+
     pub fn get_mr_comments(&self, iid: u64) -> Result<Vec<Comment>> {
         debug!("Fetching discussions for merge request !{}", iid);
 
@@ -306,11 +503,15 @@ impl GitLabClient {
         let mut comments = Vec::new();
         for discussion in &discussions {
             let discussion_id = discussion["id"].as_str().unwrap_or("").to_string();
+            let discussion_location = Self::discussion_location(discussion);
             if let Some(notes) = discussion["notes"].as_array() {
                 for note in notes {
                     if note["system"].as_bool().unwrap_or(true) {
                         continue;
                     }
+                    let note_location =
+                        Self::position_location(&note["position"]).or(discussion_location.clone());
+                    let note_location_details = Self::position_details(&note["position"]);
                     comments.push(Comment {
                         id: note["id"].as_u64().unwrap_or(0),
                         body: note["body"].as_str().unwrap_or("").to_string(),
@@ -319,6 +520,8 @@ impl GitLabClient {
                             .unwrap_or("unknown")
                             .to_string(),
                         discussion_id: discussion_id.clone(),
+                        location: note_location,
+                        location_details: note_location_details,
                     });
                 }
             }
@@ -380,6 +583,81 @@ impl GitLabClient {
             Some((true, all_resolved))
         } else {
             None
+        }
+    }
+
+    fn discussion_location(discussion: &serde_json::Value) -> Option<String> {
+        Self::position_location(&discussion["position"]).or_else(|| {
+            discussion["notes"].as_array().and_then(|notes| {
+                notes
+                    .iter()
+                    .find_map(|note| Self::position_location(&note["position"]))
+            })
+        })
+    }
+
+    fn position_location(position: &serde_json::Value) -> Option<String> {
+        if !position.is_object() {
+            return None;
+        }
+
+        let new_path = position["new_path"].as_str().filter(|s| !s.is_empty());
+        let old_path = position["old_path"].as_str().filter(|s| !s.is_empty());
+        let path = new_path.or(old_path)?;
+
+        if let Some(range) = position["line_range"].as_object() {
+            let start_line = range
+                .get("start")
+                .and_then(|v| v["new_line"].as_u64().or_else(|| v["old_line"].as_u64()));
+            let end_line = range
+                .get("end")
+                .and_then(|v| v["new_line"].as_u64().or_else(|| v["old_line"].as_u64()));
+            match (start_line, end_line) {
+                (Some(start), Some(end)) if start != end => {
+                    return Some(format!("{}:{}-{}", path, start, end));
+                }
+                (Some(line), _) | (_, Some(line)) => {
+                    return Some(format!("{}:{}", path, line));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(line) = position["new_line"]
+            .as_u64()
+            .or_else(|| position["old_line"].as_u64())
+        {
+            return Some(format!("{}:{}", path, line));
+        }
+
+        Some(path.to_string())
+    }
+
+    fn position_details(position: &serde_json::Value) -> Option<String> {
+        if !position.is_object() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if let Some(v) = position["position_type"].as_str()
+            && !v.is_empty()
+        {
+            parts.push(format!("type={}", v));
+        }
+        if let Some(v) = position["new_line"].as_u64() {
+            parts.push(format!("new_line={}", v));
+        }
+        if let Some(v) = position["old_line"].as_u64() {
+            parts.push(format!("old_line={}", v));
+        }
+        if let Some(v) = position["line_code"].as_str()
+            && !v.is_empty()
+        {
+            parts.push(format!("line_code={}", v));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
         }
     }
 
@@ -497,8 +775,7 @@ impl GitLabClient {
         Ok(())
     }
 
-    /// Creates a resolvable discussion thread on an MR via the discussions API.
-    pub fn add_mr_discussion(&self, iid: u64, body: &str) -> Result<()> {
+    fn create_mr_discussion(&self, iid: u64, body: &str) -> Result<String> {
         debug!("Creating discussion thread on MR !{}", iid);
 
         let endpoint = format!("projects/:id/merge_requests/{}/discussions", iid);
@@ -522,6 +799,25 @@ impl GitLabClient {
             );
         }
 
+        let discussion: serde_json::Value =
+            serde_json::from_slice(&output.stdout).context("Failed to parse MR discussion JSON")?;
+        let discussion_id = discussion["id"]
+            .as_str()
+            .context("MR discussion response missing id")?;
+
+        Ok(discussion_id.to_string())
+    }
+
+    /// Creates a resolvable discussion thread on an MR via the discussions API.
+    pub fn add_mr_discussion(&self, iid: u64, body: &str) -> Result<()> {
+        let _ = self.create_mr_discussion(iid, body)?;
+        Ok(())
+    }
+
+    /// Creates a resolvable discussion thread on an MR and immediately resolves it.
+    pub fn add_resolved_mr_discussion(&self, iid: u64, body: &str) -> Result<()> {
+        let discussion_id = self.create_mr_discussion(iid, body)?;
+        self.resolve_discussion(iid, &discussion_id)?;
         Ok(())
     }
 
@@ -550,6 +846,41 @@ impl GitLabClient {
         }
 
         Ok(())
+    }
+
+    /// Like [`Self::add_mr_label`], but on likely-transient failures (GitLab 5xx, rate limits, etc.)
+    /// sleeps with exponential backoff (capped) and retries until success. Returns `Err` only when
+    /// the error looks permanent (e.g. 401/403/404/400/422) so the caller can log and continue.
+    pub fn add_mr_label_with_transient_retries(&self, iid: u64, label: &str) -> Result<()> {
+        let mut attempt = 0u32;
+        let mut delay = Duration::from_secs(1);
+        const MAX_DELAY: Duration = Duration::from_secs(60);
+        loop {
+            attempt += 1;
+            match self.add_mr_label(iid, label) {
+                Ok(()) => {
+                    if attempt > 1 {
+                        info!(
+                            "Added label {:?} to MR !{} after {} attempts",
+                            label, iid, attempt
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !mr_label_api_error_should_retry(&msg) {
+                        return Err(e);
+                    }
+                    warn!(
+                        "Transient failure adding label {:?} to MR !{} (attempt {}), retrying in {:?}: {}",
+                        label, iid, attempt, delay, msg
+                    );
+                    thread::sleep(delay);
+                    delay = (delay * 2).min(MAX_DELAY);
+                }
+            }
+        }
     }
 
     pub fn remove_mr_label(&self, iid: u64, label: &str) -> Result<()> {
@@ -764,55 +1095,94 @@ impl GitLabClient {
         )
     }
 
+    /// Issue notes (comments) from `glab api projects/:id/issues/:iid/discussions` — same payload as
+    /// [`Self::get_issue_thread_notes`], mapped to [`Comment`] for prompts.
     pub fn get_issue_comments(&self, issue_iid: u64) -> Result<Vec<Comment>> {
-        debug!("Fetching comments for issue #{}", issue_iid);
+        debug!(
+            "Fetching comments for issue #{} (glab api …/discussions)",
+            issue_iid
+        );
+        Ok(issue_thread_notes_as_comments(
+            self.fetch_issue_discussions_via_api(issue_iid)?,
+        ))
+    }
 
+    /// Issue thread notes with GitLab discussion ids, from `glab api projects/:id/issues/:iid/discussions`.
+    pub fn get_issue_thread_notes(&self, issue_iid: u64) -> Result<Vec<IssueThreadNote>> {
+        debug!(
+            "Fetching thread notes for issue #{} (glab api …/discussions)",
+            issue_iid
+        );
+        self.fetch_issue_discussions_via_api(issue_iid)
+    }
+
+    fn fetch_issue_discussions_via_api(&self, issue_iid: u64) -> Result<Vec<IssueThreadNote>> {
+        let endpoint = format!("projects/:id/issues/{issue_iid}/discussions");
         let output = Command::new("glab")
-            .args([
-                "issue",
-                "note",
-                "list",
-                &issue_iid.to_string(),
-                "--output",
-                "json",
-            ])
+            .args(["api", &endpoint])
             .current_dir(&self.repo_path)
             .output()
-            .context("Failed to fetch issue comments")?;
+            .context("Failed to run glab api for issue discussions")?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "glab issue note list failed: {}",
+                "glab api issue discussions failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
 
         #[derive(Deserialize)]
-        struct NoteResponse {
-            id: u64,
-            body: String,
-            author: AuthorInfo,
+        struct DiscussionJson {
+            id: String,
+            notes: Vec<DiscussionNoteJson>,
         }
 
         #[derive(Deserialize)]
-        struct AuthorInfo {
+        struct DiscussionNoteJson {
+            id: u64,
+            #[serde(default)]
+            body: String,
+            #[serde(default)]
+            system: bool,
+            /// GitLab may omit or null this for some system/imported notes.
+            #[serde(default)]
+            author: Option<DiscussionNoteAuthorJson>,
+        }
+
+        #[derive(Deserialize)]
+        struct DiscussionNoteAuthorJson {
+            #[serde(default)]
             username: String,
         }
 
-        let notes: Vec<NoteResponse> = serde_json::from_slice(&output.stdout)
-            .context("Failed to parse issue comments JSON")?;
+        let discussions: Vec<DiscussionJson> = serde_json::from_slice(&output.stdout)
+            .with_context(|| {
+                let preview =
+                    String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(400)]);
+                format!("Failed to parse issue discussions JSON (stdout preview): {preview}")
+            })?;
 
-        let comments = notes
-            .into_iter()
-            .map(|note| Comment {
-                id: note.id,
-                body: note.body,
-                author: note.author.username,
-                discussion_id: format!("issue_{}", note.id),
-            })
-            .collect();
+        let mut out = Vec::new();
+        for d in discussions {
+            for n in d.notes {
+                let username = n
+                    .author
+                    .as_ref()
+                    .map(|a| a.username.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("(unknown)")
+                    .to_string();
+                out.push(IssueThreadNote {
+                    id: n.id,
+                    body: n.body,
+                    system: n.system,
+                    discussion_id: Some(d.id.clone()),
+                    author: IssueThreadNoteAuthor { username },
+                });
+            }
+        }
 
-        Ok(comments)
+        Ok(out)
     }
 }
 
@@ -834,4 +1204,215 @@ pub fn sort_issues_by_priority(issues: &mut [Issue]) {
 /// Extract an issue IID from a branch name following the `issue-N` convention.
 pub fn issue_iid_from_branch(branch: &str) -> Option<u64> {
     branch.strip_prefix("issue-")?.parse().ok()
+}
+
+static CLOSES_ISSUE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)closes?\s+#(\d+)").expect("CLOSES_ISSUE_RE"));
+
+/// True if the MR description contains `Closes #iid` / `Close #iid` for this issue (case-insensitive).
+pub fn mr_description_closes_issue(description: &str, issue_iid: u64) -> bool {
+    CLOSES_ISSUE_RE.captures_iter(description).any(|cap| {
+        cap.get(1)
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .is_some_and(|n| n == issue_iid)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, mr_description_closes_issue,
+        mr_label_api_error_should_retry,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn discussion_location_prefers_inline_new_line() {
+        let discussion = json!({
+            "position": {
+                "new_path": "src/lib.rs",
+                "old_path": "src/lib.rs",
+                "new_line": 42
+            }
+        });
+
+        assert_eq!(
+            GitLabClient::discussion_location(&discussion).as_deref(),
+            Some("src/lib.rs:42")
+        );
+    }
+
+    #[test]
+    fn discussion_location_supports_line_ranges() {
+        let discussion = json!({
+            "position": {
+                "new_path": "src/lib.rs",
+                "line_range": {
+                    "start": { "new_line": 10 },
+                    "end": { "new_line": 14 }
+                }
+            }
+        });
+
+        assert_eq!(
+            GitLabClient::discussion_location(&discussion).as_deref(),
+            Some("src/lib.rs:10-14")
+        );
+    }
+
+    #[test]
+    fn parse_mr_changes_payload_handles_paths_and_patch() {
+        let payload = json!({
+            "overflow": false,
+            "changes": [
+                {
+                    "old_path": "src/old.rs",
+                    "new_path": "src/new.rs",
+                    "diff": "@@ -1 +1 @@\n-old\n+new"
+                },
+                {
+                    "old_path": "",
+                    "new_path": "src/added.rs",
+                    "diff": "@@ -0,0 +1 @@\n+line"
+                }
+            ]
+        });
+
+        let parsed: MergeRequestChangesSnapshot = GitLabClient::parse_mr_changes_payload(&payload);
+        assert!(!parsed.overflow);
+        assert_eq!(
+            parsed.files,
+            vec![
+                "src/old.rs -> src/new.rs".to_string(),
+                "src/added.rs".to_string()
+            ]
+        );
+        assert!(
+            parsed
+                .patch
+                .contains("diff --git a/src/old.rs b/src/new.rs")
+        );
+        assert!(parsed.patch.contains("@@ -1 +1 @@"));
+        assert!(
+            parsed
+                .patch
+                .contains("diff --git a/dev/null b/src/added.rs")
+        );
+        assert_eq!(parsed.base_sha, None);
+        assert_eq!(parsed.start_sha, None);
+        assert_eq!(parsed.head_sha, None);
+    }
+
+    #[test]
+    fn parse_mr_changes_payload_preserves_overflow_flag() {
+        let payload = json!({
+            "overflow": true,
+            "changes": []
+        });
+        let parsed = GitLabClient::parse_mr_changes_payload(&payload);
+        assert!(parsed.overflow);
+        assert!(parsed.files.is_empty());
+        assert!(parsed.patch.is_empty());
+    }
+
+    #[test]
+    fn parse_mr_changes_payload_reads_diff_refs() {
+        let payload = json!({
+            "overflow": false,
+            "diff_refs": {
+                "base_sha": "base123",
+                "start_sha": "start123",
+                "head_sha": "head123"
+            },
+            "changes": []
+        });
+        let parsed = GitLabClient::parse_mr_changes_payload(&payload);
+        assert_eq!(parsed.base_sha.as_deref(), Some("base123"));
+        assert_eq!(parsed.start_sha.as_deref(), Some("start123"));
+        assert_eq!(parsed.head_sha.as_deref(), Some("head123"));
+    }
+
+    #[test]
+    fn mr_label_api_error_retry_heuristic_matches_glab_500() {
+        assert!(mr_label_api_error_should_retry(
+            "Failed to add label to MR: glab: 500 Internal Server Error (HTTP 500)"
+        ));
+    }
+
+    #[test]
+    fn mr_label_api_error_retry_skips_permanent_http_codes() {
+        assert!(!mr_label_api_error_should_retry(
+            "Failed to add label to MR: glab: 404 Not Found (HTTP 404)"
+        ));
+        assert!(!mr_label_api_error_should_retry(
+            "Failed to add label to MR: HTTP 403 Forbidden"
+        ));
+    }
+
+    /// Matches a single note object inside `glab api projects/:id/issues/:iid/discussions`
+    /// (verified against a live GitLab instance before relying on API-only fetching).
+    #[test]
+    fn issue_discussions_api_note_deserializes_to_issue_thread_note() {
+        let j = json!({
+            "id": 24087u64,
+            "type": null,
+            "body": "**PMO needs clarification**",
+            "attachment": null,
+            "author": {
+                "id": 480,
+                "username": "alice",
+                "name": "Alice",
+                "state": "active",
+                "web_url": "https://example.com/alice"
+            },
+            "system": false,
+            "noteable_id": 291,
+            "noteable_type": "Issue",
+            "noteable_iid": 24
+        });
+        let n: IssueThreadNote = serde_json::from_value(j).unwrap();
+        assert_eq!(n.id, 24087);
+        assert_eq!(n.author_username(), "alice");
+        assert!(!n.system);
+        assert!(n.discussion_id.is_none());
+    }
+
+    #[test]
+    fn glab_issue_discussions_json_flattens_with_discussion_ids() {
+        let j = json!([
+            {
+                "id": "disc-a",
+                "notes": [
+                    { "id": 1u64, "body": "root", "system": false, "author": { "username": "u1" } },
+                    { "id": 2u64, "body": "reply", "system": false, "author": { "username": "u2" } }
+                ]
+            },
+            {
+                "id": "disc-b",
+                "notes": [
+                    { "id": 3u64, "body": "other", "system": false, "author": { "username": "u3" } }
+                ]
+            }
+        ]);
+
+        let discussions = j.as_array().unwrap();
+        let mut flat: Vec<(&str, u64)> = Vec::new();
+        for d in discussions {
+            let id = d["id"].as_str().unwrap();
+            for n in d["notes"].as_array().unwrap() {
+                flat.push((id, n["id"].as_u64().unwrap()));
+            }
+        }
+        assert_eq!(flat, vec![("disc-a", 1), ("disc-a", 2), ("disc-b", 3)]);
+    }
+
+    #[test]
+    fn mr_description_closes_issue_matches_variants() {
+        assert!(mr_description_closes_issue("Closes #42", 42));
+        assert!(mr_description_closes_issue("closes #42", 42));
+        assert!(mr_description_closes_issue("CLOSE #7 and more", 7));
+        assert!(mr_description_closes_issue("Text\n\nCloses #99\n", 99));
+        assert!(!mr_description_closes_issue("Closes #42", 43));
+        assert!(!mr_description_closes_issue("Refs #42", 42));
+    }
 }

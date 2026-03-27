@@ -1,59 +1,385 @@
-use anyhow::{Context, Result};
+//! Cursor **`agent acp`** runs as **one long-lived subprocess** per Codepair agent role. Each task
+//! calls **`session/close`** (best effort) then **`session/new`** on the same stdio connection so
+//! the model does not keep prior in-agent transcript; workflow continuity stays in Codepair’s
+//! state files and token use stays lower than reusing one session for every task.
+//!
+//! [ACP slash commands](https://agentclientprotocol.com/protocol/slash-commands): the agent may
+//! send `available_commands_update`; [`StreamTextHooks`] records command names for future
+//! role-specific prompt logic (not wired into prompts yet).
+//!
+//! [Session modes](https://agentclientprotocol.com/protocol/session-modes): the reviewer requests
+//! **`ask`** and the PMO **`plan`** only when the agent advertises that mode (config-option `mode`
+//! value or non-empty legacy `availableModes`). Otherwise the agent default is kept; see
+//! `RUST_LOG=debug` target `codepair::acp_modes`. `current_mode_update` keeps hooks in sync.
+//!
+//! Optional HTTP MCP registration ([`crate::mcp_http`]) is controlled by config (`mcp.enabled`);
+//! tasks use ACP only and do not use `codepair/wait_for_next_task`.
+
 use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
+
+use crate::acp::client::{AcpClient, CursorAskQuestionHandler};
+use crate::acp::orchestrator_hooks::StreamTextHooks;
+use crate::acp::types::{
+    ClientCapabilities, ClientFsCapabilities, DEFAULT_PROTOCOL_VERSION, ImplementationInfo,
+    InitializeParams, InitializeResult, NewSessionParams, NewSessionResult, PromptResult,
+    mode_id_is_available, model_selector_for_session, select_option_allows_value,
+    session_mode_config_option,
+};
+use crate::mcp_coord::{AgentHandoff, RoleAgentBridge};
+
+const TASK_CONTEXT_RESET_GUIDANCE: &str = r#"IMPORTANT CONTEXT HANDLING:
+Treat this assignment as a fresh task. Do not rely on prior chat history or assumptions from earlier assignments unless this prompt explicitly refers to them. Use only the repository state, issue/MR context, and instructions present in this task.
+
+"#;
+
+/// ACP session mode for the reviewer (read-oriented, permission before edits).
+pub const PREFERRED_SESSION_MODE_REVIEWER: &str = "ask";
+/// ACP session mode for the PMO (planning / decomposition for sub-issues and guidance).
+pub const PREFERRED_SESSION_MODE_PMO: &str = "plan";
+
+struct AcpSession {
+    client: Arc<AcpClient>,
+    child: Child,
+    session_id: String,
+    hooks: Arc<StreamTextHooks>,
+}
+
+fn dispose_acp_session(s: AcpSession) {
+    let _ = s.client.session_cancel(&s.session_id);
+    let mut s = s;
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+    drop(s.client);
+}
+
+fn close_acp_session_best_effort(client: &AcpClient, session_id: &str) {
+    match client.session_close(session_id) {
+        Ok(()) => {}
+        Err(e) => debug!(
+            target: "codepair::acp",
+            "session/close failed for session {} (continuing with session/new): {}",
+            session_id,
+            e
+        ),
+    }
+}
 
 pub struct Agent {
     repo_path: String,
     model: Option<String>,
+    /// When set, applied after `session/new` via ACP mode APIs ([`PREFERRED_SESSION_MODE_REVIEWER`], [`PREFERRED_SESSION_MODE_PMO`]).
+    preferred_session_mode: Option<&'static str>,
     shutdown: Arc<AtomicBool>,
+    agent_id: String,
+    /// When [`Some`], keeps this `agent_id` registered with the MCP HTTP coordinator.
+    mcp_bridge: Option<RoleAgentBridge>,
+    acp: Mutex<Option<AcpSession>>,
+    unexpected_quits_count: Arc<AtomicU64>,
 }
 
 impl Agent {
-    pub fn new(repo_path: String, model: Option<String>, shutdown: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        repo_path: String,
+        model: Option<String>,
+        preferred_session_mode: Option<&'static str>,
+        shutdown: Arc<AtomicBool>,
+        agent_id: String,
+        mcp_bridge: Option<RoleAgentBridge>,
+    ) -> Self {
         Self {
             repo_path,
             model,
+            preferred_session_mode,
             shutdown,
+            agent_id,
+            mcp_bridge,
+            acp: Mutex::new(None),
+            unexpected_quits_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub fn run(&self, prompt: &str) -> Result<String> {
-        self.run_with_cancel(prompt, None)
+    pub fn unexpected_quits_count(&self) -> u64 {
+        self.unexpected_quits_count.load(Ordering::SeqCst)
     }
 
-    /// Run the agent with an optional cancellation callback. The callback is
-    /// invoked periodically (~every 5 seconds) while the agent is running.
-    /// If it returns `true`, the agent process is killed and an error is returned.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    /// True when this process registered with the Codepair MCP HTTP server (`config.mcp.enabled`).
+    pub fn mcp_registered(&self) -> bool {
+        self.mcp_bridge.is_some()
+    }
+
+    pub fn run(&self, prompt: &str) -> Result<AgentHandoff> {
+        self.run_with_cancel(prompt, None, None)
+    }
+
+    /// Run one task: ensure a fresh ACP session (`session/close` then `session/new` on the same
+    /// child when the process is already running), send `session/prompt`. Retries after transport
+    /// failures keep the same session while the child stays up; if the child exits, a new process
+    /// and session are created.
     pub fn run_with_cancel(
         &self,
         prompt: &str,
         cancel_check: Option<&dyn Fn() -> bool>,
-    ) -> Result<String> {
+        cursor_ask_question_handler: Option<Arc<dyn CursorAskQuestionHandler>>,
+    ) -> Result<AgentHandoff> {
+        let prompt = prepare_task_prompt(prompt);
+        const MAX_UNFINISHED_TASK_RETRIES: u32 = 5;
         if let Some(model) = &self.model {
             info!(
-                "Running agent with model: {}, prompt length: {} chars",
+                "Running ACP agent {} model={:?} prompt_len={} (new session per task, same process)",
+                self.agent_id(),
                 model,
                 prompt.len()
             );
         } else {
-            info!("Running agent with prompt length: {} chars", prompt.len());
+            info!(
+                "Running ACP agent {} prompt_len={} (new session per task, same process)",
+                self.agent_id(),
+                prompt.len()
+            );
+        }
+        debug!("Agent task prompt: {}", prompt);
+
+        self.rotate_acp_session_for_new_task()?;
+
+        let mut unfinished_task_retries: u32 = 0;
+        let mut polls_since_cancel_check: u32 = 0;
+        const CANCEL_CHECK_INTERVAL: u32 = 25;
+
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                self.kill_child();
+                anyhow::bail!("Agent interrupted by shutdown");
+            }
+
+            let (client, session_id, hooks) = {
+                let g = self.acp.lock().unwrap();
+                let s = g.as_ref().context("ACP session missing after ensure")?;
+                (
+                    Arc::clone(&s.client),
+                    s.session_id.clone(),
+                    Arc::clone(&s.hooks),
+                )
+            };
+
+            hooks.clear();
+            hooks.set_cursor_ask_question_handler(cursor_ask_question_handler.clone());
+            let prompt_owned = prompt.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<Result<PromptResult, String>>();
+            thread::spawn(move || {
+                let out = client
+                    .session_prompt(&session_id, &prompt_owned)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(out);
+            });
+
+            let handoff_result = loop {
+                if self.shutdown.load(Ordering::SeqCst) {
+                    self.kill_child();
+                    break Err(anyhow::anyhow!("Agent interrupted by shutdown"));
+                }
+                polls_since_cancel_check += 1;
+                if polls_since_cancel_check >= CANCEL_CHECK_INTERVAL {
+                    polls_since_cancel_check = 0;
+                    if let Some(check) = cancel_check
+                        && check()
+                    {
+                        warn!(
+                            "Cancel check triggered, killing ACP agent {}",
+                            self.agent_id()
+                        );
+                        self.kill_child();
+                        break Err(anyhow::anyhow!("Agent cancelled by external condition"));
+                    }
+                }
+
+                if let Some(exit) = self.take_child_exit_status()? {
+                    self.kill_child();
+                    break Err(anyhow::anyhow!(
+                        "agent {} exited during prompt ({})",
+                        self.agent_id(),
+                        exit
+                    ));
+                }
+
+                match rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Ok(pr)) => break Ok(handoff_from_prompt_hooks(&hooks, pr)),
+                    Ok(Err(e)) => break Err(anyhow::anyhow!("ACP session/prompt: {}", e)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(anyhow::anyhow!(
+                            "ACP prompt thread died for {}",
+                            self.agent_id()
+                        ));
+                    }
+                }
+            };
+
+            hooks.set_cursor_ask_question_handler(None);
+
+            match handoff_result {
+                Ok(h) => return Ok(h),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("exited during prompt") || msg.contains("ACP session/prompt") {
+                        unfinished_task_retries += 1;
+                        if unfinished_task_retries > MAX_UNFINISHED_TASK_RETRIES {
+                            return Err(e);
+                        }
+                        warn!(
+                            "ACP task failed for {} ({msg}). Retry {unfinished_task_retries}/{MAX_UNFINISHED_TASK_RETRIES}",
+                            self.agent_id(),
+                        );
+                        self.unexpected_quits_count.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(retry_backoff_for_unfinished_task(unfinished_task_retries));
+                        self.ensure_acp_session_for_retry()?;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    fn kill_child(&self) {
+        let mut g = self.acp.lock().unwrap();
+        if let Some(s) = g.take() {
+            dispose_acp_session(s);
+        }
+    }
+
+    /// Applies [`Self::preferred_session_mode`] only when the agent advertises that mode:
+    ///
+    /// - Config option with `id`/`category` `mode` and the value in `options`, or
+    /// - Legacy `session/new` `modes.availableModes` non-empty and containing the id.
+    ///
+    /// Otherwise leaves the agent default and logs at `debug` (`codepair::acp_modes`).
+    fn try_apply_preferred_session_mode(
+        &self,
+        client: &AcpClient,
+        session: &NewSessionResult,
+        hooks: &StreamTextHooks,
+    ) {
+        let Some(mode_id) = self.preferred_session_mode else {
+            return;
+        };
+
+        let legacy_advertises = session
+            .modes
+            .as_ref()
+            .is_some_and(|m| !m.available_modes.is_empty() && mode_id_is_available(m, mode_id));
+
+        if let Some(cfg) = session.config_options.as_deref()
+            && let Some(opt) = session_mode_config_option(cfg)
+            && select_option_allows_value(opt, mode_id)
+        {
+            match client.session_set_config_option(&session.session_id, &opt.id, mode_id) {
+                Ok(_) => {
+                    info!(
+                        "ACP session mode {:?} via session/set_config_option for {}",
+                        mode_id, self.agent_id
+                    );
+                    hooks.sync_tracked_current_mode(mode_id);
+                    return;
+                }
+                Err(e) => debug!(
+                    target: "codepair::acp_modes",
+                    agent_id = %self.agent_id,
+                    err = %e,
+                    "session/set_config_option for mode failed",
+                ),
+            }
+            if legacy_advertises {
+                match client.session_set_mode(&session.session_id, mode_id) {
+                    Ok(_) => {
+                        info!(
+                            "ACP session mode {:?} via session/set_mode (fallback) for {}",
+                            mode_id, self.agent_id
+                        );
+                        hooks.sync_tracked_current_mode(mode_id);
+                    }
+                    Err(e) => debug!(
+                        target: "codepair::acp_modes",
+                        agent_id = %self.agent_id,
+                        err = %e,
+                        "session/set_mode fallback after set_config_option failure also failed",
+                    ),
+                }
+            } else {
+                debug!(
+                    target: "codepair::acp_modes",
+                    agent_id = %self.agent_id,
+                    preferred = mode_id,
+                    "set_config_option for mode failed and agent does not advertise this mode in legacy availableModes; leaving default",
+                );
+            }
+            return;
         }
 
-        debug!("Agent prompt: {}", prompt);
+        if legacy_advertises {
+            match client.session_set_mode(&session.session_id, mode_id) {
+                Ok(_) => {
+                    info!(
+                        "ACP session mode {:?} via session/set_mode for {}",
+                        mode_id, self.agent_id
+                    );
+                    hooks.sync_tracked_current_mode(mode_id);
+                }
+                Err(e) => debug!(
+                    target: "codepair::acp_modes",
+                    agent_id = %self.agent_id,
+                    err = %e,
+                    "session/set_mode failed",
+                ),
+            }
+            return;
+        }
 
+        debug!(
+            target: "codepair::acp_modes",
+            agent_id = %self.agent_id,
+            preferred = mode_id,
+            "preferred session mode not advertised (no mode config option value match and no legacy availableModes entry); leaving agent default mode",
+        );
+    }
+
+    /// True when [`InitializeResult::auth_methods`] includes Cursor's `cursor_login` method.
+    ///
+    /// Cursor ACP requires [`AcpClient::authenticate`] with `cursor_login` after `initialize` and
+    /// before `session/new` ([Cursor ACP docs](https://cursor.com/docs/cli/acp)).
+    fn acp_init_advertises_cursor_login(init: &InitializeResult) -> bool {
+        init.auth_methods.iter().any(|m| {
+            m.get("id")
+                .or_else(|| m.get("methodId"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id == "cursor_login")
+        })
+    }
+
+    /// Spawns `agent acp`, attaches stdio, `initialize`, and Cursor `authenticate` when advertised — no `session/new` yet.
+    fn spawn_acp_connection(&self) -> Result<(Arc<AcpClient>, Child, Arc<StreamTextHooks>)> {
         let mut cmd = Command::new("agent");
-        cmd.arg("--print");
-        cmd.arg("--trust");
-        cmd.arg("--force");
-
+        // Global flags like `--model` should come before the `acp` subcommand.
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
+        cmd.arg("--print");
+        cmd.arg("--trust");
+        cmd.arg("--force");
+        cmd.arg("--approve-mcps");
+        cmd.arg("acp");
 
         let mut child = cmd
             .current_dir(&self.repo_path)
@@ -61,82 +387,380 @@ impl Agent {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("Failed to spawn agent process")?;
+            .context("Failed to spawn `agent acp` process")?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin
-                .write_all(prompt.as_bytes())
-                .context("Failed to write to agent stdin")?;
+        let stderr = child.stderr.take();
+        if let Some(mut err) = stderr {
+            let aid = self.agent_id().to_string();
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let n = err.read_to_end(&mut buf).unwrap_or(0);
+                if n > 0 {
+                    let preview = String::from_utf8_lossy(&buf[..n.min(2048)]);
+                    debug!(target: "codepair::agent_stderr", agent_id = %aid, "stderr: {}", preview);
+                }
+            });
         }
 
-        // Drain stdout/stderr in background threads to avoid pipe-buffer
-        // deadlocks when the child produces more than ~64KB of output.
-        let stdout_handle = child.stdout.take().map(|mut out| {
-            thread::spawn(move || {
-                let mut buf = Vec::new();
-                out.read_to_end(&mut buf).ok();
-                buf
-            })
-        });
-        let stderr_handle = child.stderr.take().map(|mut err| {
-            thread::spawn(move || {
-                let mut buf = Vec::new();
-                err.read_to_end(&mut buf).ok();
-                buf
-            })
-        });
+        let hooks = Arc::new(StreamTextHooks::with_workspace(PathBuf::from(
+            self.repo_path.clone(),
+        )));
+        let (client, child) = AcpClient::from_child_stdio(child, hooks.clone())
+            .context("attach ACP client to agent stdio")?;
+        let client = Arc::new(client);
 
-        // Poll for child exit while checking the shutdown flag and the
-        // optional cancel callback. The cancel_check is called every
-        // ~5 seconds to avoid excessive API calls.
-        let mut polls_since_cancel_check: u32 = 0;
-        const CANCEL_CHECK_INTERVAL: u32 = 25; // 25 * 200ms = 5s
-        loop {
-            match child.try_wait() {
-                Ok(Some(_status)) => break,
-                Ok(None) => {
-                    if self.shutdown.load(Ordering::SeqCst) {
-                        warn!("Shutdown requested, killing agent child process");
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        anyhow::bail!("Agent interrupted by shutdown");
+        let init_result = client
+            .initialize(&InitializeParams {
+                protocol_version: DEFAULT_PROTOCOL_VERSION,
+                client_capabilities: ClientCapabilities {
+                    fs: ClientFsCapabilities {
+                        read_text_file: true,
+                        write_text_file: false,
+                    },
+                    terminal: false,
+                },
+                client_info: ImplementationInfo {
+                    name: "codepair".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                },
+            })
+            .context("ACP initialize")?;
+
+        if Self::acp_init_advertises_cursor_login(&init_result) {
+            debug!(
+                target: "codepair::acp",
+                agent_id = %self.agent_id,
+                auth_methods = init_result.auth_methods.len(),
+                "initialize result includes authMethods; calling authenticate(cursor_login)"
+            );
+        } else {
+            warn!(
+                target: "codepair::acp",
+                agent_id = %self.agent_id,
+                "initialize result has no recognizable cursor_login authMethods; still calling authenticate(cursor_login) (required by Cursor ACP before session/new)"
+            );
+        }
+
+        client.authenticate_cursor_login().context(
+            "ACP authenticate (cursor_login). Run `agent login` or set CURSOR_API_KEY / CURSOR_AUTH_TOKEN; see https://cursor.com/docs/cli/acp",
+        )?;
+
+        Ok((client, child, hooks))
+    }
+
+    fn start_acp_session_on_connection(
+        &self,
+        client: &Arc<AcpClient>,
+        hooks: &Arc<StreamTextHooks>,
+    ) -> Result<String> {
+        let cwd: PathBuf = std::fs::canonicalize(&self.repo_path)
+            .unwrap_or_else(|_| PathBuf::from(&self.repo_path));
+        let session = client
+            .session_new(&NewSessionParams {
+                cwd: cwd.to_string_lossy().into_owned(),
+                mcp_servers: vec![],
+            })
+            .context("ACP session/new")?;
+
+        if let Some(ref modes) = session.modes {
+            hooks.seed_session_modes(modes);
+            if !mode_id_is_available(modes, &modes.current_mode_id) {
+                debug!(
+                    target: "codepair::acp_modes",
+                    agent_id = %self.agent_id,
+                    current = %modes.current_mode_id,
+                    "ACP session/new currentModeId not listed in availableModes",
+                );
+            }
+            debug!(
+                target: "codepair::acp_modes",
+                agent_id = %self.agent_id,
+                current = %modes.current_mode_id,
+                available = ?modes
+                    .available_modes
+                    .iter()
+                    .map(|m| m.id.as_str())
+                    .collect::<Vec<_>>(),
+                "ACP session modes from session/new",
+            );
+        }
+
+        self.try_apply_preferred_session_mode(client, &session, hooks);
+
+        if let Some(model) = &self.model {
+            let mut applied = false;
+            if let Some(cfg) = session.config_options.as_deref()
+                && let Some(opt) = model_selector_for_session(cfg)
+                && select_option_allows_value(opt, model)
+            {
+                match client.session_set_config_option(&session.session_id, &opt.id, model) {
+                    Ok(_) => {
+                        info!(
+                            "ACP model set via session/set_config_option for agent {}",
+                            self.agent_id
+                        );
+                        applied = true;
                     }
-                    polls_since_cancel_check += 1;
-                    if polls_since_cancel_check >= CANCEL_CHECK_INTERVAL {
-                        polls_since_cancel_check = 0;
-                        if let Some(check) = cancel_check
-                            && check()
-                        {
-                            warn!("Cancel check triggered, killing agent child process");
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            anyhow::bail!("Agent cancelled by external condition");
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(200));
+                    Err(e) => debug!(
+                        "ACP session/set_config_option failed for {}, trying session/set_model: {}",
+                        self.agent_id, e
+                    ),
                 }
-                Err(e) => {
-                    anyhow::bail!("Failed to wait for agent process: {}", e);
+            }
+            if !applied {
+                match client.session_set_model(&session.session_id, model) {
+                    Ok(_) => info!(
+                        "ACP model set via session/set_model for agent {}",
+                        self.agent_id
+                    ),
+                    Err(e) => debug!(
+                        "ACP session/set_model model={model:?} skipped for {}: {} (CLI --model still in effect)",
+                        self.agent_id, e
+                    ),
                 }
             }
         }
 
-        let stdout_buf = stdout_handle
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
-        let stderr_buf = stderr_handle
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
+        info!(
+            "ACP session {} ready for agent {}",
+            session.session_id, self.agent_id
+        );
 
-        let exit_status = child.wait().context("Failed to get agent exit status")?;
-        if !exit_status.success() {
-            let stderr = String::from_utf8_lossy(&stderr_buf);
-            anyhow::bail!("Agent execution failed: {}", stderr);
+        Ok(session.session_id)
+    }
+
+    /// At the start of each task: new `session/new` on the existing child, or spawn if needed.
+    fn rotate_acp_session_for_new_task(&self) -> Result<()> {
+        let mut g = self.acp.lock().unwrap();
+        let need_fresh_spawn = match g.as_mut() {
+            None => true,
+            Some(s) => match s.child.try_wait() {
+                Ok(Some(_)) => {
+                    if let Some(s) = g.take() {
+                        dispose_acp_session(s);
+                    }
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => {
+                    if let Some(s) = g.take() {
+                        dispose_acp_session(s);
+                    }
+                    true
+                }
+            },
+        };
+
+        if need_fresh_spawn {
+            let (client, child, hooks) = self.spawn_acp_connection()?;
+            let session_id = self.start_acp_session_on_connection(&client, &hooks)?;
+            *g = Some(AcpSession {
+                client,
+                child,
+                session_id,
+                hooks,
+            });
+            return Ok(());
         }
 
-        let result = String::from_utf8_lossy(&stdout_buf).to_string();
-        debug!("Agent output length: {} chars", result.len());
-        Ok(result)
+        let s = g
+            .as_mut()
+            .context("ACP session missing after child check")?;
+        close_acp_session_best_effort(&s.client, &s.session_id);
+        s.session_id = self.start_acp_session_on_connection(&s.client, &s.hooks)?;
+        Ok(())
+    }
+
+    /// After a failed prompt while the child may have exited: respawn + `session/new` if needed.
+    /// If the child is still running, the current session is left in place for the next attempt.
+    fn ensure_acp_session_for_retry(&self) -> Result<()> {
+        let mut g = self.acp.lock().unwrap();
+        let need_spawn = match g.as_mut() {
+            None => true,
+            Some(s) => match s.child.try_wait() {
+                Ok(Some(_)) => {
+                    if let Some(s) = g.take() {
+                        dispose_acp_session(s);
+                    }
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => {
+                    if let Some(s) = g.take() {
+                        dispose_acp_session(s);
+                    }
+                    true
+                }
+            },
+        };
+
+        if need_spawn {
+            let (client, child, hooks) = self.spawn_acp_connection()?;
+            let session_id = self.start_acp_session_on_connection(&client, &hooks)?;
+            *g = Some(AcpSession {
+                client,
+                child,
+                session_id,
+                hooks,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn take_child_exit_status(&self) -> Result<Option<String>> {
+        let mut g = self.acp.lock().unwrap();
+        let Some(s) = g.as_mut() else {
+            return Ok(Some("ACP child missing".to_string()));
+        };
+        match s.child.try_wait() {
+            Ok(Some(status)) => Ok(Some(status.to_string())),
+            Ok(None) => Ok(None),
+            Err(err) => Ok(Some(format!("unable to query child status: {}", err))),
+        }
+    }
+}
+
+fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> AgentHandoff {
+    let stream = hooks.take_text();
+    let extra_msg = pr
+        .extra
+        .get("message")
+        .or_else(|| pr.extra.get("output"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut response = match (stream.trim().is_empty(), extra_msg) {
+        (true, Some(s)) => s.to_string(),
+        (false, None) => stream,
+        (false, Some(s)) => {
+            // Final `message` / `output` sometimes carries PMO `SUB_ISSUE_*` blocks while streamed
+            // chunks are prose-only — merge only when the extra text has those markers.
+            if s.contains("SUB_ISSUE_") && !stream.contains("SUB_ISSUE_") {
+                format!("{stream}\n\n{s}")
+            } else {
+                stream
+            }
+        }
+        (true, None) => String::new(),
+    };
+
+    if response.trim().is_empty()
+        && let Some(s) = extra_msg
+    {
+        response = s.to_string();
+    }
+
+    AgentHandoff {
+        response,
+        ..Default::default()
+    }
+}
+
+fn prepare_task_prompt(prompt: &str) -> String {
+    format!("{}{}", TASK_CONTEXT_RESET_GUIDANCE, prompt)
+}
+
+fn retry_backoff_for_unfinished_task(attempt: u32) -> Duration {
+    let capped = attempt.min(5) as u64;
+    Duration::from_millis(capped * 200)
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let mut g = self.acp.lock().unwrap();
+        if let Some(s) = g.take() {
+            dispose_acp_session(s);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::client::AcpHooks;
+    use crate::acp::types::InitializeResult;
+    use serde_json::json;
+
+    #[test]
+    fn acp_init_detects_cursor_login_in_auth_methods() {
+        let with_login: InitializeResult = serde_json::from_value(json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {},
+            "authMethods": [{"id": "cursor_login", "name": "Cursor Login"}]
+        }))
+        .unwrap();
+        assert!(Agent::acp_init_advertises_cursor_login(&with_login));
+
+        let empty: InitializeResult = serde_json::from_value(json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {},
+            "authMethods": []
+        }))
+        .unwrap();
+        assert!(!Agent::acp_init_advertises_cursor_login(&empty));
+    }
+
+    #[test]
+    fn prepends_fresh_context_guidance_to_each_task() {
+        let prompt = prepare_task_prompt("Implement issue #42.");
+        assert!(prompt.starts_with(TASK_CONTEXT_RESET_GUIDANCE));
+        assert!(prompt.ends_with("Implement issue #42."));
+    }
+
+    #[test]
+    fn unfinished_task_retry_backoff_is_capped() {
+        assert_eq!(
+            retry_backoff_for_unfinished_task(1),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            retry_backoff_for_unfinished_task(3),
+            Duration::from_millis(600)
+        );
+        assert_eq!(
+            retry_backoff_for_unfinished_task(99),
+            Duration::from_millis(1000)
+        );
+    }
+
+    #[test]
+    fn handoff_prefers_stream_buffer_then_prompt_extra() {
+        let hooks = StreamTextHooks::new();
+        let params = serde_json::json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "text": "from stream" }
+            }
+        });
+        hooks.on_agent_notification("session/update", &params);
+        let pr: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "message": "from result"
+        }))
+        .unwrap();
+        let h = handoff_from_prompt_hooks(&hooks, pr);
+        assert_eq!(h.response, "from stream");
+
+        let hooks_m = StreamTextHooks::new();
+        hooks_m.on_agent_notification("session/update", &params);
+        let pr_m: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "message": "SUB_ISSUE_1:\nTITLE: T\nDESCRIPTION:\nD"
+        }))
+        .unwrap();
+        let hm = handoff_from_prompt_hooks(&hooks_m, pr_m);
+        assert!(hm.response.contains("from stream"));
+        assert!(hm.response.contains("SUB_ISSUE_1"));
+
+        let hooks2 = StreamTextHooks::new();
+        let pr2: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "message": "only result"
+        }))
+        .unwrap();
+        let h2 = handoff_from_prompt_hooks(&hooks2, pr2);
+        assert_eq!(h2.response, "only result");
     }
 }

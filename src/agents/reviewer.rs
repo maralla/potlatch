@@ -7,11 +7,22 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use super::{claim, extract_project_name};
+use super::{claim, extract_project_name, mr_in_scope, write_task_context_file};
 use crate::agent::Agent;
 use crate::config::ReviewerConfig;
+use crate::cursor_mcp_config;
 use crate::git::GitRepo;
 use crate::gitlab::{self, GitLabClient, MergeRequest};
+use crate::mcp_coord::AgentHandoff;
+use crate::mcp_coord::CoordinatorHandle;
+
+const REVIEWER_APPROVED_LABEL: &str = "reviewer-approved";
+
+enum ReviewOutcome {
+    Merged,
+    ApprovedWithoutMerge,
+    NeedsChanges,
+}
 
 fn interruptible_sleep(shutdown: &AtomicBool, duration: Duration) -> bool {
     let interval = Duration::from_millis(200);
@@ -29,23 +40,52 @@ fn interruptible_sleep(shutdown: &AtomicBool, duration: Duration) -> bool {
     }
 }
 
+fn state_meta(agent: &Agent) -> String {
+    let quits = agent.unexpected_quits_count();
+    if quits == 0 {
+        String::new()
+    } else {
+        format!(", {} unexpected quits", quits)
+    }
+}
+
 pub fn run(
     repo_url: String,
     config: ReviewerConfig,
     instance_id: usize,
     shutdown: Arc<AtomicBool>,
     base_dir: String,
+    coordinator: Option<CoordinatorHandle>,
+    scope_label: String,
 ) -> Result<()> {
     let project_name = extract_project_name(&repo_url)?;
     let agent_id = format!("reviewer-{}", instance_id);
     let reviewer_dir = super::work_dir(&base_dir, &project_name, &agent_id);
+    let sessions_dir = super::sessions_dir(&base_dir, &project_name);
 
     let git_repo = GitRepo::new(reviewer_dir.clone());
     let gitlab = GitLabClient::new(reviewer_dir.clone());
-    let agent = Agent::new(reviewer_dir.clone(), config.model.clone(), shutdown.clone());
 
+    if coordinator.is_some() {
+        cursor_mcp_config::refresh_mcp_mirror_best_effort(&reviewer_dir);
+    }
+
+    let bridge = coordinator
+        .as_ref()
+        .map(|c| c.register_agent(&agent_id))
+        .transpose()?;
+    let agent = Agent::new(
+        reviewer_dir.clone(),
+        config.model.clone(),
+        Some(crate::agent::PREFERRED_SESSION_MODE_REVIEWER),
+        shutdown.clone(),
+        agent_id.clone(),
+        bridge,
+    );
+
+    let scope = crate::config::scope_label_filter(&scope_label);
     let mut merged_mrs: HashSet<u64> = HashSet::new();
-    let mut claimed_mr_iid: Option<u64> = find_claimed_mr(&agent_id, &gitlab);
+    let mut claimed_mr_iid: Option<u64> = find_claimed_mr(&agent_id, &gitlab, scope);
 
     info!(
         "{}: Poll interval: {} seconds",
@@ -66,12 +106,15 @@ pub fn run(
             &agent_id,
             &project_name,
             &reviewer_dir,
+            &sessions_dir,
+            &config,
             &git_repo,
             &gitlab,
             &agent,
             &mut merged_mrs,
             &mut claimed_mr_iid,
             &shutdown,
+            scope,
         ) {
             if shutdown.load(Ordering::SeqCst) {
                 break;
@@ -102,13 +145,20 @@ fn reviewer_cycle(
     agent_id: &str,
     project_name: &str,
     reviewer_dir: &str,
+    sessions_dir: &str,
+    config: &ReviewerConfig,
     git_repo: &GitRepo,
     gitlab: &GitLabClient,
     agent: &Agent,
     merged_mrs: &mut HashSet<u64>,
     claimed_mr_iid: &mut Option<u64>,
     shutdown: &AtomicBool,
+    scope_label: Option<&str>,
 ) -> Result<()> {
+    if agent.mcp_registered() {
+        cursor_mcp_config::refresh_mcp_mirror_best_effort(reviewer_dir);
+    }
+
     let default_branch = git_repo.get_default_branch()?;
     git_repo.fetch()?;
     if shutdown.load(Ordering::SeqCst) {
@@ -168,6 +218,18 @@ fn reviewer_cycle(
             continue;
         }
 
+        if !mr_in_scope(&mr, scope_label) {
+            continue;
+        }
+
+        if mr_has_label(&mr, REVIEWER_APPROVED_LABEL) {
+            debug!(
+                "{}: MR !{} already marked {}, skipping",
+                agent_id, mr.iid, REVIEWER_APPROVED_LABEL
+            );
+            continue;
+        }
+
         if claim::is_mr_claimed(&mr.labels) {
             debug!("{}: MR !{} already claimed, skipping", agent_id, mr.iid);
             continue;
@@ -195,21 +257,36 @@ fn reviewer_cycle(
 
         info!("{}: Reviewing MR !{}: {}", agent_id, mr.iid, mr.title);
 
-        match review_merge_request(project_name, reviewer_dir, git_repo, gitlab, agent, &mr) {
-            Ok(approved) => {
-                if approved {
-                    info!("{}: MR !{} approved and merged", agent_id, mr.iid);
-                    merged_mrs.insert(mr.iid);
-                    let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
-                    *claimed_mr_iid = None;
-                } else {
-                    info!(
-                        "{}: MR !{} reviewed with feedback, releasing claim",
-                        agent_id, mr.iid
-                    );
-                    let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
-                    *claimed_mr_iid = None;
-                }
+        match review_merge_request(
+            project_name,
+            sessions_dir,
+            config,
+            git_repo,
+            gitlab,
+            agent,
+            &mr,
+        ) {
+            Ok(ReviewOutcome::Merged) => {
+                info!("{}: MR !{} approved and merged", agent_id, mr.iid);
+                merged_mrs.insert(mr.iid);
+                let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
+                *claimed_mr_iid = None;
+            }
+            Ok(ReviewOutcome::ApprovedWithoutMerge) => {
+                info!(
+                    "{}: MR !{} approved without merge, releasing claim",
+                    agent_id, mr.iid
+                );
+                let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
+                *claimed_mr_iid = None;
+            }
+            Ok(ReviewOutcome::NeedsChanges) => {
+                info!(
+                    "{}: MR !{} reviewed with feedback, releasing claim",
+                    agent_id, mr.iid
+                );
+                let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
+                *claimed_mr_iid = None;
             }
             Err(e) => {
                 error!("{}: Failed to review MR !{}: {}", agent_id, mr.iid, e);
@@ -224,7 +301,12 @@ fn reviewer_cycle(
         break;
     }
 
-    info!("{}: {} MRs merged total", agent_id, merged_mrs.len());
+    info!(
+        "{}: {} MRs merged{}",
+        agent_id,
+        merged_mrs.len(),
+        state_meta(agent)
+    );
 
     Ok(())
 }
@@ -261,12 +343,13 @@ fn has_unresolved_comments(gitlab: &GitLabClient, mr_iid: u64) -> bool {
 
 fn review_merge_request(
     project_name: &str,
-    reviewer_dir: &str,
+    sessions_dir: &str,
+    config: &ReviewerConfig,
     git_repo: &GitRepo,
     gitlab: &GitLabClient,
     agent: &Agent,
     mr: &MergeRequest,
-) -> Result<bool> {
+) -> Result<ReviewOutcome> {
     // Check if the MR links to an issue via description first, then branch name
     let issue_iid = {
         let re = regex::Regex::new(r"(?i)closes?\s+#(\d+)").ok();
@@ -286,7 +369,7 @@ fn review_merge_request(
             mr.iid,
             "This MR does not reference an issue. Please link it to the relevant issue by using a branch name like `issue-N` or adding `Closes #N` in the MR description.",
         )?;
-        return Ok(false);
+        return Ok(ReviewOutcome::NeedsChanges);
     }
 
     if has_bad_title_or_description(mr) {
@@ -307,14 +390,8 @@ fn review_merge_request(
                     .to_string(),
             );
         }
-        gitlab.add_mr_discussion(
-            mr.iid,
-            &format!(
-                "REQUEST_CHANGES — please fix the following before review:\n\n{}",
-                issues.join("\n\n")
-            ),
-        )?;
-        return Ok(false);
+        gitlab.add_mr_discussion(mr.iid, &issues.join("\n\n"))?;
+        return Ok(ReviewOutcome::NeedsChanges);
     }
 
     let _ = git_repo.reset_hard();
@@ -340,18 +417,27 @@ fn review_merge_request(
             ),
         )?;
         git_repo.checkout_remote_branch(&mr.target_branch)?;
-        return Ok(false);
+        return Ok(ReviewOutcome::NeedsChanges);
     }
 
-    let diff = git_repo.diff_against(&mr.target_branch)?;
+    let diff_stat = git_repo.diff_stat_against(&mr.target_branch)?;
+    let changed_files = git_repo.changed_files_against(&mr.target_branch)?;
 
-    let prompt = build_review_prompt(project_name, gitlab, mr, &diff, issue_iid, reviewer_dir)?;
+    let prompt = build_review_prompt(
+        project_name,
+        gitlab,
+        mr,
+        &diff_stat,
+        &changed_files,
+        issue_iid,
+        sessions_dir,
+    )?;
 
     let agent_output = agent.run(&prompt)?;
 
     git_repo.checkout_remote_branch(&mr.target_branch)?;
 
-    if agent_output.contains("APPROVE") && agent_output.contains("LGTM") {
+    if reviewer_approves(&agent_output) {
         info!("MR !{} approved by reviewer", mr.iid);
 
         // Re-check for unresolved discussions before merging — another reviewer
@@ -361,44 +447,58 @@ fn review_merge_request(
                 "MR !{} approved but has unresolved discussions, skipping merge",
                 mr.iid
             );
-            return Ok(false);
+            return Ok(ReviewOutcome::NeedsChanges);
         }
 
-        match gitlab.merge_mr(mr.iid) {
-            Ok(_) => {
-                info!("Successfully merged MR !{}", mr.iid);
-                return Ok(true);
+        if config.merge_when_approved {
+            match gitlab.merge_mr(mr.iid) {
+                Ok(_) => {
+                    info!("Successfully merged MR !{}", mr.iid);
+                    return Ok(ReviewOutcome::Merged);
+                }
+                Err(e) => {
+                    warn!("Failed to merge MR !{}: {}", mr.iid, e);
+                    gitlab.add_mr_discussion(
+                        mr.iid,
+                        &format!(
+                            "Code is approved, but automatic merge failed (`{}`). \
+                             This is likely due to merge conflicts with the target branch. \
+                             Please rebase or resolve conflicts and push again.",
+                            e
+                        ),
+                    )?;
+                }
             }
-            Err(e) => {
-                warn!("Failed to merge MR !{}: {}", mr.iid, e);
-                gitlab.add_mr_discussion(
-                    mr.iid,
-                    &format!(
-                        "Code is approved, but automatic merge failed (`{}`). \
-                         This is likely due to merge conflicts with the target branch. \
-                         Please rebase or resolve conflicts and push again.",
-                        e
-                    ),
-                )?;
-            }
+        } else {
+            let approval_message = extract_approval_message(&agent_output);
+            gitlab.add_resolved_mr_discussion(mr.iid, &approval_message)?;
+            gitlab.add_mr_label(mr.iid, REVIEWER_APPROVED_LABEL)?;
+            return Ok(ReviewOutcome::ApprovedWithoutMerge);
         }
-    } else if agent_output.contains("REQUEST_CHANGES") {
+    } else if reviewer_requests_changes(&agent_output) {
         info!("MR !{} needs changes", mr.iid);
 
         let feedback = extract_review_feedback(&agent_output);
         gitlab.add_mr_discussion(mr.iid, &feedback)?;
+    } else if let Some(feedback) = extract_fallback_review_feedback(&agent_output) {
+        warn!(
+            "MR !{} reviewer output missed decision marker, posting fallback feedback",
+            mr.iid
+        );
+        gitlab.add_mr_discussion(mr.iid, &feedback)?;
     }
 
-    Ok(false)
+    Ok(ReviewOutcome::NeedsChanges)
 }
 
 fn build_review_prompt(
     project_name: &str,
     gitlab: &GitLabClient,
     mr: &MergeRequest,
-    diff: &str,
+    diff_stat: &str,
+    changed_files: &[String],
     issue_iid: Option<u64>,
-    reviewer_dir: &str,
+    sessions_dir: &str,
 ) -> Result<String> {
     let comments = gitlab.get_mr_comments(mr.iid).unwrap_or_default();
 
@@ -407,15 +507,21 @@ fn build_review_prompt(
     } else {
         comments
             .iter()
-            .map(|c| format!("- {}: {}", c.author, c.body))
+            .map(|c| c.format_for_prompt())
             .collect::<Vec<_>>()
             .join("\n")
     };
 
-    let diff_text = if diff.is_empty() {
-        "No changes detected.".to_string()
+    let diff_stat_text = if diff_stat.is_empty() {
+        "No diff stat detected.".to_string()
     } else {
-        diff.to_string()
+        diff_stat.to_string()
+    };
+
+    let changed_files_text = if changed_files.is_empty() {
+        "No changed files detected.".to_string()
+    } else {
+        changed_files.join("\n")
     };
 
     let issue_context = if let Some(iid) = issue_iid {
@@ -423,8 +529,27 @@ fn build_review_prompt(
     } else {
         String::new()
     };
-
-    let agents_md = load_agents_md(reviewer_dir);
+    let context_path = write_task_context_file(
+        sessions_dir,
+        &format!("reviewer-mr-{}.md", mr.iid),
+        &format!(
+            "# Review Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n## MR description\n{mr_description}\n\n## Linked issue context\n{issue_context}\n\n## Diff summary against {target_branch}\n{diff_stat}\n\n## Changed files\n{changed_files}\n\n## Comment history\n{comments}\n",
+            project_name = project_name,
+            mr_iid = mr.iid,
+            mr_title = mr.title,
+            source_branch = mr.source_branch,
+            target_branch = mr.target_branch,
+            mr_description = mr.description,
+            issue_context = if issue_context.is_empty() {
+                "No linked issue context.".to_string()
+            } else {
+                issue_context
+            },
+            diff_stat = diff_stat_text,
+            changed_files = changed_files_text,
+            comments = comments_text
+        ),
+    )?;
 
     let prompt = format!(
         r#"You are reviewing a merge request for a software project in a fully automated, non-interactive environment.
@@ -433,19 +558,9 @@ PROJECT: {}
 
 MERGE REQUEST !{}: {}
 
-DESCRIPTION:
-{}
-
 SOURCE BRANCH: {}
 TARGET BRANCH: {}
-{}
-PROJECT RULES (AGENTS.md — STRICT COMPLIANCE REQUIRED):
-{}
-
-DIFF (changes against {}):
-{}
-
-FULL COMMENT HISTORY:
+TASK CONTEXT FILE:
 {}
 
 CRITICAL REQUIREMENTS:
@@ -461,17 +576,20 @@ CRITICAL REQUIREMENTS:
 - Do NOT repeat feedback that has already been addressed
 
 INSTRUCTIONS:
-1. Review the full comment history to understand previous feedback and responses
-2. The source branch has already been merged with the target branch locally - you are on the merged result
-3. Review the code changes in the DIFF section thoroughly
-4. Check if the implementation matches the stated goal
-5. COMPLETENESS CHECK (STRICT): Compare the DIFF against the LINKED ISSUE (title, description, and comments). Every requirement or item mentioned in the issue MUST be addressed in the implementation. If any part is missing or only partially implemented, list the missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.
-6. Run tests locally to verify they pass (do NOT rely on CI/CD)
-7. Run linting locally to verify it passes (do NOT rely on CI/CD)
-8. Check code quality, best practices, and potential issues
-9. Only raise NEW issues not already covered in previous comments
-10. Readability and maintainability must be ensured
-11. Make autonomous decisions about approval or requesting changes
+1. Read `AGENTS.md` from the repository root before starting the review. Treat it as authoritative project policy.
+2. Read the task context file above before starting the review.
+3. Review the full comment history to understand previous feedback and responses
+4. The source branch has already been merged with the target branch locally - you are on the merged result
+5. Use the local git checkout to inspect the actual code changes yourself. You are in the merged result already, so run commands like `git diff origin/{}`..., `git diff --stat origin/{}`..., `git diff --name-only origin/{}`..., and read the changed files directly instead of relying only on the summaries above.
+6. Review the code changes thoroughly using the local repository state
+7. Check if the implementation matches the stated goal
+8. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the LINKED ISSUE (title, description, and comments). Every requirement or item mentioned in the issue MUST be addressed in the implementation. If any part is missing or only partially implemented, list the missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.
+9. Run tests locally to verify they pass (do NOT rely on CI/CD)
+10. Run linting locally to verify it passes (do NOT rely on CI/CD)
+11. Check code quality, best practices, and potential issues
+12. Only raise NEW issues not already covered in previous comments
+13. Readability and maintainability must be ensured
+14. Make autonomous decisions about approval or requesting changes
 
 MR TITLE AND DESCRIPTION (STRICT — reject if violated):
 - The MR title MUST be a concise, meaningful summary of the code changes. Reject if the title is generic (e.g. "Implementation changes", "Update", "Fix"), just an issue number, or contains markdown formatting like ** or backticks.
@@ -493,8 +611,7 @@ TEST QUALITY (STRICT — reject if violated):
 - Every test MUST exercise the actual production code path it claims to cover. If a test does not meaningfully verify the behavior described in the issue, reject it and ask for a real test.
 
 AGENTS.md COMPLIANCE (STRICT — reject if violated):
-- The PROJECT RULES (AGENTS.md) section above contains the project's mandatory conventions and standards.
-- You MUST check every code change in the DIFF against AGENTS.md rules. If the code violates any rule defined there (naming conventions, file structure, required patterns, forbidden patterns, testing requirements, etc.), you MUST reject and cite the specific rule being violated.
+- You MUST check every code change in the DIFF against the local `AGENTS.md` file. If the code violates any rule defined there (naming conventions, file structure, required patterns, forbidden patterns, testing requirements, etc.), you MUST reject and cite the specific rule being violated.
 - AGENTS.md rules take precedence over general best practices when they conflict.
 - If AGENTS.md specifies test locations, file naming, code style, or architecture patterns, verify the MR follows them exactly.
 
@@ -522,25 +639,15 @@ Proceed with the review autonomously. Do not ask for any user input.
         project_name,
         mr.iid,
         mr.title,
-        mr.description,
         mr.source_branch,
         mr.target_branch,
-        issue_context,
-        agents_md,
+        context_path,
         mr.target_branch,
-        diff_text,
-        comments_text
+        mr.target_branch,
+        mr.target_branch
     );
 
     Ok(prompt)
-}
-
-fn load_agents_md(reviewer_dir: &str) -> String {
-    let path = std::path::Path::new(reviewer_dir).join("AGENTS.md");
-    match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(_) => "No AGENTS.md found in the project.".to_string(),
-    }
 }
 
 fn build_issue_context(gitlab: &GitLabClient, issue_iid: u64) -> String {
@@ -606,18 +713,156 @@ fn is_generic_description(desc: &str) -> bool {
         || lower == "implementation changes."
 }
 
-fn extract_review_feedback(agent_output: &str) -> String {
-    if let Some(pos) = agent_output.find("FEEDBACK:") {
-        let feedback = &agent_output[pos + 9..];
-        return feedback.trim().to_string();
+fn reviewer_approves(agent_output: &AgentHandoff) -> bool {
+    agent_output
+        .decision
+        .as_deref()
+        .is_some_and(|d| d.eq_ignore_ascii_case("approve"))
+        || (agent_output.response.contains("APPROVE") && agent_output.response.contains("LGTM"))
+}
+
+fn reviewer_requests_changes(agent_output: &AgentHandoff) -> bool {
+    agent_output
+        .decision
+        .as_deref()
+        .is_some_and(|d| d.eq_ignore_ascii_case("request_changes"))
+        || agent_output.response.contains("REQUEST_CHANGES")
+}
+
+/// Resolved approval thread on GitLab: keep the body minimal (no long LGTM narrative).
+fn extract_approval_message(_agent_output: &AgentHandoff) -> String {
+    "LGTM".to_string()
+}
+
+/// Removes a leading `REQUEST_CHANGES` marker (and `—` / `:`).
+fn strip_request_changes_prefix(text: &str) -> String {
+    let s = text.trim();
+    let lower = s.to_lowercase();
+    const PREFIX: &str = "request_changes";
+    if !lower.starts_with(PREFIX) {
+        return s.to_string();
+    }
+    let mut rest = s[PREFIX.len()..].trim_start();
+    loop {
+        let trimmed = rest.trim_start();
+        if let Some(r) = trimmed.strip_prefix('—') {
+            rest = r.trim_start();
+            continue;
+        }
+        if let Some(r) = trimmed.strip_prefix('-') {
+            rest = r.trim_start();
+            continue;
+        }
+        if let Some(r) = trimmed.strip_prefix(':') {
+            rest = r.trim_start();
+            continue;
+        }
+        break;
+    }
+    rest.trim().to_string()
+}
+
+/// Strips the common “please fix the following before review” intro (and punctuation after it).
+fn strip_review_boilerplate(text: &str) -> String {
+    let mut s = text.trim();
+    const BOILERPLATE: &[u8] = b"please fix the following before review";
+    loop {
+        let t = s.trim_start();
+        let b = t.as_bytes();
+        if b.len() < BOILERPLATE.len() || !b[..BOILERPLATE.len()].eq_ignore_ascii_case(BOILERPLATE)
+        {
+            break;
+        }
+        let after = &t[BOILERPLATE.len()..];
+        s = after.trim_start_matches(|c: char| {
+            c == ':' || c == '.' || c == '—' || c == '-' || c.is_whitespace()
+        });
+    }
+    s.trim().to_string()
+}
+
+fn normalize_review_comment_body(text: &str) -> String {
+    strip_review_boilerplate(&strip_request_changes_prefix(text))
+}
+
+fn extract_review_feedback(agent_output: &AgentHandoff) -> String {
+    if let Some(feedback) = &agent_output.feedback {
+        let trimmed = feedback.trim();
+        if !trimmed.is_empty() {
+            let out = normalize_review_comment_body(trimmed);
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    if let Some(pos) = agent_output.response.find("FEEDBACK:") {
+        let feedback = &agent_output.response[pos + 9..];
+        let out = normalize_review_comment_body(feedback.trim());
+        if !out.is_empty() {
+            return out;
+        }
     }
 
-    if let Some(pos) = agent_output.find("REQUEST_CHANGES") {
-        let feedback = &agent_output[pos + 15..];
-        return format!("Changes requested:\n{}", feedback.trim());
+    if let Some(pos) = find_request_changes_ignore_case(&agent_output.response) {
+        let tail = agent_output.response[pos..].trim_start();
+        let out = normalize_review_comment_body(tail);
+        if !out.is_empty() {
+            return out;
+        }
     }
 
     "Please review the changes and address any issues.".to_string()
+}
+
+fn find_request_changes_ignore_case(haystack: &str) -> Option<usize> {
+    const NEEDLE: &[u8] = b"REQUEST_CHANGES";
+    let h = haystack.as_bytes();
+    let n = NEEDLE.len();
+    if h.len() < n {
+        return None;
+    }
+    for i in 0..=h.len() - n {
+        if h[i..i + n].eq_ignore_ascii_case(NEEDLE) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn extract_fallback_review_feedback(agent_output: &AgentHandoff) -> Option<String> {
+    if let Some(feedback) = &agent_output.feedback {
+        let trimmed = feedback.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let trimmed = agent_output.response.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let filtered_lines = trimmed
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            !t.is_empty()
+                && t != "Ready for next assignment."
+                && t != "Ready for next task."
+                && t != "Proceed with the review autonomously. Do not ask for any user input."
+        })
+        .collect::<Vec<_>>();
+
+    if filtered_lines.is_empty() {
+        None
+    } else {
+        Some(filtered_lines.join("\n"))
+    }
+}
+
+fn mr_has_label(mr: &MergeRequest, label: &str) -> bool {
+    mr.labels
+        .as_ref()
+        .is_some_and(|labels| labels.iter().any(|existing| existing == label))
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +871,11 @@ fn extract_review_feedback(agent_output: &str) -> String {
 
 /// Scan all open MRs for this reviewer's claim label.
 /// The GitLab label is the single source of truth — no local state file needed.
-fn find_claimed_mr(agent_id: &str, gitlab: &GitLabClient) -> Option<u64> {
+fn find_claimed_mr(
+    agent_id: &str,
+    gitlab: &GitLabClient,
+    scope_label: Option<&str>,
+) -> Option<u64> {
     let claim_label = format!("claimed:{}", agent_id);
 
     match gitlab.list_merge_requests() {
@@ -635,11 +884,8 @@ fn find_claimed_mr(agent_id: &str, gitlab: &GitLabClient) -> Option<u64> {
                 if mr.state != "opened" {
                     continue;
                 }
-                let has_claim = mr
-                    .labels
-                    .as_ref()
-                    .is_some_and(|l| l.contains(&claim_label));
-                if has_claim {
+                let has_claim = mr.labels.as_ref().is_some_and(|l| l.contains(&claim_label));
+                if has_claim && mr_in_scope(mr, scope_label) {
                     info!(
                         "{}: Found existing claim on MR !{}, will release next cycle",
                         agent_id, mr.iid
@@ -657,4 +903,88 @@ fn find_claimed_mr(agent_id: &str, gitlab: &GitLabClient) -> Option<u64> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_review_feedback_keeps_substantive_reviewer_output() {
+        let output = AgentHandoff {
+            response: r#"## MR !89 review
+
+### Gaps / concerns
+1. MR description vs diff is inaccurate.
+2. Tests document current bug.
+
+Ready for next assignment."#
+                .to_string(),
+            ..Default::default()
+        };
+
+        let feedback = extract_fallback_review_feedback(&output).expect("feedback");
+        assert!(feedback.contains("## MR !89 review"));
+        assert!(feedback.contains("Gaps / concerns"));
+        assert!(!feedback.contains("Ready for next assignment."));
+    }
+
+    #[test]
+    fn extract_approval_message_is_always_short_lgtm() {
+        let output = AgentHandoff {
+            lgtm: Some("Long narrative that must not appear in the GitLab thread.".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(extract_approval_message(&output), "LGTM");
+    }
+
+    #[test]
+    fn strip_request_changes_prefix_removes_marker_only() {
+        assert_eq!(
+            strip_request_changes_prefix(
+                "REQUEST_CHANGES — please fix the following before review:\n\nThe MR title is bad."
+            ),
+            "please fix the following before review:\n\nThe MR title is bad."
+        );
+    }
+
+    #[test]
+    fn strip_review_boilerplate_removes_intro_line() {
+        assert_eq!(
+            strip_review_boilerplate(
+                "Please fix the following before review:\n\nThe MR title `x` is too generic."
+            ),
+            "The MR title `x` is too generic."
+        );
+    }
+
+    #[test]
+    fn normalize_review_comment_body_strips_marker_and_boilerplate() {
+        assert_eq!(
+            normalize_review_comment_body(
+                "REQUEST_CHANGES — please fix the following before review:\n\nThe MR title is bad."
+            ),
+            "The MR title is bad."
+        );
+    }
+
+    #[test]
+    fn extract_review_feedback_strips_request_changes_and_boilerplate() {
+        let output = AgentHandoff {
+            response: "REQUEST_CHANGES — please fix the following before review:\n\nThe MR title `x` is too generic."
+                .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_review_feedback(&output),
+            "The MR title `x` is too generic."
+        );
+    }
+
+    #[test]
+    fn find_request_changes_ignore_case_finds_mixed_case() {
+        let s = "Prefix request_changes: more text";
+        assert_eq!(find_request_changes_ignore_case(s), Some(7));
+    }
 }

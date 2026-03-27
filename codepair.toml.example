@@ -1,11 +1,21 @@
 # Codepair Configuration File
 # This file configures the worker, reviewer, and PMO agents
 
+# Optional: start the Codepair MCP HTTP server and write .cursor/mcp.json under each agent workspace.
+# Default is false — tasks use ACP only; enable if you want Cursor to load extra MCP tools from that file.
+# [mcp]
+# enabled = true
+
+# Optional: only process issues (worker, PMO) and merge requests (reviewer) that include this label (exact name).
+# Default is empty (no filter). Non-empty: new MRs from the worker and new sub-issues from the PMO get this label automatically.
+# scope_label = "codepair"
+
 [worker]
-# Model to use for the worker agent (optional)
-# Examples: "claude-3-5-sonnet", "claude-3-opus", "gpt-4", etc.
-# If not specified, uses the default model configured in the agent CLI
-# model = "claude-3-5-sonnet"
+# Model to use for the worker agent (optional). Run `agent --list-models` for valid ids.
+# Codepair passes --model and, after session/new, ACP session/set_config_option when the agent
+# advertises the model in configOptions; otherwise session/set_model (experimental).
+# If not specified, uses the agent CLI default.
+# model = "composer-2"
 
 # How often (in seconds) the worker checks for new issues
 poll_interval_secs = 60
@@ -14,9 +24,8 @@ poll_interval_secs = 60
 instances = 1
 
 [reviewer]
-# Model to use for the reviewer agent (optional)
-# You can use a different model for reviewing than for implementation
-# model = "claude-3-opus"
+# Model to use for the reviewer agent (optional); same rules as [worker] model.
+# model = "gpt-5.3-codex"
 
 # How often (in seconds) the reviewer checks for merge requests to review
 poll_interval_secs = 120
@@ -24,10 +33,14 @@ poll_interval_secs = 120
 # Number of concurrent reviewer instances
 instances = 1
 
+# If true, the reviewer merges approved MRs automatically.
+# If false, the reviewer leaves an approval comment, adds the
+# `reviewer-approved` label, and skips that MR in later polling.
+merge_when_approved = true
+
 [pmo]
-# Model to use for the PMO (Project Management Office) agent (optional)
-# The PMO agent splits large issues into smaller, implementable sub-issues
-# model = "claude-3-5-sonnet"
+# Model to use for the PMO agent (optional); same rules as [worker] model.
+# model = "composer-2"
 
 # How often (in seconds) the PMO checks for action-required issues
 poll_interval_secs = 180

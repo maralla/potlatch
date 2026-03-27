@@ -2,11 +2,15 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
+mod acp;
 mod agent;
 mod agents;
 mod config;
+mod cursor_mcp_config;
 mod git;
 mod gitlab;
+mod mcp_coord;
+mod mcp_http;
 
 use config::Config;
 
