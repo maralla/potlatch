@@ -32,6 +32,148 @@ struct ActiveIssue {
     mr_created: bool,
 }
 
+struct AgentState {
+    project_name: String,
+    agent_id: String,
+    working_dir: String,
+    sessions_dir: String,
+
+    git_repo: GitRepo,
+    glab: GitLabClient,
+}
+
+impl AgentState {
+    fn session_file_path(&self, issue_iid: u64) -> std::path::PathBuf {
+        Path::new(&self.sessions_dir).join(format!("{}_issue_{}.json", &self.agent_id, issue_iid))
+    }
+
+    fn load_session(&self, issue_iid: u64) -> Option<SessionFile> {
+        let path = self.session_file_path(issue_iid);
+        let content = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    fn load_implementation_summary(&self, issue_number: u64) -> String {
+        if let Some(session) = self.load_session(issue_number)
+            && let Some(summary) = session.implementation_summary
+        {
+            return summary;
+        }
+        "No previous implementation summary available.".to_string()
+    }
+
+    fn cleanup_session(&self, issue_iid: u64) {
+        let path = self.session_file_path(issue_iid);
+        if fs::remove_file(&path).is_ok() {
+            info!("Cleaned up session file for issue #{}", issue_iid);
+        }
+    }
+
+    fn save_session(&self, issue_iid: u64, mr_iid: u64) -> Result<()> {
+        let session = SessionFile {
+            issue_iid,
+            mr_iid,
+            agent_id: Some(self.agent_id.clone()),
+            implementation_summary: None,
+        };
+
+        let path = self.session_file_path(issue_iid);
+        let json = serde_json::to_string_pretty(&session)?;
+        fs::write(&path, json).context("Failed to write session file")?;
+        Ok(())
+    }
+
+    fn save_session_with_summary(&self, issue_iid: u64, mr_iid: u64, summary: &str) -> Result<()> {
+        let session = SessionFile {
+            issue_iid,
+            mr_iid,
+            agent_id: Some(self.agent_id.clone()),
+            implementation_summary: Some(summary.to_string()),
+        };
+
+        let path = self.session_file_path(issue_iid);
+        let json = serde_json::to_string_pretty(&session)?;
+        fs::write(&path, json).context("Failed to write session file")?;
+        Ok(())
+    }
+
+    fn release_worker_hold_pending_gitlab_only(&self, issue_iid: u64) {
+        info!(
+            "{}: Issue #{} has `{}` — releasing claim and session (no close)",
+            &self.agent_id, issue_iid, WORKER_PENDING_LABEL
+        );
+
+        let _ = claim::release_claim(&self.glab, issue_iid, &self.agent_id);
+        let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+        self.cleanup_session(issue_iid);
+    }
+
+    fn clear_resumed_issue_state(&self, issue_iid: u64) {
+        let default_branch = self
+            .git_repo
+            .get_default_branch()
+            .unwrap_or("main".to_string());
+
+        let branch = format!("issue-{}", issue_iid);
+
+        let _ = self.git_repo.reset_hard();
+        let _ = self.git_repo.checkout_remote_branch(&default_branch);
+        let _ = self.git_repo.delete_local_branch(&branch);
+
+        let _ = claim::release_claim(&self.glab, issue_iid, &self.agent_id);
+        let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+
+        self.cleanup_session(issue_iid);
+    }
+
+    fn abandon_closed_issue(&self, issue_iid: u64, mr_iid: Option<u64>) {
+        info!(
+            "{}: Issue #{} was closed externally, abandoning work",
+            &self.agent_id, issue_iid
+        );
+
+        if let Some(mr) = mr_iid {
+            let _ = self
+                .glab
+                .add_mr_comment(mr, "Closing this MR — the linked issue has been closed.");
+            let _ = self.glab.close_mr(mr);
+        }
+
+        let branch = format!("issue-{}", issue_iid);
+        let default_branch = self
+            .git_repo
+            .get_default_branch()
+            .unwrap_or("main".to_string());
+
+        let _ = self.git_repo.reset_hard();
+        let _ = self.git_repo.checkout_remote_branch(&default_branch);
+        let _ = self.git_repo.delete_local_branch(&branch);
+        let _ = self.git_repo.delete_remote_branch(&branch);
+        let _ = claim::release_claim(&self.glab, issue_iid, &self.agent_id);
+        let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+
+        self.cleanup_session(issue_iid);
+    }
+
+    fn cleanup_on_shutdown(&self, active: &Option<ActiveIssue>) {
+        let Some(a) = active else { return };
+
+        // Always keep the claim and session so this worker resumes on restart.
+        // The session file (even with mr_iid=0) tells try_resume_session that
+        // this worker owns the issue.
+        info!(
+            "{}: Preserving claim on issue #{} for restart (MR: {})",
+            &self.agent_id,
+            a.issue_iid,
+            a.mr_iid.map_or("none".to_string(), |id| format!("!{}", id))
+        );
+
+        let mr_iid = a.mr_iid.unwrap_or(0);
+        let _ = self.save_session(a.issue_iid, mr_iid);
+        let _ = self.git_repo.reset_hard();
+    }
+}
+
 fn interruptible_sleep(shutdown: &AtomicBool, duration: Duration) -> bool {
     let interval = Duration::from_millis(200);
     let mut remaining = duration;
@@ -68,26 +210,36 @@ pub fn run(
 ) -> Result<()> {
     let project_name = extract_project_name(&repo_url)?;
     let agent_id = format!("worker-{}", instance_id);
-    let worker_dir = super::work_dir(&base_dir, &project_name, &agent_id);
+    let working_dir = super::work_dir(&base_dir, &project_name, &agent_id);
     let sessions_dir = super::sessions_dir(&base_dir, &project_name);
 
-    let git_repo = GitRepo::new(worker_dir.clone());
-    let gitlab = GitLabClient::new(worker_dir.clone());
+    let git_repo = GitRepo::new(working_dir.clone());
+    let glab = GitLabClient::new(working_dir.clone());
+
+    let state = AgentState {
+        project_name,
+        agent_id,
+        working_dir,
+        sessions_dir,
+        git_repo,
+        glab,
+    };
 
     if coordinator.is_some() {
-        cursor_mcp_config::refresh_mcp_mirror_best_effort(&worker_dir);
+        cursor_mcp_config::refresh_mcp_mirror_best_effort(&state.working_dir);
     }
 
     let bridge = coordinator
         .as_ref()
-        .map(|c| c.register_agent(&agent_id))
+        .map(|c| c.register_agent(&state.agent_id))
         .transpose()?;
+
     let agent = Agent::new(
-        worker_dir.clone(),
+        state.working_dir.clone(),
         config.model.clone(),
         None,
         shutdown.clone(),
-        agent_id.clone(),
+        state.agent_id.clone(),
         bridge,
     );
 
@@ -96,24 +248,26 @@ pub fn run(
     // GitLab issues for an orphaned claim label belonging to this worker.
     let scope = crate::config::scope_label_filter(&scope_label);
     let mut active: Option<ActiveIssue> =
-        try_resume_session(&agent_id, &sessions_dir, &gitlab, scope)
-            .or_else(|| find_claimed_issue(&agent_id, &gitlab, scope, &sessions_dir));
-    active =
-        clear_resumed_issue_if_ignored(&agent_id, &sessions_dir, &git_repo, &gitlab, active, scope);
+        try_resume_session(&state, scope).or_else(|| find_claimed_issue(&state, scope));
+
+    active = clear_resumed_issue_if_ignored(&state, active, scope);
     if let Some(ref a) = active {
         if let Some(mr_iid) = a.mr_iid {
             info!(
                 "{}: Resumed issue #{} with MR !{}",
-                agent_id, a.issue_iid, mr_iid
+                &state.agent_id, a.issue_iid, mr_iid
             );
         } else {
-            info!("{}: Resumed issue #{} (no MR yet)", agent_id, a.issue_iid);
+            info!(
+                "{}: Resumed issue #{} (no MR yet)",
+                &state.agent_id, a.issue_iid
+            );
         }
     }
 
     info!(
         "{}: Poll interval: {} seconds",
-        agent_id, config.poll_interval_secs
+        &state.agent_id, config.poll_interval_secs
     );
 
     loop {
@@ -126,22 +280,12 @@ pub fn run(
             break;
         }
 
-        if let Err(e) = worker_cycle(
-            &agent_id,
-            &project_name,
-            &worker_dir,
-            &sessions_dir,
-            &git_repo,
-            &gitlab,
-            &agent,
-            &mut active,
-            &shutdown,
-            scope,
-        ) {
+        if let Err(e) = worker_cycle(&state, &agent, &mut active, &shutdown, scope) {
             if shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            error!("{}: Cycle error: {}", agent_id, e);
+
+            error!("{}: Cycle error: {}", &state.agent_id, e);
         }
 
         if interruptible_sleep(&shutdown, Duration::from_secs(config.poll_interval_secs)) {
@@ -149,60 +293,30 @@ pub fn run(
         }
     }
 
-    info!("{}: Shutting down, cleaning up...", agent_id);
-    cleanup_on_shutdown(&agent_id, &active, &sessions_dir, &git_repo);
-    info!("{}: Stopped", agent_id);
+    info!("{}: Shutting down, cleaning up...", &state.agent_id);
+    state.cleanup_on_shutdown(&active);
+    info!("{}: Stopped", &state.agent_id);
 
     Ok(())
 }
 
-fn cleanup_on_shutdown(
-    agent_id: &str,
-    active: &Option<ActiveIssue>,
-    sessions_dir: &str,
-    git_repo: &GitRepo,
-) {
-    let Some(a) = active else { return };
-
-    // Always keep the claim and session so this worker resumes on restart.
-    // The session file (even with mr_iid=0) tells try_resume_session that
-    // this worker owns the issue.
-    info!(
-        "{}: Preserving claim on issue #{} for restart (MR: {})",
-        agent_id,
-        a.issue_iid,
-        a.mr_iid.map_or("none".to_string(), |id| format!("!{}", id))
-    );
-
-    let mr_iid = a.mr_iid.unwrap_or(0);
-    let _ = save_session(sessions_dir, a.issue_iid, mr_iid, agent_id);
-    let _ = git_repo.reset_hard();
-}
-
 fn clear_resumed_issue_if_ignored(
-    agent_id: &str,
-    sessions_dir: &str,
-    git_repo: &GitRepo,
-    gitlab: &GitLabClient,
+    state: &AgentState,
     active: Option<ActiveIssue>,
     scope_label: Option<&str>,
 ) -> Option<ActiveIssue> {
     let active_issue = active?;
 
-    let issue = match gitlab.get_issue(active_issue.issue_iid) {
+    let issue = match state.glab.get_issue(active_issue.issue_iid) {
         Ok(issue) => issue,
         Err(e) => {
             warn!(
                 "{}: Failed to verify resumed issue #{}: {}, dropping resume state",
-                agent_id, active_issue.issue_iid, e
+                &state.agent_id, active_issue.issue_iid, e
             );
-            clear_resumed_issue_state(
-                agent_id,
-                active_issue.issue_iid,
-                sessions_dir,
-                git_repo,
-                gitlab,
-            );
+
+            state.clear_resumed_issue_state(active_issue.issue_iid);
+
             return None;
         }
     };
@@ -210,65 +324,45 @@ fn clear_resumed_issue_if_ignored(
     if !issue_in_scope(&issue, scope_label) {
         info!(
             "{}: Resumed issue #{} is outside scope label {:?}, dropping resume state",
-            agent_id, issue.iid, scope_label
+            &state.agent_id, issue.iid, scope_label
         );
-        clear_resumed_issue_state(agent_id, issue.iid, sessions_dir, git_repo, gitlab);
+
+        state.clear_resumed_issue_state(issue.iid);
         return None;
     }
 
     if issue_has_worker_pending_label(&issue.labels) {
         info!(
             "{}: Resumed issue #{} has `{}` label; releasing worker hold",
-            agent_id, issue.iid, WORKER_PENDING_LABEL
+            &state.agent_id, issue.iid, WORKER_PENDING_LABEL
         );
-        clear_resumed_issue_state(agent_id, issue.iid, sessions_dir, git_repo, gitlab);
+
+        state.clear_resumed_issue_state(issue.iid);
         return None;
     }
 
     if has_worker_resume_abandon_label(&issue.labels) {
         info!(
             "{}: Resumed issue #{} has blocking labels {:?}, abandoning resume state",
-            agent_id, issue.iid, issue.labels
+            &state.agent_id, issue.iid, issue.labels
         );
-        clear_resumed_issue_state(agent_id, issue.iid, sessions_dir, git_repo, gitlab);
+
+        state.clear_resumed_issue_state(issue.iid);
         return None;
     }
 
     Some(active_issue)
 }
 
-fn clear_resumed_issue_state(
-    agent_id: &str,
-    issue_iid: u64,
-    sessions_dir: &str,
-    git_repo: &GitRepo,
-    gitlab: &GitLabClient,
-) {
-    let default_branch = git_repo.get_default_branch().unwrap_or("main".to_string());
-    let branch = format!("issue-{}", issue_iid);
-    let _ = git_repo.reset_hard();
-    let _ = git_repo.checkout_remote_branch(&default_branch);
-    let _ = git_repo.delete_local_branch(&branch);
-    let _ = claim::release_claim(gitlab, issue_iid, agent_id);
-    let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-    cleanup_session_file(sessions_dir, issue_iid);
-}
-
-#[allow(clippy::too_many_arguments)]
 fn worker_cycle(
-    agent_id: &str,
-    project_name: &str,
-    worker_dir: &str,
-    sessions_dir: &str,
-    git_repo: &GitRepo,
-    gitlab: &GitLabClient,
+    state: &AgentState,
     agent: &Agent,
     active: &mut Option<ActiveIssue>,
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Result<()> {
     if agent.mcp_registered() {
-        cursor_mcp_config::refresh_mcp_mirror_best_effort(worker_dir);
+        cursor_mcp_config::refresh_mcp_mirror_best_effort(&state.working_dir);
     }
 
     // If we have an active issue with an MR, watch the MR
@@ -277,34 +371,31 @@ fn worker_cycle(
     {
         // Check if the issue was closed externally (e.g. by PMO stale cleanup)
         // or no longer matches the configured scope label.
-        if let Ok(issue) = gitlab.get_issue(a.issue_iid) {
+        if let Ok(issue) = state.glab.get_issue(a.issue_iid) {
             if issue.state != "opened" {
-                abandon_closed_issue(
-                    agent_id,
-                    a.issue_iid,
-                    Some(mr_iid),
-                    sessions_dir,
-                    git_repo,
-                    gitlab,
-                );
+                state.abandon_closed_issue(a.issue_iid, Some(mr_iid));
                 *active = None;
                 return Ok(());
             }
+
             if !issue_in_scope(&issue, scope_label) {
                 info!(
                     "{}: Issue #{} left scope label {:?}, releasing worker state",
-                    agent_id, a.issue_iid, scope_label
+                    &state.agent_id, a.issue_iid, scope_label
                 );
-                clear_resumed_issue_state(agent_id, a.issue_iid, sessions_dir, git_repo, gitlab);
+
+                state.clear_resumed_issue_state(a.issue_iid);
                 *active = None;
                 return Ok(());
             }
+
             if issue_has_worker_pending_label(&issue.labels) {
                 info!(
                     "{}: Issue #{} has `{}` — stopping MR watch (issue stays open)",
-                    agent_id, a.issue_iid, WORKER_PENDING_LABEL
+                    &state.agent_id, a.issue_iid, WORKER_PENDING_LABEL
                 );
-                clear_resumed_issue_state(agent_id, a.issue_iid, sessions_dir, git_repo, gitlab);
+
+                state.clear_resumed_issue_state(a.issue_iid);
                 *active = None;
                 return Ok(());
             }
@@ -312,50 +403,54 @@ fn worker_cycle(
 
         info!(
             "{}: Watching MR !{} for issue #{}",
-            agent_id, mr_iid, a.issue_iid
+            &state.agent_id, mr_iid, a.issue_iid
         );
 
-        match gitlab.get_merge_request(mr_iid) {
+        match state.glab.get_merge_request(mr_iid) {
             Ok(mr) => {
                 if mr.state == "merged" || mr.state == "closed" {
                     info!(
                         "{}: MR !{} is {}, releasing issue #{}",
-                        agent_id, mr_iid, mr.state, a.issue_iid
+                        &state.agent_id, mr_iid, mr.state, a.issue_iid
                     );
+
                     let branch = format!("issue-{}", a.issue_iid);
-                    let default_branch =
-                        git_repo.get_default_branch().unwrap_or("main".to_string());
-                    let _ = git_repo.reset_hard();
-                    let _ = git_repo.checkout_remote_branch(&default_branch);
-                    let _ = git_repo.delete_local_branch(&branch);
+                    let default_branch = state
+                        .git_repo
+                        .get_default_branch()
+                        .unwrap_or("main".to_string());
+
+                    let _ = state.git_repo.reset_hard();
+                    let _ = state.git_repo.checkout_remote_branch(&default_branch);
+                    let _ = state.git_repo.delete_local_branch(&branch);
+
                     if mr.state == "merged" {
-                        let _ = git_repo.delete_remote_branch(&branch);
+                        let _ = state.git_repo.delete_remote_branch(&branch);
                     }
-                    let _ = claim::release_claim(gitlab, a.issue_iid, agent_id);
-                    let _ = gitlab.remove_issue_label(a.issue_iid, WORKING_ON_LABEL);
-                    cleanup_session_file(sessions_dir, a.issue_iid);
+
+                    let _ = claim::release_claim(&state.glab, a.issue_iid, &state.agent_id);
+                    let _ = state.glab.remove_issue_label(a.issue_iid, WORKING_ON_LABEL);
+
+                    state.cleanup_session(a.issue_iid);
+
                     if mr.state == "merged" {
-                        close_issue_best_effort(gitlab, a.issue_iid);
+                        close_issue_best_effort(&state.glab, a.issue_iid);
                     }
+
                     *active = None;
                     return Ok(());
                 }
 
-                match handle_mr_comments(
-                    project_name,
-                    sessions_dir,
-                    gitlab,
-                    git_repo,
-                    agent,
-                    &mr,
-                ) {
+                match handle_mr_comments(state, agent, &mr) {
                     Ok(true) => {
                         info!(
                             "{}: Issue #{} abandoned, MR !{} closed",
-                            agent_id, a.issue_iid, mr_iid
+                            &state.agent_id, a.issue_iid, mr_iid
                         );
-                        let _ = claim::release_claim(gitlab, a.issue_iid, agent_id);
-                        cleanup_session_file(sessions_dir, a.issue_iid);
+
+                        let _ = claim::release_claim(&state.glab, a.issue_iid, &state.agent_id);
+
+                        state.cleanup_session(a.issue_iid);
                         *active = None;
                         return Ok(());
                     }
@@ -363,16 +458,17 @@ fn worker_cycle(
                         if shutdown.load(Ordering::SeqCst) {
                             return Ok(());
                         }
+
                         error!(
                             "{}: Failed to handle comments for MR !{}: {}",
-                            agent_id, mr_iid, e
+                            &state.agent_id, mr_iid, e
                         );
                     }
                     Ok(false) => {}
                 }
             }
             Err(e) => {
-                warn!("{}: Failed to check MR !{}: {}", agent_id, mr_iid, e);
+                warn!("{}: Failed to check MR !{}: {}", &state.agent_id, mr_iid, e);
             }
         }
 
@@ -388,27 +484,29 @@ fn worker_cycle(
         let issue_iid = a.issue_iid;
 
         // Check if the issue was closed externally or left the scope label.
-        if let Ok(issue) = gitlab.get_issue(issue_iid) {
+        if let Ok(issue) = state.glab.get_issue(issue_iid) {
             if issue.state != "opened" {
-                abandon_closed_issue(agent_id, issue_iid, None, sessions_dir, git_repo, gitlab);
+                state.abandon_closed_issue(issue_iid, None);
                 *active = None;
                 return Ok(());
             }
             if !issue_in_scope(&issue, scope_label) {
                 info!(
                     "{}: Active issue #{} left scope label {:?}, releasing",
-                    agent_id, issue_iid, scope_label
+                    &state.agent_id, issue_iid, scope_label
                 );
-                clear_resumed_issue_state(agent_id, issue_iid, sessions_dir, git_repo, gitlab);
+
+                state.clear_resumed_issue_state(issue_iid);
                 *active = None;
                 return Ok(());
             }
             if issue_has_worker_pending_label(&issue.labels) {
                 info!(
                     "{}: Active issue #{} has `{}` — yielding (issue stays open)",
-                    agent_id, issue_iid, WORKER_PENDING_LABEL
+                    &state.agent_id, issue_iid, WORKER_PENDING_LABEL
                 );
-                clear_resumed_issue_state(agent_id, issue_iid, sessions_dir, git_repo, gitlab);
+
+                state.clear_resumed_issue_state(issue_iid);
                 *active = None;
                 return Ok(());
             }
@@ -416,10 +514,10 @@ fn worker_cycle(
 
         info!(
             "{}: Active issue #{} has no MR, re-attempting implementation",
-            agent_id, issue_iid
+            &state.agent_id, issue_iid
         );
 
-        match gitlab.get_issue(issue_iid) {
+        match state.glab.get_issue(issue_iid) {
             Ok(issue) => {
                 let mut current = ActiveIssue {
                     issue_iid,
@@ -428,23 +526,13 @@ fn worker_cycle(
                     mr_created: false,
                 };
 
-                match process_issue(
-                    agent_id,
-                    project_name,
-                    sessions_dir,
-                    git_repo,
-                    gitlab,
-                    agent,
-                    &issue,
-                    &mut current,
-                    scope_label,
-                ) {
+                match process_issue(state, agent, &issue, &mut current, scope_label) {
                     Ok(_) => {
                         if current.mr_created {
                             *active = Some(current);
                         } else {
-                            let _ = claim::release_claim(gitlab, issue_iid, agent_id);
-                            cleanup_session_file(sessions_dir, issue_iid);
+                            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                            state.cleanup_session(issue_iid);
                             *active = None;
                         }
                     }
@@ -455,18 +543,21 @@ fn worker_cycle(
                         }
                         error!(
                             "{}: Failed to re-process issue #{}: {}",
-                            agent_id, issue_iid, e
+                            &state.agent_id, issue_iid, e
                         );
-                        let _ = claim::release_claim(gitlab, issue_iid, agent_id);
-                        let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-                        cleanup_session_file(sessions_dir, issue_iid);
+
+                        let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                        let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+                        state.cleanup_session(issue_iid);
                         *active = None;
                         if let Some(ref branch) = current.branch_name {
-                            let default_branch =
-                                git_repo.get_default_branch().unwrap_or("main".to_string());
-                            let _ = git_repo.reset_hard();
-                            let _ = git_repo.checkout_remote_branch(&default_branch);
-                            let _ = git_repo.delete_local_branch(branch);
+                            let default_branch = state
+                                .git_repo
+                                .get_default_branch()
+                                .unwrap_or("main".to_string());
+                            let _ = state.git_repo.reset_hard();
+                            let _ = state.git_repo.checkout_remote_branch(&default_branch);
+                            let _ = state.git_repo.delete_local_branch(branch);
                         }
                     }
                 }
@@ -476,11 +567,12 @@ fn worker_cycle(
             Err(e) => {
                 warn!(
                     "{}: Failed to fetch issue #{} for re-attempt: {}, releasing",
-                    agent_id, issue_iid, e
+                    &state.agent_id, issue_iid, e
                 );
-                let _ = claim::release_claim(gitlab, issue_iid, agent_id);
-                let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-                cleanup_session_file(sessions_dir, issue_iid);
+
+                let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+                state.cleanup_session(issue_iid);
                 *active = None;
             }
         }
@@ -492,11 +584,11 @@ fn worker_cycle(
 
     // No active issue — try to pick up an orphaned session first
     if active.is_none() {
-        *active = try_adopt_orphaned_session(agent_id, sessions_dir, gitlab, shutdown, scope_label);
+        *active = try_adopt_orphaned_session(state, shutdown, scope_label);
         if let Some(a) = &*active {
             info!(
                 "{}: Adopted orphaned issue #{} with MR !{}",
-                agent_id,
+                &state.agent_id,
                 a.issue_iid,
                 a.mr_iid.unwrap_or(0)
             );
@@ -505,8 +597,8 @@ fn worker_cycle(
     }
 
     // No orphaned sessions — poll for new issues
-    info!("{}: Polling for new issues...", agent_id);
-    let issues = gitlab.list_issues()?;
+    info!("{}: Polling for new issues...", &state.agent_id);
+    let issues = state.glab.list_issues()?;
 
     if shutdown.load(Ordering::SeqCst) {
         return Ok(());
@@ -528,31 +620,31 @@ fn worker_cycle(
         if claim::is_claimed(&issue.labels) {
             debug!(
                 "{}: Issue #{} already claimed, skipping",
-                agent_id, issue.iid
+                &state.agent_id, issue.iid
             );
             continue;
         }
 
-        if !claim::try_claim_issue(gitlab, issue.iid, agent_id, shutdown)? {
+        if !claim::try_claim_issue(&state.glab, issue.iid, &state.agent_id, shutdown)? {
             info!(
                 "{}: Failed to claim issue #{}, skipping",
-                agent_id, issue.iid
+                &state.agent_id, issue.iid
             );
             continue;
         }
 
         if shutdown.load(Ordering::SeqCst) {
-            let _ = claim::release_claim(gitlab, issue.iid, agent_id);
+            let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
             return Ok(());
         }
 
         // Persist a pre-session immediately so that even a SIGKILL leaves
         // a record of which issue this worker owns. mr_iid=0 means no MR yet.
-        let _ = save_session(sessions_dir, issue.iid, 0, agent_id);
+        let _ = state.save_session(issue.iid, 0);
 
         info!(
             "{}: Implementing issue #{}: {}",
-            agent_id, issue.iid, issue.title
+            &state.agent_id, issue.iid, issue.title
         );
 
         let mut current = ActiveIssue {
@@ -562,23 +654,13 @@ fn worker_cycle(
             mr_created: false,
         };
 
-        match process_issue(
-            agent_id,
-            project_name,
-            sessions_dir,
-            git_repo,
-            gitlab,
-            agent,
-            &issue,
-            &mut current,
-            scope_label,
-        ) {
+        match process_issue(state, agent, &issue, &mut current, scope_label) {
             Ok(_) => {
                 if current.mr_created {
                     *active = Some(current);
                 } else {
                     // Rejected or no MR — release claim
-                    let _ = claim::release_claim(gitlab, issue.iid, agent_id);
+                    let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
                 }
             }
             Err(e) => {
@@ -589,16 +671,20 @@ fn worker_cycle(
                 }
                 error!(
                     "{}: Failed to process issue #{}: {}",
-                    agent_id, issue.iid, e
+                    &state.agent_id, issue.iid, e
                 );
-                let _ = claim::release_claim(gitlab, issue.iid, agent_id);
-                let _ = gitlab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
+                let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
+                let _ = state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
+
                 if let Some(ref branch) = current.branch_name {
-                    let default_branch =
-                        git_repo.get_default_branch().unwrap_or("main".to_string());
-                    let _ = git_repo.reset_hard();
-                    let _ = git_repo.checkout_remote_branch(&default_branch);
-                    let _ = git_repo.delete_local_branch(branch);
+                    let default_branch = state
+                        .git_repo
+                        .get_default_branch()
+                        .unwrap_or("main".to_string());
+
+                    let _ = state.git_repo.reset_hard();
+                    let _ = state.git_repo.checkout_remote_branch(&default_branch);
+                    let _ = state.git_repo.delete_local_branch(branch);
                 }
             }
         }
@@ -609,7 +695,7 @@ fn worker_cycle(
     if active.is_none() {
         info!(
             "{}: Idle, no issues to work on{}",
-            agent_id,
+            &state.agent_id,
             state_meta(agent)
         );
     }
@@ -710,21 +796,6 @@ fn resolve_tracked_mr_for_worker_issue(
     ResolvedTrackedMr::None
 }
 
-fn release_worker_hold_pending_gitlab_only(
-    agent_id: &str,
-    issue_iid: u64,
-    sessions_dir: &str,
-    gitlab: &GitLabClient,
-) {
-    info!(
-        "{}: Issue #{} has `{}` — releasing claim and session (no close)",
-        agent_id, issue_iid, WORKER_PENDING_LABEL
-    );
-    let _ = claim::release_claim(gitlab, issue_iid, agent_id);
-    let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-    cleanup_session_file(sessions_dir, issue_iid);
-}
-
 fn has_worker_resume_abandon_label(labels: &[String]) -> bool {
     labels.contains(&ACTION_REQUIRED_LABEL.to_string())
         || labels.contains(&PMO_PROCESSED_LABEL.to_string())
@@ -735,28 +806,26 @@ fn has_worker_skip_label(labels: &[String]) -> bool {
     labels.contains(&WORKING_ON_LABEL.to_string()) || has_worker_resume_abandon_label(labels)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_issue(
-    agent_id: &str,
-    project_name: &str,
-    sessions_dir: &str,
-    git_repo: &GitRepo,
-    gitlab: &GitLabClient,
+    state: &AgentState,
     agent: &Agent,
     issue: &Issue,
     current: &mut ActiveIssue,
     scope_label: Option<&str>,
 ) -> Result<Option<u64>> {
-    match closes_keyword_mr_status(gitlab, issue.iid) {
+    match closes_keyword_mr_status(&state.glab, issue.iid) {
         Some(ClosesLinkedMr::Open(mr_iid)) => {
             info!(
                 "Issue #{} has open MR !{} (linked via Closes #{}), tracking it",
                 issue.iid, mr_iid, issue.iid
             );
+
             current.mr_iid = Some(mr_iid);
             current.mr_created = true;
-            let _ = gitlab.add_issue_label(issue.iid, WORKING_ON_LABEL);
-            save_session(sessions_dir, issue.iid, mr_iid, agent_id)?;
+
+            let _ = state.glab.add_issue_label(issue.iid, WORKING_ON_LABEL);
+            let _ = state.save_session(issue.iid, mr_iid);
+
             return Ok(Some(mr_iid));
         }
         Some(ClosesLinkedMr::Merged) => {
@@ -764,87 +833,102 @@ fn process_issue(
                 "Issue #{}: merged MR already references it via Closes #; closing issue",
                 issue.iid
             );
-            close_issue_best_effort(gitlab, issue.iid);
-            cleanup_session_file(sessions_dir, issue.iid);
+            close_issue_best_effort(&state.glab, issue.iid);
+            state.cleanup_session(issue.iid);
             return Ok(None);
         }
         None => {}
     }
 
     // Open MR on branch issue-<n> (no Closes # link required)
-    if let Some(mr_iid) = find_open_mr_for_issue(gitlab, issue.iid) {
+    if let Some(mr_iid) = find_open_mr_for_issue(&state.glab, issue.iid) {
         info!(
             "Issue #{} already has open MR !{}, tracking it",
             issue.iid, mr_iid
         );
+
         current.mr_iid = Some(mr_iid);
         current.mr_created = true;
-        let _ = gitlab.add_issue_label(issue.iid, WORKING_ON_LABEL);
-        save_session(sessions_dir, issue.iid, mr_iid, agent_id)?;
+        let _ = state.glab.add_issue_label(issue.iid, WORKING_ON_LABEL);
+        state.save_session(issue.iid, mr_iid)?;
         return Ok(Some(mr_iid));
     }
 
-    let default_branch = git_repo.get_default_branch()?;
-    git_repo.fetch()?;
-    let _ = git_repo.reset_hard();
+    let default_branch = state.git_repo.get_default_branch()?;
+    state.git_repo.fetch()?;
+    let _ = state.git_repo.reset_hard();
 
     let branch_name = format!("issue-{}", issue.iid);
 
-    let branch_existed = if git_repo.remote_branch_exists(&branch_name)? {
+    let branch_existed = if state.git_repo.remote_branch_exists(&branch_name)? {
         info!(
             "Branch {} already exists on remote, checking if it's stale",
             branch_name
         );
-        git_repo.checkout_remote_branch(&branch_name)?;
+        state.git_repo.checkout_remote_branch(&branch_name)?;
 
         // Check if the branch has any diff against the target — if not, it's
         // stale (content already merged). Delete and start fresh.
-        if !git_repo.has_diff_against(&default_branch)? {
+        if !state.git_repo.has_diff_against(&default_branch)? {
             warn!(
                 "Branch {} has no diff against {}, discarding stale branch",
                 branch_name, default_branch
             );
-            let _ = git_repo.reset_hard();
-            git_repo.checkout_remote_branch(&default_branch)?;
-            let _ = git_repo.delete_local_branch(&branch_name);
-            let _ = git_repo.delete_remote_branch(&branch_name);
-            git_repo.create_branch_from(&branch_name, &default_branch)?;
+
+            let _ = state.git_repo.reset_hard();
+            state.git_repo.checkout_remote_branch(&default_branch)?;
+            let _ = state.git_repo.delete_local_branch(&branch_name);
+            let _ = state.git_repo.delete_remote_branch(&branch_name);
+
+            state
+                .git_repo
+                .create_branch_from(&branch_name, &default_branch)?;
+
             false
-        } else if !git_repo.try_merge(&default_branch)? {
+        } else if !state.git_repo.try_merge(&default_branch)? {
             warn!(
                 "Branch {} has conflicts with {}, creating fresh branch instead",
                 branch_name, default_branch
             );
-            let _ = git_repo.reset_hard();
-            git_repo.checkout_remote_branch(&default_branch)?;
-            let _ = git_repo.delete_local_branch(&branch_name);
-            git_repo.create_branch_from(&branch_name, &default_branch)?;
+
+            let _ = state.git_repo.reset_hard();
+            state.git_repo.checkout_remote_branch(&default_branch)?;
+            let _ = state.git_repo.delete_local_branch(&branch_name);
+            state
+                .git_repo
+                .create_branch_from(&branch_name, &default_branch)?;
+
             false
         } else {
             true
         }
     } else {
-        git_repo.create_branch_from(&branch_name, &default_branch)?;
+        state
+            .git_repo
+            .create_branch_from(&branch_name, &default_branch)?;
         false
     };
 
     current.branch_name = Some(branch_name.clone());
 
-    gitlab.add_issue_label(issue.iid, WORKING_ON_LABEL)?;
+    state.glab.add_issue_label(issue.iid, WORKING_ON_LABEL)?;
 
-    let gl_comments = format_issue_comments_for_worker_context(gitlab, issue.iid);
+    let gl_comments = format_issue_comments_for_worker_context(&state.glab, issue.iid);
+
     let prompt = if branch_existed {
-        build_continuation_prompt(project_name, sessions_dir, issue, &gl_comments)?
+        build_continuation_prompt(state, issue, &gl_comments)?
     } else {
-        build_implementation_prompt(project_name, sessions_dir, issue, &gl_comments)?
+        build_implementation_prompt(state, issue, &gl_comments)?
     };
 
     let issue_iid_for_cancel = issue.iid;
     let cancel_check = || {
-        gitlab
+        state
+            .glab
             .get_issue(issue_iid_for_cancel)
             .is_ok_and(|i| i.state != "opened")
     };
+
     let agent_output = agent.run_with_cancel(&prompt, Some(&cancel_check), None)?;
 
     if output_signals_cannot_implement(&agent_output) {
@@ -859,28 +943,33 @@ fn process_issue(
             warn!("Issue #{} needs clarification", issue.iid);
             extract_clarification(&agent_output)
         };
-        gitlab.add_issue_comment(issue.iid, &reason)?;
+        state.glab.add_issue_comment(issue.iid, &reason)?;
 
         // If the branch already had an open MR, close it
-        if let Some(mr_iid) = find_open_mr_for_issue(gitlab, issue.iid) {
-            gitlab.add_mr_comment(
+        if let Some(mr_iid) = find_open_mr_for_issue(&state.glab, issue.iid) {
+            state.glab.add_mr_comment(
                 mr_iid,
                 &format!(
                     "Closing this MR — the issue cannot be implemented:\n\n{}",
                     reason
                 ),
             )?;
-            let _ = gitlab.close_mr(mr_iid);
+            let _ = state.glab.close_mr(mr_iid);
         }
 
         // Reset git to a clean state — keep remote branch for potential retry
-        let default_branch = git_repo.get_default_branch().unwrap_or("main".to_string());
-        let _ = git_repo.reset_hard();
-        let _ = git_repo.checkout_remote_branch(&default_branch);
-        let _ = git_repo.delete_local_branch(&branch_name);
+        let default_branch = state
+            .git_repo
+            .get_default_branch()
+            .unwrap_or("main".to_string());
+        let _ = state.git_repo.reset_hard();
+        let _ = state.git_repo.checkout_remote_branch(&default_branch);
+        let _ = state.git_repo.delete_local_branch(&branch_name);
 
-        gitlab.remove_issue_label(issue.iid, WORKING_ON_LABEL)?;
-        gitlab.add_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
+        state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL)?;
+        state
+            .glab
+            .add_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
         current.branch_name = None;
         info!(
             "Issue #{} requires user action, labeled with '{}'",
@@ -892,55 +981,59 @@ fn process_issue(
     // The agent may have already committed changes itself (it has full shell
     // access). Stage+commit any remaining uncommitted work, then check whether
     // the branch diverges from the base at all.
-    git_repo.add_all()?;
+    state.git_repo.add_all()?;
 
     let mr_title = extract_mr_title(&agent_output);
 
-    if git_repo.has_staged_changes()? {
+    if state.git_repo.has_staged_changes()? {
         let commit_message = build_commit_message(&mr_title, issue.iid);
-        git_repo.commit(&commit_message)?;
+        state.git_repo.commit(&commit_message)?;
     }
 
-    if !git_repo.has_diff_against(&default_branch)? {
+    if !state.git_repo.has_diff_against(&default_branch)? {
         warn!(
             "Issue #{}: agent produced no code changes, rejecting",
             issue.iid
         );
         let reason = "The implementation produced no code changes. The issue may need more detail or a different approach.";
-        gitlab.add_issue_comment(issue.iid, reason)?;
-        let _ = git_repo.reset_hard();
-        let _ = git_repo.checkout_remote_branch(&default_branch);
-        let _ = git_repo.delete_local_branch(&branch_name);
-        gitlab.remove_issue_label(issue.iid, WORKING_ON_LABEL)?;
-        gitlab.add_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
+        state.glab.add_issue_comment(issue.iid, reason)?;
+        let _ = state.git_repo.reset_hard();
+        let _ = state.git_repo.checkout_remote_branch(&default_branch);
+        let _ = state.git_repo.delete_local_branch(&branch_name);
+        state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL)?;
+        state
+            .glab
+            .add_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
         current.branch_name = None;
         return Ok(None);
     }
 
-    git_repo.push(&branch_name)?;
+    state.git_repo.push(&branch_name)?;
     let mr_description = format!(
         "Closes #{}\n\n{}",
         issue.iid,
         extract_mr_description(&agent_output)
     );
 
-    let mr_iid = gitlab.create_merge_request(&branch_name, &mr_title, &mr_description)?;
+    let mr_iid = state
+        .glab
+        .create_merge_request(&branch_name, &mr_title, &mr_description)?;
     current.mr_iid = Some(mr_iid);
     current.mr_created = true;
 
     info!("Created MR !{} for issue #{}", mr_iid, issue.iid);
 
     if let Some(lbl) = scope_label
-        && let Err(e) = gitlab.add_mr_label_with_transient_retries(mr_iid, lbl)
+        && let Err(e) = state.glab.add_mr_label_with_transient_retries(mr_iid, lbl)
     {
         warn!(
             "{}: Failed to add scope label {:?} to MR !{} (permanent error): {}",
-            agent_id, lbl, mr_iid, e
+            &state.agent_id, lbl, mr_iid, e
         );
     }
 
     let impl_summary = extract_mr_description(&agent_output);
-    save_session_with_summary(sessions_dir, issue.iid, mr_iid, agent_id, &impl_summary)?;
+    state.save_session_with_summary(issue.iid, mr_iid, &impl_summary)?;
 
     Ok(Some(mr_iid))
 }
@@ -952,15 +1045,12 @@ fn process_issue(
 /// Returns `Ok(true)` if the agent decided the issue cannot be resolved and
 /// the MR was closed + issue rejected.
 fn handle_mr_comments(
-    project_name: &str,
-    sessions_dir: &str,
-    gitlab: &GitLabClient,
-    git_repo: &GitRepo,
+    state: &AgentState,
     agent: &Agent,
     mr: &crate::gitlab::MergeRequest,
 ) -> Result<bool> {
-    let latest_mr = gitlab.get_merge_request(mr.iid)?;
-    let unresolved_ids = gitlab.get_unresolved_discussion_ids(latest_mr.iid)?;
+    let latest_mr = state.glab.get_merge_request(mr.iid)?;
+    let unresolved_ids = state.glab.get_unresolved_discussion_ids(latest_mr.iid)?;
 
     if unresolved_ids.is_empty() && !latest_mr.has_conflicts {
         return Ok(false);
@@ -973,19 +1063,23 @@ fn handle_mr_comments(
             unresolved_ids.len()
         );
     }
+
     if latest_mr.has_conflicts {
         info!("MR !{} has merge conflicts to resolve", latest_mr.iid);
     }
 
-    let mut comments = gitlab.get_mr_comments(latest_mr.iid)?;
+    let mut comments = state.glab.get_mr_comments(latest_mr.iid)?;
     if !unresolved_ids.is_empty() {
         let unresolved_set: HashSet<&str> = unresolved_ids.iter().map(String::as_str).collect();
         comments.retain(|c| unresolved_set.contains(c.discussion_id.as_str()));
     }
 
-    git_repo.fetch()?;
-    let _ = git_repo.reset_hard();
-    git_repo.checkout_remote_branch(&latest_mr.source_branch)?;
+    state.git_repo.fetch()?;
+    let _ = state.git_repo.reset_hard();
+
+    state
+        .git_repo
+        .checkout_remote_branch(&latest_mr.source_branch)?;
 
     // Remember the remote HEAD so we can detect changes after the agent runs,
     // even if the agent disobeys and commits/pushes itself.
@@ -995,14 +1089,23 @@ fn handle_mr_comments(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or(git_repo.rev_parse(&format!("origin/{}", latest_mr.source_branch))?);
+        .unwrap_or(
+            state
+                .git_repo
+                .rev_parse(&format!("origin/{}", latest_mr.source_branch))?,
+        );
 
     // Build a diff snapshot from the latest source/target state before we merge
     // target into source locally for conflict handling.
-    let diff_context_content = build_mr_diff_context(project_name, &latest_mr, git_repo, gitlab);
+    let diff_context_content = build_mr_diff_context(
+        &state.project_name,
+        &latest_mr,
+        &state.git_repo,
+        &state.glab,
+    );
 
     // Merge the latest target branch so the worker has up-to-date upstream code.
-    let merge_ok = git_repo.merge_no_abort(&latest_mr.target_branch)?;
+    let merge_ok = state.git_repo.merge_no_abort(&latest_mr.target_branch)?;
     if !merge_ok {
         warn!(
             "MR !{}: source branch has conflicts with {}, worker agent will resolve them",
@@ -1011,18 +1114,24 @@ fn handle_mr_comments(
     }
 
     let issue_number = extract_issue_number_from_branch(&latest_mr.source_branch)?;
-    let issue_context = load_issue_context(gitlab, issue_number)?;
-    let implementation_summary = load_implementation_summary(sessions_dir, issue_number);
+    let issue_context = load_issue_context(&state.glab, issue_number)?;
+    let implementation_summary = state.load_implementation_summary(issue_number);
+
     let comment_lines = comments
         .iter()
         .map(|c| c.format_for_prompt())
         .collect::<Vec<_>>();
+
     let all_comments_text = comment_lines.join("\n");
+
     let combined_context_path = write_task_context_file(
-        sessions_dir,
-        &format!("worker-mr-feedback-and-diff-{}.md", latest_mr.iid),
+        &state.sessions_dir,
+        &format!(
+            "{}-mr-feedback-and-diff-{}.md",
+            &state.agent_id, latest_mr.iid
+        ),
         &build_combined_mr_feedback_context(
-            project_name,
+            &state.project_name,
             &latest_mr,
             &issue_context,
             &implementation_summary,
@@ -1094,11 +1203,12 @@ REMINDER: You are fully autonomous. Execute every command, test, and file operat
 
 Proceed with addressing the feedback autonomously. Do not ask for any user input.
 "#,
-        project_name, latest_mr.iid, latest_mr.title, combined_context_path
+        &state.project_name, latest_mr.iid, latest_mr.title, combined_context_path
     );
 
     let cancel_check = || {
-        gitlab
+        state
+            .glab
             .get_issue(issue_number)
             .is_ok_and(|i| i.state != "opened")
     };
@@ -1110,14 +1220,9 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
             "MR !{} cannot be resolved autonomously: {}",
             latest_mr.iid, reason
         );
-        abandon_mr(
-            gitlab,
-            git_repo,
-            &latest_mr,
-            issue_number,
-            sessions_dir,
-            &reason,
-        )?;
+
+        abandon_mr(state, &latest_mr, issue_number, &reason)?;
+
         return Ok(true);
     }
 
@@ -1131,12 +1236,17 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         } else {
             &latest_mr.title
         };
+
         let desc = if new_desc != "Implementation completed." {
             &new_desc
         } else {
             &latest_mr.description
         };
-        if let Err(e) = gitlab.update_mr_title_description(latest_mr.iid, title, desc) {
+
+        if let Err(e) = state
+            .glab
+            .update_mr_title_description(latest_mr.iid, title, desc)
+        {
             warn!("Failed to update MR !{} metadata: {}", latest_mr.iid, e);
         } else {
             info!(
@@ -1149,27 +1259,27 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     // Detect all changes the agent made: working tree, staged, or committed
     // (even if the agent disobeyed and ran git commit/push itself).
     // Re-fetch in case the agent pushed.
-    git_repo.fetch()?;
-    let has_new_changes = git_repo.has_changes_since(&pre_agent_sha)?;
+    state.git_repo.fetch()?;
+    let has_new_changes = state.git_repo.has_changes_since(&pre_agent_sha)?;
 
     if has_new_changes {
         // Stage and commit any uncommitted leftovers
-        git_repo.add_all()?;
+        state.git_repo.add_all()?;
         let summary_for_commit = extract_changes_summary(&agent_output);
-        if git_repo.has_staged_changes()? {
+        if state.git_repo.has_staged_changes()? {
             let commit_msg = build_commit_message(&summary_for_commit, issue_number);
-            git_repo.commit(&commit_msg)?;
+            state.git_repo.commit(&commit_msg)?;
         }
     }
 
     let diff_highlights = if has_new_changes {
-        build_diff_highlights_since(git_repo, &pre_agent_sha)
+        build_diff_highlights_since(&state.git_repo, &pre_agent_sha)
     } else {
         None
     };
 
     if has_new_changes {
-        git_repo.push(&latest_mr.source_branch)?;
+        state.git_repo.push(&latest_mr.source_branch)?;
         info!(
             "Pushed changes addressing feedback for MR !{}",
             latest_mr.iid
@@ -1181,12 +1291,13 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         );
     }
 
-    let post_origin_head = git_repo
+    let post_origin_head = state
+        .git_repo
         .rev_parse(&format!("origin/{}", latest_mr.source_branch))
         .unwrap_or_else(|_| pre_agent_sha.clone());
     let branch_tip_changed = post_origin_head.trim() != pre_agent_sha.trim();
 
-    let mr_now = gitlab.get_merge_request(latest_mr.iid)?;
+    let mr_now = state.glab.get_merge_request(latest_mr.iid)?;
     let mr_gitlab_surface_changed = merge_request_surface_changed(&latest_mr, &mr_now);
 
     let implicit_resolve_discussions =
@@ -1196,12 +1307,14 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     // if we were triggered by has_conflicts alone. After pushing, resolve all
     // remaining open discussions (including conflict comments).
     let ids_to_resolve = if unresolved_ids.is_empty() {
-        gitlab
+        state
+            .glab
             .get_unresolved_discussion_ids(latest_mr.iid)
             .unwrap_or_default()
     } else {
         unresolved_ids
     };
+
     let reply_raw =
         build_feedback_resolution_reply(&agent_output, has_new_changes, diff_highlights.as_deref());
     let reply_body = strip_worker_reply_boilerplate(&reply_raw);
@@ -1213,12 +1326,16 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
             latest_mr.iid
         );
     }
+
     for discussion_id in &ids_to_resolve {
-        if let Err(e) = gitlab.reply_to_discussion(latest_mr.iid, discussion_id, &reply_body) {
+        if let Err(e) = state
+            .glab
+            .reply_to_discussion(latest_mr.iid, discussion_id, &reply_body)
+        {
             warn!("Failed to reply to discussion {}: {}", discussion_id, e);
         }
         if resolve_discussions
-            && let Err(e) = gitlab.resolve_discussion(latest_mr.iid, discussion_id)
+            && let Err(e) = state.glab.resolve_discussion(latest_mr.iid, discussion_id)
         {
             warn!("Failed to resolve discussion {}: {}", discussion_id, e);
         }
@@ -1231,10 +1348,6 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
 // Session file management (shared directory)
 // ---------------------------------------------------------------------------
 
-fn session_file_path(sessions_dir: &str, issue_iid: u64) -> std::path::PathBuf {
-    Path::new(sessions_dir).join(format!("issue_{}.json", issue_iid))
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SessionFile {
     issue_iid: u64,
@@ -1245,63 +1358,12 @@ struct SessionFile {
     implementation_summary: Option<String>,
 }
 
-fn save_session(sessions_dir: &str, issue_iid: u64, mr_iid: u64, agent_id: &str) -> Result<()> {
-    let session = SessionFile {
-        issue_iid,
-        mr_iid,
-        agent_id: Some(agent_id.to_string()),
-        implementation_summary: None,
-    };
-    let path = session_file_path(sessions_dir, issue_iid);
-    let json = serde_json::to_string_pretty(&session)?;
-    fs::write(&path, json).context("Failed to write session file")?;
-    debug!("Saved session for issue #{} -> MR !{}", issue_iid, mr_iid);
-    Ok(())
-}
-
-fn save_session_with_summary(
-    sessions_dir: &str,
-    issue_iid: u64,
-    mr_iid: u64,
-    agent_id: &str,
-    summary: &str,
-) -> Result<()> {
-    let session = SessionFile {
-        issue_iid,
-        mr_iid,
-        agent_id: Some(agent_id.to_string()),
-        implementation_summary: Some(summary.to_string()),
-    };
-    let path = session_file_path(sessions_dir, issue_iid);
-    let json = serde_json::to_string_pretty(&session)?;
-    fs::write(&path, json).context("Failed to write session file")?;
-    Ok(())
-}
-
-fn load_session(sessions_dir: &str, issue_iid: u64) -> Option<SessionFile> {
-    let path = session_file_path(sessions_dir, issue_iid);
-    let content = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-fn cleanup_session_file(sessions_dir: &str, issue_iid: u64) {
-    let path = session_file_path(sessions_dir, issue_iid);
-    if fs::remove_file(&path).is_ok() {
-        info!("Cleaned up session file for issue #{}", issue_iid);
-    }
-}
-
 /// On startup, try to resume a session this worker previously owned.
 /// Checks the stored agent_id first, then falls back to checking GitLab labels.
-fn try_resume_session(
-    agent_id: &str,
-    sessions_dir: &str,
-    gitlab: &GitLabClient,
-    scope_label: Option<&str>,
-) -> Option<ActiveIssue> {
-    let claim_label = format!("claimed:{}", agent_id);
+fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<ActiveIssue> {
+    let claim_label = format!("claimed:{}", &state.agent_id);
 
-    let entries = match fs::read_dir(sessions_dir) {
+    let entries = match fs::read_dir(&state.sessions_dir) {
         Ok(e) => e,
         Err(e) => {
             warn!("Failed to read sessions directory: {}", e);
@@ -1323,56 +1385,54 @@ fn try_resume_session(
         else {
             continue;
         };
+
         let Ok(issue_iid) = issue_str.parse::<u64>() else {
             continue;
         };
 
-        let Some(session) = load_session(sessions_dir, issue_iid) else {
+        let Some(session) = state.load_session(issue_iid) else {
             continue;
         };
 
         // Fast path: session file records which agent owned it
         if let Some(ref stored_id) = session.agent_id {
-            if stored_id == agent_id {
-                let issue = match gitlab.get_issue(issue_iid) {
+            if stored_id == &state.agent_id {
+                let issue = match state.glab.get_issue(issue_iid) {
                     Ok(i) => i,
                     Err(e) => {
                         warn!(
                             "{}: Failed to verify issue #{} for session resume: {}, skipping",
-                            agent_id, issue_iid, e
+                            &state.agent_id, issue_iid, e
                         );
                         continue;
                     }
                 };
+
                 if !issue_in_scope(&issue, scope_label) {
-                    debug!(
-                        "{}: Session for issue #{} skipped (outside scope label {:?})",
-                        agent_id, issue_iid, scope_label
-                    );
                     continue;
                 }
+
                 if issue_has_worker_pending_label(&issue.labels) {
-                    release_worker_hold_pending_gitlab_only(
-                        agent_id,
-                        issue_iid,
-                        sessions_dir,
-                        gitlab,
-                    );
+                    state.release_worker_hold_pending_gitlab_only(issue_iid);
                     continue;
                 }
-                match resolve_tracked_mr_for_worker_issue(gitlab, issue_iid, session.mr_iid) {
+
+                match resolve_tracked_mr_for_worker_issue(&state.glab, issue_iid, session.mr_iid) {
                     ResolvedTrackedMr::MergedCloseIssue => {
-                        close_issue_best_effort(gitlab, issue_iid);
-                        let _ = claim::release_claim(gitlab, issue_iid, agent_id);
-                        let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-                        cleanup_session_file(sessions_dir, issue_iid);
+                        close_issue_best_effort(&state.glab, issue_iid);
+
+                        let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                        let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+
+                        state.cleanup_session(issue_iid);
                         continue;
                     }
                     ResolvedTrackedMr::Track(mr_iid) => {
                         info!(
                             "{}: Found session file for issue #{} (MR: !{}), resuming",
-                            agent_id, issue_iid, mr_iid
+                            &state.agent_id, issue_iid, mr_iid
                         );
+
                         return Some(ActiveIssue {
                             issue_iid,
                             mr_iid: Some(mr_iid),
@@ -1383,8 +1443,9 @@ fn try_resume_session(
                     ResolvedTrackedMr::None => {
                         info!(
                             "{}: Found session file for issue #{} (no MR yet), resuming",
-                            agent_id, issue_iid
+                            &state.agent_id, issue_iid
                         );
+
                         return Some(ActiveIssue {
                             issue_iid,
                             mr_iid: None,
@@ -1399,32 +1460,31 @@ fn try_resume_session(
         }
 
         // Fallback for old session files without agent_id: check GitLab labels
-        match gitlab.get_issue(issue_iid) {
+        match state.glab.get_issue(issue_iid) {
             Ok(issue)
                 if issue.labels.contains(&claim_label) && issue_in_scope(&issue, scope_label) =>
             {
                 if issue_has_worker_pending_label(&issue.labels) {
-                    release_worker_hold_pending_gitlab_only(
-                        agent_id,
-                        issue_iid,
-                        sessions_dir,
-                        gitlab,
-                    );
+                    state.release_worker_hold_pending_gitlab_only(issue_iid);
                     continue;
                 }
-                match resolve_tracked_mr_for_worker_issue(gitlab, issue_iid, session.mr_iid) {
+
+                match resolve_tracked_mr_for_worker_issue(&state.glab, issue_iid, session.mr_iid) {
                     ResolvedTrackedMr::MergedCloseIssue => {
-                        close_issue_best_effort(gitlab, issue_iid);
-                        let _ = claim::release_claim(gitlab, issue_iid, agent_id);
-                        let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-                        cleanup_session_file(sessions_dir, issue_iid);
+                        close_issue_best_effort(&state.glab, issue_iid);
+
+                        let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                        let _ = &state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+
+                        state.cleanup_session(issue_iid);
                         continue;
                     }
                     ResolvedTrackedMr::Track(mr_iid) => {
                         info!(
                             "{}: Found unclaimed session for issue #{} with matching label, resuming (MR !{})",
-                            agent_id, issue_iid, mr_iid
+                            &state.agent_id, issue_iid, mr_iid
                         );
+
                         return Some(ActiveIssue {
                             issue_iid,
                             mr_iid: Some(mr_iid),
@@ -1435,8 +1495,9 @@ fn try_resume_session(
                     ResolvedTrackedMr::None => {
                         info!(
                             "{}: Found unclaimed session for issue #{} with matching label, resuming",
-                            agent_id, issue_iid
+                            &state.agent_id, issue_iid
                         );
+
                         return Some(ActiveIssue {
                             issue_iid,
                             mr_iid: None,
@@ -1446,16 +1507,17 @@ fn try_resume_session(
                     }
                 }
             }
+
             Ok(_) => {
                 debug!(
                     "{}: Session for issue #{} exists but claim label not found",
-                    agent_id, issue_iid
+                    &state.agent_id, issue_iid
                 );
             }
             Err(e) => {
                 warn!(
                     "{}: Failed to verify issue #{} on GitLab: {}, skipping",
-                    agent_id, issue_iid, e
+                    &state.agent_id, issue_iid, e
                 );
             }
         }
@@ -1466,21 +1528,17 @@ fn try_resume_session(
 
 /// Scan all open GitLab issues for this worker's claim label.
 /// Used as a fallback when the session file is missing (e.g. hard kill / crash).
-fn find_claimed_issue(
-    agent_id: &str,
-    gitlab: &GitLabClient,
-    scope_label: Option<&str>,
-    sessions_dir: &str,
-) -> Option<ActiveIssue> {
-    let claim_label = format!("claimed:{}", agent_id);
+fn find_claimed_issue(state: &AgentState, scope_label: Option<&str>) -> Option<ActiveIssue> {
+    let claim_label = format!("claimed:{}", &state.agent_id);
 
-    let issues = match gitlab.list_issues() {
+    let issues = match state.glab.list_issues() {
         Ok(i) => i,
         Err(e) => {
             warn!(
                 "{}: Failed to scan issues for orphaned claims: {}",
-                agent_id, e
+                &state.agent_id, e
             );
+
             return None;
         }
     };
@@ -1489,31 +1547,36 @@ fn find_claimed_issue(
         if issue.state != "opened" {
             continue;
         }
+
         if !issue.labels.contains(&claim_label) {
             continue;
         }
+
         if !issue_in_scope(issue, scope_label) {
             continue;
         }
 
         if issue_has_worker_pending_label(&issue.labels) {
-            release_worker_hold_pending_gitlab_only(agent_id, issue.iid, sessions_dir, gitlab);
+            state.release_worker_hold_pending_gitlab_only(issue.iid);
             continue;
         }
 
-        match resolve_tracked_mr_for_worker_issue(gitlab, issue.iid, 0) {
+        match resolve_tracked_mr_for_worker_issue(&state.glab, issue.iid, 0) {
             ResolvedTrackedMr::MergedCloseIssue => {
-                close_issue_best_effort(gitlab, issue.iid);
-                let _ = claim::release_claim(gitlab, issue.iid, agent_id);
-                let _ = gitlab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
-                cleanup_session_file(sessions_dir, issue.iid);
+                close_issue_best_effort(&state.glab, issue.iid);
+
+                let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
+                let _ = state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
+
+                state.cleanup_session(issue.iid);
                 continue;
             }
             ResolvedTrackedMr::Track(mr_iid) => {
                 info!(
                     "{}: Found orphaned claim on issue #{} (MR: !{}), adopting it",
-                    agent_id, issue.iid, mr_iid
+                    &state.agent_id, issue.iid, mr_iid
                 );
+
                 return Some(ActiveIssue {
                     issue_iid: issue.iid,
                     mr_iid: Some(mr_iid),
@@ -1524,8 +1587,9 @@ fn find_claimed_issue(
             ResolvedTrackedMr::None => {
                 info!(
                     "{}: Found orphaned claim on issue #{} (no MR), adopting it",
-                    agent_id, issue.iid
+                    &state.agent_id, issue.iid
                 );
+
                 return Some(ActiveIssue {
                     issue_iid: issue.iid,
                     mr_iid: None,
@@ -1541,32 +1605,35 @@ fn find_claimed_issue(
 
 /// Try to adopt an orphaned session file (issue has no claim label from any worker).
 fn try_adopt_orphaned_session(
-    agent_id: &str,
-    sessions_dir: &str,
-    gitlab: &GitLabClient,
+    state: &AgentState,
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Option<ActiveIssue> {
-    let entries = fs::read_dir(sessions_dir).ok()?;
+    let entries = fs::read_dir(&state.sessions_dir).ok()?;
+
+    let issue_prefix = format!("{}_issue_", &state.agent_id);
+
     for entry in entries.flatten() {
         let Ok(file_name) = entry.file_name().into_string() else {
             continue;
         };
-        if !file_name.starts_with("issue_") || !file_name.ends_with(".json") {
+
+        if !file_name.starts_with(&issue_prefix) || !file_name.ends_with(".json") {
             continue;
         }
 
         let Some(issue_str) = file_name
-            .strip_prefix("issue_")
+            .strip_prefix(&issue_prefix)
             .and_then(|s| s.strip_suffix(".json"))
         else {
             continue;
         };
+
         let Ok(issue_iid) = issue_str.parse::<u64>() else {
             continue;
         };
 
-        let Some(session) = load_session(sessions_dir, issue_iid) else {
+        let Some(session) = state.load_session(issue_iid) else {
             continue;
         };
 
@@ -1576,7 +1643,7 @@ fn try_adopt_orphaned_session(
             continue;
         }
 
-        let Ok(issue) = gitlab.get_issue(issue_iid) else {
+        let Ok(issue) = state.glab.get_issue(issue_iid) else {
             continue;
         };
 
@@ -1595,14 +1662,15 @@ fn try_adopt_orphaned_session(
 
         let (mr_iid, mr_created) = if session.mr_iid > 0 {
             // Check if the MR is still open
-            if let Ok(mr) = gitlab.get_merge_request(session.mr_iid) {
+            if let Ok(mr) = state.glab.get_merge_request(session.mr_iid) {
                 if mr.state == "merged" || mr.state == "closed" {
                     info!(
                         "{}: Orphaned session for issue #{} has {} MR !{}, cleaning up",
-                        agent_id, issue_iid, mr.state, session.mr_iid
+                        &state.agent_id, issue_iid, mr.state, session.mr_iid
                     );
-                    cleanup_session_file(sessions_dir, issue_iid);
-                    let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+
+                    state.cleanup_session(issue_iid);
+                    let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
                     continue;
                 }
             } else {
@@ -1611,21 +1679,22 @@ fn try_adopt_orphaned_session(
             (Some(session.mr_iid), true)
         } else {
             // No MR yet — check if one was created in the meantime
-            match find_open_mr_for_issue(gitlab, issue_iid) {
+            match find_open_mr_for_issue(&state.glab, issue_iid) {
                 Some(mr) => (Some(mr), true),
                 None => (None, false),
             }
         };
 
         // Try to claim this issue
-        match claim::try_claim_issue(gitlab, issue_iid, agent_id, shutdown) {
+        match claim::try_claim_issue(&state.glab, issue_iid, &state.agent_id, shutdown) {
             Ok(true) => {
                 info!(
                     "{}: Adopted orphaned issue #{} (MR: {})",
-                    agent_id,
+                    &state.agent_id,
                     issue_iid,
                     mr_iid.map_or("none".to_string(), |id| format!("!{}", id))
                 );
+
                 return Some(ActiveIssue {
                     issue_iid,
                     mr_iid,
@@ -1657,37 +1726,6 @@ fn find_open_mr_for_issue(gitlab: &GitLabClient, issue_iid: u64) -> Option<u64> 
     None
 }
 
-/// Clean up everything when the issue we're working on has been closed externally.
-/// Closes any related MR, deletes branches, releases the claim, and removes session.
-fn abandon_closed_issue(
-    agent_id: &str,
-    issue_iid: u64,
-    mr_iid: Option<u64>,
-    sessions_dir: &str,
-    git_repo: &GitRepo,
-    gitlab: &GitLabClient,
-) {
-    info!(
-        "{}: Issue #{} was closed externally, abandoning work",
-        agent_id, issue_iid
-    );
-
-    if let Some(mr) = mr_iid {
-        let _ = gitlab.add_mr_comment(mr, "Closing this MR — the linked issue has been closed.");
-        let _ = gitlab.close_mr(mr);
-    }
-
-    let branch = format!("issue-{}", issue_iid);
-    let default_branch = git_repo.get_default_branch().unwrap_or("main".to_string());
-    let _ = git_repo.reset_hard();
-    let _ = git_repo.checkout_remote_branch(&default_branch);
-    let _ = git_repo.delete_local_branch(&branch);
-    let _ = git_repo.delete_remote_branch(&branch);
-    let _ = claim::release_claim(gitlab, issue_iid, agent_id);
-    let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-    cleanup_session_file(sessions_dir, issue_iid);
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1715,40 +1753,34 @@ fn load_issue_context(gitlab: &GitLabClient, issue_number: u64) -> Result<String
     }
 }
 
-fn load_implementation_summary(sessions_dir: &str, issue_number: u64) -> String {
-    if let Some(session) = load_session(sessions_dir, issue_number)
-        && let Some(summary) = session.implementation_summary
-    {
-        return summary;
-    }
-    "No previous implementation summary available.".to_string()
-}
-
 fn abandon_mr(
-    gitlab: &GitLabClient,
-    git_repo: &GitRepo,
+    state: &AgentState,
     mr: &crate::gitlab::MergeRequest,
     issue_iid: u64,
-    sessions_dir: &str,
     reason: &str,
 ) -> Result<()> {
-    gitlab.add_mr_comment(
+    state.glab.add_mr_comment(
         mr.iid,
         &format!(
             "Closing this MR — the issue cannot be resolved autonomously:\n\n{}",
             reason
         ),
     )?;
-    let _ = gitlab.close_mr(mr.iid);
+    let _ = state.glab.close_mr(mr.iid);
 
-    let default_branch = git_repo.get_default_branch().unwrap_or("main".to_string());
-    let _ = git_repo.reset_hard();
-    let _ = git_repo.checkout_remote_branch(&default_branch);
-    let _ = git_repo.delete_local_branch(&mr.source_branch);
+    let default_branch = state
+        .git_repo
+        .get_default_branch()
+        .unwrap_or("main".to_string());
+    let _ = state.git_repo.reset_hard();
+    let _ = state.git_repo.checkout_remote_branch(&default_branch);
+    let _ = state.git_repo.delete_local_branch(&mr.source_branch);
 
-    let _ = gitlab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-    gitlab.add_issue_label(issue_iid, ACTION_REQUIRED_LABEL)?;
-    gitlab.add_issue_comment(
+    let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+    state
+        .glab
+        .add_issue_label(issue_iid, ACTION_REQUIRED_LABEL)?;
+    state.glab.add_issue_comment(
         issue_iid,
         &format!(
             "This issue requires additional human input before it can be implemented:\n\n{}",
@@ -1756,7 +1788,7 @@ fn abandon_mr(
         ),
     )?;
 
-    cleanup_session_file(sessions_dir, issue_iid);
+    state.cleanup_session(issue_iid);
 
     info!(
         "Abandoned MR !{} and rejected issue #{} with action-required",
@@ -2158,16 +2190,16 @@ fn worker_issue_context_markdown(issue: &Issue, gitlab_comments_text: &str) -> S
 }
 
 fn build_implementation_prompt(
-    project_name: &str,
-    session_dir: &str,
+    state: &AgentState,
     issue: &Issue,
     gitlab_comments_text: &str,
 ) -> Result<String> {
     let context_path = write_task_context_file(
-        session_dir,
-        &format!("worker-issue-{}.md", issue.iid),
+        &state.sessions_dir,
+        &format!("{}-issue-{}.md", state.agent_id, issue.iid),
         &worker_issue_context_markdown(issue, gitlab_comments_text),
     )?;
+
     let common_requirements = get_common_requirements();
     let scope_rules = get_scope_rules(false);
     let output_format = get_output_format();
@@ -2230,7 +2262,7 @@ REMINDER: You are fully autonomous. Execute every command, test, and file operat
 
 Proceed with the implementation autonomously. Do not ask for any user input.
 "#,
-        project_name,
+        &state.project_name,
         issue.iid,
         issue.title,
         context_path,
@@ -2243,16 +2275,16 @@ Proceed with the implementation autonomously. Do not ask for any user input.
 }
 
 fn build_continuation_prompt(
-    project_name: &str,
-    session_dir: &str,
+    state: &AgentState,
     issue: &Issue,
     gitlab_comments_text: &str,
 ) -> Result<String> {
     let context_path = write_task_context_file(
-        session_dir,
-        &format!("worker-issue-{}.md", issue.iid),
+        &state.sessions_dir,
+        &format!("{}-issue-{}.md", &state.agent_id, issue.iid),
         &worker_issue_context_markdown(issue, gitlab_comments_text),
     )?;
+
     let common_requirements = get_common_requirements();
     let scope_rules = get_scope_rules(true);
     let output_format = get_output_format();
@@ -2320,7 +2352,7 @@ REMINDER: You are fully autonomous. Execute every command, test, and file operat
 
 Proceed with continuing the implementation autonomously. Do not ask for any user input.
 "#,
-        project_name,
+        &state.project_name,
         issue.iid,
         issue.title,
         context_path,

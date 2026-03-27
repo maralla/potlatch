@@ -246,8 +246,6 @@ impl AcpClient {
                 continue;
             }
 
-            // Intentional: mirror inbound ACP JSON-RPC lines to stdout for operator visibility.
-            println!("{}", trimmed);
             let msg: Value = serde_json::from_str(trimmed).with_context(|| {
                 format!(
                     "ACP invalid JSON: {}",
