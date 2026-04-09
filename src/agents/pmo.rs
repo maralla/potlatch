@@ -978,9 +978,37 @@ CRITICAL REQUIREMENTS:
   PUBLIC_COMMENT_BEGIN
   <only final public comment text; no progress/status/tool logs>
   PUBLIC_COMMENT_END
-- **Plan mode:** Cursor may save the plan as a `.md` file under the repo. Codepair reads that file after the turn and treats its contents like assistant text for parsing. A structured UI plan **without** the plain-text formats below is **not** enough — the saved plan file (or streamed text) **must** include `GUIDE_WORKER`, `SPLIT` + `SUB_ISSUE_N` blocks, `ALREADY_DONE`, or `NEEDS_CLARIFICATION` as required. Do not stop after only using plan UI widgets, and do not wait for user confirmation — this run is fully automated.
-- When applicable, mirror structured intent clearly in prose so parsers can pick it up, e.g. state `decision`, `question` / clarification needs, `instructions` for worker guidance, `reason` for ALREADY_DONE, and numbered `SUB_ISSUE_N` blocks for SPLIT.
-- For SPLIT, describe each planned sub-issue using the human-readable `SUB_ISSUE_N / TITLE / PRIORITY / DESCRIPTION` blocks in your reply (include acceptance criteria in `DESCRIPTION`).
+- **Plan mode (STRICT):** Cursor may save your work as a `.md` file under the repo. Codepair **reads that file after the turn** and appends its text to your output for parsing. A Cursor plan UI (outline, checkboxes, widgets) **does not count** unless the **saved file body** contains the plain-text markers below. You **must** put the machine-readable blocks **inside the `.md` file** (or duplicate them in your final streamed message). Do not finish the turn with only UI structure — **edit the plan file** to include the exact formats in `CURSOR PLAN FILE — CANONICAL BLOCKS` below. This run is fully automated; do not wait for user confirmation.
+- Also mirror intent in prose where helpful (`decision:`, `question:`, `instructions:`, `reason:`) but **parsers require the literal marker lines** (`GUIDE_WORKER`, `SUB_ISSUE_1:`, `ALREADY_DONE`, etc.) — prose alone is not enough.
+- For SPLIT, each sub-issue **must** use the `SUB_ISSUE_N:` + `TITLE:` + `PRIORITY:` + `DESCRIPTION:` layout (see canonical examples). Include acceptance criteria inside `DESCRIPTION:`.
+
+CURSOR PLAN FILE — CANONICAL BLOCKS (copy these shapes into the saved plan file; spelling and keywords must match):
+- **GUIDE_WORKER** — exact lines:
+  GUIDE_WORKER
+  INSTRUCTIONS:
+  <3–5 sentences; one clear action for the worker>
+- **SPLIT** — repeat per sub-issue; **preferred** format (dependencies line optional, inside DESCRIPTION):
+  SUB_ISSUE_1:
+  TITLE: <concise title>
+  PRIORITY: <1, 2, or 3>
+  DESCRIPTION:
+  <scope and acceptance criteria>
+  <optional single line: Issue Dependencies: SUB_ISSUE_2, SUB_ISSUE_3>
+
+  SUB_ISSUE_2:
+  TITLE: <next title>
+  PRIORITY: <1, 2, or 3>
+  DESCRIPTION:
+  <...>
+- **ALREADY_DONE** — strict (only whitespace between the two lines, or same line):
+  ALREADY_DONE
+  REASON: <why the codebase already satisfies the issue>
+- **NEEDS_CLARIFICATION:**
+  NEEDS_CLARIFICATION
+  QUESTION:
+  <precise questions for a human>
+- **JSON fallback (SPLIT only):** a fenced `json` code block whose body is a JSON **array** of objects, each with string `title`, string `description`, optional numeric `priority` (1–3). Use this only if you cannot use `SUB_ISSUE_N` blocks; plain `SUB_ISSUE_N` text is preferred for dependency lines (`Issue Dependencies: …`).
+
 - Dependency formatting rule for each `DESCRIPTION`:
   - If a sub-issue has NO dependencies, do NOT mention dependencies at all.
   - If it DOES depend on other sub-issues, include EXACTLY one single line in the description:
@@ -1848,6 +1876,31 @@ fn resume_split(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_split_prompt_includes_cursor_plan_canonical_blocks() {
+        let state = AgentState {
+            sessions_dir: "/tmp".into(),
+            working_dir: "/tmp".into(),
+            agent_id: "pmo-test".into(),
+            project_name: "test-proj".into(),
+        };
+        let issue = Issue {
+            iid: 42,
+            title: "Worker could not complete".into(),
+            description: "Details".into(),
+            labels: vec![],
+            state: "opened".into(),
+            created_at: None,
+            updated_at: None,
+        };
+        let prompt = build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2).unwrap();
+        assert!(prompt.contains("CURSOR PLAN FILE — CANONICAL BLOCKS"));
+        assert!(prompt.contains("SUB_ISSUE_1:"));
+        assert!(prompt.contains("ALREADY_DONE"));
+        assert!(prompt.contains("NEEDS_CLARIFICATION"));
+        assert!(prompt.contains("GUIDE_WORKER"));
+    }
 
     #[test]
     fn test_extract_project_name() {
