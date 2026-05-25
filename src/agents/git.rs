@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
-use tracing::{debug, warn};
+use tracing::debug;
 
 pub struct GitRepo {
     pub path: String,
@@ -10,18 +10,6 @@ pub struct GitRepo {
 impl GitRepo {
     pub fn new(path: String) -> Self {
         Self { path }
-    }
-
-    /// Re-copy Codepair `mcp.json` from the agent container into this repo (filesystem only).
-    fn sync_codepair_mcp_mirror(&self) {
-        if let Err(e) =
-            crate::cursor_mcp_config::sync_mcp_into_repo_from_container(Path::new(&self.path))
-        {
-            warn!(
-                "Could not sync .cursor/mcp.json into {} from agent container: {}",
-                self.path, e
-            );
-        }
     }
 
     pub fn exists(&self) -> bool {
@@ -122,7 +110,6 @@ impl GitRepo {
             );
         }
 
-        self.sync_codepair_mcp_mirror();
         Ok(())
     }
 
@@ -142,7 +129,6 @@ impl GitRepo {
             );
         }
 
-        self.sync_codepair_mcp_mirror();
         Ok(())
     }
 
@@ -424,8 +410,6 @@ impl GitRepo {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-
-        self.sync_codepair_mcp_mirror();
 
         Ok(())
     }

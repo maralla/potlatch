@@ -2,17 +2,13 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
-mod acp;
-mod agent;
 mod agents;
-mod config;
-mod cursor_mcp_config;
-mod git;
-mod gitlab;
-mod mcp_coord;
-mod mcp_http;
+mod core;
+mod util;
 
-use config::Config;
+use core::config::Config;
+
+use agents::settings::AgentSettings;
 
 #[derive(Parser, Debug)]
 #[command(name = "codepair")]
@@ -21,9 +17,6 @@ enum Cli {
     /// Run the codepair agent system
     #[command(name = "run", alias = "start")]
     Run {
-        /// GitLab repository address (e.g., https://gitlab.com/user/repo)
-        git_repo_address: String,
-
         /// Path to config file (default: codepair.toml)
         #[arg(short, long)]
         config: Option<String>,
@@ -41,9 +34,6 @@ enum Cli {
 #[command(name = "codepair")]
 #[command(about = "A CLI-Based AI Agent Pair System", long_about = None)]
 struct Args {
-    /// GitLab repository address (e.g., https://gitlab.com/user/repo)
-    git_repo_address: String,
-
     /// Path to config file (default: codepair.toml)
     #[arg(short, long)]
     config: Option<String>,
@@ -52,24 +42,18 @@ struct Args {
 fn main() -> Result<()> {
     let cli = Cli::try_parse();
 
-    let (git_repo_address, config_path) = match cli {
+    let config_path = match cli {
         Ok(Cli::InitConfig { path }) => {
             Config::save_example(&path)?;
             println!("Example config file created at: {}", path);
-            println!("\nEdit this file to configure worker and reviewer models.");
+            println!("\nEdit this file to configure agents under [agent.*] sections.");
             println!("\nExample usage:");
-            println!("  codepair https://gitlab.com/user/repo");
-            println!("  codepair --config {} https://gitlab.com/user/repo", path);
+            println!("  codepair run");
+            println!("  codepair run --config {}", path);
             return Ok(());
         }
-        Ok(Cli::Run {
-            git_repo_address,
-            config,
-        }) => (git_repo_address, config),
-        Err(_) => {
-            let args = Args::parse();
-            (args.git_repo_address, args.config)
-        }
+        Ok(Cli::Run { config }) => config,
+        Err(_) => Args::parse().config,
     };
 
     tracing_subscriber::fmt()
@@ -79,9 +63,12 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let config = Config::load(config_path.as_deref())?;
+    let (config, content) = Config::load_with_content(config_path.as_deref())?;
+    let agent_settings = AgentSettings::from_toml_str(&content)?;
 
-    info!("Starting Codepair for repository: {}", git_repo_address);
+    if let Some(repo) = agent_settings.gitlab_repo() {
+        info!("GitLab repository: {}", repo);
+    }
 
-    agents::run(git_repo_address, config)
+    agents::run(config, agent_settings)
 }

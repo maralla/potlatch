@@ -36,7 +36,7 @@ pub trait AcpHooks: Send + Sync {
 /// Optional override for the Cursor ACP extension `cursor/ask_question`.
 ///
 /// Role-specific implementations (e.g. GitLab) live outside this module; the ACP client only
-/// invokes this when installed on [`crate::acp::orchestrator_hooks::StreamTextHooks`].
+/// invokes this when installed on [`crate::core::model::acp::orchestrator_hooks::StreamTextHooks`].
 pub trait CursorAskQuestionHandler: Send + Sync {
     /// JSON-RPC `result` for `cursor/ask_question`.
     fn handle_ask_question(&self, params: &Value) -> Value;
@@ -103,7 +103,7 @@ pub fn headless_cursor_ask_question_reply(params: &Value) -> Value {
 
 fn cursor_extension_headless_reply(method: &str, params: &Value) -> Option<Value> {
     match method {
-        "cursor/create_plan" => Some(json!({})),
+        "cursor/create_plan" => Some(json!({ "approved": true })),
         "cursor/ask_question" => Some(headless_cursor_ask_question_reply(params)),
         _ => None,
     }
@@ -113,7 +113,7 @@ fn cursor_extension_headless_reply(method: &str, params: &Value) -> Option<Value
 ///
 /// Implements [Cursor ACP extension methods](https://cursor.com/docs/cli/acp) (`cursor/create_plan`,
 /// `cursor/ask_question` when no [`CursorAskQuestionHandler`] is installed) and permission
-/// auto-selection. Used by [`crate::acp::orchestrator_hooks::StreamTextHooks`] and tests.
+/// auto-selection. Used by [`crate::core::model::acp::orchestrator_hooks::StreamTextHooks`] and tests.
 pub fn headless_agent_request_result(method: &str, params: &Value) -> Value {
     if method == "session/request_permission" {
         let option_id = pick_auto_permission_option_id(params);
@@ -396,7 +396,7 @@ impl AcpClient {
 
     /// [`session/set_config_option`](https://agentclientprotocol.com/protocol/session-config-options):
     /// `config_id` is the option's `id`; `value` must appear in that option's `options` from
-    /// `session/new` (see [`crate::acp::types::select_option_allows_value`]).
+    /// `session/new` (see [`crate::core::model::acp::types::select_option_allows_value`]).
     pub fn session_set_config_option(
         &self,
         session_id: &str,
@@ -948,11 +948,11 @@ mod tests {
         );
 
         let sid = session.session_id;
-        let opt = crate::acp::types::model_selector_for_session(
+        let opt = crate::core::model::acp::types::model_selector_for_session(
             session.config_options.as_deref().unwrap(),
         )
         .expect("model option");
-        assert!(crate::acp::types::select_option_allows_value(
+        assert!(crate::core::model::acp::types::select_option_allows_value(
             opt,
             "composer-2"
         ));

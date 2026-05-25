@@ -148,6 +148,85 @@ fn issue_thread_notes_as_comments(notes: Vec<IssueThreadNote>) -> Vec<Comment> {
 #[derive(Clone)]
 pub struct GitLabClient {
     repo_path: String,
+    host: String,
+    project_id: u64,
+}
+
+fn parse_gitlab_repo(repo_url: &str) -> Result<(String, String)> {
+    let repo_url = repo_url.trim();
+    if let Some(rest) = repo_url.strip_prefix("git@") {
+        let (host, path) = rest
+            .split_once(':')
+            .with_context(|| format!("invalid SSH gitlab_repo URL: {repo_url}"))?;
+        let path = path.trim_end_matches('/').trim_end_matches(".git");
+        anyhow::ensure!(!path.is_empty(), "missing project path in gitlab_repo");
+        return Ok((host.to_string(), path.to_string()));
+    }
+    if repo_url.starts_with("http://") || repo_url.starts_with("https://") {
+        let without_scheme = repo_url
+            .split("//")
+            .nth(1)
+            .with_context(|| format!("invalid HTTPS gitlab_repo URL: {repo_url}"))?;
+        let (host, path) = without_scheme
+            .split_once('/')
+            .with_context(|| format!("missing project path in gitlab_repo URL: {repo_url}"))?;
+        let path = path.trim_end_matches('/').trim_end_matches(".git");
+        anyhow::ensure!(!path.is_empty(), "missing project path in gitlab_repo");
+        return Ok((host.to_string(), path.to_string()));
+    }
+    anyhow::bail!("unsupported gitlab_repo URL scheme: {repo_url}");
+}
+
+fn resolve_project_id(host: &str, project_path: &str) -> Result<u64> {
+    let search_term = project_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(project_path);
+    let endpoint = format!(
+        "projects?search={}&membership=true&simple=true&per_page=50",
+        search_term
+    );
+    let output = Command::new("glab")
+        .args(["api", "--hostname", host, &endpoint])
+        .output()
+        .with_context(|| format!("Failed to resolve GitLab project id for {project_path}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to resolve GitLab project id for {}: {}",
+            project_path,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[derive(Deserialize)]
+    struct ProjectHit {
+        id: u64,
+        path_with_namespace: String,
+    }
+    let hits: Vec<ProjectHit> =
+        serde_json::from_slice(&output.stdout).context("Failed to parse project search JSON")?;
+    let want = project_path.to_ascii_lowercase();
+    hits.into_iter()
+        .find(|p| p.path_with_namespace.to_ascii_lowercase() == want)
+        .map(|p| p.id)
+        .with_context(|| format!("GitLab project not found for path {project_path} on {host}"))
+}
+
+fn configure_repo_glab(repo_path: &str, host: &str) -> Result<()> {
+    use std::fs;
+    use std::path::Path;
+    let config_dir = Path::new(repo_path).join(".git/glab-cli");
+    fs::create_dir_all(&config_dir).with_context(|| {
+        format!(
+            "Failed to create glab config directory {}",
+            config_dir.display()
+        )
+    })?;
+    fs::write(
+        config_dir.join("config.yml"),
+        format!("host: {host}\n"),
+    )
+    .with_context(|| format!("Failed to write glab config under {}", config_dir.display()))?;
+    Ok(())
 }
 
 /// Returns `true` when the glab/API error string suggests a transient problem worth retrying.
@@ -169,8 +248,60 @@ fn mr_label_api_error_should_retry(err_msg: &str) -> bool {
 }
 
 impl GitLabClient {
-    pub fn new(repo_path: String) -> Self {
-        Self { repo_path }
+    pub fn new(repo_path: String, gitlab_repo: &str) -> Result<Self> {
+        let (host, project_path) = parse_gitlab_repo(gitlab_repo)?;
+        let project_id = resolve_project_id(&host, &project_path)?;
+        configure_repo_glab(&repo_path, &host)?;
+        info!(
+            "GitLab client for {} on {} (project id {})",
+            project_path, host, project_id
+        );
+        Ok(Self {
+            repo_path,
+            host,
+            project_id,
+        })
+    }
+
+    fn api_path(&self, tail: &str) -> String {
+        format!("projects/{}/{}", self.project_id, tail.trim_start_matches('/'))
+    }
+
+    fn run_api(&self, endpoint: &str, extra_args: &[&str]) -> Result<std::process::Output> {
+        Command::new("glab")
+            .arg("api")
+            .arg("--hostname")
+            .arg(&self.host)
+            .arg(endpoint)
+            .args(extra_args)
+            .current_dir(&self.repo_path)
+            .output()
+            .with_context(|| format!("Failed to execute glab api {endpoint}"))
+    }
+
+    fn run_api_method(
+        &self,
+        tail: &str,
+        method: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<std::process::Output> {
+        let endpoint = self.api_path(tail);
+        let field_strings: Vec<String> = fields
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        let mut cmd = Command::new("glab");
+        cmd.arg("api")
+            .arg("--hostname")
+            .arg(&self.host)
+            .arg(&endpoint)
+            .args(["--method", method]);
+        for field in &field_strings {
+            cmd.args(["-f", field]);
+        }
+        cmd.current_dir(&self.repo_path)
+            .output()
+            .with_context(|| format!("Failed to execute glab api {method} {endpoint}"))
     }
 
     pub fn list_issues(&self) -> Result<Vec<Issue>> {
@@ -180,15 +311,10 @@ impl GitLabClient {
         let mut issues = Vec::new();
 
         loop {
-            let endpoint = format!(
-                "projects/:id/issues?state=opened&per_page={}&page={}",
-                PER_PAGE, page
-            );
-            let output = Command::new("glab")
-                .args(["api", &endpoint])
-                .current_dir(&self.repo_path)
-                .output()
-                .context("Failed to execute glab api for issue list")?;
+            let endpoint = self.api_path(&format!(
+                "issues?state=opened&per_page={PER_PAGE}&page={page}"
+            ));
+            let output = self.run_api(&endpoint, &[])?;
 
             if !output.status.success() {
                 anyhow::bail!(
@@ -217,15 +343,12 @@ impl GitLabClient {
     pub fn get_issue(&self, iid: u64) -> Result<Issue> {
         debug!("Fetching issue #{}", iid);
 
-        let output = Command::new("glab")
-            .args(["issue", "view", &iid.to_string(), "--output", "json"])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to execute glab issue view")?;
+        let endpoint = self.api_path(&format!("issues/{iid}"));
+        let output = self.run_api(&endpoint, &[])?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "glab issue view failed: {}",
+                "glab api issue view failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -239,19 +362,11 @@ impl GitLabClient {
     pub fn add_issue_label(&self, iid: u64, label: &str) -> Result<()> {
         debug!("Adding label '{}' to issue #{}", label, iid);
 
-        let endpoint = format!("projects/:id/issues/{}", iid);
-        let output = Command::new("glab")
-            .args([
-                "api",
-                &endpoint,
-                "--method",
-                "PUT",
-                "-f",
-                &format!("add_labels={}", label),
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to add label to issue")?;
+        let output = self.run_api_method(
+            &format!("issues/{iid}"),
+            "PUT",
+            &[("add_labels", label)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -266,19 +381,11 @@ impl GitLabClient {
     pub fn remove_issue_label(&self, iid: u64, label: &str) -> Result<()> {
         debug!("Removing label '{}' from issue #{}", label, iid);
 
-        let endpoint = format!("projects/:id/issues/{}", iid);
-        let output = Command::new("glab")
-            .args([
-                "api",
-                &endpoint,
-                "--method",
-                "PUT",
-                "-f",
-                &format!("remove_labels={}", label),
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to remove label from issue")?;
+        let output = self.run_api_method(
+            &format!("issues/{iid}"),
+            "PUT",
+            &[("remove_labels", label)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -293,15 +400,15 @@ impl GitLabClient {
     pub fn add_issue_comment(&self, iid: u64, comment: &str) -> Result<()> {
         debug!("Adding comment to issue #{}", iid);
 
-        let output = Command::new("glab")
-            .args(["issue", "note", &iid.to_string(), "--message", comment])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to add comment to issue")?;
+        let output = self.run_api_method(
+            &format!("issues/{iid}/notes"),
+            "POST",
+            &[("body", comment)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "glab issue note failed: {}",
+                "glab api issue note failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -312,56 +419,55 @@ impl GitLabClient {
     pub fn create_merge_request(
         &self,
         source_branch: &str,
+        target_branch: &str,
         title: &str,
         description: &str,
     ) -> Result<u64> {
-        debug!("Creating merge request from branch {}", source_branch);
+        debug!(
+            "Creating merge request from {} into {}",
+            source_branch, target_branch
+        );
 
-        let output = Command::new("glab")
-            .args([
-                "mr",
-                "create",
-                "--source-branch",
-                source_branch,
-                "--title",
-                title,
-                "--description",
-                description,
-                "--yes",
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to create merge request")?;
+        let output = self.run_api_method(
+            "merge_requests",
+            "POST",
+            &[
+                ("source_branch", source_branch),
+                ("target_branch", target_branch),
+                ("title", title),
+                ("description", description),
+            ],
+        )?;
 
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
             anyhow::bail!(
-                "glab mr create failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "glab api mr create failed: {}{}",
+                stderr,
+                if stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{stdout}")
+                }
             );
         }
 
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        #[derive(Deserialize)]
+        struct CreatedMr {
+            iid: u64,
+        }
+        let mr: CreatedMr =
+            serde_json::from_slice(&output.stdout).context("Failed to parse created MR JSON")?;
 
-        debug!("MR create stdout: {}", output_str);
-        debug!("MR create stderr: {}", stderr_str);
-
-        let mr_iid = self.extract_mr_iid(&output_str, &stderr_str)?;
-
-        Ok(mr_iid)
+        Ok(mr.iid)
     }
 
     pub fn list_merge_requests(&self) -> Result<Vec<MergeRequest>> {
         debug!("Fetching merge requests from GitLab");
 
-        let output = Command::new("glab")
-            .args([
-                "api",
-                "projects/:id/merge_requests?state=opened&per_page=100",
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to fetch merge requests via API")?;
+        let endpoint = self.api_path("merge_requests?state=opened&per_page=100");
+        let output = self.run_api(&endpoint, &[])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -379,12 +485,8 @@ impl GitLabClient {
     pub fn get_merge_request(&self, iid: u64) -> Result<MergeRequest> {
         debug!("Fetching merge request !{}", iid);
 
-        let endpoint = format!("projects/:id/merge_requests/{}", iid);
-        let output = Command::new("glab")
-            .args(["api", &endpoint])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to execute glab api for MR")?;
+        let endpoint = self.api_path(&format!("merge_requests/{iid}"));
+        let output = self.run_api(&endpoint, &[])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -404,12 +506,8 @@ impl GitLabClient {
     pub fn get_merge_request_changes(&self, iid: u64) -> Result<MergeRequestChangesSnapshot> {
         debug!("Fetching merge request !{} changes", iid);
 
-        let endpoint = format!("projects/:id/merge_requests/{}/changes", iid);
-        let output = Command::new("glab")
-            .args(["api", &endpoint])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to execute glab api for MR changes")?;
+        let endpoint = self.api_path(&format!("merge_requests/{iid}/changes"));
+        let output = self.run_api(&endpoint, &[])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -481,15 +579,8 @@ impl GitLabClient {
     pub fn get_mr_comments(&self, iid: u64) -> Result<Vec<Comment>> {
         debug!("Fetching discussions for merge request !{}", iid);
 
-        let endpoint = format!(
-            "projects/:id/merge_requests/{}/discussions?per_page=100",
-            iid
-        );
-        let output = Command::new("glab")
-            .args(["api", &endpoint])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to fetch MR discussions via API")?;
+        let endpoint = self.api_path(&format!("merge_requests/{iid}/discussions?per_page=100"));
+        let output = self.run_api(&endpoint, &[])?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -531,15 +622,8 @@ impl GitLabClient {
     }
 
     fn fetch_discussions(&self, iid: u64) -> Result<Vec<serde_json::Value>> {
-        let endpoint = format!(
-            "projects/:id/merge_requests/{}/discussions?per_page=100",
-            iid
-        );
-        let output = Command::new("glab")
-            .args(["api", &endpoint])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to fetch MR discussions via API")?;
+        let endpoint = self.api_path(&format!("merge_requests/{iid}/discussions?per_page=100"));
+        let output = self.run_api(&endpoint, &[])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -705,15 +789,11 @@ impl GitLabClient {
     pub fn resolve_discussion(&self, mr_iid: u64, discussion_id: &str) -> Result<()> {
         debug!("Resolving discussion {} on MR !{}", discussion_id, mr_iid);
 
-        let endpoint = format!(
-            "projects/:id/merge_requests/{}/discussions/{}",
-            mr_iid, discussion_id
-        );
-        let output = Command::new("glab")
-            .args(["api", &endpoint, "--method", "PUT", "-f", "resolved=true"])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to resolve discussion")?;
+        let output = self.run_api_method(
+            &format!("merge_requests/{mr_iid}/discussions/{discussion_id}"),
+            "PUT",
+            &[("resolved", "true")],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -728,22 +808,11 @@ impl GitLabClient {
     pub fn reply_to_discussion(&self, mr_iid: u64, discussion_id: &str, body: &str) -> Result<()> {
         debug!("Replying to discussion {} on MR !{}", discussion_id, mr_iid);
 
-        let endpoint = format!(
-            "projects/:id/merge_requests/{}/discussions/{}/notes",
-            mr_iid, discussion_id
-        );
-        let output = Command::new("glab")
-            .args([
-                "api",
-                &endpoint,
-                "--method",
-                "POST",
-                "-f",
-                &format!("body={}", body),
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to reply to discussion")?;
+        let output = self.run_api_method(
+            &format!("merge_requests/{mr_iid}/discussions/{discussion_id}/notes"),
+            "POST",
+            &[("body", body)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -759,15 +828,15 @@ impl GitLabClient {
     pub fn add_mr_comment(&self, iid: u64, comment: &str) -> Result<()> {
         debug!("Adding comment to merge request !{}", iid);
 
-        let output = Command::new("glab")
-            .args(["mr", "note", &iid.to_string(), "--message", comment])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to add comment to merge request")?;
+        let output = self.run_api_method(
+            &format!("merge_requests/{iid}/notes"),
+            "POST",
+            &[("body", comment)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "glab mr note failed: {}",
+                "glab api mr note failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -778,19 +847,11 @@ impl GitLabClient {
     fn create_mr_discussion(&self, iid: u64, body: &str) -> Result<String> {
         debug!("Creating discussion thread on MR !{}", iid);
 
-        let endpoint = format!("projects/:id/merge_requests/{}/discussions", iid);
-        let output = Command::new("glab")
-            .args([
-                "api",
-                &endpoint,
-                "--method",
-                "POST",
-                "-f",
-                &format!("body={}", body),
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to create MR discussion")?;
+        let output = self.run_api_method(
+            &format!("merge_requests/{iid}/discussions"),
+            "POST",
+            &[("body", body)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -824,19 +885,11 @@ impl GitLabClient {
     pub fn add_mr_label(&self, iid: u64, label: &str) -> Result<()> {
         debug!("Adding label '{}' to MR !{}", label, iid);
 
-        let endpoint = format!("projects/:id/merge_requests/{}", iid);
-        let output = Command::new("glab")
-            .args([
-                "api",
-                &endpoint,
-                "--method",
-                "PUT",
-                "-f",
-                &format!("add_labels={}", label),
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to add label to merge request")?;
+        let output = self.run_api_method(
+            &format!("merge_requests/{iid}"),
+            "PUT",
+            &[("add_labels", label)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -886,19 +939,11 @@ impl GitLabClient {
     pub fn remove_mr_label(&self, iid: u64, label: &str) -> Result<()> {
         debug!("Removing label '{}' from MR !{}", label, iid);
 
-        let endpoint = format!("projects/:id/merge_requests/{}", iid);
-        let output = Command::new("glab")
-            .args([
-                "api",
-                &endpoint,
-                "--method",
-                "PUT",
-                "-f",
-                &format!("remove_labels={}", label),
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to remove label from MR")?;
+        let output = self.run_api_method(
+            &format!("merge_requests/{iid}"),
+            "PUT",
+            &[("remove_labels", label)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -913,15 +958,15 @@ impl GitLabClient {
     pub fn merge_mr(&self, iid: u64) -> Result<()> {
         debug!("Merging merge request !{}", iid);
 
-        let output = Command::new("glab")
-            .args(["mr", "merge", &iid.to_string(), "--yes"])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to merge merge request")?;
+        let output = self.run_api_method(
+            &format!("merge_requests/{iid}/merge"),
+            "PUT",
+            &[],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "glab mr merge failed: {}",
+                "glab api mr merge failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -932,15 +977,15 @@ impl GitLabClient {
     pub fn close_mr(&self, iid: u64) -> Result<()> {
         debug!("Closing merge request !{}", iid);
 
-        let output = Command::new("glab")
-            .args(["mr", "close", &iid.to_string()])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to close merge request")?;
+        let output = self.run_api_method(
+            &format!("merge_requests/{iid}"),
+            "PUT",
+            &[("state_event", "close")],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "glab mr close failed: {}",
+                "glab api mr close failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -951,19 +996,11 @@ impl GitLabClient {
     pub fn close_issue(&self, iid: u64) -> Result<()> {
         debug!("Closing issue #{}", iid);
 
-        let endpoint = format!("projects/:id/issues/{}", iid);
-        let output = Command::new("glab")
-            .args([
-                "api",
-                &endpoint,
-                "--method",
-                "PUT",
-                "-f",
-                "state_event=close",
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to close issue")?;
+        let output = self.run_api_method(
+            &format!("issues/{iid}"),
+            "PUT",
+            &[("state_event", "close")],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -985,21 +1022,11 @@ impl GitLabClient {
     ) -> Result<()> {
         debug!("Updating MR !{} title and description", iid);
 
-        let endpoint = format!("projects/:id/merge_requests/{}", iid);
-        let output = Command::new("glab")
-            .args([
-                "api",
-                &endpoint,
-                "--method",
-                "PUT",
-                "-f",
-                &format!("title={}", title),
-                "-f",
-                &format!("description={}", description),
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to update MR")?;
+        let output = self.run_api_method(
+            &format!("merge_requests/{iid}"),
+            "PUT",
+            &[("title", title), ("description", description)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -1013,89 +1040,34 @@ impl GitLabClient {
         Ok(())
     }
 
-    fn extract_mr_iid(&self, stdout: &str, stderr: &str) -> Result<u64> {
-        // Try multiple patterns to extract MR IID
-        let patterns = vec![
-            r"!(\d+)",                  // !123
-            r"#(\d+)",                  // #123
-            r"/merge_requests/(\d+)",   // URL format
-            r"merge_requests/(\d+)",    // URL without leading slash
-            r"MR\s+!?(\d+)",            // MR !123 or MR 123
-            r"merge request\s+!?(\d+)", // merge request !123
-            r"created.*?!(\d+)",        // created !123
-        ];
-
-        // Check both stdout and stderr
-        let combined = format!("{}\n{}", stdout, stderr);
-
-        for pattern in patterns {
-            let re = regex::Regex::new(pattern).unwrap();
-            if let Some(caps) = re.captures(&combined)
-                && let Ok(iid) = caps[1].parse::<u64>()
-            {
-                debug!("Extracted MR IID {} using pattern: {}", iid, pattern);
-                return Ok(iid);
-            }
-        }
-
-        anyhow::bail!(
-            "Could not extract MR IID from output.\nStdout: {}\nStderr: {}",
-            stdout,
-            stderr
-        )
-    }
-
     pub fn create_issue(&self, title: &str, description: &str) -> Result<u64> {
         debug!("Creating issue: {}", title);
 
-        let output = Command::new("glab")
-            .args([
-                "issue",
-                "create",
-                "--title",
-                title,
-                "--description",
-                description,
-            ])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to create issue")?;
+        let output = self.run_api_method(
+            "issues",
+            "POST",
+            &[("title", title), ("description", description)],
+        )?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "glab issue create failed: {}",
+                "glab api issue create failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
 
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-
-        debug!("Issue create stdout: {}", output_str);
-        debug!("Issue create stderr: {}", stderr_str);
-
-        // Extract issue IID from output (similar to MR extraction)
-        let combined = format!("{}\n{}", output_str, stderr_str);
-        let patterns = vec![r"#(\d+)", r"issue/(\d+)", r"issues/(\d+)"];
-
-        for pattern in patterns {
-            let re = regex::Regex::new(pattern).unwrap();
-            if let Some(caps) = re.captures(&combined)
-                && let Ok(iid) = caps[1].parse::<u64>()
-            {
-                debug!("Extracted issue IID {}", iid);
-                return Ok(iid);
-            }
+        #[derive(Deserialize)]
+        struct CreatedIssue {
+            iid: u64,
         }
+        let issue: CreatedIssue =
+            serde_json::from_slice(&output.stdout).context("Failed to parse created issue JSON")?;
 
-        anyhow::bail!(
-            "Could not extract issue IID from output.\nStdout: {}\nStderr: {}",
-            output_str,
-            stderr_str
-        )
+        debug!("Created issue IID {}", issue.iid);
+        Ok(issue.iid)
     }
 
-    /// Issue notes (comments) from `glab api projects/:id/issues/:iid/discussions` — same payload as
+    /// Issue notes (comments) from GitLab issue discussions API — same payload as
     /// [`Self::get_issue_thread_notes`], mapped to [`Comment`] for prompts.
     pub fn get_issue_comments(&self, issue_iid: u64) -> Result<Vec<Comment>> {
         debug!(
@@ -1107,7 +1079,7 @@ impl GitLabClient {
         ))
     }
 
-    /// Issue thread notes with GitLab discussion ids, from `glab api projects/:id/issues/:iid/discussions`.
+    /// Issue thread notes with GitLab discussion ids from the issue discussions API.
     pub fn get_issue_thread_notes(&self, issue_iid: u64) -> Result<Vec<IssueThreadNote>> {
         debug!(
             "Fetching thread notes for issue #{} (glab api …/discussions)",
@@ -1117,12 +1089,8 @@ impl GitLabClient {
     }
 
     fn fetch_issue_discussions_via_api(&self, issue_iid: u64) -> Result<Vec<IssueThreadNote>> {
-        let endpoint = format!("projects/:id/issues/{issue_iid}/discussions");
-        let output = Command::new("glab")
-            .args(["api", &endpoint])
-            .current_dir(&self.repo_path)
-            .output()
-            .context("Failed to run glab api for issue discussions")?;
+        let endpoint = self.api_path(&format!("issues/{issue_iid}/discussions"));
+        let output = self.run_api(&endpoint, &[])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -1222,9 +1190,32 @@ pub fn mr_description_closes_issue(description: &str, issue_iid: u64) -> bool {
 mod tests {
     use super::{
         GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, mr_description_closes_issue,
-        mr_label_api_error_should_retry,
+        mr_label_api_error_should_retry, parse_gitlab_repo,
     };
     use serde_json::json;
+
+    #[test]
+    fn parse_gitlab_repo_ssh_url() {
+        let (host, path) = parse_gitlab_repo(
+            "git@git.example.com:platform/projects/data-worker.git",
+        )
+        .unwrap();
+        assert_eq!(host, "git.example.com");
+        assert_eq!(path, "platform/projects/data-worker");
+    }
+
+    #[test]
+    fn parse_gitlab_repo_https_url() {
+        let (host, path) =
+            parse_gitlab_repo("https://gitlab.com/group/sub/project.git").unwrap();
+        assert_eq!(host, "gitlab.com");
+        assert_eq!(path, "group/sub/project");
+    }
+
+    #[test]
+    fn parse_gitlab_repo_rejects_invalid_url() {
+        assert!(parse_gitlab_repo("not-a-url").is_err());
+    }
 
     #[test]
     fn discussion_location_prefers_inline_new_line() {
@@ -1349,8 +1340,7 @@ mod tests {
         ));
     }
 
-    /// Matches a single note object inside `glab api projects/:id/issues/:iid/discussions`
-    /// (verified against a live GitLab instance before relying on API-only fetching).
+    /// Matches a single note object inside GitLab issue discussions API JSON.
     #[test]
     fn issue_discussions_api_note_deserializes_to_issue_thread_note() {
         let j = json!({

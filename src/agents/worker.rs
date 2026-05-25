@@ -1,32 +1,57 @@
 use anyhow::{Context, Result};
-use rand::RngExt;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    claim, extract_project_name, extract_public_comment_block, issue_in_scope,
-    strip_public_comment_blocks, write_task_context_file,
+    claim, extract_public_comment_block, issue_in_scope, strip_public_comment_blocks,
+    write_task_context_file,
 };
-use crate::agent::Agent;
-use crate::config::WorkerConfig;
-use crate::cursor_mcp_config;
-use crate::git::GitRepo;
-use crate::gitlab::{GitLabClient, Issue};
-use crate::mcp_coord::{AgentHandoff, CoordinatorHandle};
+use crate::agents::git::GitRepo;
+use crate::agents::gitlab::{GitLabClient, Issue};
+use crate::agents::settings;
+use crate::agents::workspace::{
+    ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
+};
+use crate::core::agent::AgentHandoff;
+use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const WORKING_ON_LABEL: &str = "in-progress";
+/// Root-level file updated by Codepair after each successful worker run (impl or MR feedback).
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
 const PMO_PENDING_LABEL: &str = "pmo-pending";
 const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
 /// Human/workflow pause: worker skips the issue (no close) and releases its hold until removed.
 const WORKER_PENDING_LABEL: &str = "pending";
+
+#[derive(Debug, Clone)]
+struct WorkerConfig {
+    poll_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct WorkerAgentSettings {
+    #[serde(default = "default_worker_poll_interval")]
+    poll_interval_secs: u64,
+}
+
+fn default_worker_poll_interval() -> u64 {
+    60
+}
+
+impl WorkerAgentSettings {
+    fn from_raw(raw: &toml::Value) -> Result<Self> {
+        raw.clone()
+            .try_into()
+            .context("worker agent settings from config")
+    }
+}
 
 /// The single issue a worker is pinned to for its full lifecycle.
 struct ActiveIssue {
@@ -178,130 +203,122 @@ impl AgentState {
     }
 }
 
-fn interruptible_sleep(shutdown: &AtomicBool, duration: Duration) -> bool {
-    let interval = Duration::from_millis(200);
-    let mut remaining = duration;
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return true;
-        }
-        if remaining.is_zero() {
-            return false;
-        }
-        let sleep_time = remaining.min(interval);
-        thread::sleep(sleep_time);
-        remaining = remaining.saturating_sub(sleep_time);
-    }
-}
-
-fn state_meta(agent: &Agent) -> String {
-    let quits = agent.unexpected_quits_count();
-    if quits == 0 {
-        String::new()
-    } else {
-        format!(", {} unexpected quits", quits)
-    }
-}
-
-pub fn run(
-    repo_url: String,
+pub(crate) struct WorkerAgent {
+    state: AgentState,
+    model: AgentModel,
     config: WorkerConfig,
-    instance_id: usize,
-    shutdown: Arc<AtomicBool>,
-    base_dir: String,
-    coordinator: Option<CoordinatorHandle>,
     scope_label: String,
-) -> Result<()> {
-    let project_name = extract_project_name(&repo_url)?;
-    let agent_id = format!("worker-{}", instance_id);
-    let working_dir = super::work_dir(&base_dir, &project_name, &agent_id);
-    let sessions_dir = super::sessions_dir(&base_dir, &project_name);
+    active: Option<ActiveIssue>,
+}
 
-    let git_repo = GitRepo::new(working_dir.clone());
-    let glab = GitLabClient::new(working_dir.clone());
+impl CoreAgent for WorkerAgent {
+    type SpawnContext = crate::core::workflow::AgentSpawnContext;
 
-    let state = AgentState {
-        project_name,
-        agent_id,
-        working_dir,
-        sessions_dir,
-        git_repo,
-        glab,
-    };
-
-    if coordinator.is_some() {
-        cursor_mcp_config::refresh_mcp_mirror_best_effort(&state.working_dir);
+    fn model(&self) -> &AgentModel {
+        &self.model
     }
 
-    let bridge = coordinator
-        .as_ref()
-        .map(|c| c.register_agent(&state.agent_id))
-        .transpose()?;
-
-    let agent = Agent::new(
-        state.working_dir.clone(),
-        config.model.clone(),
-        None,
-        shutdown.clone(),
-        state.agent_id.clone(),
-        bridge,
-    );
-
-    // Try to resume an existing session from a previous run.
-    // If the session file is missing (e.g. hard kill), fall back to scanning
-    // GitLab issues for an orphaned claim label belonging to this worker.
-    let scope = crate::config::scope_label_filter(&scope_label);
-    let mut active: Option<ActiveIssue> =
-        try_resume_session(&state, scope).or_else(|| find_claimed_issue(&state, scope));
-
-    active = clear_resumed_issue_if_ignored(&state, active, scope);
-    if let Some(ref a) = active {
-        if let Some(mr_iid) = a.mr_iid {
-            info!(
-                "{}: Resumed issue #{} with MR !{}",
-                &state.agent_id, a.issue_iid, mr_iid
-            );
-        } else {
-            info!(
-                "{}: Resumed issue #{} (no MR yet)",
-                &state.agent_id, a.issue_iid
-            );
-        }
+    fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
+        vec![PeriodicTaskSpec {
+            id: "gitlab_poll",
+            interval: Duration::from_secs(self.config.poll_interval_secs),
+            jitter: JitterPolicy::BeforeEachCycle,
+            jitter_max_ms: 5000,
+            autostart: true,
+        }]
     }
 
-    info!(
-        "{}: Poll interval: {} seconds",
-        &state.agent_id, config.poll_interval_secs
-    );
-
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-
-        let jitter = rand::rng().random_range(0..5000);
-        if interruptible_sleep(&shutdown, Duration::from_millis(jitter)) {
-            break;
-        }
-
-        if let Err(e) = worker_cycle(&state, &agent, &mut active, &shutdown, scope) {
-            if shutdown.load(Ordering::SeqCst) {
-                break;
+    fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
+        match task_id {
+            "gitlab_poll" => {
+                let scope = crate::agents::scope_label_filter(&self.scope_label);
+                let model = &self.model;
+                let shutdown = Arc::clone(model.shutdown());
+                if let Err(e) = worker_cycle(&self.state, model, &mut self.active, &shutdown, scope)
+                {
+                    if !shutdown.load(Ordering::SeqCst) {
+                        error!("{}: Cycle error: {}", self.state.agent_id, e);
+                    }
+                }
+                Ok(())
             }
-
-            error!("{}: Cycle error: {}", &state.agent_id, e);
-        }
-
-        if interruptible_sleep(&shutdown, Duration::from_secs(config.poll_interval_secs)) {
-            break;
+            _ => Ok(()),
         }
     }
 
-    info!("{}: Shutting down, cleaning up...", &state.agent_id);
-    state.cleanup_on_shutdown(&active);
-    info!("{}: Stopped", &state.agent_id);
+    fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
+        let gitlab_repo = require_gitlab_repo()?;
+        let section = ctx
+            .workflow
+            .config
+            .agent("worker")
+            .context("[agent.worker] section required")?;
+        let settings = WorkerAgentSettings::from_raw(&section.raw)?;
+        let project_name = extract_project_name(&gitlab_repo)?;
+        let agent_id = format!("worker-{}", ctx.instance_id);
+        ensure_agent_repo(
+            &ctx.workflow.base_dir,
+            &gitlab_repo,
+            &project_name,
+            &agent_id,
+        )?;
+        let working_dir = work_dir(&ctx.workflow.base_dir, &project_name, &agent_id);
+        let sessions_dir = sessions_dir(&ctx.workflow.base_dir, &project_name);
+        let git_repo = GitRepo::new(working_dir.clone());
+        let glab = GitLabClient::new(working_dir.clone(), &gitlab_repo)?;
+        let state = AgentState {
+            project_name,
+            agent_id: agent_id.clone(),
+            working_dir: working_dir.clone(),
+            sessions_dir,
+            git_repo,
+            glab,
+        };
+        let config = WorkerConfig {
+            poll_interval_secs: settings.poll_interval_secs,
+        };
+        let model = AgentModel::connect(
+            &ctx,
+            "worker",
+            state.working_dir.clone(),
+            ModelPreferences::worker(),
+        )?;
+        let agent_settings = settings::settings();
+        let scope = agent_settings.scope_label_filter();
+        let mut active =
+            try_resume_session(&state, scope).or_else(|| find_claimed_issue(&state, scope));
+        active = clear_resumed_issue_if_ignored(&state, active, scope);
+        if let Some(ref a) = active {
+            if let Some(mr_iid) = a.mr_iid {
+                info!(
+                    "{}: Resumed issue #{} with MR !{}",
+                    &state.agent_id, a.issue_iid, mr_iid
+                );
+            } else {
+                info!(
+                    "{}: Resumed issue #{} (no MR yet)",
+                    &state.agent_id, a.issue_iid
+                );
+            }
+        }
+        info!(
+            "{}: Poll interval: {} seconds",
+            state.agent_id, config.poll_interval_secs
+        );
+        Ok(Self {
+            state,
+            model,
+            config,
+            scope_label: agent_settings.scope_label.clone(),
+            active,
+        })
+    }
 
-    Ok(())
+    fn on_shutdown(&mut self) {
+        info!("{}: Shutting down, cleaning up...", self.state.agent_id);
+        self.state.cleanup_on_shutdown(&self.active);
+        info!("{}: Stopped", self.state.agent_id);
+    }
 }
 
 fn clear_resumed_issue_if_ignored(
@@ -360,15 +377,11 @@ fn clear_resumed_issue_if_ignored(
 
 fn worker_cycle(
     state: &AgentState,
-    agent: &Agent,
+    model: &AgentModel,
     active: &mut Option<ActiveIssue>,
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Result<()> {
-    if agent.mcp_registered() {
-        cursor_mcp_config::refresh_mcp_mirror_best_effort(&state.working_dir);
-    }
-
     // If we have an active issue with an MR, watch the MR
     if let Some(a) = &*active
         && let Some(mr_iid) = a.mr_iid
@@ -445,7 +458,7 @@ fn worker_cycle(
                     return Ok(());
                 }
 
-                match handle_mr_comments(state, agent, &mr, Some(a.issue_iid), false) {
+                match handle_mr_comments(state, model, &mr, Some(a.issue_iid), false) {
                     Ok(true) => {
                         info!(
                             "{}: Issue #{} abandoned, MR !{} closed",
@@ -530,7 +543,7 @@ fn worker_cycle(
                     mr_created: false,
                 };
 
-                match process_issue(state, agent, &issue, &mut current, scope_label) {
+                match process_issue(state, model, &issue, &mut current, scope_label) {
                     Ok(_) => {
                         if current.mr_created {
                             *active = Some(current);
@@ -601,7 +614,7 @@ fn worker_cycle(
     }
 
     // No orphaned sessions — poll for new issues
-    if try_handle_need_ai_worker_mr(state, agent, shutdown, scope_label)? {
+    if try_handle_need_ai_worker_mr(state, model, shutdown, scope_label)? {
         return Ok(());
     }
 
@@ -663,7 +676,7 @@ fn worker_cycle(
             mr_created: false,
         };
 
-        match process_issue(state, agent, &issue, &mut current, scope_label) {
+        match process_issue(state, model, &issue, &mut current, scope_label) {
             Ok(_) => {
                 if current.mr_created {
                     *active = Some(current);
@@ -705,14 +718,14 @@ fn worker_cycle(
         info!(
             "{}: Idle, no issues to work on{}",
             &state.agent_id,
-            state_meta(agent)
+            model.runtime_meta()
         );
     }
 
     Ok(())
 }
 
-fn mr_has_label(mr: &crate::gitlab::MergeRequest, label: &str) -> bool {
+fn mr_has_label(mr: &crate::agents::gitlab::MergeRequest, label: &str) -> bool {
     mr.labels
         .as_ref()
         .is_some_and(|ls| ls.iter().any(|l| l.eq_ignore_ascii_case(label)))
@@ -722,7 +735,7 @@ fn mr_has_label(mr: &crate::gitlab::MergeRequest, label: &str) -> bool {
 /// claim MR directly, address unresolved discussions, then release claim.
 fn try_handle_need_ai_worker_mr(
     state: &AgentState,
-    agent: &Agent,
+    model: &AgentModel,
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Result<bool> {
@@ -762,7 +775,7 @@ fn try_handle_need_ai_worker_mr(
             NEED_AI_WORKER_LABEL,
             unresolved.len()
         );
-        let result = handle_mr_comments(state, agent, &mr, None, true);
+        let result = handle_mr_comments(state, model, &mr, None, true);
         let _ = claim::release_mr_claim(&state.glab, mr.iid, &state.agent_id);
         result?;
         return Ok(true);
@@ -815,7 +828,7 @@ fn closes_keyword_mr_status(gitlab: &GitLabClient, issue_iid: u64) -> Option<Clo
     let mut opens: Vec<u64> = Vec::new();
     let mut any_merged = false;
     for mr in mrs {
-        if !crate::gitlab::mr_description_closes_issue(&mr.description, issue_iid) {
+        if !crate::agents::gitlab::mr_description_closes_issue(&mr.description, issue_iid) {
             continue;
         }
         match mr.state.as_str() {
@@ -875,7 +888,7 @@ fn has_worker_skip_label(labels: &[String]) -> bool {
 
 fn process_issue(
     state: &AgentState,
-    agent: &Agent,
+    model: &AgentModel,
     issue: &Issue,
     current: &mut ActiveIssue,
     scope_label: Option<&str>,
@@ -988,15 +1001,14 @@ fn process_issue(
         build_implementation_prompt(state, issue, &gl_comments)?
     };
 
+    let glab = state.glab.clone();
     let issue_iid_for_cancel = issue.iid;
-    let cancel_check = || {
-        state
-            .glab
-            .get_issue(issue_iid_for_cancel)
+    let cancel_check: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+        glab.get_issue(issue_iid_for_cancel)
             .is_ok_and(|i| i.state != "opened")
-    };
+    });
 
-    let agent_output = agent.run_with_cancel(&prompt, Some(&cancel_check), None)?;
+    let agent_output = model.complete_with_cancel(&prompt, cancel_check)?;
 
     if output_signals_cannot_implement(&agent_output) {
         let reason = if output_needs_split(&agent_output) {
@@ -1082,9 +1094,12 @@ fn process_issue(
         extract_mr_description(&agent_output)
     );
 
-    let mr_iid = state
-        .glab
-        .create_merge_request(&branch_name, &mr_title, &mr_description)?;
+    let mr_iid = state.glab.create_merge_request(
+        &branch_name,
+        &default_branch,
+        &mr_title,
+        &mr_description,
+    )?;
     current.mr_iid = Some(mr_iid);
     current.mr_created = true;
 
@@ -1113,8 +1128,8 @@ fn process_issue(
 /// the MR was closed + issue rejected.
 fn handle_mr_comments(
     state: &AgentState,
-    agent: &Agent,
-    mr: &crate::gitlab::MergeRequest,
+    model: &AgentModel,
+    mr: &crate::agents::gitlab::MergeRequest,
     linked_issue_iid: Option<u64>,
     comments_only_mode: bool,
 ) -> Result<bool> {
@@ -1182,7 +1197,8 @@ fn handle_mr_comments(
         );
     }
 
-    let issue_number = linked_issue_iid.or_else(|| extract_issue_number_from_branch(&latest_mr.source_branch).ok());
+    let issue_number = linked_issue_iid
+        .or_else(|| extract_issue_number_from_branch(&latest_mr.source_branch).ok());
     let issue_context = issue_number
         .map(|n| load_issue_context(&state.glab, n))
         .transpose()?
@@ -1265,7 +1281,7 @@ INSTRUCTIONS:
 14. If the reviewer asked you to fix the MR title or description, include updated versions in your response:
    MR_TITLE: <SHORT title (max 8-10 words) stating the main feature or fix — no enumeration of details, no markdown. It must describe the overall MR, not just the latest incremental change. Do NOT change the title just because you made another follow-up commit; keep it stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.>
    MR_DESCRIPTION:
-   <full description with goal, implementation, and testing sections — NEVER include PUBLIC_COMMENT_BEGIN/END here; those markers are only for thread replies below>
+   <full description with goal, implementation, and testing sections — NEVER include PUBLIC_COMMENT_BEGIN/END here; those markers are only for thread replies below; NEVER paste or quote text from repo-root notes.md here>
 15. After addressing feedback, provide a summary:
    CHANGES_SUMMARY: <A concise sentence summarizing the substance of the changes made — this will be used as the git commit message, so it must convey the main idea of what was changed>
 16. For any human-facing GitLab comment/reply text, include a stable block:
@@ -1276,6 +1292,7 @@ INSTRUCTIONS:
    - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
    - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not fix the comment (e.g. explaining why the current code already satisfies it, partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
    - If you omit this line: the system assumes `yes` when it detects resolving actions: new commits (including rebases) on the MR branch, the MR title/description or labels changed on GitLab, or the remote branch tip moved. It assumes `no` only when none of those happened and you made no code changes.
+18. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR_DESCRIPTION, MR_TITLE, PUBLIC_COMMENT, or any GitLab field.
 
 REMINDER: You are fully autonomous. Execute every command, test, and file operation yourself. Never output instructions for a human.
 
@@ -1285,15 +1302,14 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     );
 
     let agent_output = if let Some(issue_number) = issue_number {
-        let cancel_check = || {
-            state
-                .glab
-                .get_issue(issue_number)
+        let glab = state.glab.clone();
+        let cancel_check: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+            glab.get_issue(issue_number)
                 .is_ok_and(|i| i.state != "opened")
-        };
-        agent.run_with_cancel(&prompt, Some(&cancel_check), None)?
+        });
+        model.complete_with_cancel(&prompt, cancel_check)?
     } else {
-        agent.run_with_cancel(&prompt, None, None)?
+        model.complete_prompt(&prompt)?
     };
 
     if output_signals_cannot_resolve(&agent_output) {
@@ -1393,8 +1409,15 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     let mr_now = state.glab.get_merge_request(latest_mr.iid)?;
     let mr_gitlab_surface_changed = merge_request_surface_changed(&latest_mr, &mr_now);
 
-    let implicit_resolve_discussions =
-        has_new_changes || branch_tip_changed || mr_gitlab_surface_changed;
+    // Only auto-resolve when the branch tip actually changed. MR metadata-only
+    // changes (title/description/labels) can happen without addressing feedback.
+    let implicit_resolve_discussions = has_new_changes || branch_tip_changed;
+    if mr_gitlab_surface_changed && !implicit_resolve_discussions {
+        info!(
+            "MR !{} metadata changed without branch updates; discussions will remain open unless explicitly requested",
+            latest_mr.iid
+        );
+    }
 
     // Re-fetch unresolved discussions — the original list may have been empty
     // if we were triggered by has_conflicts alone. After pushing, resolve all
@@ -1849,7 +1872,7 @@ fn load_issue_context(gitlab: &GitLabClient, issue_number: u64) -> Result<String
 
 fn abandon_mr(
     state: &AgentState,
-    mr: &crate::gitlab::MergeRequest,
+    mr: &crate::agents::gitlab::MergeRequest,
     issue_iid: u64,
     reason: &str,
 ) -> Result<()> {
@@ -2008,7 +2031,11 @@ fn strip_worker_reply_boilerplate(text: &str) -> String {
         }
     }
     let cleaned = strip_diff_highlights_block(trimmed);
-    let base = if cleaned.is_empty() { trimmed } else { &cleaned };
+    let base = if cleaned.is_empty() {
+        trimmed
+    } else {
+        &cleaned
+    };
     let sanitized = base.trim();
     if sanitized.is_empty() {
         "Addressed the requested feedback.".to_string()
@@ -2047,8 +2074,8 @@ fn should_resolve_mr_feedback_discussions(
 /// True when MR title, description, or labels differ between two GitLab snapshots (e.g. metadata
 /// edit, label added/removed).
 fn merge_request_surface_changed(
-    before: &crate::gitlab::MergeRequest,
-    after: &crate::gitlab::MergeRequest,
+    before: &crate::agents::gitlab::MergeRequest,
+    after: &crate::agents::gitlab::MergeRequest,
 ) -> bool {
     before.title.trim() != after.title.trim()
         || before.description.trim() != after.description.trim()
@@ -2102,7 +2129,7 @@ fn build_diff_highlights_since(git_repo: &GitRepo, base_ref: &str) -> Option<Str
 
 fn build_mr_diff_context(
     project_name: &str,
-    mr: &crate::gitlab::MergeRequest,
+    mr: &crate::agents::gitlab::MergeRequest,
     git_repo: &GitRepo,
     gitlab: &GitLabClient,
 ) -> String {
@@ -2197,7 +2224,7 @@ fn build_mr_diff_context(
 
 fn build_combined_mr_feedback_context(
     project_name: &str,
-    mr: &crate::gitlab::MergeRequest,
+    mr: &crate::agents::gitlab::MergeRequest,
     issue_context: &str,
     implementation_summary: &str,
     all_comments_text: &str,
@@ -2255,24 +2282,6 @@ fn extract_no_change_resolution_reason(agent_output: &AgentHandoff) -> String {
             raw.trim()
         };
         let cleaned = strip_markdown_formatting(line);
-        if !cleaned.is_empty() {
-            return cleaned;
-        }
-    }
-
-    for line in agent_output.response.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.ends_with(':') {
-            continue;
-        }
-        let is_marker = trimmed.chars().all(|c| c.is_ascii_uppercase() || c == '_');
-        if is_marker {
-            continue;
-        }
-        let cleaned = strip_markdown_formatting(trimmed);
         if !cleaned.is_empty() {
             return cleaned;
         }
@@ -2506,7 +2515,8 @@ fn get_common_requirements() -> &'static str {
 - Do NOT create merge requests or pull requests (e.g. via `glab mr create`, `gh pr create`, or any API call) — the system creates them automatically after you finish
 - If information is missing, document what's needed in your response (do not ask interactively)
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
-- Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed"#
+- Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed
+- Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules (see MANDATORY OUTPUT): not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments"#
 }
 
 fn get_scope_rules(is_continuation: bool) -> String {
@@ -2573,7 +2583,27 @@ Do NOT put PUBLIC_COMMENT_BEGIN / PUBLIC_COMMENT_END inside MR_DESCRIPTION or MR
 For any human-facing GitLab comment text (separate from the MR description), also include:
 PUBLIC_COMMENT_BEGIN
 <final public comment only; no progress/status logs>
-PUBLIC_COMMENT_END"#
+PUBLIC_COMMENT_END
+
+NOTES.MD (agent-maintained in the repo — edit before you finish **only if** you earn real bullets):
+- Open or create notes.md at the repository root. Append **0–3** new "- " lines this run (often **0**). Each line is **one** short sentence capturing a **genuine surprise, near-mistake, or emotional friction** from the run — something you almost got wrong or that wasted time — expressed so a stranger learns the *habit of noticing*, not the *contents of this MR*.
+
+HARD REJECT (if a line violates any of these, delete it — do not append):
+- Backticks, file or directory paths, dotted import paths, or shell snippets tied to this repo layout.
+- Names of this project's classes, functions, modules, config keys, env vars, or third-party symbols (anything a reader would grep for in *this* tree).
+- Documentation-style explanation of how this tree works — put that in MR description or code, not notes.
+- Obvious restatements of AGENTS.md / the issue / standard practice, and hollow platitudes ("write tests", "read carefully").
+- **Abstract recap of your implementation** dressed as advice: if the line is basically "what we changed" or "how we tested" in generic software-engineering words (single source of truth for identifiers, test through public API, stub optional deps, match CI cwd when running tests, etc.) **without** a sharp *I almost messed this up because…* insight, it is **rubbish** — delete it.
+- **Meta about notes.md** (e.g. "keep notes short and transferable", "agent-maintained") — never; that parrots instructions, not experience.
+- Anything that could appear unchanged on a generic "best practices" slide deck with no story of *what tripped you* — delete it.
+
+SELF-CHECK before saving: (1) "Would this still help on a **different** repo without opening our source?" If no, drop. (2) "Could I have written this bullet **before** starting this task?" If yes, drop. If **no** line survives, append nothing this run.
+
+BAD STYLE (examples of rubbish — do not imitate):
+- In-repo code tours (paths, classes, long semicolon chains).
+- "Timeless" bullets that are really your MR summary: composable naming over literals, property vs field assumptions, stub heavy imports, run tests like automation, cwd/import wiring — unless each line names a **non-obvious failure mode you personally hit** in **one** concrete clause (still without paths or symbol names).
+
+Stay concise; no secrets. That file is committed with your other changes. Never paste or quote any text from notes.md into MR_TITLE, MR_DESCRIPTION, PUBLIC_COMMENT, or anywhere on GitLab — those surfaces are for humans/reviewers only."#
 }
 
 fn extract_split_reason(agent_output: &AgentHandoff) -> String {
@@ -2836,22 +2866,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_project_name() {
-        assert_eq!(
-            extract_project_name("https://gitlab.com/user/project").unwrap(),
-            "project"
-        );
-        assert_eq!(
-            extract_project_name("https://gitlab.com/user/project.git").unwrap(),
-            "project"
-        );
-        assert_eq!(
-            extract_project_name("https://gitlab.com/user/project/").unwrap(),
-            "project"
-        );
-    }
-
-    #[test]
     fn test_should_skip_issue() {
         let mut issue = Issue {
             iid: 1,
@@ -3014,7 +3028,10 @@ mod tests {
     #[test]
     fn strip_worker_reply_boilerplate_uses_public_comment_block() {
         let input = "Addressed feedback:\n\nPUBLIC_COMMENT_BEGIN\nFinal reviewer reply.\nPUBLIC_COMMENT_END";
-        assert_eq!(strip_worker_reply_boilerplate(input), "Final reviewer reply.");
+        assert_eq!(
+            strip_worker_reply_boilerplate(input),
+            "Final reviewer reply."
+        );
     }
 
     #[test]
@@ -3039,8 +3056,34 @@ mod tests {
     }
 
     #[test]
+    fn extract_no_change_resolution_reason_ignores_freeform_planning_text() {
+        let out = AgentHandoff {
+            response: "I'll help you address the reviewer feedback.\nLet me inspect files first."
+                .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_no_change_resolution_reason(&out),
+            "No source changes were required; the feedback is already satisfied by the current implementation."
+        );
+    }
+
+    #[test]
+    fn extract_no_change_resolution_reason_prefers_structured_reason_marker() {
+        let out = AgentHandoff {
+            response: "Some analysis\nREASON: Property deletion already removes stored data on schema update."
+                .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_no_change_resolution_reason(&out),
+            "Property deletion already removes stored data on schema update."
+        );
+    }
+
+    #[test]
     fn merge_request_surface_changed_detects_title_labels() {
-        use crate::gitlab::MergeRequest;
+        use crate::agents::gitlab::MergeRequest;
         let a = MergeRequest {
             iid: 1,
             title: "Old".into(),

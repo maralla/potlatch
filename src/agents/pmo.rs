@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use rand::RngExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,24 +7,56 @@ use std::path;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-use super::{
-    claim, extract_project_name, extract_public_comment_block, issue_in_scope, labels, pmo_cursor_ask,
+use super::{claim, extract_public_comment_block, issue_in_scope, labels, pmo_cursor_ask};
+use crate::agents::git::GitRepo;
+use crate::agents::gitlab::{self, GitLabClient, Issue};
+use crate::agents::settings;
+use crate::agents::workspace::{
+    ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
 };
-use crate::acp::workspace_read::read_text_file_under_workspace;
-use crate::agent::Agent;
-use crate::config::PmoConfig;
-use crate::cursor_mcp_config;
-use crate::git::GitRepo;
-use crate::gitlab::{self, GitLabClient, Issue};
-use crate::mcp_coord::CoordinatorHandle;
-use crate::mcp_coord::{AgentHandoff, HandoffSubIssue};
+use crate::core::agent::{AgentHandoff, HandoffSubIssue};
+use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::model::acp::workspace_read::read_text_file_under_workspace;
+use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
+
+#[derive(Debug, Clone)]
+struct PmoConfig {
+    poll_interval_secs: u64,
+    cursor_ask_via_gitlab: bool,
+    cursor_ask_gitlab_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PmoAgentSettings {
+    #[serde(default = "default_pmo_poll_interval")]
+    poll_interval_secs: u64,
+    #[serde(default)]
+    cursor_ask_via_gitlab: bool,
+    #[serde(default = "default_cursor_ask_gitlab_timeout_secs")]
+    cursor_ask_gitlab_timeout_secs: u64,
+}
+
+fn default_pmo_poll_interval() -> u64 {
+    180
+}
+
+fn default_cursor_ask_gitlab_timeout_secs() -> u64 {
+    600
+}
+
+impl PmoAgentSettings {
+    fn from_raw(raw: &toml::Value) -> Result<Self> {
+        raw.clone()
+            .try_into()
+            .context("pmo agent settings from config")
+    }
+}
 
 struct AgentState {
     sessions_dir: String,
@@ -77,149 +108,147 @@ impl AgentState {
     }
 }
 
-fn interruptible_sleep(shutdown: &AtomicBool, duration: Duration) -> bool {
-    let interval = Duration::from_millis(200);
-    let mut remaining = duration;
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return true;
-        }
-        if remaining.is_zero() {
-            return false;
-        }
-        let sleep_time = remaining.min(interval);
-        thread::sleep(sleep_time);
-        remaining = remaining.saturating_sub(sleep_time);
-    }
-}
-
-fn state_meta(agent: &Agent) -> String {
-    let quits = agent.unexpected_quits_count();
-    if quits == 0 {
-        String::new()
-    } else {
-        format!(", {} unexpected quits", quits)
-    }
-}
-
-pub fn run(
-    repo_url: String,
+pub(crate) struct PmoAgent {
+    state: AgentState,
+    git_repo: GitRepo,
+    gitlab: GitLabClient,
+    model: AgentModel,
     config: PmoConfig,
-    instance_id: usize,
-    shutdown: Arc<AtomicBool>,
-    base_dir: String,
-    coordinator: Option<CoordinatorHandle>,
     scope_label: String,
-) -> Result<()> {
-    let project_name = extract_project_name(&repo_url)?;
-    let agent_id = format!("pmo-{}", instance_id);
-    let pmo_dir = super::work_dir(&base_dir, &project_name, &agent_id);
-    let sessions_dir = super::sessions_dir(&base_dir, &project_name);
+    claimed_issue_iid: Option<u64>,
+}
 
-    let state = AgentState {
-        sessions_dir: sessions_dir,
-        working_dir: pmo_dir,
-        agent_id: agent_id,
-        project_name,
-    };
+impl CoreAgent for PmoAgent {
+    type SpawnContext = crate::core::workflow::AgentSpawnContext;
 
-    state.ensure_sessions_dir()?;
-
-    let git_repo = GitRepo::new(state.working_dir.clone());
-    let gitlab = GitLabClient::new(state.working_dir.clone());
-
-    if coordinator.is_some() {
-        cursor_mcp_config::refresh_mcp_mirror_best_effort(&state.working_dir);
+    fn model(&self) -> &AgentModel {
+        &self.model
     }
 
-    let bridge = coordinator
-        .as_ref()
-        .map(|c| c.register_agent(&state.agent_id))
-        .transpose()?;
-    let agent = Agent::new(
-        state.working_dir.clone(),
-        config.model.clone(),
-        Some(crate::agent::PREFERRED_SESSION_MODE_PMO),
-        shutdown.clone(),
-        state.agent_id.clone(),
-        bridge,
-    );
+    fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
+        vec![PeriodicTaskSpec {
+            id: "gitlab_poll",
+            interval: Duration::from_secs(self.config.poll_interval_secs),
+            jitter: JitterPolicy::BeforeEachCycle,
+            jitter_max_ms: 5000,
+            autostart: true,
+        }]
+    }
 
-    let scope = crate::config::scope_label_filter(&scope_label);
-    let mut claimed_issue_iid: Option<u64> = try_resume_pmo_state(&state, &gitlab, scope);
-
-    if let Some(iid) = claimed_issue_iid {
-        match (gitlab.get_issue(iid), gitlab.list_issues()) {
-            (Ok(issue), Ok(issues)) => {
-                if let Err(e) = refresh_pmo_issue_context_file(&state, &gitlab, &issue, &issues) {
-                    warn!(
-                        "{}: Could not refresh PMO context file after resuming claim on #{}: {}",
-                        &state.agent_id, iid, e
-                    );
+    fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
+        match task_id {
+            "gitlab_poll" => {
+                let scope = crate::agents::scope_label_filter(&self.scope_label);
+                let model = &self.model;
+                let shutdown = Arc::clone(model.shutdown());
+                if let Err(e) = pmo_cycle(
+                    &self.state,
+                    &self.git_repo,
+                    &self.gitlab,
+                    model,
+                    &mut self.claimed_issue_iid,
+                    Arc::clone(&shutdown),
+                    scope,
+                    &self.config,
+                ) {
+                    if !shutdown.load(Ordering::SeqCst) {
+                        error!("{}: Cycle error: {}", self.state.agent_id, e);
+                    }
                 }
+                Ok(())
             }
-            (Err(e), _) => warn!(
-                "{}: Could not fetch issue #{} to refresh context after resume: {}",
-                &state.agent_id, iid, e
-            ),
-            (_, Err(e)) => warn!(
-                "{}: Could not list issues to refresh context after resume: {}",
-                &state.agent_id, e
-            ),
+            _ => Ok(()),
         }
     }
 
-    info!(
-        "{}: Poll interval: {} seconds",
-        &state.agent_id, config.poll_interval_secs
-    );
-
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-
-        let jitter = rand::rng().random_range(0..5000);
-        if interruptible_sleep(&shutdown, Duration::from_millis(jitter)) {
-            break;
-        }
-
-        if let Err(e) = pmo_cycle(
-            &state,
-            &git_repo,
-            &gitlab,
-            &agent,
-            &mut claimed_issue_iid,
-            Arc::clone(&shutdown),
-            scope,
-            &config,
-        ) {
-            if shutdown.load(Ordering::SeqCst) {
-                break;
+    fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
+        let gitlab_repo = require_gitlab_repo()?;
+        let section = ctx
+            .workflow
+            .config
+            .agent("pmo")
+            .context("[agent.pmo] section required")?;
+        let settings = PmoAgentSettings::from_raw(&section.raw)?;
+        let project_name = extract_project_name(&gitlab_repo)?;
+        let agent_id = format!("pmo-{}", ctx.instance_id);
+        ensure_agent_repo(
+            &ctx.workflow.base_dir,
+            &gitlab_repo,
+            &project_name,
+            &agent_id,
+        )?;
+        let pmo_dir = work_dir(&ctx.workflow.base_dir, &project_name, &agent_id);
+        let sessions_dir = sessions_dir(&ctx.workflow.base_dir, &project_name);
+        let state = AgentState {
+            sessions_dir,
+            working_dir: pmo_dir.clone(),
+            agent_id: agent_id.clone(),
+            project_name,
+        };
+        state.ensure_sessions_dir()?;
+        let config = PmoConfig {
+            poll_interval_secs: settings.poll_interval_secs,
+            cursor_ask_via_gitlab: settings.cursor_ask_via_gitlab,
+            cursor_ask_gitlab_timeout_secs: settings.cursor_ask_gitlab_timeout_secs,
+        };
+        let git_repo = GitRepo::new(state.working_dir.clone());
+        let gitlab = GitLabClient::new(state.working_dir.clone(), &gitlab_repo)?;
+        let model = AgentModel::connect(
+            &ctx,
+            "pmo",
+            state.working_dir.clone(),
+            ModelPreferences::pmo(),
+        )?;
+        let agent_settings = settings::settings();
+        let scope = agent_settings.scope_label_filter();
+        let claimed_issue_iid = try_resume_pmo_state(&state, &gitlab, scope);
+        if let Some(iid) = claimed_issue_iid {
+            match (gitlab.get_issue(iid), gitlab.list_issues()) {
+                (Ok(issue), Ok(issues)) => {
+                    if let Err(e) = refresh_pmo_issue_context_file(&state, &gitlab, &issue, &issues)
+                    {
+                        warn!(
+                            "{}: Could not refresh PMO context file after resuming claim on #{}: {}",
+                            &state.agent_id, iid, e
+                        );
+                    }
+                }
+                (Err(e), _) => warn!(
+                    "{}: Could not fetch issue #{} to refresh context after resume: {}",
+                    &state.agent_id, iid, e
+                ),
+                (_, Err(e)) => warn!(
+                    "{}: Could not list issues to refresh context after resume: {}",
+                    &state.agent_id, e
+                ),
             }
-
-            error!("{}: Cycle error: {}", &state.agent_id, e);
         }
-
-        if interruptible_sleep(&shutdown, Duration::from_secs(config.poll_interval_secs)) {
-            break;
-        }
-    }
-
-    info!("{}: Shutting down, cleaning up...", &state.agent_id);
-
-    if let Some(issue_iid) = claimed_issue_iid {
         info!(
-            "{}: Preserving claim on issue #{} for restart",
-            &state.agent_id, issue_iid
+            "{}: Poll interval: {} seconds",
+            state.agent_id, config.poll_interval_secs
         );
-
-        state.save_state(issue_iid);
+        Ok(Self {
+            state,
+            git_repo,
+            gitlab,
+            model,
+            config,
+            scope_label: agent_settings.scope_label.clone(),
+            claimed_issue_iid,
+        })
     }
 
-    info!("{}: Stopped", &state.agent_id);
-
-    Ok(())
+    fn on_shutdown(&mut self) {
+        info!("{}: Shutting down, cleaning up...", self.state.agent_id);
+        if let Some(issue_iid) = self.claimed_issue_iid {
+            info!(
+                "{}: Preserving claim on issue #{} for restart",
+                self.state.agent_id, issue_iid
+            );
+            self.state.save_state(issue_iid);
+        }
+        info!("{}: Stopped", self.state.agent_id);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -227,16 +256,12 @@ fn pmo_cycle(
     state: &AgentState,
     git_repo: &GitRepo,
     gitlab: &GitLabClient,
-    agent: &Agent,
+    model: &AgentModel,
     claimed_issue_iid: &mut Option<u64>,
     shutdown: Arc<AtomicBool>,
     scope_label: Option<&str>,
     pmo_config: &PmoConfig,
 ) -> Result<()> {
-    if agent.mcp_registered() {
-        cursor_mcp_config::refresh_mcp_mirror_best_effort(&state.working_dir);
-    }
-
     let default_branch = git_repo.get_default_branch()?;
     git_repo.fetch()?;
 
@@ -431,7 +456,7 @@ fn pmo_cycle(
         match process_action_required_issue(
             state,
             gitlab,
-            agent,
+            model,
             issue,
             &issues,
             scope_label,
@@ -479,7 +504,7 @@ fn pmo_cycle(
         info!(
             "{}: No action-required issues found{}",
             &state.agent_id,
-            state_meta(agent)
+            model.runtime_meta()
         );
     }
 
@@ -663,7 +688,7 @@ fn should_process_issue(issue: &Issue, scope_label: Option<&str>) -> bool {
 fn process_action_required_issue(
     state: &AgentState,
     gitlab: &GitLabClient,
-    agent: &Agent,
+    model: &AgentModel,
     issue: &Issue,
     all_issues: &[Issue],
     scope_label: Option<&str>,
@@ -674,31 +699,41 @@ fn process_action_required_issue(
     let context_path = refresh_pmo_issue_context_file(state, gitlab, issue, all_issues)?;
     let prompt = build_split_prompt(state, issue, &context_path, parent_priority)?;
 
-    let ask_handler: Option<std::sync::Arc<dyn crate::acp::client::CursorAskQuestionHandler>> =
-        if pmo_config.cursor_ask_via_gitlab {
-            let timeout = if pmo_config.cursor_ask_gitlab_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(
-                    pmo_config.cursor_ask_gitlab_timeout_secs,
-                ))
-            } else {
-                None
-            };
-            Some(std::sync::Arc::new(
-                pmo_cursor_ask::GitLabIssueCursorAskHandler::new(
-                    issue.iid,
-                    gitlab.clone(),
-                    Arc::clone(&shutdown),
-                    timeout,
-                ),
+    let ask_handler: Option<
+        std::sync::Arc<dyn crate::core::model::acp::client::CursorAskQuestionHandler>,
+    > = if pmo_config.cursor_ask_via_gitlab {
+        let timeout = if pmo_config.cursor_ask_gitlab_timeout_secs > 0 {
+            Some(std::time::Duration::from_secs(
+                pmo_config.cursor_ask_gitlab_timeout_secs,
             ))
         } else {
             None
         };
+        Some(std::sync::Arc::new(
+            pmo_cursor_ask::GitLabIssueCursorAskHandler::new(
+                issue.iid,
+                gitlab.clone(),
+                Arc::clone(&shutdown),
+                timeout,
+            ),
+        ))
+    } else {
+        None
+    };
 
-    let agent_output = pmo_apply_cursor_plan_files(
-        &state.working_dir,
-        agent.run_with_cancel(&prompt, None, ask_handler)?,
-    );
+    let mut agent_output = model.complete_with_ask_handler(&prompt, ask_handler)?;
+    let had_plan_file_paths = !agent_output.cursor_plan_paths.is_empty();
+    agent_output = pmo_apply_cursor_plan_files(&state.working_dir, agent_output);
+    if !agent_output.has_final_result_text && !had_plan_file_paths {
+        warn!(
+            "PMO: No canonical final output for issue #{} (no final response text and no plan file), marking manual intervention",
+            issue.iid
+        );
+        let comment = build_missing_canonical_pmo_output_comment(false);
+        gitlab.add_issue_comment(issue.iid, &comment)?;
+        gitlab.add_issue_label(issue.iid, PMO_PROCESSED_LABEL)?;
+        return Ok(false);
+    }
 
     // --- NEEDS_CLARIFICATION: PMO itself cannot decide, ask human ---
     if pmo_needs_clarification(&agent_output) {
@@ -769,6 +804,28 @@ fn process_action_required_issue(
     }
 
     // --- SPLIT: create sub-issues, close the parent as a task container ---
+    if !had_plan_file_paths {
+        warn!(
+            "PMO: Split path for issue #{} has no saved plan file output, marking manual intervention",
+            issue.iid
+        );
+        let comment = build_missing_canonical_pmo_output_comment(true);
+        gitlab.add_issue_comment(issue.iid, &comment)?;
+        gitlab.add_issue_label(issue.iid, PMO_PROCESSED_LABEL)?;
+        return Ok(false);
+    }
+    let Some(plan_text) = pmo_extract_plan_file_text(&agent_output.response) else {
+        warn!(
+            "PMO: Split path for issue #{} had plan path indicator but unreadable plan content, marking manual intervention",
+            issue.iid
+        );
+        let comment = build_missing_canonical_pmo_output_comment(true);
+        gitlab.add_issue_comment(issue.iid, &comment)?;
+        gitlab.add_issue_label(issue.iid, PMO_PROCESSED_LABEL)?;
+        return Ok(false);
+    };
+    // For split parsing, consume only saved plan file content.
+    agent_output.response = plan_text;
     let sub_issues = extract_sub_issues(&agent_output);
 
     if sub_issues.is_empty() {
@@ -780,24 +837,8 @@ fn process_action_required_issue(
             preview
         );
 
-        gitlab.add_issue_comment(
-            issue.iid,
-            "PMO could not parse any sub-issues from the agent response. Manual intervention may be required.\n\n\
-             **Use one of these formats:**\n\n\
-             1) Text blocks (repeat per sub-issue):\n\
-             ```text\n\
-             SUB_ISSUE_1:\n\
-             TITLE: Short title\n\
-             PRIORITY: 1\n\
-             DESCRIPTION:\n\
-             Multi-line description.\n\
-             ```\n\
-             `PRIORITY` is optional (1–3). Headers are recognized with or without a trailing `:` and common markdown (list/`#`) prefixes.\n\n\
-             2) Or a fenced JSON array:\n\
-             ```json\n\
-             [{\"title\":\"…\",\"description\":\"…\",\"priority\":1}]\n\
-             ```",
-        )?;
+        let comment = build_unparsed_split_manual_intervention_comment(&agent_output);
+        gitlab.add_issue_comment(issue.iid, &comment)?;
 
         gitlab.add_issue_label(issue.iid, PMO_PROCESSED_LABEL)?;
         return Ok(false);
@@ -981,6 +1022,8 @@ CRITICAL REQUIREMENTS:
 - **Plan mode (STRICT):** Cursor may save your work as a `.md` file under the repo. Codepair **reads that file after the turn** and appends its text to your output for parsing. A Cursor plan UI (outline, checkboxes, widgets) **does not count** unless the **saved file body** contains the plain-text markers below. You **must** put the machine-readable blocks **inside the `.md` file** (or duplicate them in your final streamed message). Do not finish the turn with only UI structure — **edit the plan file** to include the exact formats in `CURSOR PLAN FILE — CANONICAL BLOCKS` below. This run is fully automated; do not wait for user confirmation.
 - Also mirror intent in prose where helpful (`decision:`, `question:`, `instructions:`, `reason:`) but **parsers require the literal marker lines** (`GUIDE_WORKER`, `SUB_ISSUE_1:`, `ALREADY_DONE`, etc.) — prose alone is not enough.
 - For SPLIT, each sub-issue **must** use the `SUB_ISSUE_N:` + `TITLE:` + `PRIORITY:` + `DESCRIPTION:` layout (see canonical examples). Include acceptance criteria inside `DESCRIPTION:`.
+- **STRICT OUTPUT CONTRACT (SPLIT):** if you choose `decision: split`, your final output must be machine-readable only: either `SUB_ISSUE_N` blocks or one fenced JSON array. Do not include extra prose before or after those structured blocks.
+- Any split output that is not machine-readable in those exact formats is treated as a PMO failure and will trigger manual intervention.
 
 CURSOR PLAN FILE — CANONICAL BLOCKS (copy these shapes into the saved plan file; spelling and keywords must match):
 - **GUIDE_WORKER** — exact lines:
@@ -1274,6 +1317,67 @@ fn extract_guidance(agent_output: &AgentHandoff) -> String {
     }
 }
 
+fn build_unparsed_split_manual_intervention_comment(agent_output: &AgentHandoff) -> String {
+    let public_comment = extract_public_comment_block(&agent_output.response)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let instructions = agent_output
+        .instructions
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let reason = agent_output
+        .reason
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let question = agent_output
+        .question
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let mut summary = if !public_comment.is_empty() {
+        public_comment
+    } else if !instructions.is_empty() {
+        instructions
+    } else if !reason.is_empty() {
+        reason
+    } else if !question.is_empty() {
+        format!("PMO requested clarification: {question}")
+    } else {
+        String::new()
+    };
+
+    if summary.is_empty() {
+        summary = "No usable machine-readable split output was returned by PMO. Raw PMO text was omitted because it may contain intermediate planning output rather than a final decision.".to_string();
+    }
+
+    format!(
+        "**PMO could not parse sub-issues from the PMO response. Manual intervention is required.**\n\n\
+         Diagnostic context:\n\n{summary}",
+        summary = summary
+    )
+}
+
+fn build_missing_canonical_pmo_output_comment(split_mode: bool) -> String {
+    if split_mode {
+        "**PMO could not parse sub-issues from the PMO response. Manual intervention is required.**\n\n\
+         Diagnostic context:\n\n\
+         PMO chose split mode, but no readable saved plan file content was available. Split parsing requires plan file output."
+            .to_string()
+    } else {
+        "**PMO could not parse sub-issues from the PMO response. Manual intervention is required.**\n\n\
+         Diagnostic context:\n\n\
+         PMO did not return canonical output for this run (no final response text and no saved plan file content)."
+            .to_string()
+    }
+}
+
 /// Append contents of [`AgentHandoff::cursor_plan_paths`] (Cursor plan-mode `tool_call_update`) into
 /// `handoff.response` so triage markers and `extract_sub_issues` see the plan file text.
 fn pmo_apply_cursor_plan_files(working_dir: &str, mut handoff: AgentHandoff) -> AgentHandoff {
@@ -1283,7 +1387,7 @@ fn pmo_apply_cursor_plan_files(working_dir: &str, mut handoff: AgentHandoff) -> 
 
     let root = path::Path::new(working_dir);
     for plan_path in std::mem::take(&mut handoff.cursor_plan_paths) {
-        match read_text_file_under_workspace(root, &plan_path) {
+        match pmo_read_plan_file_text(root, &plan_path) {
             Ok(body) => {
                 if !handoff.response.is_empty() {
                     handoff.response.push_str("\n\n");
@@ -1306,6 +1410,82 @@ fn pmo_apply_cursor_plan_files(working_dir: &str, mut handoff: AgentHandoff) -> 
     }
 
     handoff
+}
+
+fn pmo_cursor_home_from_env() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+fn pmo_external_cursor_plans_root(home: &path::Path) -> path::PathBuf {
+    home.join(".cursor").join("plans")
+}
+
+fn pmo_is_allowed_external_plan_path_for_home(resolved: &path::Path, home: &path::Path) -> bool {
+    let Ok(allowed_root) = pmo_external_cursor_plans_root(home).canonicalize() else {
+        return false;
+    };
+    resolved.starts_with(allowed_root)
+}
+
+fn pmo_read_plan_file_text(working_root: &path::Path, plan_path: &str) -> Result<String, String> {
+    pmo_read_plan_file_text_with_home(working_root, plan_path, pmo_cursor_home_from_env())
+}
+
+fn pmo_read_plan_file_text_with_home(
+    working_root: &path::Path,
+    plan_path: &str,
+    home_override: Option<std::path::PathBuf>,
+) -> Result<String, String> {
+    match read_text_file_under_workspace(working_root, plan_path) {
+        Ok(body) => return Ok(body),
+        Err(e) if e != "path escapes workspace" => return Err(e),
+        Err(_) => {}
+    }
+
+    let candidate = path::Path::new(plan_path);
+    if !candidate.is_absolute() {
+        return Err("path escapes workspace".to_string());
+    }
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|e| format!("path not found: {e}"))?;
+    let meta = fs::metadata(&resolved).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+    if meta.len() > MAX_READ_BYTES {
+        return Err(format!(
+            "file larger than {} MiB",
+            MAX_READ_BYTES / 1024 / 1024
+        ));
+    }
+
+    let Some(home) = home_override else {
+        return Err("path escapes workspace".to_string());
+    };
+    if !pmo_is_allowed_external_plan_path_for_home(&resolved, &home) {
+        return Err("path escapes workspace".to_string());
+    }
+
+    fs::read_to_string(&resolved).map_err(|e| e.to_string())
+}
+
+fn pmo_extract_plan_file_text(response: &str) -> Option<String> {
+    const MARKER: &str = "=== PMO Cursor plan file ===";
+    let mut sections: Vec<String> = Vec::new();
+    for chunk in response.split(MARKER).skip(1) {
+        let section = chunk.trim();
+        if !section.is_empty() {
+            sections.push(section.to_string());
+        }
+    }
+    let joined = sections.join("\n\n").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 fn combined_pmo_handoff_text(h: &AgentHandoff) -> String {
@@ -1900,18 +2080,7 @@ mod tests {
         assert!(prompt.contains("ALREADY_DONE"));
         assert!(prompt.contains("NEEDS_CLARIFICATION"));
         assert!(prompt.contains("GUIDE_WORKER"));
-    }
-
-    #[test]
-    fn test_extract_project_name() {
-        assert_eq!(
-            extract_project_name("https://gitlab.com/user/project").unwrap(),
-            "project"
-        );
-        assert_eq!(
-            extract_project_name("https://gitlab.com/user/project.git").unwrap(),
-            "project"
-        );
+        assert!(prompt.contains("STRICT OUTPUT CONTRACT (SPLIT)"));
     }
 
     #[test]
@@ -2169,6 +2338,67 @@ Body here.
     }
 
     #[test]
+    fn pmo_read_plan_file_text_allows_external_cursor_plans_under_home() {
+        let tmp =
+            std::env::temp_dir().join(format!("codepair-pmo-external-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let workspace = tmp.join("repo");
+        let home = tmp.join("home");
+        let plans = home.join(".cursor/plans");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan_file = plans.join("x.plan.md");
+        std::fs::write(
+            &plan_file,
+            "SUB_ISSUE_1:\nTITLE: External\nDESCRIPTION:\nok",
+        )
+        .unwrap();
+
+        let body =
+            pmo_read_plan_file_text_with_home(&workspace, &plan_file.to_string_lossy(), Some(home))
+                .expect("should read external plan under ~/.cursor/plans");
+        assert!(body.contains("SUB_ISSUE_1"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pmo_read_plan_file_text_rejects_external_paths_outside_allowlist() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codepair-pmo-external-reject-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let workspace = tmp.join("repo");
+        let home = tmp.join("home");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let f = outside.join("bad.plan.md");
+        std::fs::write(&f, "x").unwrap();
+
+        let err = pmo_read_plan_file_text_with_home(&workspace, &f.to_string_lossy(), Some(home))
+            .expect_err("external non-allowlisted file should be rejected");
+        assert!(err.contains("escapes workspace"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pmo_extract_plan_file_text_returns_only_plan_sections() {
+        let response = "progress line\n=== PMO Cursor plan file ===\nSUB_ISSUE_1:\nTITLE: A\n\n=== PMO Cursor plan file ===\nSUB_ISSUE_2:\nTITLE: B\n";
+        let out = pmo_extract_plan_file_text(response).expect("plan text");
+        assert!(!out.contains("progress line"));
+        assert!(out.contains("SUB_ISSUE_1:"));
+        assert!(out.contains("SUB_ISSUE_2:"));
+    }
+
+    #[test]
+    fn pmo_extract_plan_file_text_none_when_marker_missing() {
+        assert!(pmo_extract_plan_file_text("no marker here").is_none());
+    }
+
+    #[test]
     fn test_priority_from_labels() {
         assert_eq!(
             gitlab::priority_from_labels(&["priority::1".to_string()]),
@@ -2182,5 +2412,46 @@ Body here.
             gitlab::priority_from_labels(&["in-progress".to_string()]),
             3
         );
+    }
+
+    #[test]
+    fn build_unparsed_split_manual_intervention_comment_prefers_public_comment_block() {
+        let handoff = AgentHandoff {
+            response: "noise\nPUBLIC_COMMENT_BEGIN\nDo X, then Y.\nPUBLIC_COMMENT_END".to_string(),
+            instructions: Some("ignored".to_string()),
+            ..Default::default()
+        };
+        let out = build_unparsed_split_manual_intervention_comment(&handoff);
+        assert!(out.contains("Manual intervention is required"));
+        assert!(out.contains("Do X, then Y."));
+        assert!(!out.contains("ignored"));
+    }
+
+    #[test]
+    fn build_unparsed_split_manual_intervention_comment_omits_raw_response_when_no_fields() {
+        let handoff = AgentHandoff {
+            response: "Plain text analysis without markers".to_string(),
+            ..Default::default()
+        };
+        let out = build_unparsed_split_manual_intervention_comment(&handoff);
+        assert!(out.contains("Raw PMO text was omitted"));
+        assert!(!out.contains("Plain text analysis without markers"));
+        assert!(out.contains("Diagnostic context:"));
+    }
+
+    #[test]
+    fn build_missing_canonical_pmo_output_comment_mentions_missing_final_sources() {
+        let out = build_missing_canonical_pmo_output_comment(false);
+        assert!(out.contains("Manual intervention is required"));
+        assert!(out.contains("no final response text"));
+        assert!(out.contains("no saved plan file content"));
+    }
+
+    #[test]
+    fn build_missing_canonical_pmo_output_comment_for_split_requires_plan_file() {
+        let out = build_missing_canonical_pmo_output_comment(true);
+        assert!(out.contains("Manual intervention is required"));
+        assert!(out.contains("split mode"));
+        assert!(out.contains("requires plan file output"));
     }
 }

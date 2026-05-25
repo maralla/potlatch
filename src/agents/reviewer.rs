@@ -1,25 +1,179 @@
-use anyhow::Result;
-use rand::RngExt;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use super::{
-    claim, extract_project_name, extract_public_comment_block, mr_in_scope, write_task_context_file,
+use super::{claim, extract_public_comment_block, mr_in_scope, write_task_context_file};
+use crate::agents::git::GitRepo;
+use crate::agents::gitlab::{self, GitLabClient, MergeRequest};
+use crate::agents::settings;
+use crate::agents::workspace::{
+    ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
 };
-use crate::agent::Agent;
-use crate::config::ReviewerConfig;
-use crate::cursor_mcp_config;
-use crate::git::GitRepo;
-use crate::gitlab::{self, GitLabClient, MergeRequest};
-use crate::mcp_coord::AgentHandoff;
-use crate::mcp_coord::CoordinatorHandle;
+use crate::core::agent::AgentHandoff;
+use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const REVIEWER_APPROVED_LABEL: &str = "reviewer-approved";
 const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
+
+#[derive(Debug, Clone)]
+struct ReviewerConfig {
+    poll_interval_secs: u64,
+    merge_when_approved: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ReviewerAgentSettings {
+    #[serde(default = "default_reviewer_poll_interval")]
+    poll_interval_secs: u64,
+    #[serde(default = "default_merge_when_approved")]
+    merge_when_approved: bool,
+}
+
+fn default_reviewer_poll_interval() -> u64 {
+    120
+}
+
+fn default_merge_when_approved() -> bool {
+    true
+}
+
+impl ReviewerAgentSettings {
+    fn from_raw(raw: &toml::Value) -> Result<Self> {
+        raw.clone()
+            .try_into()
+            .context("reviewer agent settings from config")
+    }
+}
+
+pub(crate) struct ReviewerAgent {
+    agent_id: String,
+    project_name: String,
+    reviewer_dir: String,
+    sessions_dir: String,
+    config: ReviewerConfig,
+    git_repo: GitRepo,
+    gitlab: GitLabClient,
+    model: AgentModel,
+    scope_label: String,
+    merged_mrs: HashSet<u64>,
+    claimed_mr_iid: Option<u64>,
+}
+
+impl CoreAgent for ReviewerAgent {
+    type SpawnContext = crate::core::workflow::AgentSpawnContext;
+
+    fn model(&self) -> &AgentModel {
+        &self.model
+    }
+
+    fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
+        vec![PeriodicTaskSpec {
+            id: "gitlab_poll",
+            interval: Duration::from_secs(self.config.poll_interval_secs),
+            jitter: JitterPolicy::BeforeEachCycle,
+            jitter_max_ms: 5000,
+            autostart: true,
+        }]
+    }
+
+    fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
+        match task_id {
+            "gitlab_poll" => {
+                let scope = crate::agents::scope_label_filter(&self.scope_label);
+                let model = &self.model;
+                let shutdown = Arc::clone(model.shutdown());
+                if let Err(e) = reviewer_cycle(
+                    &self.agent_id,
+                    &self.project_name,
+                    &self.reviewer_dir,
+                    &self.sessions_dir,
+                    &self.config,
+                    &self.git_repo,
+                    &self.gitlab,
+                    model,
+                    &mut self.merged_mrs,
+                    &mut self.claimed_mr_iid,
+                    &shutdown,
+                    scope,
+                ) {
+                    if !shutdown.load(Ordering::SeqCst) {
+                        error!("{}: Cycle error: {}", self.agent_id, e);
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
+        let gitlab_repo = require_gitlab_repo()?;
+        let section = ctx
+            .workflow
+            .config
+            .agent("reviewer")
+            .context("[agent.reviewer] section required")?;
+        let settings = ReviewerAgentSettings::from_raw(&section.raw)?;
+        let project_name = extract_project_name(&gitlab_repo)?;
+        let agent_id = format!("reviewer-{}", ctx.instance_id);
+        ensure_agent_repo(
+            &ctx.workflow.base_dir,
+            &gitlab_repo,
+            &project_name,
+            &agent_id,
+        )?;
+        let reviewer_dir = work_dir(&ctx.workflow.base_dir, &project_name, &agent_id);
+        let sessions_dir = sessions_dir(&ctx.workflow.base_dir, &project_name);
+        let config = ReviewerConfig {
+            poll_interval_secs: settings.poll_interval_secs,
+            merge_when_approved: settings.merge_when_approved,
+        };
+        let git_repo = GitRepo::new(reviewer_dir.clone());
+        let gitlab = GitLabClient::new(reviewer_dir.clone(), &gitlab_repo)?;
+        let model = AgentModel::connect(
+            &ctx,
+            "reviewer",
+            reviewer_dir.clone(),
+            ModelPreferences::reviewer(),
+        )?;
+        let agent_settings = settings::settings();
+        let scope = agent_settings.scope_label_filter();
+        let claimed_mr_iid = find_claimed_mr(&agent_id, &gitlab, scope);
+        info!(
+            "{}: Poll interval: {} seconds",
+            agent_id, config.poll_interval_secs
+        );
+        Ok(Self {
+            agent_id,
+            project_name,
+            reviewer_dir,
+            sessions_dir,
+            config,
+            git_repo,
+            gitlab,
+            model,
+            scope_label: agent_settings.scope_label.clone(),
+            merged_mrs: HashSet::new(),
+            claimed_mr_iid,
+        })
+    }
+
+    fn on_shutdown(&mut self) {
+        info!("{}: Shutting down, cleaning up...", self.agent_id);
+        if let Some(mr_iid) = self.claimed_mr_iid {
+            info!(
+                "{}: Preserving claim on MR !{} for restart",
+                self.agent_id, mr_iid
+            );
+        }
+        let _ = self.git_repo.reset_hard();
+        info!("{}: Stopped", self.agent_id);
+    }
+}
 
 enum ReviewOutcome {
     Merged,
@@ -27,141 +181,21 @@ enum ReviewOutcome {
     NeedsChanges,
 }
 
-fn interruptible_sleep(shutdown: &AtomicBool, duration: Duration) -> bool {
-    let interval = Duration::from_millis(200);
-    let mut remaining = duration;
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return true;
-        }
-        if remaining.is_zero() {
-            return false;
-        }
-        let sleep_time = remaining.min(interval);
-        thread::sleep(sleep_time);
-        remaining = remaining.saturating_sub(sleep_time);
-    }
-}
-
-fn state_meta(agent: &Agent) -> String {
-    let quits = agent.unexpected_quits_count();
-    if quits == 0 {
-        String::new()
-    } else {
-        format!(", {} unexpected quits", quits)
-    }
-}
-
-pub fn run(
-    repo_url: String,
-    config: ReviewerConfig,
-    instance_id: usize,
-    shutdown: Arc<AtomicBool>,
-    base_dir: String,
-    coordinator: Option<CoordinatorHandle>,
-    scope_label: String,
-) -> Result<()> {
-    let project_name = extract_project_name(&repo_url)?;
-    let agent_id = format!("reviewer-{}", instance_id);
-    let reviewer_dir = super::work_dir(&base_dir, &project_name, &agent_id);
-    let sessions_dir = super::sessions_dir(&base_dir, &project_name);
-
-    let git_repo = GitRepo::new(reviewer_dir.clone());
-    let gitlab = GitLabClient::new(reviewer_dir.clone());
-
-    if coordinator.is_some() {
-        cursor_mcp_config::refresh_mcp_mirror_best_effort(&reviewer_dir);
-    }
-
-    let bridge = coordinator
-        .as_ref()
-        .map(|c| c.register_agent(&agent_id))
-        .transpose()?;
-    let agent = Agent::new(
-        reviewer_dir.clone(),
-        config.model.clone(),
-        Some(crate::agent::PREFERRED_SESSION_MODE_REVIEWER),
-        shutdown.clone(),
-        agent_id.clone(),
-        bridge,
-    );
-
-    let scope = crate::config::scope_label_filter(&scope_label);
-    let mut merged_mrs: HashSet<u64> = HashSet::new();
-    let mut claimed_mr_iid: Option<u64> = find_claimed_mr(&agent_id, &gitlab, scope);
-
-    info!(
-        "{}: Poll interval: {} seconds",
-        agent_id, config.poll_interval_secs
-    );
-
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-
-        let jitter = rand::rng().random_range(0..5000);
-        if interruptible_sleep(&shutdown, Duration::from_millis(jitter)) {
-            break;
-        }
-
-        if let Err(e) = reviewer_cycle(
-            &agent_id,
-            &project_name,
-            &reviewer_dir,
-            &sessions_dir,
-            &config,
-            &git_repo,
-            &gitlab,
-            &agent,
-            &mut merged_mrs,
-            &mut claimed_mr_iid,
-            &shutdown,
-            scope,
-        ) {
-            if shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-            error!("{}: Cycle error: {}", agent_id, e);
-        }
-
-        if interruptible_sleep(&shutdown, Duration::from_secs(config.poll_interval_secs)) {
-            break;
-        }
-    }
-
-    info!("{}: Shutting down, cleaning up...", agent_id);
-    if let Some(mr_iid) = claimed_mr_iid {
-        info!(
-            "{}: Preserving claim on MR !{} for restart",
-            agent_id, mr_iid
-        );
-    }
-    let _ = git_repo.reset_hard();
-    info!("{}: Stopped", agent_id);
-
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn reviewer_cycle(
     agent_id: &str,
     project_name: &str,
-    reviewer_dir: &str,
+    _reviewer_dir: &str,
     sessions_dir: &str,
     config: &ReviewerConfig,
     git_repo: &GitRepo,
     gitlab: &GitLabClient,
-    agent: &Agent,
+    model: &AgentModel,
     merged_mrs: &mut HashSet<u64>,
     claimed_mr_iid: &mut Option<u64>,
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Result<()> {
-    if agent.mcp_registered() {
-        cursor_mcp_config::refresh_mcp_mirror_best_effort(reviewer_dir);
-    }
-
     let default_branch = git_repo.get_default_branch()?;
     git_repo.fetch()?;
     if shutdown.load(Ordering::SeqCst) {
@@ -271,7 +305,7 @@ fn reviewer_cycle(
             config,
             git_repo,
             gitlab,
-            agent,
+            model,
             &mr,
         ) {
             Ok(ReviewOutcome::Merged) => {
@@ -313,7 +347,7 @@ fn reviewer_cycle(
         "{}: {} MRs merged{}",
         agent_id,
         merged_mrs.len(),
-        state_meta(agent)
+        model.runtime_meta()
     );
 
     Ok(())
@@ -355,7 +389,7 @@ fn review_merge_request(
     config: &ReviewerConfig,
     git_repo: &GitRepo,
     gitlab: &GitLabClient,
-    agent: &Agent,
+    model: &AgentModel,
     mr: &MergeRequest,
 ) -> Result<ReviewOutcome> {
     let is_need_ai_worker_mr = mr_has_label(mr, NEED_AI_WORKER_LABEL);
@@ -443,7 +477,7 @@ fn review_merge_request(
         sessions_dir,
     )?;
 
-    let agent_output = agent.run(&prompt)?;
+    let agent_output = model.complete_prompt(&prompt)?;
 
     git_repo.checkout_remote_branch(&mr.target_branch)?;
 

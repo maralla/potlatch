@@ -1,10 +1,10 @@
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::gitlab::GitLabClient;
+use crate::agents::gitlab::GitLabClient;
+use crate::util::sleep;
 
 /// Settle time in seconds. After adding a claim label, we wait this long
 /// before verifying, to allow concurrent claims from other instances to
@@ -12,22 +12,6 @@ use crate::gitlab::GitLabClient;
 const CLAIM_SETTLE_SECS: u64 = 5;
 
 const CLAIM_LABEL_PREFIX: &str = "claimed:";
-
-fn interruptible_sleep(shutdown: &AtomicBool, duration: Duration) -> bool {
-    let interval = Duration::from_millis(200);
-    let mut remaining = duration;
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return true;
-        }
-        if remaining.is_zero() {
-            return false;
-        }
-        let sleep_time = remaining.min(interval);
-        thread::sleep(sleep_time);
-        remaining = remaining.saturating_sub(sleep_time);
-    }
-}
 
 /// Attempt to atomically claim a task (issue or MR) using the
 /// claim-and-verify protocol with double-check.
@@ -52,7 +36,7 @@ pub fn try_claim_issue(
 
     gitlab.add_issue_label(issue_iid, &claim_label)?;
 
-    if interruptible_sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
+    if sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
         let _ = gitlab.remove_issue_label(issue_iid, &claim_label);
         anyhow::bail!("Shutdown during claim settle for issue #{}", issue_iid);
     }
@@ -68,7 +52,7 @@ pub fn try_claim_issue(
         return resolve_contention(gitlab, issue_iid, agent_id, &claim_label, &claim_labels);
     }
 
-    if interruptible_sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
+    if sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
         let _ = gitlab.remove_issue_label(issue_iid, &claim_label);
         anyhow::bail!("Shutdown during claim settle for issue #{}", issue_iid);
     }
@@ -142,7 +126,7 @@ pub fn try_claim_mr(
 
     gitlab.add_mr_label(mr_iid, &claim_label)?;
 
-    if interruptible_sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
+    if sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
         let _ = gitlab.remove_mr_label(mr_iid, &claim_label);
         anyhow::bail!("Shutdown during claim settle for MR !{}", mr_iid);
     }
@@ -158,7 +142,7 @@ pub fn try_claim_mr(
         return resolve_mr_contention(gitlab, mr_iid, agent_id, &claim_label, &claim_labels);
     }
 
-    if interruptible_sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
+    if sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
         let _ = gitlab.remove_mr_label(mr_iid, &claim_label);
         anyhow::bail!("Shutdown during claim settle for MR !{}", mr_iid);
     }

@@ -14,8 +14,10 @@ use rand::RngExt;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::acp::client::{CursorAskQuestionHandler, headless_cursor_ask_question_reply};
-use crate::gitlab::{GitLabClient, IssueThreadNote};
+use crate::agents::gitlab::{GitLabClient, IssueThreadNote};
+use crate::core::model::acp::client::{
+    CursorAskQuestionHandler, headless_cursor_ask_question_reply,
+};
 
 use super::labels;
 

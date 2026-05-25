@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -41,6 +42,8 @@ pub struct StreamTextHooks {
     workspace_root: Option<PathBuf>,
     /// Plan-mode `tool_call_update` paths (`Plan saved to file://…`), taken into [`AgentHandoff`] for PMO.
     cursor_plan_paths: Mutex<Vec<String>>,
+    /// Monotonic count of `session/update` notifications seen for this task.
+    notification_seq: AtomicU64,
 }
 
 impl StreamTextHooks {
@@ -52,6 +55,7 @@ impl StreamTextHooks {
             cursor_ask_question_handler: Mutex::new(None),
             workspace_root: None,
             cursor_plan_paths: Mutex::new(Vec::new()),
+            notification_seq: AtomicU64::new(0),
         }
     }
 
@@ -64,6 +68,7 @@ impl StreamTextHooks {
             cursor_ask_question_handler: Mutex::new(None),
             workspace_root: Some(workspace_root),
             cursor_plan_paths: Mutex::new(Vec::new()),
+            notification_seq: AtomicU64::new(0),
         }
     }
 
@@ -108,6 +113,7 @@ impl StreamTextHooks {
     pub fn clear(&self) {
         self.buffer.lock().unwrap().clear();
         self.cursor_plan_paths.lock().unwrap().clear();
+        self.notification_seq.store(0, Ordering::SeqCst);
     }
 
     /// Install or clear a [`CursorAskQuestionHandler`] for `cursor/ask_question`.
@@ -126,7 +132,15 @@ impl StreamTextHooks {
         std::mem::take(&mut *self.cursor_plan_paths.lock().unwrap())
     }
 
-    /// Seed from `session/new` result [`crate::acp::types::NewSessionResult::modes`].
+    pub fn has_cursor_plan_paths(&self) -> bool {
+        !self.cursor_plan_paths.lock().unwrap().is_empty()
+    }
+
+    pub fn notification_seq(&self) -> u64 {
+        self.notification_seq.load(Ordering::SeqCst)
+    }
+
+    /// Seed from `session/new` result [`super::types::NewSessionResult::modes`].
     pub(crate) fn seed_session_modes(&self, state: &SessionModeStateBrief) {
         *self.session_modes.lock().unwrap() = Some(state.clone());
     }
@@ -397,6 +411,7 @@ impl AcpHooks for StreamTextHooks {
         if method != "session/update" {
             return;
         }
+        self.notification_seq.fetch_add(1, Ordering::SeqCst);
 
         if let Some(names) = extract_available_slash_command_names(params) {
             debug!(
@@ -502,7 +517,7 @@ mod tests {
 
     #[test]
     fn hooks_apply_current_mode_update_preserves_available_list() {
-        use crate::acp::types::{SessionModeEntry, SessionModeStateBrief};
+        use super::super::types::{SessionModeEntry, SessionModeStateBrief};
 
         let h = StreamTextHooks::new();
         h.seed_session_modes(&SessionModeStateBrief {
@@ -587,8 +602,25 @@ mod tests {
     }
 
     #[test]
+    fn hooks_notification_seq_increments_on_session_updates() {
+        let h = StreamTextHooks::new();
+        assert_eq!(h.notification_seq(), 0);
+        let params = json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "text": "a" }
+            }
+        });
+        h.on_agent_notification("session/update", &params);
+        h.on_agent_notification("session/update", &params);
+        assert_eq!(h.notification_seq(), 2);
+        h.clear();
+        assert_eq!(h.notification_seq(), 0);
+    }
+
+    #[test]
     fn plan_mode_tool_call_update_records_plan_file_path() {
-        use crate::acp::types::{SessionModeEntry, SessionModeStateBrief};
+        use super::super::types::{SessionModeEntry, SessionModeStateBrief};
         use std::fs;
 
         let tmp = std::env::temp_dir().join(format!("codepair-plan-file-{}", std::process::id()));
@@ -630,7 +662,7 @@ mod tests {
 
     #[test]
     fn plan_file_injection_skipped_when_not_in_plan_mode() {
-        use crate::acp::types::{SessionModeEntry, SessionModeStateBrief};
+        use super::super::types::{SessionModeEntry, SessionModeStateBrief};
         use std::fs;
 
         let tmp = std::env::temp_dir().join(format!("codepair-plan-skip-{}", std::process::id()));
@@ -667,7 +699,7 @@ mod tests {
 
     #[test]
     fn percent_encoded_file_uri_decodes_for_plan_read() {
-        use crate::acp::types::{SessionModeEntry, SessionModeStateBrief};
+        use super::super::types::{SessionModeEntry, SessionModeStateBrief};
         use std::fs;
 
         let tmp = std::env::temp_dir().join(format!("codepair-plan-pct-{}", std::process::id()));

@@ -7,13 +7,10 @@
 //! send `available_commands_update`; [`StreamTextHooks`] records command names for future
 //! role-specific prompt logic (not wired into prompts yet).
 //!
-//! [Session modes](https://agentclientprotocol.com/protocol/session-modes): the reviewer requests
-//! **`ask`** and the PMO **`plan`** only when the agent advertises that mode (config-option `mode`
+//! [Session modes](https://agentclientprotocol.com/protocol/session-modes): the reviewer may request
+//! **`ask`** and the PMO **`plan`**. Modes apply only when the agent advertises them (config-option `mode`
 //! value or non-empty legacy `availableModes`). Otherwise the agent default is kept; see
-//! `RUST_LOG=debug` target `codepair::acp_modes`. `current_mode_update` keeps hooks in sync.
-//!
-//! Optional HTTP MCP registration ([`crate::mcp_http`]) is controlled by config (`mcp.enabled`);
-//! tasks use ACP only and do not use `codepair/wait_for_next_task`.
+//! `current_mode_update` keeps hooks in sync.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -21,20 +18,21 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
 
-use crate::acp::client::{AcpClient, CursorAskQuestionHandler};
-use crate::acp::orchestrator_hooks::StreamTextHooks;
-use crate::acp::types::{
+use super::client::{AcpClient, CursorAskQuestionHandler};
+use super::orchestrator_hooks::StreamTextHooks;
+use super::types::{
     ClientCapabilities, ClientFsCapabilities, DEFAULT_PROTOCOL_VERSION, ImplementationInfo,
     InitializeParams, InitializeResult, NewSessionParams, NewSessionResult, PromptResult,
     mode_id_is_available, model_selector_for_session, select_option_allows_value,
     session_mode_config_option,
 };
-use crate::mcp_coord::{AgentHandoff, RoleAgentBridge};
+use crate::core::agent::AgentHandoff;
 
 const TASK_CONTEXT_RESET_GUIDANCE: &str = r#"IMPORTANT CONTEXT HANDLING:
 Treat this assignment as a fresh task. Do not rely on prior chat history or assumptions from earlier assignments unless this prompt explicitly refers to them. Use only the repository state, issue/MR context, and instructions present in this task.
@@ -73,27 +71,24 @@ fn close_acp_session_best_effort(client: &AcpClient, session_id: &str) {
     }
 }
 
-pub struct Agent {
+pub(crate) struct AcpRuntime {
     repo_path: String,
     model: Option<String>,
     /// When set, applied after `session/new` via ACP mode APIs ([`PREFERRED_SESSION_MODE_REVIEWER`], [`PREFERRED_SESSION_MODE_PMO`]).
     preferred_session_mode: Option<&'static str>,
     shutdown: Arc<AtomicBool>,
     agent_id: String,
-    /// When [`Some`], keeps this `agent_id` registered with the MCP HTTP coordinator.
-    mcp_bridge: Option<RoleAgentBridge>,
     acp: Mutex<Option<AcpSession>>,
     unexpected_quits_count: Arc<AtomicU64>,
 }
 
-impl Agent {
+impl AcpRuntime {
     pub fn new(
         repo_path: String,
         model: Option<String>,
         preferred_session_mode: Option<&'static str>,
         shutdown: Arc<AtomicBool>,
         agent_id: String,
-        mcp_bridge: Option<RoleAgentBridge>,
     ) -> Self {
         Self {
             repo_path,
@@ -101,7 +96,6 @@ impl Agent {
             preferred_session_mode,
             shutdown,
             agent_id,
-            mcp_bridge,
             acp: Mutex::new(None),
             unexpected_quits_count: Arc::new(AtomicU64::new(0)),
         }
@@ -113,15 +107,6 @@ impl Agent {
 
     pub fn agent_id(&self) -> &str {
         &self.agent_id
-    }
-
-    /// True when this process registered with the Codepair MCP HTTP server (`config.mcp.enabled`).
-    pub fn mcp_registered(&self) -> bool {
-        self.mcp_bridge.is_some()
-    }
-
-    pub fn run(&self, prompt: &str) -> Result<AgentHandoff> {
-        self.run_with_cancel(prompt, None, None)
     }
 
     /// Run one task: ensure a fresh ACP session (`session/close` then `session/new` on the same
@@ -215,7 +200,10 @@ impl Agent {
                 }
 
                 match rx.recv_timeout(Duration::from_millis(200)) {
-                    Ok(Ok(pr)) => break Ok(handoff_from_prompt_hooks(&hooks, pr)),
+                    Ok(Ok(pr)) => {
+                        self.wait_for_pmo_followup_updates(&hooks, cancel_check)?;
+                        break Ok(handoff_from_prompt_hooks(&hooks, pr));
+                    }
                     Ok(Err(e)) => break Err(anyhow::anyhow!("ACP session/prompt: {}", e)),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -250,6 +238,50 @@ impl Agent {
                     return Err(e);
                 }
             }
+        }
+    }
+
+    fn wait_for_pmo_followup_updates(
+        &self,
+        hooks: &StreamTextHooks,
+        cancel_check: Option<&dyn Fn() -> bool>,
+    ) -> Result<()> {
+        if self.preferred_session_mode != Some(PREFERRED_SESSION_MODE_PMO) {
+            return Ok(());
+        }
+
+        const MAX_WAIT: Duration = Duration::from_secs(3);
+        const QUIET_WINDOW: Duration = Duration::from_millis(500);
+        const POLL: Duration = Duration::from_millis(100);
+
+        let start = Instant::now();
+        let mut last_change_at = Instant::now();
+        let mut last_seq = hooks.notification_seq();
+
+        loop {
+            if hooks.has_cursor_plan_paths() {
+                return Ok(());
+            }
+            if start.elapsed() >= MAX_WAIT || last_change_at.elapsed() >= QUIET_WINDOW {
+                return Ok(());
+            }
+            if self.shutdown.load(Ordering::SeqCst) {
+                self.kill_child();
+                anyhow::bail!("Agent interrupted by shutdown");
+            }
+            if let Some(check) = cancel_check
+                && check()
+            {
+                self.kill_child();
+                anyhow::bail!("Agent cancelled by external condition");
+            }
+
+            let seq = hooks.notification_seq();
+            if seq != last_seq {
+                last_seq = seq;
+                last_change_at = Instant::now();
+            }
+            thread::sleep(POLL);
         }
     }
 
@@ -621,41 +653,85 @@ impl Agent {
     }
 }
 
-fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> AgentHandoff {
-    let stream = hooks.take_text();
-    let extra_msg = pr
-        .extra
-        .get("message")
-        .or_else(|| pr.extra.get("output"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    let mut response = match (stream.trim().is_empty(), extra_msg) {
-        (true, Some(s)) => s.to_string(),
-        (false, None) => stream,
-        (false, Some(s)) => {
-            // Final `message` / `output` sometimes carries PMO `SUB_ISSUE_*` blocks while streamed
-            // chunks are prose-only — merge only when the extra text has those markers.
-            if s.contains("SUB_ISSUE_") && !stream.contains("SUB_ISSUE_") {
-                format!("{stream}\n\n{s}")
-            } else {
-                stream
+fn collect_text_fragments_from_value(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
             }
         }
-        (true, None) => String::new(),
-    };
-
-    if response.trim().is_empty()
-        && let Some(s) = extra_msg
-    {
-        response = s.to_string();
+        Value::Array(arr) => {
+            for item in arr {
+                collect_text_fragments_from_value(item, out);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                let t = text.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+            }
+            for key in [
+                "message", "output", "response", "content", "contents", "messages", "parts",
+                "blocks", "items",
+            ] {
+                if let Some(child) = map.get(key) {
+                    collect_text_fragments_from_value(child, out);
+                }
+            }
+        }
+        _ => {}
     }
+}
+
+fn final_text_from_prompt_extra(extra: &Map<String, Value>) -> Option<String> {
+    for key in ["message", "output", "response", "text"] {
+        if let Some(v) = extra.get(key)
+            && let Some(s) = v.as_str()
+        {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+
+    let mut pieces: Vec<String> = Vec::new();
+    for key in ["message", "output", "response", "content", "messages"] {
+        if let Some(v) = extra.get(key) {
+            collect_text_fragments_from_value(v, &mut pieces);
+        }
+    }
+    pieces.dedup();
+    let joined = pieces.join("\n\n").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> AgentHandoff {
+    let stream = hooks.take_text();
+    let final_text = final_text_from_prompt_extra(&pr.extra);
+
+    // Prefer final prompt result text (`message` / `output`) over streamed chunks.
+    // Streamed chunks can contain intermediate progress narration, while `extra` carries
+    // the end-of-turn canonical answer that downstream parsers should consume.
+    let has_final_result_text = final_text.is_some();
+    let response = if let Some(s) = final_text {
+        s.to_string()
+    } else {
+        stream
+    };
 
     let cursor_plan_paths = hooks.take_cursor_plan_paths();
 
     AgentHandoff {
         response,
+        has_final_result_text,
         cursor_plan_paths,
         ..Default::default()
     }
@@ -670,7 +746,7 @@ fn retry_backoff_for_unfinished_task(attempt: u32) -> Duration {
     Duration::from_millis(capped * 200)
 }
 
-impl Drop for Agent {
+impl Drop for AcpRuntime {
     fn drop(&mut self) {
         let mut g = self.acp.lock().unwrap();
         if let Some(s) = g.take() {
@@ -681,9 +757,9 @@ impl Drop for Agent {
 
 #[cfg(test)]
 mod tests {
+    use super::super::client::AcpHooks;
+    use super::super::types::InitializeResult;
     use super::*;
-    use crate::acp::client::AcpHooks;
-    use crate::acp::types::InitializeResult;
     use serde_json::json;
 
     #[test]
@@ -694,7 +770,7 @@ mod tests {
             "authMethods": [{"id": "cursor_login", "name": "Cursor Login"}]
         }))
         .unwrap();
-        assert!(Agent::acp_init_advertises_cursor_login(&with_login));
+        assert!(AcpRuntime::acp_init_advertises_cursor_login(&with_login));
 
         let empty: InitializeResult = serde_json::from_value(json!({
             "protocolVersion": 1,
@@ -702,7 +778,7 @@ mod tests {
             "authMethods": []
         }))
         .unwrap();
-        assert!(!Agent::acp_init_advertises_cursor_login(&empty));
+        assert!(!AcpRuntime::acp_init_advertises_cursor_login(&empty));
     }
 
     #[test]
@@ -729,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_prefers_stream_buffer_then_prompt_extra() {
+    fn handoff_prefers_prompt_extra_over_stream_buffer() {
         let hooks = StreamTextHooks::new();
         let params = serde_json::json!({
             "update": {
@@ -744,7 +820,8 @@ mod tests {
         }))
         .unwrap();
         let h = handoff_from_prompt_hooks(&hooks, pr);
-        assert_eq!(h.response, "from stream");
+        assert_eq!(h.response, "from result");
+        assert!(h.has_final_result_text);
 
         let hooks_m = StreamTextHooks::new();
         hooks_m.on_agent_notification("session/update", &params);
@@ -754,8 +831,8 @@ mod tests {
         }))
         .unwrap();
         let hm = handoff_from_prompt_hooks(&hooks_m, pr_m);
-        assert!(hm.response.contains("from stream"));
-        assert!(hm.response.contains("SUB_ISSUE_1"));
+        assert_eq!(hm.response, "SUB_ISSUE_1:\nTITLE: T\nDESCRIPTION:\nD");
+        assert!(hm.has_final_result_text);
 
         let hooks2 = StreamTextHooks::new();
         let pr2: PromptResult = serde_json::from_value(json!({
@@ -765,5 +842,34 @@ mod tests {
         .unwrap();
         let h2 = handoff_from_prompt_hooks(&hooks2, pr2);
         assert_eq!(h2.response, "only result");
+        assert!(h2.has_final_result_text);
+
+        let hooks3 = StreamTextHooks::new();
+        hooks3.on_agent_notification("session/update", &params);
+        let pr3: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn"
+        }))
+        .unwrap();
+        let h3 = handoff_from_prompt_hooks(&hooks3, pr3);
+        assert_eq!(h3.response, "from stream");
+        assert!(!h3.has_final_result_text);
+    }
+
+    #[test]
+    fn handoff_extracts_final_text_from_structured_content_blocks() {
+        let hooks = StreamTextHooks::new();
+        let pr: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "content": [
+                {"type": "text", "text": "SUB_ISSUE_1:"},
+                {"type": "text", "text": "TITLE: Refactor queue"},
+                {"type": "text", "text": "DESCRIPTION:\nDo the refactor."}
+            ]
+        }))
+        .unwrap();
+        let out = handoff_from_prompt_hooks(&hooks, pr);
+        assert!(out.has_final_result_text);
+        assert!(out.response.contains("SUB_ISSUE_1:"));
+        assert!(out.response.contains("TITLE: Refactor queue"));
     }
 }

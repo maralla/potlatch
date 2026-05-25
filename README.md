@@ -4,22 +4,23 @@ A CLI-Based AI Agent Pair System that orchestrates AI agents to automatically im
 
 ## Overview
 
-Codepair runs two AI agents in parallel in a fully automated, non-interactive mode:
+Codepair runs several AI agent roles in parallel in a fully automated, non-interactive mode:
 - **Worker Agent**: Fetches issues, implements features, and creates merge requests autonomously
 - **Reviewer Agent**: Reviews merge requests and either merges them automatically or leaves an approval comment, depending on config
+- **PMO Agent**: Triages `action-required` issues (typically after a worker could not finish) and may split work or guide the worker
 
-Both agents operate without requiring any user input, making autonomous decisions based on the code and project documentation.
+All roles operate without requiring any user input, making autonomous decisions based on the code and project documentation.
 
 ## Prerequisites
 
 1. **Rust toolchain** (`cargo`, stable) — to build Codepair from source
-2. **Cursor Agent CLI** — The `agent` command on your `PATH` is **Cursor’s agent CLI**. Codepair keeps **one** long-lived **`agent acp`** subprocess per role (optional **`--model`** first, then **`--print`**, **`--trust`**, **`--force`**, **`--approve-mcps`**). On the first task it runs **`initialize`**, then **`authenticate`** with **`cursor_login`** when Cursor advertises it (per [Cursor ACP](https://cursor.com/docs/cli/acp); use **`agent login`** or **`CURSOR_API_KEY`** / **`CURSOR_AUTH_TOKEN`**), then **`session/new`**; on **each later task** it calls **`session/close`** (best effort) then **`session/new`** again on the **same** stdio link, sends **`session/prompt`**, and leaves the child running so the next task still gets a **clean session** (no prior in-agent chat; workflow continuity stays in Codepair’s own state files). Model selection follows [ACP Session Config Options](https://agentclientprotocol.com/protocol/session-config-options): if **`configOptions`** includes a model selector and your id is in **`options`**, Codepair calls **`session/set_config_option`**; otherwise it tries experimental **`session/set_model`**. Completions come from streamed **`session/update`** chunks (including [slash-command](https://agentclientprotocol.com/protocol/slash-commands) and [session mode](https://agentclientprotocol.com/protocol/session-modes) updates). Codepair tracks **`modes`** / **`configOptions`** and logs at **`RUST_LOG=debug`** (`codepair::acp_modes`). For unattended runs it also answers **`session/request_permission`** by selecting an **`optionId`** from the agent’s **`options`** list (preferring **`allow_always`**, then **`allow_once`**) and auto-approves **`cursor/create_plan`** [ACP extensions](https://cursor.com/docs/cli/acp). For **`cursor/ask_question`**, worker and reviewer use a simple automatic reply; the **PMO** (when **`cursor_ask_via_gitlab`** is enabled) posts the question on the GitLab issue, sets **`pmo-pending`**, and waits for a **direct thread reply** on that note (`RUST_LOG=debug`: **`codepair::acp_cursor`**). The **reviewer** requests **`ask`** and the **PMO** **`plan`** only when advertised; otherwise the agent default mode stays. **By default** Codepair does **not** start its MCP HTTP server and does **not** write `.cursor/mcp.json`. To enable the optional Codepair MCP endpoint and generated config for extra MCP tools, set **`[mcp] enabled = true`** in `codepair.toml`.
+2. **Cursor Agent CLI** — The `agent` command on your `PATH` is **Cursor’s agent CLI**. Codepair keeps **one** long-lived **`agent acp`** subprocess per role (optional **`--model`** first, then **`--print`**, **`--trust`**, **`--force`**, **`--approve-mcps`**). On the first task it runs **`initialize`**, then **`authenticate`** with **`cursor_login`** when Cursor advertises it (per [Cursor ACP](https://cursor.com/docs/cli/acp); use **`agent login`** or **`CURSOR_API_KEY`** / **`CURSOR_AUTH_TOKEN`**), then **`session/new`**; on **each later task** it calls **`session/close`** (best effort) then **`session/new`** again on the **same** stdio link, sends **`session/prompt`**, and leaves the child running so the next task still gets a **clean session** (no prior in-agent chat; workflow continuity stays in Codepair’s own state files). Model selection follows [ACP Session Config Options](https://agentclientprotocol.com/protocol/session-config-options): if **`configOptions`** includes a model selector and your id is in **`options`**, Codepair calls **`session/set_config_option`**; otherwise it tries experimental **`session/set_model`**. Completions come from streamed **`session/update`** chunks (including [slash-command](https://agentclientprotocol.com/protocol/slash-commands) and [session mode](https://agentclientprotocol.com/protocol/session-modes) updates). Codepair tracks **`modes`** / **`configOptions`** and logs at **`RUST_LOG=debug`** (`codepair::acp_modes`). For unattended runs it also answers **`session/request_permission`** by selecting an **`optionId`** from the agent’s **`options`** list (preferring **`allow_always`**, then **`allow_once`**) and auto-approves **`cursor/create_plan`** [ACP extensions](https://cursor.com/docs/cli/acp). For **`cursor/ask_question`**, worker and reviewer use a simple automatic reply; the **PMO** (when **`cursor_ask_via_gitlab`** is enabled) posts the question on the GitLab issue, sets **`pmo-pending`**, and waits for a **direct thread reply** on that note (`RUST_LOG=debug`: **`codepair::acp_cursor`**). The **reviewer** may request **`ask`** and the **PMO** **`plan`**. **By default** Codepair does **not** start its MCP HTTP server and does **not** write `.cursor/mcp.json`. To enable the optional Codepair MCP endpoint and generated config for extra MCP tools, set **`[mcp] enabled = true`** in `codepair.toml`.
 3. **GitLab CLI** (`glab`) - For GitLab operations
 4. **Git** - For repository operations
 
 ## Security Note
 
-Codepair automatically trusts the cloned repository directories (`*-worker` and `*-reviewer`) by passing the `--trust` flag to the agent CLI. This is necessary for non-interactive automation. Only use Codepair with repositories you trust, as the AI agent will have full access to execute code and modify files in these directories.
+Codepair automatically trusts the cloned repository directories (`*-worker`, `*-reviewer`, `*-pmo`, etc.) by passing the `--trust` flag to the agent CLI. This is necessary for non-interactive automation. Only use Codepair with repositories you trust, as the AI agent will have full access to execute code and modify files in these directories.
 
 ## Build
 
@@ -32,17 +33,27 @@ cargo build --release
 ### Basic Usage
 
 ```bash
-codepair <git-repo-address>
+codepair run
 ```
 
-Example:
-```bash
-codepair https://gitlab.com/username/project
+Set `gitlab_repo` in `codepair.toml` (see example below), then start only the agents you configure under `[agent.*]` sections.
+
+Example config:
+
+```toml
+gitlab_repo = "https://gitlab.com/username/project"
+
+[agent.worker]
+poll_interval_secs = 60
+
+[agent.reviewer]
+poll_interval_secs = 120
+merge_when_approved = true
 ```
 
 ### With Configuration File
 
-First, generate an example config file:
+Generate an example config file:
 
 ```bash
 codepair init-config
@@ -51,25 +62,27 @@ codepair init-config
 This creates `codepair.toml`. Edit it to configure models, polling intervals, and reviewer merge behavior:
 
 ```toml
-[worker]
-model = "composer-2"
+gitlab_repo = "https://gitlab.com/username/project"
+
+[agent.worker]
+# model = "acp://cursor/composer-2"
 poll_interval_secs = 60
 
-[reviewer]
-model = "gpt-5.3-codex"
+[agent.reviewer]
+# model = "acp://cursor/gpt-5.3-codex"
 poll_interval_secs = 120
 merge_when_approved = true
 ```
 
-Then run with the config:
+Then run:
 
 ```bash
-codepair --config codepair.toml https://gitlab.com/username/project
+codepair run --config codepair.toml
 ```
 
 The command will:
-1. Clone the repository to `<project-name>-worker` and `<project-name>-reviewer` directories
-2. Start the Worker and Reviewer agents with specified models
+1. Clone the repository to `<project-name>-<role>-<n>` directories (worker, reviewer, PMO, …)
+2. Start the configured agents with the specified models
 3. Run continuously, displaying periodic status updates
 4. Never require user input
 
