@@ -1,11 +1,11 @@
-# Codepair Configuration File
+# Potlatch Configuration File
 # Configure agents under [agent.<name>] sections. Only agents with a section are started.
 
 # GitLab repository URL (HTTPS). Required by GitLab agents (worker, reviewer, pmo).
 gitlab_repo = "https://gitlab.com/group/project"
 
 # Optional: only process issues/MRs that include this label (exact name).
-# scope_label = "codepair"
+# scope_label = "potlatch"
 
 [agent.worker]
 # model = "acp://cursor/composer-2"

@@ -1,6 +1,6 @@
-//! Cursor **`agent acp`** runs as **one long-lived subprocess** per Codepair agent role. Each task
+//! Cursor **`agent acp`** runs as **one long-lived subprocess** per Potlatch agent role. Each task
 //! calls **`session/close`** (best effort) then **`session/new`** on the same stdio connection so
-//! the model does not keep prior in-agent transcript; workflow continuity stays in Codepair’s
+//! the model does not keep prior in-agent transcript; workflow continuity stays in Potlatch’s
 //! state files and token use stays lower than reusing one session for every task.
 //!
 //! [ACP slash commands](https://agentclientprotocol.com/protocol/slash-commands): the agent may
@@ -63,7 +63,7 @@ fn close_acp_session_best_effort(client: &AcpClient, session_id: &str) {
     match client.session_close(session_id) {
         Ok(()) => {}
         Err(e) => debug!(
-            target: "codepair::acp",
+            target: "potlatch::acp",
             "session/close failed for session {} (continuing with session/new): {}",
             session_id,
             e
@@ -297,7 +297,7 @@ impl AcpRuntime {
     /// - Config option with `id`/`category` `mode` and the value in `options`, or
     /// - Legacy `session/new` `modes.availableModes` non-empty and containing the id.
     ///
-    /// Otherwise leaves the agent default and logs at `debug` (`codepair::acp_modes`).
+    /// Otherwise leaves the agent default and logs at `debug` (`potlatch::acp_modes`).
     fn try_apply_preferred_session_mode(
         &self,
         client: &AcpClient,
@@ -327,7 +327,7 @@ impl AcpRuntime {
                     return;
                 }
                 Err(e) => debug!(
-                    target: "codepair::acp_modes",
+                    target: "potlatch::acp_modes",
                     agent_id = %self.agent_id,
                     err = %e,
                     "session/set_config_option for mode failed",
@@ -343,7 +343,7 @@ impl AcpRuntime {
                         hooks.sync_tracked_current_mode(mode_id);
                     }
                     Err(e) => debug!(
-                        target: "codepair::acp_modes",
+                        target: "potlatch::acp_modes",
                         agent_id = %self.agent_id,
                         err = %e,
                         "session/set_mode fallback after set_config_option failure also failed",
@@ -351,7 +351,7 @@ impl AcpRuntime {
                 }
             } else {
                 debug!(
-                    target: "codepair::acp_modes",
+                    target: "potlatch::acp_modes",
                     agent_id = %self.agent_id,
                     preferred = mode_id,
                     "set_config_option for mode failed and agent does not advertise this mode in legacy availableModes; leaving default",
@@ -370,7 +370,7 @@ impl AcpRuntime {
                     hooks.sync_tracked_current_mode(mode_id);
                 }
                 Err(e) => debug!(
-                    target: "codepair::acp_modes",
+                    target: "potlatch::acp_modes",
                     agent_id = %self.agent_id,
                     err = %e,
                     "session/set_mode failed",
@@ -380,7 +380,7 @@ impl AcpRuntime {
         }
 
         debug!(
-            target: "codepair::acp_modes",
+            target: "potlatch::acp_modes",
             agent_id = %self.agent_id,
             preferred = mode_id,
             "preferred session mode not advertised (no mode config option value match and no legacy availableModes entry); leaving agent default mode",
@@ -429,7 +429,7 @@ impl AcpRuntime {
                 let n = err.read_to_end(&mut buf).unwrap_or(0);
                 if n > 0 {
                     let preview = String::from_utf8_lossy(&buf[..n.min(2048)]);
-                    debug!(target: "codepair::agent_stderr", agent_id = %aid, "stderr: {}", preview);
+                    debug!(target: "potlatch::agent_stderr", agent_id = %aid, "stderr: {}", preview);
                 }
             });
         }
@@ -452,7 +452,7 @@ impl AcpRuntime {
                     terminal: false,
                 },
                 client_info: ImplementationInfo {
-                    name: "codepair".into(),
+                    name: "potlatch".into(),
                     version: env!("CARGO_PKG_VERSION").into(),
                 },
             })
@@ -460,14 +460,14 @@ impl AcpRuntime {
 
         if Self::acp_init_advertises_cursor_login(&init_result) {
             debug!(
-                target: "codepair::acp",
+                target: "potlatch::acp",
                 agent_id = %self.agent_id,
                 auth_methods = init_result.auth_methods.len(),
                 "initialize result includes authMethods; calling authenticate(cursor_login)"
             );
         } else {
             warn!(
-                target: "codepair::acp",
+                target: "potlatch::acp",
                 agent_id = %self.agent_id,
                 "initialize result has no recognizable cursor_login authMethods; still calling authenticate(cursor_login) (required by Cursor ACP before session/new)"
             );
@@ -498,14 +498,14 @@ impl AcpRuntime {
             hooks.seed_session_modes(modes);
             if !mode_id_is_available(modes, &modes.current_mode_id) {
                 debug!(
-                    target: "codepair::acp_modes",
+                    target: "potlatch::acp_modes",
                     agent_id = %self.agent_id,
                     current = %modes.current_mode_id,
                     "ACP session/new currentModeId not listed in availableModes",
                 );
             }
             debug!(
-                target: "codepair::acp_modes",
+                target: "potlatch::acp_modes",
                 agent_id = %self.agent_id,
                 current = %modes.current_mode_id,
                 available = ?modes

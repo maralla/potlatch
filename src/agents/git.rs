@@ -329,9 +329,9 @@ impl GitRepo {
     }
 
     pub fn add_all(&self) -> Result<()> {
-        // Exclude Codepair-generated task context (PMO/worker/reviewer prompts) from commits.
+        // Exclude Potlatch-generated task context (PMO/worker/reviewer prompts) from commits.
         let output = Command::new("git")
-            .args(["add", "--", ".", ":(exclude).codepair-context"])
+            .args(["add", "--", ".", ":(exclude).potlatch-context"])
             .current_dir(&self.path)
             .output()
             .context("Failed to git add")?;

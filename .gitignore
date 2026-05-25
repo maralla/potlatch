@@ -3,7 +3,7 @@ Cargo.lock
 *-worker/
 *-reviewer/
 issue_*.md
-codepair.toml
-.codepair.toml
+potlatch.toml
+.potlatch.toml
 todo.md
 test-repo

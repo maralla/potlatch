@@ -52,17 +52,17 @@ impl Config {
     }
 
     fn find_config_file() -> Result<PathBuf> {
-        for candidate in ["codepair.toml", ".codepair.toml", "config/codepair.toml"] {
+        for candidate in ["potlatch.toml", ".potlatch.toml", "config/potlatch.toml"] {
             let path = Path::new(candidate);
             if path.exists() {
                 return Ok(path.to_path_buf());
             }
         }
-        Ok(PathBuf::from("codepair.toml"))
+        Ok(PathBuf::from("potlatch.toml"))
     }
 
     pub fn save_example(path: &str) -> Result<()> {
-        let example = include_str!("../../../codepair.toml.example");
+        let example = include_str!("../../../potlatch.toml.example");
         fs::write(path, example).context("Failed to write config file")?;
         info!("Example config saved to: {}", path);
         Ok(())

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
@@ -178,10 +179,7 @@ fn parse_gitlab_repo(repo_url: &str) -> Result<(String, String)> {
 }
 
 fn resolve_project_id(host: &str, project_path: &str) -> Result<u64> {
-    let search_term = project_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(project_path);
+    let search_term = project_path.rsplit('/').next().unwrap_or(project_path);
     let endpoint = format!(
         "projects?search={}&membership=true&simple=true&per_page=50",
         search_term
@@ -221,12 +219,13 @@ fn configure_repo_glab(repo_path: &str, host: &str) -> Result<()> {
             config_dir.display()
         )
     })?;
-    fs::write(
-        config_dir.join("config.yml"),
-        format!("host: {host}\n"),
-    )
-    .with_context(|| format!("Failed to write glab config under {}", config_dir.display()))?;
+    fs::write(config_dir.join("config.yml"), format!("host: {host}\n"))
+        .with_context(|| format!("Failed to write glab config under {}", config_dir.display()))?;
     Ok(())
+}
+
+fn mr_create_error_is_duplicate(err_msg: &str) -> bool {
+    err_msg.to_ascii_lowercase().contains("already exists")
 }
 
 /// Returns `true` when the glab/API error string suggests a transient problem worth retrying.
@@ -264,7 +263,11 @@ impl GitLabClient {
     }
 
     fn api_path(&self, tail: &str) -> String {
-        format!("projects/{}/{}", self.project_id, tail.trim_start_matches('/'))
+        format!(
+            "projects/{}/{}",
+            self.project_id,
+            tail.trim_start_matches('/')
+        )
     }
 
     fn run_api(&self, endpoint: &str, extra_args: &[&str]) -> Result<std::process::Output> {
@@ -286,10 +289,7 @@ impl GitLabClient {
         fields: &[(&str, &str)],
     ) -> Result<std::process::Output> {
         let endpoint = self.api_path(tail);
-        let field_strings: Vec<String> = fields
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
+        let field_strings: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let mut cmd = Command::new("glab");
         cmd.arg("api")
             .arg("--hostname")
@@ -302,6 +302,78 @@ impl GitLabClient {
         cmd.current_dir(&self.repo_path)
             .output()
             .with_context(|| format!("Failed to execute glab api {method} {endpoint}"))
+    }
+
+    fn run_api_json(
+        &self,
+        tail: &str,
+        method: &str,
+        body: &impl Serialize,
+    ) -> Result<std::process::Output> {
+        let endpoint = self.api_path(tail);
+        let json = serde_json::to_vec(body).context("Failed to serialize GitLab API JSON body")?;
+        let mut child = Command::new("glab")
+            .arg("api")
+            .arg("--hostname")
+            .arg(&self.host)
+            .arg(&endpoint)
+            .args([
+                "--method",
+                method,
+                "-H",
+                "Content-Type: application/json",
+                "--input",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(&self.repo_path)
+            .spawn()
+            .with_context(|| format!("Failed to spawn glab api {method} {endpoint}"))?;
+        child
+            .stdin
+            .take()
+            .context("Failed to open glab api stdin")?
+            .write_all(&json)
+            .context("Failed to write glab api JSON body")?;
+        child
+            .wait_with_output()
+            .with_context(|| format!("Failed to execute glab api {method} {endpoint}"))
+    }
+
+    fn glab_api_error_message(output: &std::process::Output) -> String {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            stderr.into_owned()
+        } else if stderr.trim().is_empty() {
+            stdout.into_owned()
+        } else {
+            format!("{stderr}\n{stdout}")
+        }
+    }
+
+    /// Returns the IID of an open MR for `source_branch`, if one exists.
+    pub fn find_open_mr_by_source_branch(&self, source_branch: &str) -> Result<Option<u64>> {
+        let endpoint = self.api_path(&format!(
+            "merge_requests?source_branch={source_branch}&state=opened&per_page=1"
+        ));
+        let output = self.run_api(&endpoint, &[])?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to find merge request for branch {}: {}",
+                source_branch,
+                Self::glab_api_error_message(&output)
+            );
+        }
+        #[derive(Deserialize)]
+        struct MrHit {
+            iid: u64,
+        }
+        let hits: Vec<MrHit> =
+            serde_json::from_slice(&output.stdout).context("Failed to parse MR search JSON")?;
+        Ok(hits.into_iter().next().map(|mr| mr.iid))
     }
 
     pub fn list_issues(&self) -> Result<Vec<Issue>> {
@@ -362,11 +434,8 @@ impl GitLabClient {
     pub fn add_issue_label(&self, iid: u64, label: &str) -> Result<()> {
         debug!("Adding label '{}' to issue #{}", label, iid);
 
-        let output = self.run_api_method(
-            &format!("issues/{iid}"),
-            "PUT",
-            &[("add_labels", label)],
-        )?;
+        let output =
+            self.run_api_method(&format!("issues/{iid}"), "PUT", &[("add_labels", label)])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -381,11 +450,8 @@ impl GitLabClient {
     pub fn remove_issue_label(&self, iid: u64, label: &str) -> Result<()> {
         debug!("Removing label '{}' from issue #{}", label, iid);
 
-        let output = self.run_api_method(
-            &format!("issues/{iid}"),
-            "PUT",
-            &[("remove_labels", label)],
-        )?;
+        let output =
+            self.run_api_method(&format!("issues/{iid}"), "PUT", &[("remove_labels", label)])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -400,11 +466,8 @@ impl GitLabClient {
     pub fn add_issue_comment(&self, iid: u64, comment: &str) -> Result<()> {
         debug!("Adding comment to issue #{}", iid);
 
-        let output = self.run_api_method(
-            &format!("issues/{iid}/notes"),
-            "POST",
-            &[("body", comment)],
-        )?;
+        let output =
+            self.run_api_method(&format!("issues/{iid}/notes"), "POST", &[("body", comment)])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -428,29 +491,42 @@ impl GitLabClient {
             source_branch, target_branch
         );
 
-        let output = self.run_api_method(
-            "merge_requests",
-            "POST",
-            &[
-                ("source_branch", source_branch),
-                ("target_branch", target_branch),
-                ("title", title),
-                ("description", description),
-            ],
-        )?;
+        if let Some(existing) = self.find_open_mr_by_source_branch(source_branch)? {
+            info!(
+                "Open MR !{} already exists for branch {}, reusing it",
+                existing, source_branch
+            );
+            return Ok(existing);
+        }
+
+        #[derive(Serialize)]
+        struct CreateMrBody<'a> {
+            source_branch: &'a str,
+            target_branch: &'a str,
+            title: &'a str,
+            description: &'a str,
+        }
+
+        let body = CreateMrBody {
+            source_branch,
+            target_branch,
+            title,
+            description,
+        };
+        let output = self.run_api_json("merge_requests", "POST", &body)?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            anyhow::bail!(
-                "glab api mr create failed: {}{}",
-                stderr,
-                if stdout.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{stdout}")
-                }
-            );
+            let err = Self::glab_api_error_message(&output);
+            if mr_create_error_is_duplicate(&err)
+                && let Some(existing) = self.find_open_mr_by_source_branch(source_branch)?
+            {
+                info!(
+                    "Open MR !{} already exists for branch {}, reusing it after create conflict",
+                    existing, source_branch
+                );
+                return Ok(existing);
+            }
+            anyhow::bail!("glab api mr create failed: {err}");
         }
 
         #[derive(Deserialize)]
@@ -958,11 +1034,7 @@ impl GitLabClient {
     pub fn merge_mr(&self, iid: u64) -> Result<()> {
         debug!("Merging merge request !{}", iid);
 
-        let output = self.run_api_method(
-            &format!("merge_requests/{iid}/merge"),
-            "PUT",
-            &[],
-        )?;
+        let output = self.run_api_method(&format!("merge_requests/{iid}/merge"), "PUT", &[])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -996,11 +1068,8 @@ impl GitLabClient {
     pub fn close_issue(&self, iid: u64) -> Result<()> {
         debug!("Closing issue #{}", iid);
 
-        let output = self.run_api_method(
-            &format!("issues/{iid}"),
-            "PUT",
-            &[("state_event", "close")],
-        )?;
+        let output =
+            self.run_api_method(&format!("issues/{iid}"), "PUT", &[("state_event", "close")])?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -1189,27 +1258,35 @@ pub fn mr_description_closes_issue(description: &str, issue_iid: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, mr_description_closes_issue,
-        mr_label_api_error_should_retry, parse_gitlab_repo,
+        GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, mr_create_error_is_duplicate,
+        mr_description_closes_issue, mr_label_api_error_should_retry, parse_gitlab_repo,
     };
     use serde_json::json;
 
     #[test]
     fn parse_gitlab_repo_ssh_url() {
-        let (host, path) = parse_gitlab_repo(
-            "git@git.example.com:platform/projects/data-worker.git",
-        )
-        .unwrap();
+        let (host, path) =
+            parse_gitlab_repo("git@git.example.com:platform/projects/data-worker.git")
+                .unwrap();
         assert_eq!(host, "git.example.com");
         assert_eq!(path, "platform/projects/data-worker");
     }
 
     #[test]
     fn parse_gitlab_repo_https_url() {
-        let (host, path) =
-            parse_gitlab_repo("https://gitlab.com/group/sub/project.git").unwrap();
+        let (host, path) = parse_gitlab_repo("https://gitlab.com/group/sub/project.git").unwrap();
         assert_eq!(host, "gitlab.com");
         assert_eq!(path, "group/sub/project");
+    }
+
+    #[test]
+    fn mr_create_error_is_duplicate_detects_gitlab_conflict_message() {
+        assert!(mr_create_error_is_duplicate(
+            "glab: map[message:[Another open merge request already exists for this source branch: !21]]"
+        ));
+        assert!(!mr_create_error_is_duplicate(
+            "glab: HTTP 400\n{\"error\":\"target_branch is missing\"}"
+        ));
     }
 
     #[test]

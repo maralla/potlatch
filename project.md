@@ -1,6 +1,6 @@
-# Codepair
+# Potlatch
 
-A CLI-Based AI Agent Pair System
+Fully automatic agentic platform.
 
 ## Overview
 A system that orchestrates CLI-based AI agents (like `cursor agent`, `claude code`, `gemini cli`) to work as a pair:
@@ -21,7 +21,7 @@ A system that orchestrates CLI-based AI agents (like `cursor agent`, `claude cod
 Here is the interface for interacting with this tool:
 
 ```bash
-codepair <git-repo-address>
+potlatch <git-repo-address>
 ```
 
 Then the command just blocks there with periodic output of the current working issue, how many issues are finished, etc.

@@ -1,10 +1,10 @@
-# Codepair
+# Potlatch
 
-A CLI-Based AI Agent Pair System that orchestrates AI agents to automatically implement and review GitLab issues.
+Potlatch is a fully automatic agentic platform for orchestrating autonomous AI agents across workflows.
 
 ## Overview
 
-Codepair runs several AI agent roles in parallel in a fully automated, non-interactive mode:
+Potlatch runs several AI agent roles in parallel in a fully automated, non-interactive mode:
 - **Worker Agent**: Fetches issues, implements features, and creates merge requests autonomously
 - **Reviewer Agent**: Reviews merge requests and either merges them automatically or leaves an approval comment, depending on config
 - **PMO Agent**: Triages `action-required` issues (typically after a worker could not finish) and may split work or guide the worker
@@ -13,14 +13,14 @@ All roles operate without requiring any user input, making autonomous decisions 
 
 ## Prerequisites
 
-1. **Rust toolchain** (`cargo`, stable) — to build Codepair from source
-2. **Cursor Agent CLI** — The `agent` command on your `PATH` is **Cursor’s agent CLI**. Codepair keeps **one** long-lived **`agent acp`** subprocess per role (optional **`--model`** first, then **`--print`**, **`--trust`**, **`--force`**, **`--approve-mcps`**). On the first task it runs **`initialize`**, then **`authenticate`** with **`cursor_login`** when Cursor advertises it (per [Cursor ACP](https://cursor.com/docs/cli/acp); use **`agent login`** or **`CURSOR_API_KEY`** / **`CURSOR_AUTH_TOKEN`**), then **`session/new`**; on **each later task** it calls **`session/close`** (best effort) then **`session/new`** again on the **same** stdio link, sends **`session/prompt`**, and leaves the child running so the next task still gets a **clean session** (no prior in-agent chat; workflow continuity stays in Codepair’s own state files). Model selection follows [ACP Session Config Options](https://agentclientprotocol.com/protocol/session-config-options): if **`configOptions`** includes a model selector and your id is in **`options`**, Codepair calls **`session/set_config_option`**; otherwise it tries experimental **`session/set_model`**. Completions come from streamed **`session/update`** chunks (including [slash-command](https://agentclientprotocol.com/protocol/slash-commands) and [session mode](https://agentclientprotocol.com/protocol/session-modes) updates). Codepair tracks **`modes`** / **`configOptions`** and logs at **`RUST_LOG=debug`** (`codepair::acp_modes`). For unattended runs it also answers **`session/request_permission`** by selecting an **`optionId`** from the agent’s **`options`** list (preferring **`allow_always`**, then **`allow_once`**) and auto-approves **`cursor/create_plan`** [ACP extensions](https://cursor.com/docs/cli/acp). For **`cursor/ask_question`**, worker and reviewer use a simple automatic reply; the **PMO** (when **`cursor_ask_via_gitlab`** is enabled) posts the question on the GitLab issue, sets **`pmo-pending`**, and waits for a **direct thread reply** on that note (`RUST_LOG=debug`: **`codepair::acp_cursor`**). The **reviewer** may request **`ask`** and the **PMO** **`plan`**. **By default** Codepair does **not** start its MCP HTTP server and does **not** write `.cursor/mcp.json`. To enable the optional Codepair MCP endpoint and generated config for extra MCP tools, set **`[mcp] enabled = true`** in `codepair.toml`.
+1. **Rust toolchain** (`cargo`, stable) — to build Potlatch from source
+2. **Cursor Agent CLI** — The `agent` command on your `PATH` is **Cursor’s agent CLI**. Potlatch keeps **one** long-lived **`agent acp`** subprocess per role (optional **`--model`** first, then **`--print`**, **`--trust`**, **`--force`**, **`--approve-mcps`**). On the first task it runs **`initialize`**, then **`authenticate`** with **`cursor_login`** when Cursor advertises it (per [Cursor ACP](https://cursor.com/docs/cli/acp); use **`agent login`** or **`CURSOR_API_KEY`** / **`CURSOR_AUTH_TOKEN`**), then **`session/new`**; on **each later task** it calls **`session/close`** (best effort) then **`session/new`** again on the **same** stdio link, sends **`session/prompt`**, and leaves the child running so the next task still gets a **clean session** (no prior in-agent chat; workflow continuity stays in Potlatch’s own state files). Model selection follows [ACP Session Config Options](https://agentclientprotocol.com/protocol/session-config-options): if **`configOptions`** includes a model selector and your id is in **`options`**, Potlatch calls **`session/set_config_option`**; otherwise it tries experimental **`session/set_model`**. Completions come from streamed **`session/update`** chunks (including [slash-command](https://agentclientprotocol.com/protocol/slash-commands) and [session mode](https://agentclientprotocol.com/protocol/session-modes) updates). Potlatch tracks **`modes`** / **`configOptions`** and logs at **`RUST_LOG=debug`** (`potlatch::acp_modes`). For unattended runs it also answers **`session/request_permission`** by selecting an **`optionId`** from the agent’s **`options`** list (preferring **`allow_always`**, then **`allow_once`**) and auto-approves **`cursor/create_plan`** [ACP extensions](https://cursor.com/docs/cli/acp). For **`cursor/ask_question`**, worker and reviewer use a simple automatic reply; the **PMO** (when **`cursor_ask_via_gitlab`** is enabled) posts the question on the GitLab issue, sets **`pmo-pending`**, and waits for a **direct thread reply** on that note (`RUST_LOG=debug`: **`potlatch::acp_cursor`**). The **reviewer** may request **`ask`** and the **PMO** **`plan`**. **By default** Potlatch does **not** start its MCP HTTP server and does **not** write `.cursor/mcp.json`. To enable the optional Potlatch MCP endpoint and generated config for extra MCP tools, set **`[mcp] enabled = true`** in `potlatch.toml`.
 3. **GitLab CLI** (`glab`) - For GitLab operations
 4. **Git** - For repository operations
 
 ## Security Note
 
-Codepair automatically trusts the cloned repository directories (`*-worker`, `*-reviewer`, `*-pmo`, etc.) by passing the `--trust` flag to the agent CLI. This is necessary for non-interactive automation. Only use Codepair with repositories you trust, as the AI agent will have full access to execute code and modify files in these directories.
+Potlatch automatically trusts the cloned repository directories (`*-worker`, `*-reviewer`, `*-pmo`, etc.) by passing the `--trust` flag to the agent CLI. This is necessary for non-interactive automation. Only use Potlatch with repositories you trust, as the AI agent will have full access to execute code and modify files in these directories.
 
 ## Build
 
@@ -33,10 +33,10 @@ cargo build --release
 ### Basic Usage
 
 ```bash
-codepair run
+potlatch run
 ```
 
-Set `gitlab_repo` in `codepair.toml` (see example below), then start only the agents you configure under `[agent.*]` sections.
+Set `gitlab_repo` in `potlatch.toml` (see example below), then start only the agents you configure under `[agent.*]` sections.
 
 Example config:
 
@@ -56,10 +56,10 @@ merge_when_approved = true
 Generate an example config file:
 
 ```bash
-codepair init-config
+potlatch init-config
 ```
 
-This creates `codepair.toml`. Edit it to configure models, polling intervals, and reviewer merge behavior:
+This creates `potlatch.toml`. Edit it to configure models, polling intervals, and reviewer merge behavior:
 
 ```toml
 gitlab_repo = "https://gitlab.com/username/project"
@@ -77,7 +77,7 @@ merge_when_approved = true
 Then run:
 
 ```bash
-codepair run --config codepair.toml
+potlatch run --config potlatch.toml
 ```
 
 The command will:
@@ -179,7 +179,7 @@ model = "gpt-5.3-codex"      # e.g. a different model for review
 merge_when_approved = true   # Set to false to comment approval without merging
 ```
 
-Use **`agent --list-models`** (or the values listed under the model entry in **`configOptions`** when the agent sends them) for valid ids. Codepair passes **`--model`** on the CLI and, after **`session/new`**, prefers **`session/set_config_option`** with **`configId`** set to the advertised model option’s **`id`** and **`value`** set to your id—only when that value appears in the option’s **`options`** array, per the [spec](https://agentclientprotocol.com/protocol/session-config-options). If there is no matching advertised option, or the call fails, Codepair falls back to **`session/set_model`**.
+Use **`agent --list-models`** (or the values listed under the model entry in **`configOptions`** when the agent sends them) for valid ids. Potlatch passes **`--model`** on the CLI and, after **`session/new`**, prefers **`session/set_config_option`** with **`configId`** set to the advertised model option’s **`id`** and **`value`** set to your id—only when that value appears in the option’s **`options`** array, per the [spec](https://agentclientprotocol.com/protocol/session-config-options). If there is no matching advertised option, or the call fails, Potlatch falls back to **`session/set_model`**.
 
 ### Polling Intervals
 
@@ -205,7 +205,7 @@ Optional top-level `scope_label` (default **empty** = no scoping; all open issue
 When scoping is enabled, merge requests created by the worker and sub-issues created by the PMO automatically receive `scope_label`.
 
 ```toml
-scope_label = "codepair"
+scope_label = "potlatch"
 ```
 
 ## License

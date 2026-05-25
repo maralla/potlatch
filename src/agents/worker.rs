@@ -22,7 +22,7 @@ use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const WORKING_ON_LABEL: &str = "in-progress";
-/// Root-level file updated by Codepair after each successful worker run (impl or MR feedback).
+/// Root-level file updated by Potlatch after each successful worker run (impl or MR feedback).
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
 const PMO_PENDING_LABEL: &str = "pmo-pending";
@@ -1833,14 +1833,10 @@ fn try_adopt_orphaned_session(
 /// Find an *open* MR for an issue. Closed/merged MRs are ignored.
 fn find_open_mr_for_issue(gitlab: &GitLabClient, issue_iid: u64) -> Option<u64> {
     let branch_name = format!("issue-{}", issue_iid);
-    if let Ok(mrs) = gitlab.list_merge_requests() {
-        for mr in mrs {
-            if mr.source_branch == branch_name && mr.state == "opened" {
-                return Some(mr.iid);
-            }
-        }
-    }
-    None
+    gitlab
+        .find_open_mr_by_source_branch(&branch_name)
+        .ok()
+        .flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -2186,7 +2182,7 @@ fn build_mr_diff_context(
     if diff_patch.len() > MAX_DIFF_CHARS {
         diff_patch.truncate(MAX_DIFF_CHARS);
         diff_patch.push_str(
-            "\n\n[diff truncated by codepair: patch exceeded size limit; inspect full diff with git commands if needed]\n",
+            "\n\n[diff truncated by potlatch: patch exceeded size limit; inspect full diff with git commands if needed]\n",
         );
     }
     if diff_patch.trim().is_empty() {
@@ -2352,7 +2348,7 @@ TASK CONTEXT FILE (read this file on disk — full issue + all GitLab comments):
 {}
 
 CONTEXT:
-- The path above is written by Codepair: it contains this issue's **description** and **every GitLab issue comment** at the time the task started. That is your primary written spec; read it end-to-end before saying context is missing.
+- The path above is written by Potlatch: it contains this issue's **description** and **every GitLab issue comment** at the time the task started. That is your primary written spec; read it end-to-end before saying context is missing.
 - Labels on the issue (e.g. priority) are visible in GitLab; infer scope from description + comments + `AGENTS.md`.
 
 {}

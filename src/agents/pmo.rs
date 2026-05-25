@@ -68,7 +68,7 @@ struct AgentState {
 impl AgentState {
     fn ensure_sessions_dir(&self) -> Result<()> {
         let ctx_dir = path::Path::new(&self.sessions_dir);
-        fs::create_dir_all(&ctx_dir).context("Failed to create .codepair-context directory")?;
+        fs::create_dir_all(&ctx_dir).context("Failed to create .potlatch-context directory")?;
 
         Ok(())
     }
@@ -936,7 +936,7 @@ fn pmo_gitlab_comments_section(gitlab: &GitLabClient, issue_iid: u64) -> (String
             );
             (
                 format!(
-                    "**ERROR: Codepair could not load GitLab issue comments.**\n\n\
+                    "**ERROR: Potlatch could not load GitLab issue comments.**\n\n\
                      PMO triage may be unreliable until this works (check `glab` auth, network, and that `repo_path` is the git clone root).\n\n\
                      ```text\n{e}\n```"
                 ),
@@ -946,7 +946,7 @@ fn pmo_gitlab_comments_section(gitlab: &GitLabClient, issue_iid: u64) -> (String
     }
 }
 
-/// Rewrites `pmo-issue-<iid>.md` under [`CODEPAIR_CONTEXT_DIR`]. Call whenever PMO holds or resumes
+/// Rewrites `pmo-issue-<iid>.md` under [`BREEZE_CONTEXT_DIR`]. Call whenever PMO holds or resumes
 /// work on an issue (new claim, resumed claim, pmo-pending poll, pending split).
 fn refresh_pmo_issue_context_file(
     state: &AgentState,
@@ -962,7 +962,7 @@ fn refresh_pmo_issue_context_file(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let body = format!(
-        "# PMO Triage Context\n\nProject: {project_name}\nIssue: #{iid} {title}\n\n## Issue description\n{description}\n\n## Comments and worker feedback\n{comments}\n\n## Existing open issues\n{existing}\n\n---\n_Codepair: PMO refreshed this file; {gitlab_note_count} GitLab note(s) in the section above; UNIX ts {generated_ts}._\n",
+        "# PMO Triage Context\n\nProject: {project_name}\nIssue: #{iid} {title}\n\n## Issue description\n{description}\n\n## Comments and worker feedback\n{comments}\n\n## Existing open issues\n{existing}\n\n---\n_Potlatch: PMO refreshed this file; {gitlab_note_count} GitLab note(s) in the section above; UNIX ts {generated_ts}._\n",
         project_name = &state.project_name,
         iid = issue.iid,
         title = issue.title,
@@ -1003,7 +1003,7 @@ TASK CONTEXT FILE (you MUST open and read this path on disk — it has the full 
 
 CONTEXT:
 An automated worker agent attempted to implement this issue but was unable to complete it.
-Codepair wrote the path above as a markdown file: **full issue description**, **every GitLab issue comment** (including worker rejection / PMO notes), and **the list of other open issues**. That file is the authoritative written context for this triage.
+Potlatch wrote the path above as a markdown file: **full issue description**, **every GitLab issue comment** (including worker rejection / PMO notes), and **the list of other open issues**. That file is the authoritative written context for this triage.
 - Use your **file-reading** capability on the absolute path and read it **end-to-end** before you decide the situation is unclear.
 - The single line `ISSUE #…: title` in this prompt is **not** a substitute for the file; do not claim "no context" or choose NEEDS_CLARIFICATION only because you did not read the task context file.
 Your job is to analyze the failure reason (from the file + repo when needed) and take the appropriate action.
@@ -1013,13 +1013,13 @@ CRITICAL REQUIREMENTS:
 - You do NOT write new production code — you inspect the existing project state, then write comments and create issue descriptions as needed
 - The worker agent has FULL ACCESS to shell commands (rm, mv, git, etc.) and all build/test tools
 - If the worker claimed it "cannot run commands" or "cannot delete files", that is WRONG — it CAN. Instruct it clearly.
-- Before deciding GUIDE_WORKER or SPLIT, you MUST verify whether the issue is already implemented in the current project state when that is plausible from the issue, comments, or worker output. If the behavior/tests/code already exist, choose ALREADY_DONE so Codepair will close the issue and add a comment.
-- In your final reply for this turn, make the outcome obvious in plain text (markers below). Codepair parses your message; there is no separate tool call for handoff.
+- Before deciding GUIDE_WORKER or SPLIT, you MUST verify whether the issue is already implemented in the current project state when that is plausible from the issue, comments, or worker output. If the behavior/tests/code already exist, choose ALREADY_DONE so Potlatch will close the issue and add a comment.
+- In your final reply for this turn, make the outcome obvious in plain text (markers below). Potlatch parses your message; there is no separate tool call for handoff.
 - For any human-facing comment text that should be posted to GitLab, include a stable block:
   PUBLIC_COMMENT_BEGIN
   <only final public comment text; no progress/status/tool logs>
   PUBLIC_COMMENT_END
-- **Plan mode (STRICT):** Cursor may save your work as a `.md` file under the repo. Codepair **reads that file after the turn** and appends its text to your output for parsing. A Cursor plan UI (outline, checkboxes, widgets) **does not count** unless the **saved file body** contains the plain-text markers below. You **must** put the machine-readable blocks **inside the `.md` file** (or duplicate them in your final streamed message). Do not finish the turn with only UI structure — **edit the plan file** to include the exact formats in `CURSOR PLAN FILE — CANONICAL BLOCKS` below. This run is fully automated; do not wait for user confirmation.
+- **Plan mode (STRICT):** Cursor may save your work as a `.md` file under the repo. Potlatch **reads that file after the turn** and appends its text to your output for parsing. A Cursor plan UI (outline, checkboxes, widgets) **does not count** unless the **saved file body** contains the plain-text markers below. You **must** put the machine-readable blocks **inside the `.md` file** (or duplicate them in your final streamed message). Do not finish the turn with only UI structure — **edit the plan file** to include the exact formats in `CURSOR PLAN FILE — CANONICAL BLOCKS` below. This run is fully automated; do not wait for user confirmation.
 - Also mirror intent in prose where helpful (`decision:`, `question:`, `instructions:`, `reason:`) but **parsers require the literal marker lines** (`GUIDE_WORKER`, `SUB_ISSUE_1:`, `ALREADY_DONE`, etc.) — prose alone is not enough.
 - For SPLIT, each sub-issue **must** use the `SUB_ISSUE_N:` + `TITLE:` + `PRIORITY:` + `DESCRIPTION:` layout (see canonical examples). Include acceptance criteria inside `DESCRIPTION:`.
 - **STRICT OUTPUT CONTRACT (SPLIT):** if you choose `decision: split`, your final output must be machine-readable only: either `SUB_ISSUE_N` blocks or one fenced JSON array. Do not include extra prose before or after those structured blocks.
@@ -1400,7 +1400,7 @@ fn pmo_apply_cursor_plan_files(working_dir: &str, mut handoff: AgentHandoff) -> 
 
             Err(e) => {
                 warn!(
-                    target: "codepair::pmo_plan_file",
+                    target: "potlatch::pmo_plan_file",
                     path = %plan_path,
                     err = %e,
                     "PMO could not read Cursor plan file from tool_call_update"
@@ -1841,8 +1841,7 @@ fn resolve_dependency_placeholders_in_description(
 fn save_pending_split(path: &str, pending: &PendingSplit) -> Result<()> {
     let json = serde_json::to_string_pretty(pending)?;
     if let Some(parent) = std::path::Path::new(path).parent() {
-        fs::create_dir_all(parent)
-            .context("Failed to create .codepair-context for pending split")?;
+        fs::create_dir_all(parent).context("Failed to create .potlatch-context for pending split")?;
     }
     fs::write(path, json).context("Failed to save pending split file")?;
     info!(
@@ -2116,9 +2115,9 @@ mod tests {
         ];
         assert!(!should_process_issue(&issue, None));
 
-        issue.labels = vec![ACTION_REQUIRED_LABEL.to_string(), "codepair".to_string()];
+        issue.labels = vec![ACTION_REQUIRED_LABEL.to_string(), "potlatch".to_string()];
         assert!(!should_process_issue(&issue, Some("other-scope")));
-        assert!(should_process_issue(&issue, Some("codepair")));
+        assert!(should_process_issue(&issue, Some("potlatch")));
     }
 
     #[test]
@@ -2318,7 +2317,7 @@ Body here.
     #[test]
     fn pmo_apply_cursor_plan_files_merges_markdown_into_response() {
         let tmp =
-            std::env::temp_dir().join(format!("codepair-pmo-plan-merge-{}", std::process::id()));
+            std::env::temp_dir().join(format!("potlatch-pmo-plan-merge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("plans")).unwrap();
         let f = tmp.join("plans/triage.md");
@@ -2340,7 +2339,7 @@ Body here.
     #[test]
     fn pmo_read_plan_file_text_allows_external_cursor_plans_under_home() {
         let tmp =
-            std::env::temp_dir().join(format!("codepair-pmo-external-plan-{}", std::process::id()));
+            std::env::temp_dir().join(format!("potlatch-pmo-external-plan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let workspace = tmp.join("repo");
         let home = tmp.join("home");
@@ -2364,10 +2363,8 @@ Body here.
 
     #[test]
     fn pmo_read_plan_file_text_rejects_external_paths_outside_allowlist() {
-        let tmp = std::env::temp_dir().join(format!(
-            "codepair-pmo-external-reject-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("potlatch-pmo-external-reject-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let workspace = tmp.join("repo");
         let home = tmp.join("home");

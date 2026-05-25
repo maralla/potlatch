@@ -29,7 +29,7 @@ fn new_ask_id() -> String {
 }
 
 fn ask_marker_snippet(ask_id: &str) -> String {
-    format!("<!-- codepair-pmo-acp-ask:{ask_id} -->")
+    format!("<!-- potlatch-pmo-acp-ask:{ask_id} -->")
 }
 
 fn option_entry_id(opt: &Value) -> Option<&str> {
@@ -123,7 +123,7 @@ fn build_issue_comment(ask_id: &str, params: &Value) -> String {
          ---\n\n\
          **Reply to this comment** (use GitLab’s *Reply* on this note so your answer stays in this thread). \
          Your reply text is the answer — usually one line: an option id, a number (`0` = first choice), or a short answer.\n\n\
-         The `{}` label is set until Codepair forwards your reply to the running agent.",
+         The `{}` label is set until Potlatch forwards your reply to the running agent.",
         labels::PMO_PENDING
     )
 }
@@ -154,7 +154,7 @@ fn pick_direct_thread_reply<'a>(
             if n.id == root.id || n.system {
                 return false;
             }
-            if n.body.contains("codepair-pmo-acp-ask:") {
+            if n.body.contains("potlatch-pmo-acp-ask:") {
                 return false;
             }
             same_discussion_or_sequential_fallback(n, root)
@@ -204,7 +204,7 @@ fn resolve_choice_to_acp_result(params: &Value, choice_raw: &str) -> Value {
         }
     }
     warn!(
-        target: "codepair::acp_cursor",
+        target: "potlatch::acp_cursor",
         choice = %choice_trim,
         "PMO thread reply did not match a listed option; echoing as selectedOptionId"
     );
@@ -244,7 +244,7 @@ impl GitLabIssueCursorAskHandler {
         let result = resolve_choice_to_acp_result(params_for_resolve, &choice);
         clear_pmo_pending_label(&self.gitlab, self.issue_iid);
         info!(
-            target: "codepair::acp_cursor",
+            target: "potlatch::acp_cursor",
             issue_iid = self.issue_iid,
             note_id = reply.id,
             author = %reply.author_username(),
@@ -262,7 +262,7 @@ impl CursorAskQuestionHandler for GitLabIssueCursorAskHandler {
 
         if let Err(e) = self.gitlab.add_issue_comment(self.issue_iid, &comment) {
             warn!(
-                target: "codepair::acp_cursor",
+                target: "potlatch::acp_cursor",
                 err = %e,
                 "failed to post ask_question to GitLab; using headless fallback"
             );
@@ -274,7 +274,7 @@ impl CursorAskQuestionHandler for GitLabIssueCursorAskHandler {
             .add_issue_label(self.issue_iid, labels::PMO_PENDING)
         {
             warn!(
-                target: "codepair::acp_cursor",
+                target: "potlatch::acp_cursor",
                 err = %e,
                 "failed to add pmo-pending for ask_question"
             );
@@ -284,7 +284,7 @@ impl CursorAskQuestionHandler for GitLabIssueCursorAskHandler {
             Ok(n) => n,
             Err(e) => {
                 warn!(
-                    target: "codepair::acp_cursor",
+                    target: "potlatch::acp_cursor",
                     err = %e,
                     "failed to list thread notes after posting ask_question"
                 );
@@ -295,7 +295,7 @@ impl CursorAskQuestionHandler for GitLabIssueCursorAskHandler {
 
         let Some(root) = find_root_note(&notes, &ask_id) else {
             warn!(
-                target: "codepair::acp_cursor",
+                target: "potlatch::acp_cursor",
                 ask_id = %ask_id,
                 "could not find posted ask note by marker; using headless fallback"
             );
@@ -306,14 +306,14 @@ impl CursorAskQuestionHandler for GitLabIssueCursorAskHandler {
         let root_note_id = root.id;
 
         info!(
-            target: "codepair::acp_cursor",
+            target: "potlatch::acp_cursor",
             issue_iid = self.issue_iid,
             root_note_id = root.id,
             ask_id = %ask_id,
             "Posted cursor/ask_question; waiting for direct thread reply"
         );
         eprintln!(
-            "codepair PMO: Posted question on issue #{} — **Reply to that GitLab comment** (thread). Waiting…",
+            "potlatch PMO: Posted question on issue #{} — **Reply to that GitLab comment** (thread). Waiting…",
             self.issue_iid
         );
 
@@ -322,7 +322,7 @@ impl CursorAskQuestionHandler for GitLabIssueCursorAskHandler {
                 && Instant::now() >= dl
             {
                 eprintln!(
-                    "codepair PMO: GitLab thread wait timed out on issue #{}; using automatic choice.",
+                    "potlatch PMO: GitLab thread wait timed out on issue #{}; using automatic choice.",
                     self.issue_iid
                 );
                 let _ = self.gitlab.add_issue_comment(
@@ -335,7 +335,7 @@ impl CursorAskQuestionHandler for GitLabIssueCursorAskHandler {
 
             if self.shutdown.load(Ordering::SeqCst) {
                 warn!(
-                    target: "codepair::acp_cursor",
+                    target: "potlatch::acp_cursor",
                     "shutdown during ask_question wait; headless fallback"
                 );
                 clear_pmo_pending_label(&self.gitlab, self.issue_iid);
@@ -347,14 +347,14 @@ impl CursorAskQuestionHandler for GitLabIssueCursorAskHandler {
             let notes = match self.gitlab.get_issue_thread_notes(self.issue_iid) {
                 Ok(n) => n,
                 Err(e) => {
-                    warn!(target: "codepair::acp_cursor", err = %e, "poll thread notes failed");
+                    warn!(target: "potlatch::acp_cursor", err = %e, "poll thread notes failed");
                     continue;
                 }
             };
 
             let Some(root) = notes.iter().find(|n| n.id == root_note_id) else {
                 warn!(
-                    target: "codepair::acp_cursor",
+                    target: "potlatch::acp_cursor",
                     root_note_id,
                     "root note disappeared during wait"
                 );
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn pick_reply_same_discussion() {
-        let root = n(10, "<!-- codepair-pmo-acp-ask:abc -->", false, Some("d1"));
+        let root = n(10, "<!-- potlatch-pmo-acp-ask:abc -->", false, Some("d1"));
         let r1 = n(11, "opt-b", false, Some("d1"));
         let noise = n(9, "old", false, Some("d2"));
         let notes = vec![noise, root.clone(), r1.clone()];
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn pick_first_reply_when_sorted() {
-        let root = n(5, "<!-- codepair-pmo-acp-ask:x -->", false, None);
+        let root = n(5, "<!-- potlatch-pmo-acp-ask:x -->", false, None);
         let r1 = n(6, "0", false, None);
         let notes = vec![root.clone(), r1.clone()];
         let root_ref = &notes[0];
@@ -410,8 +410,8 @@ mod tests {
 
     #[test]
     fn ignores_new_ask_in_thread() {
-        let root = n(1, "<!-- codepair-pmo-acp-ask:a -->", false, Some("d"));
-        let bad = n(2, "<!-- codepair-pmo-acp-ask:b -->", false, Some("d"));
+        let root = n(1, "<!-- potlatch-pmo-acp-ask:a -->", false, Some("d"));
+        let bad = n(2, "<!-- potlatch-pmo-acp-ask:b -->", false, Some("d"));
         let notes = vec![root.clone(), bad];
         let root_ref = &notes[0];
         assert!(pick_direct_thread_reply(&notes, root_ref).is_none());

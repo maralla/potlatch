@@ -1,9 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
-use tracing::info;
+use std::path::Path;
 
 mod agents;
 mod core;
+mod ui;
 mod util;
 
 use core::config::Config;
@@ -11,13 +12,13 @@ use core::config::Config;
 use agents::settings::AgentSettings;
 
 #[derive(Parser, Debug)]
-#[command(name = "codepair")]
-#[command(about = "A CLI-Based AI Agent Pair System", long_about = None)]
+#[command(name = "potlatch")]
+#[command(about = "Potlatch — fully automatic agentic platform", long_about = None)]
 enum Cli {
-    /// Run the codepair agent system
+    /// Run the potlatch agent system
     #[command(name = "run", alias = "start")]
     Run {
-        /// Path to config file (default: codepair.toml)
+        /// Path to config file (default: potlatch.toml)
         #[arg(short, long)]
         config: Option<String>,
     },
@@ -25,16 +26,16 @@ enum Cli {
     /// Generate an example config file
     InitConfig {
         /// Output path for the config file
-        #[arg(default_value = "codepair.toml")]
+        #[arg(default_value = "potlatch.toml")]
         path: String,
     },
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "codepair")]
-#[command(about = "A CLI-Based AI Agent Pair System", long_about = None)]
+#[command(name = "potlatch")]
+#[command(about = "Potlatch — fully automatic agentic platform", long_about = None)]
 struct Args {
-    /// Path to config file (default: codepair.toml)
+    /// Path to config file (default: potlatch.toml)
     #[arg(short, long)]
     config: Option<String>,
 }
@@ -48,27 +49,33 @@ fn main() -> Result<()> {
             println!("Example config file created at: {}", path);
             println!("\nEdit this file to configure agents under [agent.*] sections.");
             println!("\nExample usage:");
-            println!("  codepair run");
-            println!("  codepair run --config {}", path);
+            println!("  potlatch run");
+            println!("  potlatch run --config {}", path);
             return Ok(());
         }
         Ok(Cli::Run { config }) => config,
         Err(_) => Args::parse().config,
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    ui::init();
 
-    let (config, content) = Config::load_with_content(config_path.as_deref())?;
+    let config_path = config_path
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| "potlatch.toml".to_string());
+
+    let (config, content) = Config::load_with_content(Some(&config_path))?;
     let agent_settings = AgentSettings::from_toml_str(&content)?;
 
-    if let Some(repo) = agent_settings.gitlab_repo() {
-        info!("GitLab repository: {}", repo);
-    }
+    let agent_names: Vec<String> = config.agent_names().map(str::to_string).collect();
+    ui::print_banner(
+        Path::new(&config_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&config_path),
+        agent_settings.gitlab_repo(),
+        &agent_names,
+    );
 
     agents::run(config, agent_settings)
 }

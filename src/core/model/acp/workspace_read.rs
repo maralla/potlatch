@@ -62,7 +62,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn scratch_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("codepair-acp-{name}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("potlatch-acp-{name}-{}", std::process::id()))
     }
 
     #[test]

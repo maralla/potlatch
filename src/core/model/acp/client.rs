@@ -127,7 +127,7 @@ pub fn headless_agent_request_result(method: &str, params: &Value) -> Value {
 
     if let Some(reply) = cursor_extension_headless_reply(method, params) {
         debug!(
-            target: "codepair::acp_cursor",
+            target: "potlatch::acp_cursor",
             %method,
             "headless auto-reply for Cursor ACP extension request"
         );
@@ -136,7 +136,7 @@ pub fn headless_agent_request_result(method: &str, params: &Value) -> Value {
 
     if method.starts_with("cursor/") {
         warn!(
-            target: "codepair::acp_cursor",
+            target: "potlatch::acp_cursor",
             %method,
             "unhandled Cursor extension request; returning empty result (agent may stall)"
         );
@@ -632,7 +632,7 @@ mod tests {
                 terminal: false,
             },
             client_info: ImplementationInfo {
-                name: "codepair-test".into(),
+                name: "potlatch-test".into(),
                 version: "0.0.1".into(),
             },
         })?;
@@ -726,7 +726,7 @@ mod tests {
                 terminal: false,
             },
             client_info: ImplementationInfo {
-                name: "codepair-test".into(),
+                name: "potlatch-test".into(),
                 version: "0.0.1".into(),
             },
         })?;
@@ -818,7 +818,7 @@ mod tests {
                 terminal: false,
             },
             client_info: ImplementationInfo {
-                name: "codepair-test".into(),
+                name: "potlatch-test".into(),
                 version: "0.0.1".into(),
             },
         })?;
@@ -930,7 +930,7 @@ mod tests {
                 terminal: false,
             },
             client_info: ImplementationInfo {
-                name: "codepair-test".into(),
+                name: "potlatch-test".into(),
                 version: "0.0.1".into(),
             },
         })?;

@@ -17,7 +17,7 @@ fn spawn_pmo(ctx: WorkflowContext, instance_id: usize) -> anyhow::Result<()> {
     spawn_core_agent::<PmoAgent>(ctx, instance_id)
 }
 
-pub fn register_codepair_agents(registry: &mut AgentRegistry) {
+pub fn register_potlatch_agents(registry: &mut AgentRegistry) {
     registry.register(AgentRegistration {
         name: "worker",
         spawn: spawn_worker,
@@ -40,7 +40,7 @@ mod tests {
     #[test]
     fn registry_has_all_roles() {
         let mut reg = AgentRegistry::new();
-        register_codepair_agents(&mut reg);
+        register_potlatch_agents(&mut reg);
         for name in ["worker", "reviewer", "pmo"] {
             assert!(reg.find(name).is_some(), "missing {name}");
         }

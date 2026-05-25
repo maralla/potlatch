@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
-use tracing::info;
 
 use crate::core::config::Config;
 use crate::core::registry::AgentRegistry;
@@ -27,7 +26,7 @@ pub fn scope_label_filter(scope_label: &str) -> Option<&str> {
     if t.is_empty() { None } else { Some(t) }
 }
 
-fn prepare_codepair_workflow(ctx: &WorkflowContext) -> Result<()> {
+fn prepare_potlatch_workflow(ctx: &WorkflowContext) -> Result<()> {
     flag::register(SIGINT, ctx.shutdown.clone()).context("Failed to register SIGINT handler")?;
     flag::register(SIGTERM, ctx.shutdown.clone()).context("Failed to register SIGTERM handler")?;
     flag::register_conditional_shutdown(SIGINT, 1, ctx.shutdown.clone())
@@ -119,19 +118,9 @@ pub(crate) fn mr_in_scope(mr: &MergeRequest, scope_label: Option<&str>) -> bool 
 
 pub fn run(config: Config, agent_settings: settings::AgentSettings) -> Result<()> {
     settings::init(agent_settings);
-    let agent_names: Vec<_> = config.agent_names().collect();
-    info!(
-        "Starting configured agents: {}",
-        if agent_names.is_empty() {
-            "(none)".to_string()
-        } else {
-            agent_names.join(", ")
-        }
-    );
-
     let mut registry = AgentRegistry::new();
-    register::register_codepair_agents(&mut registry);
-    Workflow::run(config, &registry, prepare_codepair_workflow)
+    register::register_potlatch_agents(&mut registry);
+    Workflow::run(config, &registry, prepare_potlatch_workflow)
 }
 
 #[cfg(test)]
@@ -169,21 +158,21 @@ mod scope_tests {
 
     #[test]
     fn issue_in_scope_respects_label() {
-        let issue = sample_issue(vec!["codepair", "bug"]);
+        let issue = sample_issue(vec!["potlatch", "bug"]);
         assert!(issue_in_scope(&issue, None));
-        assert!(issue_in_scope(&issue, Some("codepair")));
+        assert!(issue_in_scope(&issue, Some("potlatch")));
         assert!(!issue_in_scope(&issue, Some("other")));
     }
 
     #[test]
     fn mr_in_scope_respects_label() {
-        let mr = sample_mr(Some(vec!["codepair"]));
+        let mr = sample_mr(Some(vec!["potlatch"]));
         assert!(mr_in_scope(&mr, None));
-        assert!(mr_in_scope(&mr, Some("codepair")));
+        assert!(mr_in_scope(&mr, Some("potlatch")));
         assert!(!mr_in_scope(&mr, Some("other")));
 
         let no_labels = sample_mr(None);
-        assert!(!mr_in_scope(&no_labels, Some("codepair")));
+        assert!(!mr_in_scope(&no_labels, Some("potlatch")));
 
         let ai_worker = sample_mr(Some(vec![super::labels::NEED_AI_WORKER]));
         assert!(mr_in_scope(&ai_worker, Some("other-scope")));

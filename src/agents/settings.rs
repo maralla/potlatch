@@ -74,7 +74,7 @@ mod tests {
         let s = AgentSettings::from_toml_str(
             r#"
             gitlab_repo = "https://gitlab.com/group/project"
-            scope_label = "codepair"
+            scope_label = "potlatch"
 
             [agent.worker]
             instances = 1
@@ -82,7 +82,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.gitlab_repo(), Some("https://gitlab.com/group/project"));
-        assert_eq!(s.scope_label_filter(), Some("codepair"));
+        assert_eq!(s.scope_label_filter(), Some("potlatch"));
     }
 
     #[test]
@@ -90,10 +90,7 @@ mod tests {
         let s = AgentSettings::default();
         assert_eq!(s.scope_label_filter(), None);
         assert_eq!(super::super::scope_label_filter("  "), None);
-        assert_eq!(
-            super::super::scope_label_filter("codepair"),
-            Some("codepair")
-        );
+        assert_eq!(super::super::scope_label_filter("potlatch"), Some("potlatch"));
     }
 
     #[test]

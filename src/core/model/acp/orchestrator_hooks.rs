@@ -13,7 +13,7 @@
 //!   `cursor/ask_question`](https://cursor.com/docs/cli/acp) that expect a client response; a
 //!   headless client must answer or plan mode can block waiting for approval.
 //! - In **plan** mode, `session/update` may carry `tool_call_update` text such as
-//!   `Plan saved to file://…`. Codepair records those absolute paths on [`AgentHandoff::cursor_plan_paths`];
+//!   `Plan saved to file://…`. Potlatch records those absolute paths on [`AgentHandoff::cursor_plan_paths`];
 //!   the PMO role reads the files from the git workspace and merges their contents into the text it
 //!   parses (split markers, sub-issues, etc.).
 
@@ -75,7 +75,7 @@ impl StreamTextHooks {
     fn handle_fs_read_text_file(&self, params: &Value) -> Value {
         let Some(ref root) = self.workspace_root else {
             warn!(
-                target: "codepair::acp_fs",
+                target: "potlatch::acp_fs",
                 "fs/read_text_file requested but no workspace_root configured"
             );
             return serde_json::json!({ "content": "" });
@@ -86,7 +86,7 @@ impl StreamTextHooks {
             .unwrap_or("")
             .trim();
         if path.is_empty() {
-            warn!(target: "codepair::acp_fs", "fs/read_text_file missing path");
+            warn!(target: "potlatch::acp_fs", "fs/read_text_file missing path");
             return serde_json::json!({ "content": "" });
         }
         let line = params.get("line").and_then(|v| v.as_u64());
@@ -100,12 +100,12 @@ impl StreamTextHooks {
             }
             Err(e) => {
                 warn!(
-                    target: "codepair::acp_fs",
+                    target: "potlatch::acp_fs",
                     path = %path,
                     err = %e,
                     "fs/read_text_file failed"
                 );
-                serde_json::json!({ "content": format!("# (codepair could not read file: {e})\n") })
+                serde_json::json!({ "content": format!("# (potlatch could not read file: {e})\n") })
             }
         }
     }
@@ -415,7 +415,7 @@ impl AcpHooks for StreamTextHooks {
 
         if let Some(names) = extract_available_slash_command_names(params) {
             debug!(
-                target: "codepair::acp_slash",
+                target: "potlatch::acp_slash",
                 "available_commands_update: {:?}",
                 names
             );
@@ -425,7 +425,7 @@ impl AcpHooks for StreamTextHooks {
 
         if let Some(mode_id) = extract_current_mode_update(params) {
             debug!(
-                target: "codepair::acp_modes",
+                target: "potlatch::acp_modes",
                 "current_mode_update: {}",
                 mode_id
             );
@@ -623,7 +623,7 @@ mod tests {
         use super::super::types::{SessionModeEntry, SessionModeStateBrief};
         use std::fs;
 
-        let tmp = std::env::temp_dir().join(format!("codepair-plan-file-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("potlatch-plan-file-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join(".cursor/plans")).unwrap();
         let plan_path = tmp.join(".cursor/plans/PMO.plan.md");
@@ -665,7 +665,7 @@ mod tests {
         use super::super::types::{SessionModeEntry, SessionModeStateBrief};
         use std::fs;
 
-        let tmp = std::env::temp_dir().join(format!("codepair-plan-skip-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("potlatch-plan-skip-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join(".cursor/plans")).unwrap();
         let plan_path = tmp.join(".cursor/plans/x.plan.md");
@@ -702,7 +702,7 @@ mod tests {
         use super::super::types::{SessionModeEntry, SessionModeStateBrief};
         use std::fs;
 
-        let tmp = std::env::temp_dir().join(format!("codepair-plan-pct-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("potlatch-plan-pct-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join(".cursor/plans")).unwrap();
         let plan_path = tmp.join(".cursor/plans/PMO Issue.plan.md");
