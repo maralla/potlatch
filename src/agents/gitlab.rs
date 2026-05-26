@@ -655,17 +655,13 @@ impl GitLabClient {
     pub fn get_mr_comments(&self, iid: u64) -> Result<Vec<Comment>> {
         debug!("Fetching discussions for merge request !{}", iid);
 
-        let endpoint = self.api_path(&format!("merge_requests/{iid}/discussions?per_page=100"));
-        let output = self.run_api(&endpoint, &[])?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            debug!("Failed to get MR discussions: {}", stderr);
-            return Ok(Vec::new());
-        }
-
-        let discussions: Vec<serde_json::Value> =
-            serde_json::from_slice(&output.stdout).unwrap_or_default();
+        let discussions = match self.fetch_discussions(iid) {
+            Ok(discussions) => discussions,
+            Err(e) => {
+                debug!("Failed to get MR discussions: {}", e);
+                return Ok(Vec::new());
+            }
+        };
 
         let mut comments = Vec::new();
         for discussion in &discussions {
@@ -698,17 +694,36 @@ impl GitLabClient {
     }
 
     fn fetch_discussions(&self, iid: u64) -> Result<Vec<serde_json::Value>> {
-        let endpoint = self.api_path(&format!("merge_requests/{iid}/discussions?per_page=100"));
-        let output = self.run_api(&endpoint, &[])?;
+        const PER_PAGE: usize = 100;
+        let mut page = 1usize;
+        let mut discussions = Vec::new();
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "Failed to fetch MR discussions: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+        loop {
+            let endpoint = self.api_path(&format!(
+                "merge_requests/{iid}/discussions?per_page={PER_PAGE}&page={page}"
+            ));
+            let output = self.run_api(&endpoint, &[])?;
+
+            if !output.status.success() {
+                anyhow::bail!(
+                    "Failed to fetch MR discussions page {}: {}",
+                    page,
+                    Self::glab_api_error_message(&output)
+                );
+            }
+
+            let batch: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+                .with_context(|| format!("Failed to parse MR discussions JSON page {page}"))?;
+            let batch_len = batch.len();
+            discussions.extend(batch);
+
+            if batch_len < PER_PAGE {
+                break;
+            }
+            page += 1;
         }
 
-        Ok(serde_json::from_slice(&output.stdout).unwrap_or_default())
+        Ok(discussions)
     }
 
     /// Check whether a discussion has resolvable notes and whether any are unresolved.

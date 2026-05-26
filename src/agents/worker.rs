@@ -94,7 +94,10 @@ impl AgentState {
     fn cleanup_session(&self, issue_iid: u64) {
         let path = self.session_file_path(issue_iid);
         if fs::remove_file(&path).is_ok() {
-            info!("Cleaned up session file for issue #{}", issue_iid);
+            info!(
+                "{}: Cleaned up session file for issue #{}",
+                &self.agent_id, issue_iid
+            );
         }
     }
 

@@ -49,6 +49,7 @@ pub trait CoreAgent: Sized {
     fn on_shutdown(&mut self);
 
     fn run(mut self) -> Result<()> {
+        let _badge = crate::ui::AgentBadgeGuard::new(self.agent_id());
         self.on_start()?;
         let autostart: Vec<_> = self
             .periodic_tasks()

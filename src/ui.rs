@@ -1,7 +1,12 @@
 //! Terminal-friendly logging: compact, colored lines instead of server-style traces.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use tracing::Level;
 use tracing::field::{Field, Visit};
@@ -21,10 +26,85 @@ const MAGENTA: &str = "\x1b[35m";
 const BLUE: &str = "\x1b[34m";
 
 const BADGE_WIDTH: usize = 11;
+const SPINNER_CLEAR: &str = "\r\x1b[2K\r";
+const LOG_PREFIX_WIDTH: usize = 18;
+const SPINNER_PREFIX_WIDTH: usize = 4;
+
+static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
+static SPINNER: OnceLock<Arc<SpinnerState>> = OnceLock::new();
+
+thread_local! {
+    static AGENT_BADGE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Binds the current thread's log badge to a specific agent instance (e.g. `worker-0`).
+pub struct AgentBadgeGuard {
+    previous: Option<String>,
+}
+
+impl AgentBadgeGuard {
+    pub fn new(agent_id: &str) -> Self {
+        let previous = AGENT_BADGE.with(|badge| badge.replace(Some(agent_id.to_string())));
+        Self { previous }
+    }
+}
+
+impl Drop for AgentBadgeGuard {
+    fn drop(&mut self) {
+        AGENT_BADGE.with(|badge| {
+            *badge.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+fn agent_badge_from_context() -> Option<String> {
+    AGENT_BADGE.with(|badge| badge.borrow().clone())
+}
+
+struct SpinnerState {
+    active: AtomicUsize,
+    running: AtomicBool,
+    visible: AtomicBool,
+    enabled: bool,
+    label: Mutex<Option<String>>,
+}
+
+pub struct ActivityGuard {
+    state: Option<Arc<SpinnerState>>,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        if let Some(state) = &self.state {
+            if state.active.fetch_sub(1, Ordering::SeqCst) == 1
+                && let Ok(mut label) = state.label.lock()
+            {
+                *label = None;
+            }
+        }
+    }
+}
+
+/// Show the activity spinner until the returned guard is dropped.
+pub fn activity(label: impl Into<String>) -> ActivityGuard {
+    let Some(state) = SPINNER.get().cloned() else {
+        return ActivityGuard { state: None };
+    };
+    if !state.enabled {
+        return ActivityGuard { state: None };
+    }
+
+    if let Ok(mut current) = state.label.lock() {
+        *current = Some(label.into());
+    }
+    state.active.fetch_add(1, Ordering::SeqCst);
+    ActivityGuard { state: Some(state) }
+}
 
 /// Install the Potlatch terminal log formatter.
 pub fn init() {
     let use_color = io::stdout().is_terminal();
+    init_spinner(use_color);
 
     let filter = EnvFilter::builder()
         .with_default_directive(Level::INFO.into())
@@ -44,16 +124,84 @@ pub fn init() {
         .without_time()
         .with_level(false)
         .with_ansi(use_color)
+        .with_writer(io::stdout)
         .event_format(TuiFormatter { use_color })
         .init();
 }
 
-/// Startup summary shown once before agents begin polling.
+fn init_spinner(enabled: bool) {
+    let state = SPINNER
+        .get_or_init(|| {
+            Arc::new(SpinnerState {
+                active: AtomicUsize::new(0),
+                running: AtomicBool::new(false),
+                visible: AtomicBool::new(false),
+                enabled,
+                label: Mutex::new(None),
+            })
+        })
+        .clone();
+
+    if !enabled || state.running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    thread::spawn(move || {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut idx = 0usize;
+        let mut visible = false;
+        loop {
+            let active = state.active.load(Ordering::SeqCst);
+            let _terminal = OUTPUT_LOCK.lock().ok();
+            let mut out = io::stdout().lock();
+            if active > 0 {
+                let label = state
+                    .label
+                    .lock()
+                    .ok()
+                    .and_then(|label| label.clone())
+                    .unwrap_or_else(|| "agents".to_string());
+                let text = if active == 1 {
+                    format!("{label} working")
+                } else {
+                    format!("{active} agents working")
+                };
+                let text = truncate_to_width(&text, available_width(SPINNER_PREFIX_WIDTH));
+                let _ = write!(out, "{SPINNER_CLEAR}  {} {}{}", frames[idx], DIM, text);
+                let _ = write!(out, "{RESET}");
+                let _ = out.flush();
+                visible = true;
+                state.visible.store(true, Ordering::SeqCst);
+                idx = (idx + 1) % frames.len();
+            } else if visible {
+                let _ = write!(out, "{SPINNER_CLEAR}");
+                let _ = out.flush();
+                visible = false;
+                state.visible.store(false, Ordering::SeqCst);
+            }
+            drop(out);
+            drop(_terminal);
+            thread::sleep(Duration::from_millis(120));
+        }
+    });
+}
+
+/// Startup banner shown once before agents begin polling.
 pub fn print_banner(config_path: &str, gitlab_repo: Option<&str>, agents: &[String]) {
     let use_color = io::stdout().is_terminal();
+    let _terminal = OUTPUT_LOCK.lock().ok();
     let mut out = io::stdout().lock();
 
     let _ = writeln!(out);
+    if use_color {
+        let _ = writeln!(
+            out,
+            "{BOLD}{CYAN}  Potlatch{RESET} {DIM}Fully automatic agentic platform{RESET}"
+        );
+    } else {
+        let _ = writeln!(out, "  Potlatch  Fully automatic agentic platform");
+    }
+
     let _ = write!(out, "  ");
     let _ = label_value(&mut out, use_color, "config", config_path);
     if let Some(repo) = gitlab_repo {
@@ -67,15 +215,7 @@ pub fn print_banner(config_path: &str, gitlab_repo: Option<&str>, agents: &[Stri
     };
     let _ = write!(out, "  ");
     let _ = label_value(&mut out, use_color, "agents", &agents_line);
-    if use_color {
-        let _ = write!(
-            out,
-            "  {DIM}tip{RRESET}    RUST_LOG=debug for full diagnostics\n\n",
-            RRESET = RESET
-        );
-    } else {
-        let _ = writeln!(out, "  tip     RUST_LOG=debug for full diagnostics\n");
-    }
+    let _ = writeln!(out);
 }
 
 fn label_value(out: &mut impl Write, color: bool, key: &str, value: &str) -> io::Result<()> {
@@ -132,14 +272,25 @@ where
             return Ok(());
         }
 
-        let (agent, text) = split_agent_prefix(&message);
-        let agent = agent.or_else(|| extract_embedded_agent(&message));
+        let _terminal = OUTPUT_LOCK.lock().ok();
+        if let Some(state) = SPINNER.get()
+            && state.enabled
+            && state.visible.swap(false, Ordering::SeqCst)
+        {
+            write!(writer, "{SPINNER_CLEAR}")?;
+        }
+
+        let (prefix_agent, text) = split_agent_prefix(&message);
+        let context_agent = agent_badge_from_context();
+        let agent = prefix_agent
+            .or_else(|| extract_embedded_agent(&message))
+            .or(context_agent.as_deref());
         let badge = agent
             .map(agent_badge_label)
             .unwrap_or_else(|| badge_from_target(target));
         let icon = level_icon(level);
         let badge_color = agent_badge_color(agent, target, self.use_color);
-        let idle = is_idle_status(text);
+        let text = truncate_to_width(text, available_width(LOG_PREFIX_WIDTH));
 
         write!(writer, "  {icon} ")?;
         if self.use_color && !badge_color.is_empty() {
@@ -151,9 +302,7 @@ where
         }
         write!(writer, "  ")?;
 
-        if idle && self.use_color {
-            write!(writer, "{DIM}{text}{RESET}", DIM = DIM, RESET = RESET)?;
-        } else if level == Level::ERROR && self.use_color {
+        if level == Level::ERROR && self.use_color {
             write!(writer, "{RED}{text}{RESET}", RED = RED, RESET = RESET)?;
         } else if level == Level::WARN && self.use_color {
             write!(
@@ -261,6 +410,74 @@ fn is_idle_status(text: &str) -> bool {
         || text.contains("Idle, no issues to work on")
         || text.contains("Checking for issues requiring action")
         || text.contains("Polling for new issues")
+        || text.contains("Poll interval:")
+        || text.contains("Watching MR !")
+        || text.contains("GitLab client for")
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|w| *w >= 40)
+        .unwrap_or(100)
+}
+
+fn available_width(prefix_width: usize) -> usize {
+    terminal_width().saturating_sub(prefix_width).max(20)
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    let text = text.replace(['\r', '\n'], " ");
+    if display_width(&text) <= width {
+        return text;
+    }
+
+    if width <= 1 {
+        return "…".to_string();
+    }
+
+    let content_width = width - 1;
+    let head_width = content_width / 2;
+    let tail_width = content_width - head_width;
+
+    let head = take_display_prefix(&text, head_width);
+    let tail = take_display_suffix(&text, tail_width);
+    format!("{head}…{tail}")
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+fn take_display_prefix(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = if ch.is_ascii() { 1 } else { 2 };
+        if used + w > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
+fn take_display_suffix(text: &str, width: usize) -> String {
+    let mut chars = Vec::new();
+    let mut used = 0usize;
+    for ch in text.chars().rev() {
+        let w = if ch.is_ascii() { 1 } else { 2 };
+        if used + w > width {
+            break;
+        }
+        chars.push(ch);
+        used += w;
+    }
+    chars.into_iter().rev().collect()
 }
 
 fn should_suppress(target: &str, level: Level, message: &str) -> bool {
@@ -268,6 +485,10 @@ fn should_suppress(target: &str, level: Level, message: &str) -> bool {
         return true;
     }
     if level == Level::INFO && message.starts_with("Starting configured agents:") {
+        return true;
+    }
+    let (_, text) = split_agent_prefix(message);
+    if level == Level::INFO && is_idle_status(text) {
         return true;
     }
     if level <= Level::INFO
@@ -307,8 +528,28 @@ mod tests {
     }
 
     #[test]
+    fn agent_badge_guard_sets_thread_context() {
+        assert!(agent_badge_from_context().is_none());
+        let _guard = AgentBadgeGuard::new("worker-0");
+        assert_eq!(agent_badge_from_context().as_deref(), Some("worker-0"));
+        drop(_guard);
+        assert!(agent_badge_from_context().is_none());
+    }
+
+    #[test]
     fn idle_status_matches_heartbeat_messages() {
         assert!(is_idle_status("0 MRs merged"));
         assert!(!is_idle_status("Created MR !12 for issue #3"));
+    }
+
+    #[test]
+    fn truncate_to_width_prevents_wrapping() {
+        assert_eq!(truncate_to_width("abcdef", 4), "a…ef");
+        assert_eq!(truncate_to_width("abc", 4), "abc");
+        assert_eq!(truncate_to_width("a\nb", 10), "a b");
+        assert_eq!(
+            truncate_to_width("/very/long/path/to/repository", 14),
+            "/very/…ository"
+        );
     }
 }

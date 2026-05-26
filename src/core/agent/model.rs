@@ -85,6 +85,7 @@ impl AgentModel {
     }
 
     pub fn invoke(&self, prompt: &str, options: &InvokeOptions) -> Result<ModelResponse> {
+        let _activity = crate::ui::activity(self.agent_id.clone());
         self.engine.invoke(prompt, options)
     }
 

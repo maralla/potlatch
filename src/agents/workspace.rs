@@ -55,8 +55,11 @@ pub fn ensure_agent_repo(
         }
         std::fs::create_dir_all(&container)
             .context("Failed to create agent container directory")?;
-        tracing::info!("Cloning repository into {}...", repo_path);
-        git_repo.clone(gitlab_repo)?;
+        let _activity = crate::ui::activity(format!("cloning {agent_id} into {repo_path}"));
+        let clone_result = git_repo.clone(gitlab_repo);
+        drop(_activity);
+        clone_result?;
+        tracing::info!("Clone done {}", repo_path);
     }
     Ok(repo_path)
 }
