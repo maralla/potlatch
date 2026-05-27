@@ -143,10 +143,6 @@ impl CoreAgent for ReviewerAgent {
         let agent_settings = settings::settings();
         let scope = agent_settings.scope_label_filter();
         let claimed_mr_iid = find_claimed_mr(&agent_id, &gitlab, scope);
-        info!(
-            "{}: Poll interval: {} seconds",
-            agent_id, config.poll_interval_secs
-        );
         Ok(Self {
             agent_id,
             project_name,
@@ -278,10 +274,6 @@ fn reviewer_cycle(
         }
 
         if has_unresolved_comments(gitlab, mr.iid) {
-            info!(
-                "{}: MR !{} has unresolved comments, skipping",
-                agent_id, mr.iid
-            );
             continue;
         }
 
@@ -343,13 +335,6 @@ fn reviewer_cycle(
         break;
     }
 
-    info!(
-        "{}: {} MRs merged{}",
-        agent_id,
-        merged_mrs.len(),
-        model.runtime_meta()
-    );
-
     Ok(())
 }
 
@@ -359,10 +344,6 @@ fn has_unresolved_comments(gitlab: &GitLabClient, mr_iid: u64) -> bool {
     match gitlab.get_unresolved_discussion_count(mr_iid) {
         Ok((unresolved, total)) => {
             if unresolved > 0 {
-                info!(
-                    "MR !{} has {}/{} unresolved discussion(s)",
-                    mr_iid, unresolved, total
-                );
                 return true;
             }
             if total > 0 {

@@ -114,15 +114,6 @@ impl ModelEngine {
         )?;
         Ok(crate::core::agent::ModelResponse { handoff })
     }
-
-    pub fn runtime_meta(&self) -> String {
-        let quits = self.inner.unexpected_quits_count();
-        if quits == 0 {
-            String::new()
-        } else {
-            format!(", {} unexpected quits", quits)
-        }
-    }
 }
 
 #[cfg(test)]

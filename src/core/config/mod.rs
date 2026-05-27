@@ -38,7 +38,6 @@ impl Config {
             ));
         }
 
-        info!("Loading config from: {}", config_path.display());
         let content = fs::read_to_string(&config_path).context("Failed to read config file")?;
         Ok((Self::from_toml_str(&content)?, content))
     }

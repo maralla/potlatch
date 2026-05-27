@@ -101,10 +101,6 @@ impl AcpRuntime {
         }
     }
 
-    pub fn unexpected_quits_count(&self) -> u64 {
-        self.unexpected_quits_count.load(Ordering::SeqCst)
-    }
-
     pub fn agent_id(&self) -> &str {
         &self.agent_id
     }

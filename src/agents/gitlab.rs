@@ -251,10 +251,6 @@ impl GitLabClient {
         let (host, project_path) = parse_gitlab_repo(gitlab_repo)?;
         let project_id = resolve_project_id(&host, &project_path)?;
         configure_repo_glab(&repo_path, &host)?;
-        info!(
-            "GitLab client for {} on {} (project id {})",
-            project_path, host, project_id
-        );
         Ok(Self {
             repo_path,
             host,

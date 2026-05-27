@@ -223,10 +223,6 @@ impl CoreAgent for PmoAgent {
                 ),
             }
         }
-        info!(
-            "{}: Poll interval: {} seconds",
-            state.agent_id, config.poll_interval_secs
-        );
         Ok(Self {
             state,
             git_repo,
@@ -401,18 +397,12 @@ fn pmo_cycle(
         return Ok(());
     }
 
-    info!(
-        "{}: Checking for issues requiring action...",
-        &state.agent_id
-    );
-
     let issues = gitlab.list_issues()?;
 
     if shutdown.load(Ordering::SeqCst) {
         return Ok(());
     }
 
-    let mut found_action_required = false;
     for issue in &issues {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(());
@@ -447,7 +437,6 @@ fn pmo_cycle(
 
         state.save_state(issue.iid);
 
-        found_action_required = true;
         info!(
             "{}: Processing issue #{}: {}",
             &state.agent_id, issue.iid, issue.title
@@ -498,14 +487,6 @@ fn pmo_cycle(
         }
 
         break;
-    }
-
-    if !found_action_required {
-        info!(
-            "{}: No action-required issues found{}",
-            &state.agent_id,
-            model.runtime_meta()
-        );
     }
 
     // Assign default priority to open issues that lack a priority label.

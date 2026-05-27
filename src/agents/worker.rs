@@ -304,10 +304,6 @@ impl CoreAgent for WorkerAgent {
                 );
             }
         }
-        info!(
-            "{}: Poll interval: {} seconds",
-            state.agent_id, config.poll_interval_secs
-        );
         Ok(Self {
             state,
             model,
@@ -420,11 +416,6 @@ fn worker_cycle(
                 return Ok(());
             }
         }
-
-        info!(
-            "{}: Watching MR !{} for issue #{}",
-            &state.agent_id, mr_iid, a.issue_iid
-        );
 
         match state.glab.get_merge_request(mr_iid) {
             Ok(mr) => {
@@ -622,7 +613,6 @@ fn worker_cycle(
     }
 
     // No labeled MR work — poll for new issues
-    info!("{}: Polling for new issues...", &state.agent_id);
     let issues = state.glab.list_issues()?;
 
     if shutdown.load(Ordering::SeqCst) {
@@ -715,14 +705,6 @@ fn worker_cycle(
         }
 
         break;
-    }
-
-    if active.is_none() {
-        info!(
-            "{}: Idle, no issues to work on{}",
-            &state.agent_id,
-            model.runtime_meta()
-        );
     }
 
     Ok(())

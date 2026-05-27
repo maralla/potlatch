@@ -267,7 +267,7 @@ where
             return Ok(());
         }
 
-        if should_suppress(target, level, &message) {
+        if should_suppress(target, level) {
             return Ok(());
         }
 
@@ -403,17 +403,6 @@ fn agent_badge_color(agent: Option<&str>, target: &str, use_color: bool) -> &'st
     }
 }
 
-fn is_idle_status(text: &str) -> bool {
-    text.contains("0 MRs merged")
-        || text.contains("No action-required issues found")
-        || text.contains("Idle, no issues to work on")
-        || text.contains("Checking for issues requiring action")
-        || text.contains("Polling for new issues")
-        || text.contains("Poll interval:")
-        || text.contains("Watching MR !")
-        || text.contains("GitLab client for")
-}
-
 fn terminal_width() -> Option<usize> {
     terminal_size::terminal_size()
         .map(|(terminal_size::Width(width), _)| width as usize)
@@ -487,17 +476,7 @@ fn take_display_suffix(text: &str, width: usize) -> String {
     chars.into_iter().rev().collect()
 }
 
-fn should_suppress(target: &str, level: Level, message: &str) -> bool {
-    if level == Level::INFO && message.starts_with("Loading config from:") {
-        return true;
-    }
-    if level == Level::INFO && message.starts_with("Starting configured agents:") {
-        return true;
-    }
-    let (_, text) = split_agent_prefix(message);
-    if level == Level::INFO && is_idle_status(text) {
-        return true;
-    }
+fn should_suppress(target: &str, level: Level) -> bool {
     if level <= Level::INFO
         && (target.contains("::acp_fs")
             || target.contains("::acp_modes")
@@ -541,12 +520,6 @@ mod tests {
         assert_eq!(agent_badge_from_context().as_deref(), Some("worker-0"));
         drop(_guard);
         assert!(agent_badge_from_context().is_none());
-    }
-
-    #[test]
-    fn idle_status_matches_heartbeat_messages() {
-        assert!(is_idle_status("0 MRs merged"));
-        assert!(!is_idle_status("Created MR !12 for issue #3"));
     }
 
     #[test]
