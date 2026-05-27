@@ -29,6 +29,8 @@ const PMO_PENDING_LABEL: &str = "pmo-pending";
 const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
 /// Human/workflow pause: worker skips the issue (no close) and releases its hold until removed.
 const WORKER_PENDING_LABEL: &str = "pending";
+/// Reviewer-only workflow: worker skips and stops tracking while reviewer may still process the MR.
+const WORKER_REVIEW_ONLY_LABEL: &str = "review-only";
 
 #[derive(Debug, Clone)]
 struct WorkerConfig {
@@ -138,6 +140,15 @@ impl AgentState {
         let _ = claim::release_claim(&self.glab, issue_iid, &self.agent_id);
         let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
         self.cleanup_session(issue_iid);
+    }
+
+    fn release_worker_hold_review_only(&self, issue_iid: u64) {
+        info!(
+            "{}: Issue #{} has `{}` — releasing claim and session (review only)",
+            &self.agent_id, issue_iid, WORKER_REVIEW_ONLY_LABEL
+        );
+
+        self.clear_resumed_issue_state(issue_iid);
     }
 
     fn clear_resumed_issue_state(&self, issue_iid: u64) {
@@ -361,6 +372,11 @@ fn clear_resumed_issue_if_ignored(
         return None;
     }
 
+    if issue_has_worker_review_only_label(&issue.labels) {
+        state.release_worker_hold_review_only(issue.iid);
+        return None;
+    }
+
     if has_worker_resume_abandon_label(&issue.labels) {
         info!(
             "{}: Resumed issue #{} has blocking labels {:?}, abandoning resume state",
@@ -412,6 +428,12 @@ fn worker_cycle(
                 );
 
                 state.clear_resumed_issue_state(a.issue_iid);
+                *active = None;
+                return Ok(());
+            }
+
+            if issue_has_worker_review_only_label(&issue.labels) {
+                state.release_worker_hold_review_only(a.issue_iid);
                 *active = None;
                 return Ok(());
             }
@@ -521,6 +543,12 @@ fn worker_cycle(
                 *active = None;
                 return Ok(());
             }
+
+            if issue_has_worker_review_only_label(&issue.labels) {
+                state.release_worker_hold_review_only(issue_iid);
+                *active = None;
+                return Ok(());
+            }
         }
 
         info!(
@@ -540,7 +568,11 @@ fn worker_cycle(
                 match process_issue(state, model, &issue, &mut current, scope_label) {
                     Ok(_) => {
                         if current.mr_created {
-                            *active = Some(current);
+                            if should_track_worker_issue(state, issue_iid) {
+                                *active = Some(current);
+                            } else {
+                                *active = None;
+                            }
                         } else {
                             let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
                             state.cleanup_session(issue_iid);
@@ -672,7 +704,9 @@ fn worker_cycle(
         match process_issue(state, model, &issue, &mut current, scope_label) {
             Ok(_) => {
                 if current.mr_created {
-                    *active = Some(current);
+                    if should_track_worker_issue(state, issue.iid) {
+                        *active = Some(current);
+                    }
                 } else {
                     // Rejected or no MR — release claim
                     let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
@@ -781,6 +815,10 @@ fn should_skip_issue(issue: &Issue) -> bool {
         return true;
     }
 
+    if issue_has_worker_review_only_label(&issue.labels) {
+        return true;
+    }
+
     if has_worker_skip_label(&issue.labels) {
         return true;
     }
@@ -790,6 +828,23 @@ fn should_skip_issue(issue: &Issue) -> bool {
 
 fn issue_has_worker_pending_label(labels: &[String]) -> bool {
     labels.contains(&WORKER_PENDING_LABEL.to_string())
+}
+
+fn issue_has_worker_review_only_label(labels: &[String]) -> bool {
+    labels.contains(&WORKER_REVIEW_ONLY_LABEL.to_string())
+}
+
+fn should_track_worker_issue(state: &AgentState, issue_iid: u64) -> bool {
+    if state
+        .glab
+        .get_issue(issue_iid)
+        .is_ok_and(|issue| issue_has_worker_review_only_label(&issue.labels))
+    {
+        state.release_worker_hold_review_only(issue_iid);
+        return false;
+    }
+
+    true
 }
 
 fn close_issue_best_effort(gitlab: &GitLabClient, issue_iid: u64) {
@@ -1519,6 +1574,11 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                     continue;
                 }
 
+                if issue_has_worker_review_only_label(&issue.labels) {
+                    state.release_worker_hold_review_only(issue_iid);
+                    continue;
+                }
+
                 match resolve_tracked_mr_for_worker_issue(&state.glab, issue_iid, session.mr_iid) {
                     ResolvedTrackedMr::MergedCloseIssue => {
                         close_issue_best_effort(&state.glab, issue_iid);
@@ -1568,6 +1628,11 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
             {
                 if issue_has_worker_pending_label(&issue.labels) {
                     state.release_worker_hold_pending_gitlab_only(issue_iid);
+                    continue;
+                }
+
+                if issue_has_worker_review_only_label(&issue.labels) {
+                    state.release_worker_hold_review_only(issue_iid);
                     continue;
                 }
 
@@ -1663,6 +1728,11 @@ fn find_claimed_issue(state: &AgentState, scope_label: Option<&str>) -> Option<A
             continue;
         }
 
+        if issue_has_worker_review_only_label(&issue.labels) {
+            state.release_worker_hold_review_only(issue.iid);
+            continue;
+        }
+
         match resolve_tracked_mr_for_worker_issue(&state.glab, issue.iid, 0) {
             ResolvedTrackedMr::MergedCloseIssue => {
                 close_issue_best_effort(&state.glab, issue.iid);
@@ -1754,6 +1824,10 @@ fn try_adopt_orphaned_session(
         }
 
         if issue_has_worker_pending_label(&issue.labels) {
+            continue;
+        }
+
+        if issue_has_worker_review_only_label(&issue.labels) {
             continue;
         }
 
@@ -2881,6 +2955,9 @@ mod tests {
         issue.labels = vec![WORKER_PENDING_LABEL.to_string()];
         assert!(should_skip_issue(&issue));
 
+        issue.labels = vec![WORKER_REVIEW_ONLY_LABEL.to_string()];
+        assert!(should_skip_issue(&issue));
+
         issue.labels = vec![];
         assert!(!should_skip_issue(&issue));
     }
@@ -2890,6 +2967,19 @@ mod tests {
         assert!(!has_worker_skip_label(&[WORKER_PENDING_LABEL.to_string()]));
         assert!(issue_has_worker_pending_label(&[
             WORKER_PENDING_LABEL.to_string()
+        ]));
+    }
+
+    #[test]
+    fn worker_review_only_label_is_not_resume_abandon_label() {
+        assert!(issue_has_worker_review_only_label(&[
+            WORKER_REVIEW_ONLY_LABEL.to_string()
+        ]));
+        assert!(!has_worker_resume_abandon_label(&[
+            WORKER_REVIEW_ONLY_LABEL.to_string()
+        ]));
+        assert!(!has_worker_skip_label(&[
+            WORKER_REVIEW_ONLY_LABEL.to_string()
         ]));
     }
 

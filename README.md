@@ -95,6 +95,7 @@ The command will:
    - Marked as `[Draft]`
    - Have `do-not-implement` label
    - Have the `pending` label (human pause — issue stays open; see Labels)
+   - Have the `review-only` label (reviewer-only workflow — see Labels)
    - Already have `in-progress` label
 3. For each issue:
    - Looks for an open merge request whose description contains `Closes #<issue>` (case-insensitive) before falling back to branch `issue-<number>`
@@ -113,7 +114,7 @@ The command will:
    - Generates MR title summarizing the changes
    - Creates detailed MR description with Goal, Implementation, and Testing sections
    - Creates merge request with meaningful title and description
-4. If the `pending` label is added while the worker holds an issue, it releases its claim and stops watching the MR (no issue close). When `pending` is removed, the worker can claim again and resume from the linked MR if present.
+4. If the `pending` label is added while the worker holds an issue, it releases its claim and stops watching the MR (no issue close). When `pending` is removed, the worker can claim again and resume from the linked MR if present. If `review-only` is added, the worker also releases its claim/session and stops tracking the issue and related MR, leaving review/merge handling to the reviewer.
 5. Tracks active merge requests and monitors for reviewer feedback
    - Checks for new comments on active MRs
    - Automatically addresses reviewer feedback
@@ -151,6 +152,7 @@ The command will:
 The Worker uses the following labels:
 - `in-progress` — the worker is actively implementing or tracking an MR for this issue
 - `pending` — pauses the worker: it skips the issue in the queue, releases claim/session, and stops MR watch, without closing the issue. Remove `pending` when work should continue.
+- `review-only` — keeps the worker out of the issue: it skips queue pickup and, if already tracking, releases claim/session and stops watching the related MR without closing either.
 
 To prevent implementation, add:
 - `do-not-implement` label to issues
