@@ -75,12 +75,11 @@ pub struct ActivityGuard {
 
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
-        if let Some(state) = &self.state {
-            if state.active.fetch_sub(1, Ordering::SeqCst) == 1
-                && let Ok(mut label) = state.label.lock()
-            {
-                *label = None;
-            }
+        if let Some(state) = &self.state
+            && state.active.fetch_sub(1, Ordering::SeqCst) == 1
+            && let Ok(mut label) = state.label.lock()
+        {
+            *label = None;
         }
     }
 }
@@ -166,7 +165,7 @@ fn init_spinner(enabled: bool) {
                 } else {
                     format!("{active} agents working")
                 };
-                let text = truncate_to_width(&text, available_width(SPINNER_PREFIX_WIDTH));
+                let text = truncate_to_terminal_width(&text, SPINNER_PREFIX_WIDTH);
                 let _ = write!(out, "{SPINNER_CLEAR}  {} {}{}", frames[idx], DIM, text);
                 let _ = write!(out, "{RESET}");
                 let _ = out.flush();
@@ -220,16 +219,16 @@ pub fn print_banner(config_path: &str, gitlab_repo: Option<&str>, agents: &[Stri
 
 fn label_value(out: &mut impl Write, color: bool, key: &str, value: &str) -> io::Result<()> {
     if color {
-        write!(
+        writeln!(
             out,
-            "{DIM}{key:<7}{RESET} {value}\n",
+            "{DIM}{key:<7}{RESET} {value}",
             DIM = DIM,
             RESET = RESET,
             key = key,
             value = value
         )
     } else {
-        write!(out, "{key:<7} {value}\n", key = key, value = value)
+        writeln!(out, "{key:<7} {value}", key = key, value = value)
     }
 }
 
@@ -290,7 +289,7 @@ where
             .unwrap_or_else(|| badge_from_target(target));
         let icon = level_icon(level);
         let badge_color = agent_badge_color(agent, target, self.use_color);
-        let text = truncate_to_width(text, available_width(LOG_PREFIX_WIDTH));
+        let text = truncate_to_terminal_width(text, LOG_PREFIX_WIDTH);
 
         write!(writer, "  {icon} ")?;
         if self.use_color && !badge_color.is_empty() {
@@ -350,10 +349,10 @@ fn is_agent_id(part: &str) -> bool {
 }
 
 fn split_agent_prefix(message: &str) -> (Option<&str>, &str) {
-    if let Some((head, tail)) = message.split_once(": ") {
-        if is_agent_id(head) {
-            return (Some(head), tail);
-        }
+    if let Some((head, tail)) = message.split_once(": ")
+        && is_agent_id(head)
+    {
+        return (Some(head), tail);
     }
     (None, message)
 }
@@ -415,16 +414,24 @@ fn is_idle_status(text: &str) -> bool {
         || text.contains("GitLab client for")
 }
 
-fn terminal_width() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+fn terminal_width() -> Option<usize> {
+    terminal_size::terminal_size()
+        .map(|(terminal_size::Width(width), _)| width as usize)
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        })
         .filter(|w| *w >= 40)
-        .unwrap_or(100)
 }
 
-fn available_width(prefix_width: usize) -> usize {
-    terminal_width().saturating_sub(prefix_width).max(20)
+fn truncate_to_terminal_width(text: &str, prefix_width: usize) -> String {
+    let text = text.replace(['\r', '\n'], " ");
+    let Some(width) = terminal_width() else {
+        return text;
+    };
+    let available = width.saturating_sub(prefix_width);
+    truncate_to_width(&text, available)
 }
 
 fn truncate_to_width(text: &str, width: usize) -> String {
