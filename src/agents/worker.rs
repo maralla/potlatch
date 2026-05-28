@@ -1471,9 +1471,18 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         unresolved_ids
     };
 
-    let reply_raw = extract_public_comment_block(&agent_output.response).unwrap_or_else(|| {
+    let reply_raw = if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        block
+    } else if let Some(reply) =
         build_feedback_resolution_reply(&agent_output, has_new_changes, diff_highlights.as_deref())
-    });
+    {
+        reply
+    } else {
+        return Err(anyhow::anyhow!(
+            "worker produced no source changes and no feedback reply for MR !{}",
+            latest_mr.iid
+        ));
+    };
     let reply_body = strip_worker_reply_boilerplate(&reply_raw);
     let resolve_discussions =
         should_resolve_mr_feedback_discussions(&agent_output, implicit_resolve_discussions);
@@ -2141,23 +2150,21 @@ fn build_feedback_resolution_reply(
     agent_output: &AgentHandoff,
     has_new_changes: bool,
     diff_highlights: Option<&str>,
-) -> String {
+) -> Option<String> {
     if has_new_changes {
         let summary = extract_changes_summary(agent_output);
         if let Some(diff) = diff_highlights
             && !diff.trim().is_empty()
         {
-            return format!(
+            return Some(format!(
                 "Addressed feedback:\n\n{}\n\nDiff highlights:\n{}",
                 summary, diff
-            );
+            ));
         }
-        return format!("Addressed feedback:\n\n{}", summary);
+        return Some(format!("Addressed feedback:\n\n{}", summary));
     }
-    format!(
-        "Resolved without code changes:\n\n{}",
-        extract_no_change_resolution_reason(agent_output)
-    )
+    extract_no_change_resolution_reason(agent_output)
+        .map(|reason| format!("Resolved without code changes:\n\n{}", reason))
 }
 
 fn build_diff_highlights_since(git_repo: &GitRepo, base_ref: &str) -> Option<String> {
@@ -2304,11 +2311,11 @@ fn build_combined_mr_feedback_context(
     )
 }
 
-fn extract_no_change_resolution_reason(agent_output: &AgentHandoff) -> String {
+fn extract_no_change_resolution_reason(agent_output: &AgentHandoff) -> Option<String> {
     if let Some(reason) = &agent_output.reason {
         let trimmed = reason.trim();
         if !trimmed.is_empty() {
-            return strip_markdown_formatting(trimmed);
+            return Some(strip_markdown_formatting(trimmed));
         }
     }
     if let Some(pos) = agent_output.response.find("REASON:") {
@@ -2320,13 +2327,13 @@ fn extract_no_change_resolution_reason(agent_output: &AgentHandoff) -> String {
         };
         let cleaned = strip_markdown_formatting(line);
         if !cleaned.is_empty() {
-            return cleaned;
+            return Some(cleaned);
         }
     }
     if let Some(summary) = &agent_output.changes_summary {
         let trimmed = summary.trim();
         if !trimmed.is_empty() {
-            return strip_markdown_formatting(trimmed);
+            return Some(strip_markdown_formatting(trimmed));
         }
     }
     if let Some(pos) = agent_output.response.find("CHANGES_SUMMARY:") {
@@ -2338,12 +2345,11 @@ fn extract_no_change_resolution_reason(agent_output: &AgentHandoff) -> String {
         };
         let cleaned = strip_markdown_formatting(line);
         if !cleaned.is_empty() {
-            return cleaned;
+            return Some(cleaned);
         }
     }
 
-    "No source changes were required; the feedback is already satisfied by the current implementation."
-        .to_string()
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3032,7 +3038,10 @@ mod tests {
         };
         assert_eq!(
             build_feedback_resolution_reply(&output, false, None),
-            "Resolved without code changes:\n\nExisting validation already covered this case."
+            Some(
+                "Resolved without code changes:\n\nExisting validation already covered this case."
+                    .to_string()
+            )
         );
     }
 
@@ -3044,7 +3053,7 @@ mod tests {
         };
         assert_eq!(
             build_feedback_resolution_reply(&output, true, None),
-            "Addressed feedback:\n\nAdd missing null check in parser."
+            Some("Addressed feedback:\n\nAdd missing null check in parser.".to_string())
         );
     }
 
@@ -3057,8 +3066,17 @@ mod tests {
         let diff = "- src/validation.rs\n- 1 file changed, 4 insertions(+)";
         assert_eq!(
             build_feedback_resolution_reply(&output, true, Some(diff)),
-            "Addressed feedback:\n\nTighten input validation.\n\nDiff highlights:\n- src/validation.rs\n- 1 file changed, 4 insertions(+)"
+            Some("Addressed feedback:\n\nTighten input validation.\n\nDiff highlights:\n- src/validation.rs\n- 1 file changed, 4 insertions(+)".to_string())
         );
+    }
+
+    #[test]
+    fn build_feedback_resolution_reply_requires_reason_without_code_changes() {
+        let output = AgentHandoff {
+            response: "I'll inspect the reviewer feedback first.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(build_feedback_resolution_reply(&output, false, None), None);
     }
 
     #[test]
@@ -3133,10 +3151,7 @@ mod tests {
                 .to_string(),
             ..Default::default()
         };
-        assert_eq!(
-            extract_no_change_resolution_reason(&out),
-            "No source changes were required; the feedback is already satisfied by the current implementation."
-        );
+        assert_eq!(extract_no_change_resolution_reason(&out), None);
     }
 
     #[test]
@@ -3148,7 +3163,7 @@ mod tests {
         };
         assert_eq!(
             extract_no_change_resolution_reason(&out),
-            "Property deletion already removes stored data on schema update."
+            Some("Property deletion already removes stored data on schema update.".to_string())
         );
     }
 
