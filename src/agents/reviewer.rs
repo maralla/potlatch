@@ -511,6 +511,11 @@ fn review_merge_request(
             mr.iid
         );
         gitlab.add_mr_discussion(mr.iid, &feedback)?;
+    } else {
+        warn!(
+            "MR !{} reviewer output missed decision marker; not posting unstructured output",
+            mr.iid
+        );
     }
 
     Ok(ReviewOutcome::NeedsChanges)
@@ -904,27 +909,7 @@ fn extract_fallback_review_feedback(agent_output: &AgentHandoff) -> Option<Strin
             return Some(trimmed.to_string());
         }
     }
-    let trimmed = agent_output.response.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let filtered_lines = trimmed
-        .lines()
-        .filter(|line| {
-            let t = line.trim();
-            !t.is_empty()
-                && t != "Ready for next assignment."
-                && t != "Ready for next task."
-                && t != "Proceed with the review autonomously. Do not ask for any user input."
-        })
-        .collect::<Vec<_>>();
-
-    if filtered_lines.is_empty() {
-        None
-    } else {
-        Some(filtered_lines.join("\n"))
-    }
+    None
 }
 
 fn mr_has_label(mr: &MergeRequest, label: &str) -> bool {
@@ -978,23 +963,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_review_feedback_keeps_substantive_reviewer_output() {
+    fn fallback_review_feedback_ignores_unstructured_reviewer_output() {
         let output = AgentHandoff {
-            response: r#"## MR !89 review
-
-### Gaps / concerns
-1. MR description vs diff is inaccurate.
-2. Tests document current bug.
-
-Ready for next assignment."#
+            response: r#"I’ll review the MR from the local merged branch.
+A key prior blocker is still present.
+Error: T: Connection stalled"#
                 .to_string(),
             ..Default::default()
         };
 
-        let feedback = extract_fallback_review_feedback(&output).expect("feedback");
-        assert!(feedback.contains("## MR !89 review"));
-        assert!(feedback.contains("Gaps / concerns"));
-        assert!(!feedback.contains("Ready for next assignment."));
+        assert!(extract_fallback_review_feedback(&output).is_none());
     }
 
     #[test]
