@@ -583,9 +583,9 @@ fn build_review_prompt(
     )?;
 
     let completeness_line = if is_need_ai_worker_mr {
-        "8. COMPLETENESS CHECK (STRICT): For `need-ai-worker` MRs, evaluate completeness against the MR title, MR description, diff, and comment history (do not require linked issue context). If scope implied by those sources is missing or partial, list missing items and REQUEST_CHANGES.".to_string()
+        "8. COMPLETENESS CHECK (STRICT): For `need-ai-worker` MRs, evaluate completeness against the current MR title, MR description, diff, and comment history (do not require linked issue context). Treat later comments as updates to the requested work. If the current scope implied by those sources is missing or partial, list missing items and REQUEST_CHANGES.".to_string()
     } else {
-        "8. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the LINKED ISSUE (title, description, and comments). Every requirement or item mentioned in the issue MUST be addressed in the implementation. If any part is missing or only partially implemented, list the missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.".to_string()
+        "8. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the CURRENT linked issue requirements: issue title, issue description, issue comments, MR description, and MR comment history. Later comments may clarify, narrow, expand, or supersede earlier issue text. Every current requirement MUST be addressed in the implementation, but do not request changes for an older constraint that later comments removed, changed, or accepted as intentionally out of scope. If any current requirement is missing or only partially implemented, list the missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.".to_string()
     };
     let prompt = format!(
         r#"You are reviewing a merge request for a software project in a fully automated, non-interactive environment.
@@ -601,15 +601,14 @@ TASK CONTEXT FILE:
 
 CRITICAL REQUIREMENTS:
 - This is a NON-INTERACTIVE automated system
-- You have FULL ACCESS to the local workspace, git, and all build/test tools
-- You CAN and MUST execute git commands, run tests, run linters directly
-- NEVER claim you cannot run commands - you have full access
 - NEVER ask the user for input, confirmation, or decisions
 - NEVER prompt for additional information interactively
 - Make all review decisions autonomously based on the code and information provided
 - Provide clear, actionable feedback in comments (do not ask questions)
 - Review the full comment history to understand what feedback was already given and addressed
 - Do NOT repeat feedback that has already been addressed
+- Treat comments after the original issue description as requirement updates when they clarify, narrow, expand, or supersede earlier constraints
+- Do NOT request changes for outdated requirements from the original issue when later issue or MR comments clearly changed the accepted scope
 
 GITLAB COMMENT STYLE (STRICT — for REQUEST_CHANGES and any posted feedback):
 - Do NOT start with a long paragraph of hollow praise or thanks that only restates the diff or issue number (e.g. listing routes, files, or "aligns with #N" without adding a review decision). That adds no value and wastes the reader's time.
@@ -620,11 +619,11 @@ GITLAB COMMENT STYLE (STRICT — for REQUEST_CHANGES and any posted feedback):
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before starting the review. Treat it as authoritative project policy.
 2. Read the task context file above before starting the review. For description quality, rely on the full text under `## MR description` there (do not judge from the MR title line alone).
-3. Review the full comment history to understand previous feedback and responses
+3. Review the full comment history to understand previous feedback, worker responses, and scope updates after the original issue was written
 4. The source branch has already been merged with the target branch locally - you are on the merged result
-5. Use the local git checkout to inspect the actual code changes yourself. You are in the merged result already, so run commands like `git diff origin/{}`..., `git diff --stat origin/{}`..., `git diff --name-only origin/{}`..., and read the changed files directly instead of relying only on the summaries above.
+5. Inspect the actual code changes in the merged local repository state instead of relying only on the summaries above.
 6. Review the code changes thoroughly using the local repository state
-7. Check if the implementation matches the stated goal
+7. Check if the implementation matches the current stated goal after considering the issue description, issue comments, MR description, and MR comment history
 {}
 9. Run tests locally to verify they pass (do NOT rely on CI/CD)
 10. Run linting locally to verify it passes (do NOT rely on CI/CD)
@@ -689,10 +688,7 @@ Proceed with the review autonomously. Do not ask for any user input.
         mr.source_branch,
         mr.target_branch,
         context_path,
-        completeness_line,
-        mr.target_branch,
-        mr.target_branch,
-        mr.target_branch
+        completeness_line
     );
 
     Ok(prompt)
@@ -716,7 +712,7 @@ fn build_issue_context(gitlab: &GitLabClient, issue_iid: u64) -> String {
 
     match gitlab.get_issue_comments(issue_iid) {
         Ok(comments) if !comments.is_empty() => {
-            ctx.push_str("\nISSUE COMMENTS:\n");
+            ctx.push_str("\nISSUE COMMENTS (read as possible updates to requirements):\n");
             for c in &comments {
                 ctx.push_str(&format!("- {}: {}\n", c.author, c.body));
             }
