@@ -2349,7 +2349,7 @@ fn build_mr_diff_context(
         };
 
     if diff_patch.len() > MAX_DIFF_CHARS {
-        diff_patch.truncate(MAX_DIFF_CHARS);
+        truncate_utf8_string_in_place(&mut diff_patch, MAX_DIFF_CHARS);
         diff_patch.push_str(
             "\n\n[diff truncated by potlatch: patch exceeded size limit; full diff may contain additional context]\n",
         );
@@ -2385,6 +2385,18 @@ fn build_mr_diff_context(
         patch = diff_patch,
         overflow_line = overflow_note.unwrap_or("")
     )
+}
+
+/// Truncate a UTF-8 string to at most `max_bytes` without splitting a multibyte character.
+fn truncate_utf8_string_in_place(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
 }
 
 fn build_combined_mr_feedback_context(
@@ -3124,18 +3136,27 @@ mod tests {
     }
 
     #[test]
+    fn truncate_utf8_string_in_place_does_not_split_multibyte_chars() {
+        let mut patch = "α".repeat(60_000);
+        patch.push_str(&"β".repeat(60_000));
+        assert!(patch.len() > 120_000);
+        truncate_utf8_string_in_place(&mut patch, 120_000);
+        assert!(patch.len() <= 120_000);
+        assert!(std::str::from_utf8(patch.as_bytes()).is_ok());
+    }
+
+    #[test]
     fn extract_issue_number_from_branch_for_mr_source() {
-        assert_eq!(
-            extract_issue_number_from_branch("issue-42").unwrap(),
-            42
-        );
+        assert_eq!(extract_issue_number_from_branch("issue-42").unwrap(), 42);
     }
 
     #[test]
     fn is_worker_agent_cancelled_matches_runtime_message() {
         let err = anyhow::anyhow!(WORKER_AGENT_CANCELLED_MSG);
         assert!(is_worker_agent_cancelled(&err));
-        assert!(!is_worker_agent_cancelled(&anyhow::anyhow!("other failure")));
+        assert!(!is_worker_agent_cancelled(&anyhow::anyhow!(
+            "other failure"
+        )));
     }
 
     #[test]
