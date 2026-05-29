@@ -1270,6 +1270,7 @@ fn handle_mr_comments(
         ),
     )?;
 
+    let feedback_scope_rules = get_feedback_scope_rules();
     let prompt = format!(
         r#"SYSTEM: You are an autonomous coding agent with FULL shell access. You MUST execute all commands yourself. Never say you cannot run commands — you can and must.
 
@@ -1298,6 +1299,8 @@ CRITICAL REQUIREMENTS:
 - Make all necessary code changes to resolve the comments
 - Keep the original issue requirements in mind while addressing feedback
 - If the workspace has merge conflict markers (<<<<<<< / ======= / >>>>>>>), resolve ALL of them before doing anything else. Edit each conflicted file to keep the correct version.
+
+{}
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly.
@@ -1331,14 +1334,18 @@ INSTRUCTIONS:
 17. Control whether GitLab should mark open review discussions as resolved after your reply:
    - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
    - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not fix the comment (e.g. explaining why the current code already satisfies it, partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
-   - If you omit this line: the system assumes `yes` when it detects resolving actions: new commits (including rebases) on the MR branch, the MR title/description or labels changed on GitLab, or the remote branch tip moved. It assumes `no` only when none of those happened and you made no code changes.
+   - If you omit this line: the system assumes `yes` only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set `MARK_DISCUSSIONS_RESOLVED: yes` explicitly when the feedback is resolved.
 18. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR_DESCRIPTION, MR_TITLE, PUBLIC_COMMENT, or any GitLab field.
 
 REMINDER: You are fully autonomous. Execute every command, test, and file operation yourself. Never output instructions for a human.
 
 Proceed with addressing the feedback autonomously. Do not ask for any user input.
 "#,
-        &state.project_name, latest_mr.iid, latest_mr.title, combined_context_path
+        &state.project_name,
+        latest_mr.iid,
+        latest_mr.title,
+        combined_context_path,
+        feedback_scope_rules
     );
 
     let agent_output = if let Some(issue_number) = issue_number {
@@ -2580,6 +2587,26 @@ fn get_common_requirements() -> &'static str {
 - Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules (see MANDATORY OUTPUT): not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments"#
 }
 
+fn get_evidence_bound_scope_bullets() -> &'static str {
+    r#"- Only modify code that is strongly supported by the issue title, issue description, GitLab issue comments, or current unresolved MR feedback. If a change is merely adjacent, speculative, weakly coupled, or "nice to have", do not make it.
+- Treat the issue title, issue description, and GitLab issue comments as the strict boundary of allowed code changes.
+- Every production code change must have a clear, direct link to those issue details or comments; if you cannot explain that link in one sentence, do not make the change.
+- Do NOT add features, refactors, or integrations not described in the issue.
+- Do NOT over-engineer: avoid new abstractions, compatibility layers, broad refactors, generalized frameworks, hypothetical future cases, unrelated edge cases, broad compatibility, "while here" cleanup, or behavior changes that are not directly required by the task evidence.
+- The only acceptable unrelated edits are lint-only fixes or unit-test-only fixes needed to validate the requested implementation."#
+}
+
+fn get_feedback_scope_rules() -> String {
+    format!(
+        r#"FEEDBACK SCOPE RULES:
+- Treat the current unresolved reviewer feedback as the PRIMARY request. The original issue, MR description, and older comments provide context, but they do not override the current unresolved feedback.
+- Do NOT mutate, reinterpret, or weaken the current feedback to fit an old implementation choice or old commit. Change the code so it strictly complies with the reviewer feedback.
+- Scope each change directly to the unresolved comment, its inline code location, the linked issue, or the MR description. Do not use feedback handling as an opportunity for broader cleanup, redesign, abstraction, feature expansion, or compatibility shims unless the reviewer explicitly asked for it.
+{}"#,
+        get_evidence_bound_scope_bullets()
+    )
+}
+
 fn get_scope_rules(is_continuation: bool) -> String {
     let line_context = if is_continuation {
         "Review existing changes and estimate remaining work"
@@ -2590,7 +2617,7 @@ fn get_scope_rules(is_continuation: bool) -> String {
     format!(
         r#"SCOPE RULES:
 - ONLY implement what the issue specifically asks for, nothing more
-- Do NOT add features, refactors, or integrations not described in the issue
+{}
 - CHANGE SIZE LIMITS (STRICT):
   * Non-test, non-generated code: ~500 changed lines maximum
   * Total changes including tests: ~1500 changed lines maximum
@@ -2605,6 +2632,7 @@ fn get_scope_rules(is_continuation: bool) -> String {
 - If implementing the issue requires a large feature integration that is mainly unrelated to the task, respond with:
   CANNOT_IMPLEMENT
   NEEDS_SPLIT: <explain why the issue is too broad and how to split it>"#,
+        get_evidence_bound_scope_bullets(),
         line_context,
         if is_continuation {
             "completed"
