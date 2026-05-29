@@ -1272,7 +1272,7 @@ fn handle_mr_comments(
 
     let feedback_scope_rules = get_feedback_scope_rules();
     let prompt = format!(
-        r#"SYSTEM: You are an autonomous coding agent with FULL shell access. You MUST execute all commands yourself. Never say you cannot run commands — you can and must.
+        r#"SYSTEM: You are an autonomous coding agent.
 
 You are addressing reviewer feedback on a merge request in a fully automated, non-interactive environment.
 
@@ -1284,15 +1284,9 @@ TASK CONTEXT FILE:
 {}
 
 CRITICAL REQUIREMENTS:
-- This is a NON-INTERACTIVE automated system running with --trust mode (full shell access granted)
-- You MUST execute all necessary commands yourself — there is no human to do anything for you
-- You have FULL shell access: rm, mv, cp, mkdir, git, python, cargo, npm, etc.
-- You MUST run tests, linters, build commands directly — do not suggest them, EXECUTE them
+- This is a NON-INTERACTIVE automated system
 - You MUST delete, rename, or move files as needed — do not ask permission or suggest it
-- You MUST NOT say "I cannot run commands" or "please run this" — YOU run everything
-- You MUST NOT produce passive output suggesting a human take action — YOU take all actions
-- Do NOT run `git add`, `git commit`, or `git push` — the system handles staging, committing, and pushing automatically after you finish
-- Do NOT create merge requests or pull requests (e.g. via `glab mr create`, `gh pr create`, or any API call) — the system manages them automatically
+- Leave staging, committing, pushing, and merge request creation to the system
 - Review ALL comments to understand the full conversation
 - Identify which feedback items still need to be addressed
 - Address all unresolved feedback autonomously
@@ -1306,38 +1300,35 @@ INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly.
 2. Read the task context file above before making any changes.
 3. In that combined file, use inline comment locations (`path:line` or `path:start-end`) to find corresponding hunks in the diff section and make targeted fixes.
-4. First, check for merge conflicts: run `git status` and look for "Unmerged paths" or "both modified". If any exist, resolve ALL conflicts in every file before proceeding.
+4. First, check for merge conflicts. If any exist, resolve ALL conflicts in every file before proceeding.
 5. Review the original issue and what was implemented
 6. Review ALL comments to understand the full conversation and context
 7. Identify which feedback items are still unresolved
 8. Make the necessary code changes to address all unresolved feedback
-9. After making changes, RUN tests and linters to verify everything passes. If the reviewer asked you to run tests or fix linting — you MUST actually execute those commands (e.g. `cargo test`, `cargo clippy`, `python -m pytest`, `npm test`, etc.) and fix any failures.
-10. If the reviewer asked you to delete, rename, or move files — do it directly with `rm`, `mv`, `mkdir`, etc.
-11. Ensure changes align with both the original requirements and reviewer feedback
-12. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
-   a) Adjust your implementation to reduce changed lines — simplify, remove unnecessary changes, trim scope — then re-run tests
+9. If the reviewer asked you to delete, rename, or move files, make those file changes.
+10. Ensure changes align with both the original requirements and reviewer feedback
+11. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
+   a) Adjust your implementation to reduce changed lines — simplify, remove unnecessary changes, trim scope
    b) If you cannot reasonably reduce the size, respond with CANNOT_RESOLVE so the issue is rejected and the problem is reported back
    Do NOT try to split the issue yourself — that is handled by the PMO agent, not you.
-13. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), respond with:
+12. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), respond with:
    CANNOT_RESOLVE
    REASON: <explain concisely why this cannot be resolved autonomously and what input is needed>
-14. If the reviewer asked you to fix the MR title or description, include updated versions in your response:
+13. If the reviewer asked you to fix the MR title or description, include updated versions in your response:
    MR_TITLE: <SHORT title (max 8-10 words) stating the main feature or fix — no enumeration of details, no markdown. It must describe the overall MR, not just the latest incremental change. Do NOT change the title just because you made another follow-up commit; keep it stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.>
    MR_DESCRIPTION:
    <full description with goal, implementation, and testing sections — NEVER include PUBLIC_COMMENT_BEGIN/END here; those markers are only for thread replies below; NEVER paste or quote text from repo-root notes.md here>
-15. After addressing feedback, provide a summary:
+14. After addressing feedback, provide a summary:
    CHANGES_SUMMARY: <A concise sentence summarizing the substance of the changes made — this will be used as the git commit message, so it must convey the main idea of what was changed>
-16. For any human-facing GitLab comment/reply text, include a stable block:
+15. For any human-facing GitLab comment/reply text, include a stable block:
    PUBLIC_COMMENT_BEGIN
    <only the final comment text to post publicly; no progress updates, no tool/log output>
    PUBLIC_COMMENT_END
-17. Control whether GitLab should mark open review discussions as resolved after your reply:
+16. Control whether GitLab should mark open review discussions as resolved after your reply:
    - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
    - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not fix the comment (e.g. explaining why the current code already satisfies it, partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
    - If you omit this line: the system assumes `yes` only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set `MARK_DISCUSSIONS_RESOLVED: yes` explicitly when the feedback is resolved.
-18. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR_DESCRIPTION, MR_TITLE, PUBLIC_COMMENT, or any GitLab field.
-
-REMINDER: You are fully autonomous. Execute every command, test, and file operation yourself. Never output instructions for a human.
+17. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR_DESCRIPTION, MR_TITLE, PUBLIC_COMMENT, or any GitLab field.
 
 Proceed with addressing the feedback autonomously. Do not ask for any user input.
 "#,
@@ -2255,7 +2246,7 @@ fn build_mr_diff_context(
     if diff_patch.len() > MAX_DIFF_CHARS {
         diff_patch.truncate(MAX_DIFF_CHARS);
         diff_patch.push_str(
-            "\n\n[diff truncated by potlatch: patch exceeded size limit; inspect full diff with git commands if needed]\n",
+            "\n\n[diff truncated by potlatch: patch exceeded size limit; full diff may contain additional context]\n",
         );
     }
     if diff_patch.trim().is_empty() {
@@ -2408,7 +2399,7 @@ fn build_implementation_prompt(
     let output_format = get_output_format();
 
     let prompt = format!(
-        r#"SYSTEM: You are an autonomous coding agent with FULL shell access. You MUST execute all commands yourself. Never say you cannot run commands — you can and must.
+        r#"SYSTEM: You are an autonomous coding agent.
 
 You are implementing a feature for a software project in a fully automated, non-interactive environment.
 
@@ -2429,7 +2420,7 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly for implementation, tests, linting, and documentation rules.
-2. Read the **entire** TASK CONTEXT FILE at the absolute path above (open it with your file-reading tools). Do not skip the "GitLab issue comments" section.
+2. Read the **entire** TASK CONTEXT FILE at the absolute path above. Do not skip the "GitLab issue comments" section.
 3. Analyze the issue and comments carefully
 4. Estimate the number of changed lines:
    - Non-test, non-generated code: should stay around ~500 lines
@@ -2461,8 +2452,6 @@ IMPORTANT — When in doubt, REJECT:
 11. Make reasonable assumptions only when minor details are unclear and the overall approach is certain
 12. {}
 
-REMINDER: You are fully autonomous. Execute every command, test, and file operation yourself. Never output instructions for a human.
-
 Proceed with the implementation autonomously. Do not ask for any user input.
 "#,
         &state.project_name,
@@ -2493,7 +2482,7 @@ fn build_continuation_prompt(
     let output_format = get_output_format();
 
     let prompt = format!(
-        r#"SYSTEM: You are an autonomous coding agent with FULL shell access. You MUST execute all commands yourself. Never say you cannot run commands — you can and must.
+        r#"SYSTEM: You are an autonomous coding agent.
 
 You are continuing work on an existing feature branch in a fully automated, non-interactive environment.
 
@@ -2551,8 +2540,6 @@ IMPORTANT — When in doubt, REJECT:
 13. Make reasonable assumptions only when minor details are unclear and the overall approach is certain
 14. {}
 
-REMINDER: You are fully autonomous. Execute every command, test, and file operation yourself. Never output instructions for a human.
-
 Proceed with continuing the implementation autonomously. Do not ask for any user input.
 "#,
         &state.project_name,
@@ -2569,18 +2556,11 @@ Proceed with continuing the implementation autonomously. Do not ask for any user
 
 fn get_common_requirements() -> &'static str {
     r#"CRITICAL REQUIREMENTS:
-- This is a NON-INTERACTIVE automated system running with --trust mode (full shell access granted)
-- You MUST execute all necessary commands yourself — there is no human to do anything for you
-- You have FULL shell access: rm, mv, cp, mkdir, cat, grep, sed, git, python, pip, cargo, npm, make, etc.
-- You MUST run tests, linters, and build commands directly — do not suggest them, EXECUTE them
+- This is a NON-INTERACTIVE automated system
 - You MUST delete, rename, move, or create files as needed — do not ask permission or suggest it
-- You MUST NOT say "I cannot run commands", "I don't have permission", or "please run this command"
 - You MUST NOT ask the user for input, confirmation, or decisions — decide autonomously
 - You MUST NOT produce output that suggests actions for a human to take — YOU take those actions
-- You MUST NOT be passive — if a file needs deleting, delete it; if a test needs running, run it
-- Do NOT run `git add` or `git commit` — the system handles staging and committing automatically after you finish
-- Do NOT run `git push` — the system handles pushing automatically
-- Do NOT create merge requests or pull requests (e.g. via `glab mr create`, `gh pr create`, or any API call) — the system creates them automatically after you finish
+- Leave staging, committing, pushing, and merge request creation to the system
 - If information is missing, document what's needed in your response (do not ask interactively)
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
 - Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed
@@ -2690,7 +2670,7 @@ SELF-CHECK before saving: (1) "Would this still help on a **different** repo wit
 
 BAD STYLE (examples of rubbish — do not imitate):
 - In-repo code tours (paths, classes, long semicolon chains).
-- "Timeless" bullets that are really your MR summary: composable naming over literals, property vs field assumptions, stub heavy imports, run tests like automation, cwd/import wiring — unless each line names a **non-obvious failure mode you personally hit** in **one** concrete clause (still without paths or symbol names).
+- "Timeless" bullets that are really your MR summary: composable naming over literals, property vs field assumptions, stub heavy imports, or environment wiring — unless each line names a **non-obvious failure mode you personally hit** in **one** concrete clause (still without paths or symbol names).
 
 Stay concise; no secrets. That file is committed with your other changes. Never paste or quote any text from notes.md into MR_TITLE, MR_DESCRIPTION, PUBLIC_COMMENT, or anywhere on GitLab — those surfaces are for humans/reviewers only."#
 }
