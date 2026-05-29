@@ -31,6 +31,8 @@ const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
 const WORKER_PENDING_LABEL: &str = "pending";
 /// Reviewer-only workflow: worker skips and stops tracking while reviewer may still process the MR.
 const WORKER_REVIEW_ONLY_LABEL: &str = "review-only";
+/// ACP runtime message when `cancel_check` returns true.
+const WORKER_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
 
 #[derive(Debug, Clone)]
 struct WorkerConfig {
@@ -491,6 +493,10 @@ fn worker_cycle(
                         if shutdown.load(Ordering::SeqCst) {
                             return Ok(());
                         }
+                        if handle_worker_issue_processing_cancelled(state, a.issue_iid, &e) {
+                            *active = None;
+                            return Ok(());
+                        }
 
                         error!(
                             "{}: Failed to handle comments for MR !{}: {}",
@@ -582,6 +588,10 @@ fn worker_cycle(
                     Err(e) => {
                         if shutdown.load(Ordering::SeqCst) {
                             *active = Some(current);
+                            return Ok(());
+                        }
+                        if handle_worker_issue_processing_cancelled(state, issue_iid, &e) {
+                            *active = None;
                             return Ok(());
                         }
                         error!(
@@ -718,6 +728,10 @@ fn worker_cycle(
                     *active = Some(current);
                     return Ok(());
                 }
+                if handle_worker_issue_processing_cancelled(state, issue.iid, &e) {
+                    *active = None;
+                    break;
+                }
                 error!(
                     "{}: Failed to process issue #{}: {}",
                     &state.agent_id, issue.iid, e
@@ -834,6 +848,78 @@ fn issue_has_worker_review_only_label(labels: &[String]) -> bool {
     labels.contains(&WORKER_REVIEW_ONLY_LABEL.to_string())
 }
 
+fn worker_should_cancel_issue_processing(issue: &Issue) -> bool {
+    issue.state != "opened" || issue_has_worker_review_only_label(&issue.labels)
+}
+
+fn worker_issue_cancel_check(
+    glab: GitLabClient,
+    issue_iid: u64,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    Arc::new(move || {
+        glab.get_issue(issue_iid)
+            .ok()
+            .is_some_and(|issue| worker_should_cancel_issue_processing(&issue))
+    })
+}
+
+fn is_worker_agent_cancelled(err: &anyhow::Error) -> bool {
+    err.to_string().contains(WORKER_AGENT_CANCELLED_MSG)
+}
+
+/// Stop in-flight work when the issue was closed or switched to review-only.
+/// Returns true when the error was handled as an intentional stop.
+fn handle_worker_issue_processing_cancelled(
+    state: &AgentState,
+    issue_iid: u64,
+    err: &anyhow::Error,
+) -> bool {
+    if !is_worker_agent_cancelled(err) {
+        return false;
+    }
+
+    match state.glab.get_issue(issue_iid) {
+        Ok(issue) if issue_has_worker_review_only_label(&issue.labels) => {
+            state.release_worker_hold_review_only(issue_iid);
+            true
+        }
+        Ok(issue) if issue.state != "opened" => {
+            state.abandon_closed_issue(issue_iid, None);
+            true
+        }
+        Ok(_) => {
+            info!(
+                "{}: Stopped work on issue #{} after external cancel signal",
+                &state.agent_id, issue_iid
+            );
+            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+            let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+            state.cleanup_session(issue_iid);
+            true
+        }
+        Err(e) => {
+            warn!(
+                "{}: Cancelled while working on issue #{} but failed to re-fetch issue: {}",
+                &state.agent_id, issue_iid, e
+            );
+            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+            state.cleanup_session(issue_iid);
+            true
+        }
+    }
+}
+
+fn stop_worker_issue_if_review_only(state: &AgentState, issue_iid: u64) -> bool {
+    let Ok(issue) = state.glab.get_issue(issue_iid) else {
+        return false;
+    };
+    if !issue_has_worker_review_only_label(&issue.labels) {
+        return false;
+    }
+    state.release_worker_hold_review_only(issue_iid);
+    true
+}
+
 fn should_track_worker_issue(state: &AgentState, issue_iid: u64) -> bool {
     if state
         .glab
@@ -933,6 +1019,10 @@ fn process_issue(
     current: &mut ActiveIssue,
     scope_label: Option<&str>,
 ) -> Result<Option<u64>> {
+    if stop_worker_issue_if_review_only(state, issue.iid) {
+        return Ok(None);
+    }
+
     match closes_keyword_mr_status(&state.glab, issue.iid) {
         Some(ClosesLinkedMr::Open(mr_iid)) => {
             info!(
@@ -1031,6 +1121,10 @@ fn process_issue(
 
     current.branch_name = Some(branch_name.clone());
 
+    if stop_worker_issue_if_review_only(state, issue.iid) {
+        return Ok(None);
+    }
+
     state.glab.add_issue_label(issue.iid, WORKING_ON_LABEL)?;
 
     let gl_comments = format_issue_comments_for_worker_context(&state.glab, issue.iid);
@@ -1041,14 +1135,16 @@ fn process_issue(
         build_implementation_prompt(state, issue, &gl_comments)?
     };
 
-    let glab = state.glab.clone();
-    let issue_iid_for_cancel = issue.iid;
-    let cancel_check: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
-        glab.get_issue(issue_iid_for_cancel)
-            .is_ok_and(|i| i.state != "opened")
-    });
-
-    let agent_output = model.complete_with_cancel(&prompt, cancel_check)?;
+    let agent_output = match model.complete_with_cancel(
+        &prompt,
+        worker_issue_cancel_check(state.glab.clone(), issue.iid),
+    ) {
+        Ok(output) => output,
+        Err(e) if handle_worker_issue_processing_cancelled(state, issue.iid, &e) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
 
     if output_signals_cannot_implement(&agent_output) {
         let reason = if output_needs_split(&agent_output) {
@@ -1239,6 +1335,11 @@ fn handle_mr_comments(
 
     let issue_number = linked_issue_iid
         .or_else(|| extract_issue_number_from_branch(&latest_mr.source_branch).ok());
+    if let Some(issue_iid) = issue_number
+        && stop_worker_issue_if_review_only(state, issue_iid)
+    {
+        return Ok(false);
+    }
     let issue_context = issue_number
         .map(|n| load_issue_context(&state.glab, n))
         .transpose()?
@@ -1339,13 +1440,17 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         feedback_scope_rules
     );
 
-    let agent_output = if let Some(issue_number) = issue_number {
-        let glab = state.glab.clone();
-        let cancel_check: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
-            glab.get_issue(issue_number)
-                .is_ok_and(|i| i.state != "opened")
-        });
-        model.complete_with_cancel(&prompt, cancel_check)?
+    let agent_output = if let Some(issue_iid) = issue_number {
+        match model.complete_with_cancel(
+            &prompt,
+            worker_issue_cancel_check(state.glab.clone(), issue_iid),
+        ) {
+            Ok(output) => output,
+            Err(e) if handle_worker_issue_processing_cancelled(state, issue_iid, &e) => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         model.complete_prompt(&prompt)?
     };
@@ -2995,6 +3100,42 @@ mod tests {
         assert!(!has_worker_skip_label(&[
             WORKER_REVIEW_ONLY_LABEL.to_string()
         ]));
+    }
+
+    #[test]
+    fn worker_should_cancel_issue_processing_for_review_only_or_closed() {
+        let mut issue = Issue {
+            iid: 9,
+            title: "Test".into(),
+            description: String::new(),
+            state: "opened".into(),
+            labels: vec![WORKER_REVIEW_ONLY_LABEL.to_string()],
+            created_at: None,
+            updated_at: None,
+        };
+        assert!(worker_should_cancel_issue_processing(&issue));
+
+        issue.labels.clear();
+        issue.state = "closed".into();
+        assert!(worker_should_cancel_issue_processing(&issue));
+
+        issue.state = "opened".into();
+        assert!(!worker_should_cancel_issue_processing(&issue));
+    }
+
+    #[test]
+    fn extract_issue_number_from_branch_for_mr_source() {
+        assert_eq!(
+            extract_issue_number_from_branch("issue-42").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn is_worker_agent_cancelled_matches_runtime_message() {
+        let err = anyhow::anyhow!(WORKER_AGENT_CANCELLED_MSG);
+        assert!(is_worker_agent_cancelled(&err));
+        assert!(!is_worker_agent_cancelled(&anyhow::anyhow!("other failure")));
     }
 
     #[test]
