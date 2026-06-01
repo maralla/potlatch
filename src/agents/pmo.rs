@@ -707,13 +707,13 @@ fn process_action_required_issue(
     agent_output = pmo_apply_cursor_plan_files(&state.working_dir, agent_output);
     if !agent_output.has_final_result_text && !had_plan_file_paths {
         warn!(
-            "PMO: No canonical final output for issue #{} (no final response text and no plan file), marking manual intervention",
+            "PMO: No canonical final output for issue #{} (no final response text and no plan file), releasing claim for retry",
             issue.iid
         );
-        let comment = build_missing_canonical_pmo_output_comment(false);
-        gitlab.add_issue_comment(issue.iid, &comment)?;
-        gitlab.add_issue_label(issue.iid, PMO_PROCESSED_LABEL)?;
-        return Ok(false);
+        anyhow::bail!(
+            "PMO returned no canonical final output for issue #{}; retrying later",
+            issue.iid
+        );
     }
 
     // --- NEEDS_CLARIFICATION: PMO itself cannot decide, ask human ---
@@ -758,6 +758,16 @@ fn process_action_required_issue(
     // --- GUIDE_WORKER: single focused retry instruction ---
     if pmo_guides_worker(&agent_output) {
         let guidance = extract_guidance(&agent_output);
+        if guidance.trim().is_empty() {
+            warn!(
+                "PMO: GUIDE_WORKER output for issue #{} had no usable guidance, releasing claim for retry",
+                issue.iid
+            );
+            anyhow::bail!(
+                "PMO GUIDE_WORKER output for issue #{} had no usable guidance; retrying later",
+                issue.iid
+            );
+        }
         info!("PMO: Issue #{} needs guidance, not splitting", issue.iid);
         gitlab.add_issue_comment(
             issue.iid,
@@ -770,13 +780,17 @@ fn process_action_required_issue(
 
     if pmo_no_split_needed(&agent_output) {
         let guidance = extract_guidance(&agent_output);
-        let comment = if guidance.is_empty() {
-            "PMO Agent reviewed this issue and determined it does not need splitting. \
-             The worker should retry implementation."
-                .to_string()
-        } else {
-            format!("**PMO guidance for the worker agent:**\n\n{}", guidance)
-        };
+        if guidance.trim().is_empty() {
+            warn!(
+                "PMO: NO_SPLIT_NEEDED output for issue #{} had no usable guidance, releasing claim for retry",
+                issue.iid
+            );
+            anyhow::bail!(
+                "PMO NO_SPLIT_NEEDED output for issue #{} had no usable guidance; retrying later",
+                issue.iid
+            );
+        }
+        let comment = format!("**PMO guidance for the worker agent:**\n\n{}", guidance);
         info!("PMO: Issue #{} does not need splitting", issue.iid);
         gitlab.add_issue_comment(issue.iid, &comment)?;
         gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
@@ -787,23 +801,23 @@ fn process_action_required_issue(
     // --- SPLIT: create sub-issues, close the parent as a task container ---
     if !had_plan_file_paths {
         warn!(
-            "PMO: Split path for issue #{} has no saved plan file output, marking manual intervention",
+            "PMO: Split path for issue #{} has no saved plan file output, releasing claim for retry",
             issue.iid
         );
-        let comment = build_missing_canonical_pmo_output_comment(true);
-        gitlab.add_issue_comment(issue.iid, &comment)?;
-        gitlab.add_issue_label(issue.iid, PMO_PROCESSED_LABEL)?;
-        return Ok(false);
+        anyhow::bail!(
+            "PMO split output for issue #{} had no saved plan file content; retrying later",
+            issue.iid
+        );
     }
     let Some(plan_text) = pmo_extract_plan_file_text(&agent_output.response) else {
         warn!(
-            "PMO: Split path for issue #{} had plan path indicator but unreadable plan content, marking manual intervention",
+            "PMO: Split path for issue #{} had plan path indicator but unreadable plan content, releasing claim for retry",
             issue.iid
         );
-        let comment = build_missing_canonical_pmo_output_comment(true);
-        gitlab.add_issue_comment(issue.iid, &comment)?;
-        gitlab.add_issue_label(issue.iid, PMO_PROCESSED_LABEL)?;
-        return Ok(false);
+        anyhow::bail!(
+            "PMO split output for issue #{} had unreadable plan file content; retrying later",
+            issue.iid
+        );
     };
     // For split parsing, consume only saved plan file content.
     agent_output.response = plan_text;
@@ -818,11 +832,10 @@ fn process_action_required_issue(
             preview
         );
 
-        let comment = build_unparsed_split_manual_intervention_comment(&agent_output);
-        gitlab.add_issue_comment(issue.iid, &comment)?;
-
-        gitlab.add_issue_label(issue.iid, PMO_PROCESSED_LABEL)?;
-        return Ok(false);
+        anyhow::bail!(
+            "PMO split output for issue #{} was not machine-readable; retrying later",
+            issue.iid
+        );
     }
 
     let pending_file = state.task_path();
@@ -1004,7 +1017,7 @@ CRITICAL REQUIREMENTS:
 - Also mirror intent in prose where helpful (`decision:`, `question:`, `instructions:`, `reason:`) but **parsers require the literal marker lines** (`GUIDE_WORKER`, `SUB_ISSUE_1:`, `ALREADY_DONE`, etc.) — prose alone is not enough.
 - For SPLIT, each sub-issue **must** use the `SUB_ISSUE_N:` + `TITLE:` + `PRIORITY:` + `DESCRIPTION:` layout (see canonical examples). Include acceptance criteria inside `DESCRIPTION:`.
 - **STRICT OUTPUT CONTRACT (SPLIT):** if you choose `decision: split`, your final output must be machine-readable only: either `SUB_ISSUE_N` blocks or one fenced JSON array. Do not include extra prose before or after those structured blocks.
-- Any split output that is not machine-readable in those exact formats is treated as a PMO failure and will trigger manual intervention.
+- Any split output that is not machine-readable in those exact formats is treated as a PMO failure; Potlatch will retry later without posting a GitLab intervention request.
 
 CURSOR PLAN FILE — CANONICAL BLOCKS (copy these shapes into the saved plan file; spelling and keywords must match):
 - **GUIDE_WORKER** — exact lines:
@@ -1295,67 +1308,6 @@ fn extract_guidance(agent_output: &AgentHandoff) -> String {
         }
     } else {
         raw
-    }
-}
-
-fn build_unparsed_split_manual_intervention_comment(agent_output: &AgentHandoff) -> String {
-    let public_comment = extract_public_comment_block(&agent_output.response)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let instructions = agent_output
-        .instructions
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let reason = agent_output
-        .reason
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let question = agent_output
-        .question
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    let mut summary = if !public_comment.is_empty() {
-        public_comment
-    } else if !instructions.is_empty() {
-        instructions
-    } else if !reason.is_empty() {
-        reason
-    } else if !question.is_empty() {
-        format!("PMO requested clarification: {question}")
-    } else {
-        String::new()
-    };
-
-    if summary.is_empty() {
-        summary = "No usable machine-readable split output was returned by PMO. Raw PMO text was omitted because it may contain intermediate planning output rather than a final decision.".to_string();
-    }
-
-    format!(
-        "**PMO could not parse sub-issues from the PMO response. Manual intervention is required.**\n\n\
-         Diagnostic context:\n\n{summary}",
-        summary = summary
-    )
-}
-
-fn build_missing_canonical_pmo_output_comment(split_mode: bool) -> String {
-    if split_mode {
-        "**PMO could not parse sub-issues from the PMO response. Manual intervention is required.**\n\n\
-         Diagnostic context:\n\n\
-         PMO chose split mode, but no readable saved plan file content was available. Split parsing requires plan file output."
-            .to_string()
-    } else {
-        "**PMO could not parse sub-issues from the PMO response. Manual intervention is required.**\n\n\
-         Diagnostic context:\n\n\
-         PMO did not return canonical output for this run (no final response text and no saved plan file content)."
-            .to_string()
     }
 }
 
@@ -2296,6 +2248,25 @@ Body here.
     }
 
     #[test]
+    fn extract_guidance_returns_empty_for_marker_without_body() {
+        let output = AgentHandoff {
+            response: "GUIDE_WORKER\n".to_string(),
+            ..Default::default()
+        };
+        assert!(pmo_guides_worker(&output));
+        assert!(extract_guidance(&output).is_empty());
+    }
+
+    #[test]
+    fn extract_guidance_reads_instructions_marker() {
+        let output = AgentHandoff {
+            response: "GUIDE_WORKER\nINSTRUCTIONS:\nUse the existing config loader.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_guidance(&output), "Use the existing config loader.");
+    }
+
+    #[test]
     fn pmo_apply_cursor_plan_files_merges_markdown_into_response() {
         let tmp =
             std::env::temp_dir().join(format!("potlatch-pmo-plan-merge-{}", std::process::id()));
@@ -2390,46 +2361,5 @@ Body here.
             gitlab::priority_from_labels(&["in-progress".to_string()]),
             3
         );
-    }
-
-    #[test]
-    fn build_unparsed_split_manual_intervention_comment_prefers_public_comment_block() {
-        let handoff = AgentHandoff {
-            response: "noise\nPUBLIC_COMMENT_BEGIN\nDo X, then Y.\nPUBLIC_COMMENT_END".to_string(),
-            instructions: Some("ignored".to_string()),
-            ..Default::default()
-        };
-        let out = build_unparsed_split_manual_intervention_comment(&handoff);
-        assert!(out.contains("Manual intervention is required"));
-        assert!(out.contains("Do X, then Y."));
-        assert!(!out.contains("ignored"));
-    }
-
-    #[test]
-    fn build_unparsed_split_manual_intervention_comment_omits_raw_response_when_no_fields() {
-        let handoff = AgentHandoff {
-            response: "Plain text analysis without markers".to_string(),
-            ..Default::default()
-        };
-        let out = build_unparsed_split_manual_intervention_comment(&handoff);
-        assert!(out.contains("Raw PMO text was omitted"));
-        assert!(!out.contains("Plain text analysis without markers"));
-        assert!(out.contains("Diagnostic context:"));
-    }
-
-    #[test]
-    fn build_missing_canonical_pmo_output_comment_mentions_missing_final_sources() {
-        let out = build_missing_canonical_pmo_output_comment(false);
-        assert!(out.contains("Manual intervention is required"));
-        assert!(out.contains("no final response text"));
-        assert!(out.contains("no saved plan file content"));
-    }
-
-    #[test]
-    fn build_missing_canonical_pmo_output_comment_for_split_requires_plan_file() {
-        let out = build_missing_canonical_pmo_output_comment(true);
-        assert!(out.contains("Manual intervention is required"));
-        assert!(out.contains("split mode"));
-        assert!(out.contains("requires plan file output"));
     }
 }
