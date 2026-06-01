@@ -1421,11 +1421,13 @@ INSTRUCTIONS:
    <full description with goal, implementation, and testing sections — NEVER include PUBLIC_COMMENT_BEGIN/END here; those markers are only for thread replies below; NEVER paste or quote text from repo-root notes.md here>
 14. After addressing feedback, provide a summary:
    CHANGES_SUMMARY: <A concise sentence summarizing the substance of the changes made — this will be used as the git commit message, so it must convey the main idea of what was changed>
+   The summary must reflect the actual source/MR metadata changes you made in this run. Do not mention a reviewer concern as fixed unless the final diff or MR metadata actually changed to address it.
 15. For any human-facing GitLab comment/reply text, include a stable block:
    PUBLIC_COMMENT_BEGIN
    <only the final comment text to post publicly; no progress updates, no tool/log output>
    PUBLIC_COMMENT_END
    Keep this public reply concise. Do NOT include a `Validation:` section, test/lint command lists, passed/failed command output, or unrelated repository backlog notes.
+   The public reply must exactly match the committed changes from this run. Mention only feedback items you actually resolved in code or MR metadata. If you did not change code/metadata for an item, say so with MARK_DISCUSSIONS_RESOLVED: no instead of implying it was fixed.
 16. Control whether GitLab should mark open review discussions as resolved after your reply:
    - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
    - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not fix the comment (e.g. explaining why the current code already satisfies it, partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
