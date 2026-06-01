@@ -1288,11 +1288,17 @@ fn handle_mr_comments(
         info!("MR !{} has merge conflicts to resolve", latest_mr.iid);
     }
 
-    let mut comments = state.glab.get_mr_comments(latest_mr.iid)?;
-    if !unresolved_ids.is_empty() {
+    let all_comments = state.glab.get_mr_comments(latest_mr.iid)?;
+    let unresolved_comments = if unresolved_ids.is_empty() {
+        Vec::new()
+    } else {
         let unresolved_set: HashSet<&str> = unresolved_ids.iter().map(String::as_str).collect();
-        comments.retain(|c| unresolved_set.contains(c.discussion_id.as_str()));
-    }
+        all_comments
+            .iter()
+            .filter(|c| unresolved_set.contains(c.discussion_id.as_str()))
+            .cloned()
+            .collect()
+    };
 
     state.git_repo.fetch()?;
     let _ = state.git_repo.reset_hard();
@@ -1348,12 +1354,8 @@ fn handle_mr_comments(
         .map(|n| state.load_implementation_summary(n))
         .unwrap_or_else(|| "No previous implementation summary available.".to_string());
 
-    let comment_lines = comments
-        .iter()
-        .map(|c| c.format_for_prompt())
-        .collect::<Vec<_>>();
-
-    let all_comments_text = comment_lines.join("\n");
+    let unresolved_comments_text = format_comments_for_prompt(&unresolved_comments);
+    let all_comments_text = format_comments_for_prompt(&all_comments);
 
     let combined_context_path = write_task_context_file(
         &state.sessions_dir,
@@ -1366,6 +1368,7 @@ fn handle_mr_comments(
             &latest_mr,
             &issue_context,
             &implementation_summary,
+            &unresolved_comments_text,
             &all_comments_text,
             &diff_context_content,
         ),
@@ -1399,12 +1402,12 @@ CRITICAL REQUIREMENTS:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly.
-2. Read the task context file above before making any changes.
+2. Read the task context file above before making any changes, including both "Unresolved MR comments to address" and "Full MR comment history for context".
 3. In that combined file, use inline comment locations (`path:line` or `path:start-end`) to find corresponding hunks in the diff section and make targeted fixes.
 4. First, check for merge conflicts. If any exist, resolve ALL conflicts in every file before proceeding.
 5. Review the original issue and what was implemented
-6. Review ALL comments to understand the full conversation and context
-7. Identify which feedback items are still unresolved
+6. Review ALL comments to understand the full conversation and context, including simple comments that do not require resolution.
+7. Identify which feedback items are still unresolved. Treat only comments in "Unresolved MR comments to address" as actionable feedback; use the full comment history only for context, clarification, and avoiding stale assumptions.
 8. Make the necessary code changes to address all unresolved feedback
 9. If the reviewer asked you to delete, rename, or move files, make those file changes.
 10. Ensure changes align with both the original requirements and reviewer feedback
@@ -2402,16 +2405,25 @@ fn truncate_utf8_string_in_place(s: &mut String, max_bytes: usize) {
     s.truncate(end);
 }
 
+fn format_comments_for_prompt(comments: &[crate::agents::gitlab::Comment]) -> String {
+    comments
+        .iter()
+        .map(|c| c.format_for_prompt())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn build_combined_mr_feedback_context(
     project_name: &str,
     mr: &crate::agents::gitlab::MergeRequest,
     issue_context: &str,
     implementation_summary: &str,
+    unresolved_comments_text: &str,
     all_comments_text: &str,
     diff_context: &str,
 ) -> String {
     format!(
-        "# Merge Request Feedback + Diff Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n## Original issue context\n{issue_context}\n\n## Original implementation summary\n{implementation_summary}\n\n## MR description\n{mr_description}\n\n## Unresolved MR comments\n{all_comments_text}\n\n## MR diff context\n{diff_context}\n",
+        "# Merge Request Feedback + Diff Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n## Original issue context\n{issue_context}\n\n## Original implementation summary\n{implementation_summary}\n\n## MR description\n{mr_description}\n\n## Unresolved MR comments to address\n{unresolved_comments_text}\n\n## Full MR comment history for context\n{all_comments_text}\n\n## MR diff context\n{diff_context}\n",
         project_name = project_name,
         mr_iid = mr.iid,
         mr_title = mr.title,
@@ -2420,8 +2432,13 @@ fn build_combined_mr_feedback_context(
         issue_context = issue_context,
         implementation_summary = implementation_summary,
         mr_description = mr.description,
-        all_comments_text = if all_comments_text.trim().is_empty() {
+        unresolved_comments_text = if unresolved_comments_text.trim().is_empty() {
             "No unresolved comments.".to_string()
+        } else {
+            unresolved_comments_text.to_string()
+        },
+        all_comments_text = if all_comments_text.trim().is_empty() {
+            "No MR comments.".to_string()
         } else {
             all_comments_text.to_string()
         },
@@ -3250,6 +3267,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(build_feedback_resolution_reply(&output, false, None), None);
+    }
+
+    #[test]
+    fn combined_mr_feedback_context_separates_unresolved_and_full_history() {
+        let mr = crate::agents::gitlab::MergeRequest {
+            iid: 287,
+            title: "Add config".into(),
+            description: "MR description".into(),
+            source_branch: "issue-285".into(),
+            target_branch: "main".into(),
+            state: "opened".into(),
+            sha: None,
+            labels: None,
+            has_conflicts: false,
+        };
+        let ctx = build_combined_mr_feedback_context(
+            "project",
+            &mr,
+            "issue context",
+            "implementation summary",
+            "- reviewer (discussion d1): fix this",
+            "- reviewer (discussion d1): fix this\n- maintainer (discussion d2): simple context",
+            "diff context",
+        );
+
+        assert!(ctx.contains("## Unresolved MR comments to address"));
+        assert!(ctx.contains("## Full MR comment history for context"));
+        assert!(ctx.contains("fix this"));
+        assert!(ctx.contains("simple context"));
     }
 
     #[test]
