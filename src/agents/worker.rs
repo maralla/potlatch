@@ -1425,6 +1425,7 @@ INSTRUCTIONS:
    PUBLIC_COMMENT_BEGIN
    <only the final comment text to post publicly; no progress updates, no tool/log output>
    PUBLIC_COMMENT_END
+   Keep this public reply concise. Do NOT include a `Validation:` section, test/lint command lists, passed/failed command output, or unrelated repository backlog notes.
 16. Control whether GitLab should mark open review discussions as resolved after your reply:
    - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
    - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not fix the comment (e.g. explaining why the current code already satisfies it, partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
