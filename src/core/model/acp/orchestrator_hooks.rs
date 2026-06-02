@@ -23,9 +23,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use super::client::{AcpHooks, CursorAskQuestionHandler, headless_agent_request_result};
+use super::client::{
+    AcpHooks, CursorAskQuestionHandler, extract_cursor_create_plan_text,
+    headless_agent_request_result, headless_cursor_create_plan_reply,
+};
 use super::types::SessionModeStateBrief;
 use super::workspace_read::{read_text_file_under_workspace, slice_by_line_range};
 
@@ -42,6 +45,8 @@ pub struct StreamTextHooks {
     workspace_root: Option<PathBuf>,
     /// Plan-mode `tool_call_update` paths (`Plan saved to file://…`), taken into [`AgentHandoff`] for PMO.
     cursor_plan_paths: Mutex<Vec<String>>,
+    /// Plan-mode `cursor/create_plan` markdown body (ACP extension RPC).
+    cursor_create_plan_text: Mutex<String>,
     /// Monotonic count of `session/update` notifications seen for this task.
     notification_seq: AtomicU64,
 }
@@ -55,6 +60,7 @@ impl StreamTextHooks {
             cursor_ask_question_handler: Mutex::new(None),
             workspace_root: None,
             cursor_plan_paths: Mutex::new(Vec::new()),
+            cursor_create_plan_text: Mutex::new(String::new()),
             notification_seq: AtomicU64::new(0),
         }
     }
@@ -68,6 +74,7 @@ impl StreamTextHooks {
             cursor_ask_question_handler: Mutex::new(None),
             workspace_root: Some(workspace_root),
             cursor_plan_paths: Mutex::new(Vec::new()),
+            cursor_create_plan_text: Mutex::new(String::new()),
             notification_seq: AtomicU64::new(0),
         }
     }
@@ -113,6 +120,7 @@ impl StreamTextHooks {
     pub fn clear(&self) {
         self.buffer.lock().unwrap().clear();
         self.cursor_plan_paths.lock().unwrap().clear();
+        self.cursor_create_plan_text.lock().unwrap().clear();
         self.notification_seq.store(0, Ordering::SeqCst);
     }
 
@@ -130,6 +138,10 @@ impl StreamTextHooks {
 
     pub(crate) fn take_cursor_plan_paths(&self) -> Vec<String> {
         std::mem::take(&mut *self.cursor_plan_paths.lock().unwrap())
+    }
+
+    pub(crate) fn take_cursor_create_plan_text(&self) -> String {
+        std::mem::take(&mut *self.cursor_create_plan_text.lock().unwrap())
     }
 
     pub fn has_cursor_plan_paths(&self) -> bool {
@@ -400,6 +412,24 @@ impl AcpHooks for StreamTextHooks {
         {
             return h.handle_ask_question(params);
         }
+        if method == "cursor/create_plan" {
+            if let Some(plan) = extract_cursor_create_plan_text(params) {
+                info!(
+                    target: "potlatch::acp_cursor",
+                    plan_len = plan.len(),
+                    "Captured cursor/create_plan markdown for PMO parsing"
+                );
+                *self.cursor_create_plan_text.lock().unwrap() = plan;
+            }
+            return headless_cursor_create_plan_reply();
+        }
+        if method.starts_with("cursor/") {
+            debug!(
+                target: "potlatch::acp_cursor",
+                %method,
+                "handling Cursor ACP extension request"
+            );
+        }
         if method == "fs/read_text_file" {
             return self.handle_fs_read_text_file(params);
         }
@@ -445,6 +475,19 @@ impl AcpHooks for StreamTextHooks {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hooks_capture_cursor_create_plan_markdown() {
+        let h = StreamTextHooks::new();
+        let params = json!({
+            "toolCallId": "call_1",
+            "name": "PMO triage",
+            "plan": "GUIDE_WORKER\nINSTRUCTIONS:\nUse the existing loader."
+        });
+        let result = h.handle_agent_request("cursor/create_plan", &params, &json!(1));
+        assert_eq!(result["outcome"]["outcome"], "accepted");
+        assert!(h.take_cursor_create_plan_text().contains("GUIDE_WORKER"));
+    }
 
     #[test]
     fn extracts_snake_case_chunk_kind() {

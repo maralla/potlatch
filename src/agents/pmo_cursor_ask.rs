@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rand::RngExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::agents::gitlab::{GitLabClient, IssueThreadNote};
@@ -50,12 +50,40 @@ fn option_entry_label(opt: &Value) -> String {
     option_entry_id(opt).unwrap_or("(option)").to_string()
 }
 
+fn question_options(params: &Value) -> Option<&Vec<Value>> {
+    params
+        .get("options")
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            params
+                .get("questions")
+                .and_then(|v| v.as_array())
+                .and_then(|q| q.first())
+                .and_then(|q| q.get("options"))
+                .and_then(|v| v.as_array())
+        })
+}
+
 fn extract_question_text(params: &Value) -> String {
     for k in ["question", "message", "text", "prompt", "title", "body"] {
         if let Some(s) = params.get(k).and_then(|v| v.as_str()) {
             let t = s.trim();
             if !t.is_empty() {
                 return t.to_string();
+            }
+        }
+    }
+    if let Some(question) = params
+        .get("questions")
+        .and_then(|v| v.as_array())
+        .and_then(|q| q.first())
+    {
+        for k in ["prompt", "question", "text", "title"] {
+            if let Some(s) = question.get(k).and_then(|v| v.as_str()) {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return t.to_string();
+                }
             }
         }
     }
@@ -74,7 +102,7 @@ fn extract_question_text(params: &Value) -> String {
 }
 
 fn format_options_for_comment(params: &Value) -> String {
-    if let Some(opts) = params.get("options").and_then(|v| v.as_array()) {
+    if let Some(opts) = question_options(params) {
         if opts.is_empty() {
             return "_Reply with an option id, or a number like `0` for the first choice._\n"
                 .to_string();
@@ -171,44 +199,64 @@ fn same_discussion_or_sequential_fallback(n: &IssueThreadNote, root: &IssueThrea
     }
 }
 
+fn question_id_from_params(params: &Value) -> &str {
+    params
+        .get("questions")
+        .and_then(|v| v.as_array())
+        .and_then(|q| q.first())
+        .and_then(|q| q.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("q1")
+}
+
+fn cursor_ask_question_answered(question_id: &str, selected_option_ids: &[&str]) -> Value {
+    json!({
+        "outcome": {
+            "outcome": "answered",
+            "answers": [{
+                "questionId": question_id,
+                "selectedOptionIds": selected_option_ids
+            }]
+        }
+    })
+}
+
 fn resolve_choice_to_acp_result(params: &Value, choice_raw: &str) -> Value {
     let choice_trim = choice_raw.trim();
+    let question_id = question_id_from_params(params);
     if choice_trim.is_empty() {
         return headless_cursor_ask_question_reply(params);
     }
     if let Ok(idx) = choice_trim.parse::<usize>() {
-        if let Some(opts) = params.get("options").and_then(|v| v.as_array()) {
-            if let Some(opt) = opts.get(idx)
+        if let Some(opts) = question_options(params) {
+            let selected = if idx == 0 {
+                opts.first()
+            } else {
+                opts.get(idx - 1)
+            };
+            if let Some(opt) = selected
                 && let Some(id) = option_entry_id(opt)
             {
-                return serde_json::json!({ "selectedOptionId": id });
-            }
-            if let Some(opt) = idx.checked_sub(1).and_then(|j| opts.get(j))
-                && let Some(id) = option_entry_id(opt)
-            {
-                return serde_json::json!({ "selectedOptionId": id });
+                return cursor_ask_question_answered(question_id, &[id]);
             }
         }
-        if params.get("choices").and_then(|v| v.as_array()).is_some() {
-            return serde_json::json!({ "selectedIndex": idx });
-        }
-        return serde_json::json!({ "selectedIndex": idx });
+        return headless_cursor_ask_question_reply(params);
     }
-    if let Some(opts) = params.get("options").and_then(|v| v.as_array()) {
+    if let Some(opts) = question_options(params) {
         for opt in opts {
             if let Some(id) = option_entry_id(opt)
                 && id == choice_trim
             {
-                return serde_json::json!({ "selectedOptionId": id });
+                return cursor_ask_question_answered(question_id, &[id]);
             }
         }
     }
     warn!(
         target: "potlatch::acp_cursor",
         choice = %choice_trim,
-        "PMO thread reply did not match a listed option; echoing as selectedOptionId"
+        "PMO thread reply did not match a listed option; echoing as selectedOptionIds"
     );
-    serde_json::json!({ "selectedOptionId": choice_trim })
+    cursor_ask_question_answered(question_id, &[choice_trim])
 }
 
 fn clear_pmo_pending_label(gitlab: &GitLabClient, issue_iid: u64) {
@@ -415,5 +463,64 @@ mod tests {
         let notes = vec![root.clone(), bad];
         let root_ref = &notes[0];
         assert!(pick_direct_thread_reply(&notes, root_ref).is_none());
+    }
+
+    #[test]
+    fn resolves_nested_question_option_reply() {
+        let params = json!({
+            "questions": [{
+                "id": "mode",
+                "prompt": "Choose a mode",
+                "options": [
+                    { "id": "guide", "label": "Guide worker" },
+                    { "id": "split", "label": "Split issue" }
+                ]
+            }]
+        });
+
+        let by_number = resolve_choice_to_acp_result(&params, "2");
+        assert_eq!(by_number["outcome"]["outcome"], "answered");
+        assert_eq!(by_number["outcome"]["answers"][0]["questionId"], "mode");
+        assert_eq!(
+            by_number["outcome"]["answers"][0]["selectedOptionIds"][0],
+            "split"
+        );
+
+        let by_zero = resolve_choice_to_acp_result(&params, "0");
+        assert_eq!(
+            by_zero["outcome"]["answers"][0]["selectedOptionIds"][0],
+            "guide"
+        );
+
+        let by_one = resolve_choice_to_acp_result(&params, "1");
+        assert_eq!(
+            by_one["outcome"]["answers"][0]["selectedOptionIds"][0],
+            "guide"
+        );
+
+        let by_id = resolve_choice_to_acp_result(&params, "guide");
+        assert_eq!(
+            by_id["outcome"]["answers"][0]["selectedOptionIds"][0],
+            "guide"
+        );
+    }
+
+    #[test]
+    fn comment_uses_nested_question_prompt_and_options() {
+        let params = json!({
+            "questions": [{
+                "id": "mode",
+                "prompt": "Choose a mode",
+                "options": [
+                    { "id": "guide", "label": "Guide worker" },
+                    { "id": "split", "label": "Split issue" }
+                ]
+            }]
+        });
+
+        assert_eq!(extract_question_text(&params), "Choose a mode");
+        let choices = format_options_for_comment(&params);
+        assert!(choices.contains("`guide`"));
+        assert!(choices.contains("Split issue"));
     }
 }

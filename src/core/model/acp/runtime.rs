@@ -712,16 +712,27 @@ fn final_text_from_prompt_extra(extra: &Map<String, Value>) -> Option<String> {
 fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> AgentHandoff {
     let stream = hooks.take_text();
     let final_text = final_text_from_prompt_extra(&pr.extra);
+    let create_plan_text = hooks.take_cursor_create_plan_text();
+    let has_create_plan_text = !create_plan_text.trim().is_empty();
+    let has_final_result_text = final_text.is_some() || has_create_plan_text;
 
     // Prefer final prompt result text (`message` / `output`) over streamed chunks.
     // Streamed chunks can contain intermediate progress narration, while `extra` carries
     // the end-of-turn canonical answer that downstream parsers should consume.
-    let has_final_result_text = final_text.is_some();
-    let response = if let Some(s) = final_text {
+    let mut response = if let Some(s) = final_text {
         s.to_string()
     } else {
         stream
     };
+
+    if has_create_plan_text {
+        if response.trim().is_empty() {
+            response = create_plan_text;
+        } else {
+            response.push_str("\n\n");
+            response.push_str(&create_plan_text);
+        }
+    }
 
     let cursor_plan_paths = hooks.take_cursor_plan_paths();
 
@@ -798,6 +809,22 @@ mod tests {
             retry_backoff_for_unfinished_task(99),
             Duration::from_millis(1000)
         );
+    }
+
+    #[test]
+    fn handoff_merges_cursor_create_plan_text() {
+        let hooks = StreamTextHooks::new();
+        let params = json!({
+            "plan": "SUB_ISSUE_1:\nTITLE: Add tests\nPRIORITY: 2\nDESCRIPTION:\nDo it."
+        });
+        hooks.handle_agent_request("cursor/create_plan", &params, &json!(1));
+        let pr: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn"
+        }))
+        .unwrap();
+        let h = handoff_from_prompt_hooks(&hooks, pr);
+        assert!(h.has_final_result_text);
+        assert!(h.response.contains("SUB_ISSUE_1:"));
     }
 
     #[test]

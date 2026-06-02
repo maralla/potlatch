@@ -81,7 +81,11 @@ impl AgentModel {
     }
 
     pub fn invoke(&self, prompt: &str, options: &InvokeOptions) -> Result<ModelResponse> {
-        let _activity = crate::ui::activity(self.agent_id.clone());
+        let activity_label = options
+            .activity_label
+            .clone()
+            .unwrap_or_else(|| self.agent_id.clone());
+        let _activity = crate::ui::activity(activity_label);
         self.engine.invoke(prompt, options)
     }
 
@@ -103,20 +107,6 @@ impl AgentModel {
             prompt,
             &InvokeOptions {
                 cancel_check: Some(cancel_check),
-                ..InvokeOptions::default()
-            },
-        )
-    }
-
-    pub fn complete_with_ask_handler(
-        &self,
-        prompt: &str,
-        ask_handler: Option<Arc<dyn crate::core::model::acp::client::CursorAskQuestionHandler>>,
-    ) -> Result<AgentHandoff> {
-        self.complete(
-            prompt,
-            &InvokeOptions {
-                cursor_ask_question_handler: ask_handler,
                 ..InvokeOptions::default()
             },
         )

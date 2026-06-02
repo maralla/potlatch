@@ -17,7 +17,7 @@ use crate::agents::settings;
 use crate::agents::workspace::{
     ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
 };
-use crate::core::agent::{AgentHandoff, HandoffSubIssue};
+use crate::core::agent::{AgentHandoff, HandoffSubIssue, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::model::acp::workspace_read::read_text_file_under_workspace;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
@@ -702,7 +702,22 @@ fn process_action_required_issue(
         None
     };
 
-    let mut agent_output = model.complete_with_ask_handler(&prompt, ask_handler)?;
+    info!(
+        "{}: PMO agent triaging issue #{}",
+        &state.agent_id, issue.iid
+    );
+    let mut agent_output = model.complete(
+        &prompt,
+        &InvokeOptions {
+            cursor_ask_question_handler: ask_handler,
+            activity_label: Some(format!("{} triaging issue #{}", &state.agent_id, issue.iid)),
+            ..InvokeOptions::default()
+        },
+    )?;
+    info!(
+        "{}: PMO agent finished triaging issue #{}",
+        &state.agent_id, issue.iid
+    );
     let had_plan_file_paths = !agent_output.cursor_plan_paths.is_empty();
     agent_output = pmo_apply_cursor_plan_files(&state.working_dir, agent_output);
     if !agent_output.has_final_result_text && !had_plan_file_paths {
@@ -712,6 +727,16 @@ fn process_action_required_issue(
         );
         anyhow::bail!(
             "PMO returned no canonical final output for issue #{}; retrying later",
+            issue.iid
+        );
+    }
+    if agent_output.response.trim().is_empty() {
+        warn!(
+            "PMO: Empty canonical output for issue #{}, releasing claim for retry",
+            issue.iid
+        );
+        anyhow::bail!(
+            "PMO returned empty canonical output for issue #{}; retrying later",
             issue.iid
         );
     }

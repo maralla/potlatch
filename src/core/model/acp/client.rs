@@ -82,8 +82,43 @@ fn pick_auto_permission_option_id(params: &Value) -> String {
         .to_string()
 }
 
-/// Fallback JSON-RPC `result` for [`cursor/ask_question`](https://cursor.com/docs/cli/acp) when no
-/// interactive delegate is installed (worker/reviewer, tests).
+/// Markdown body from a Cursor [`cursor/create_plan`](https://cursor.com/docs/cli/acp) request.
+pub fn extract_cursor_create_plan_text(params: &Value) -> Option<String> {
+    let plan = params.get("plan").and_then(Value::as_str)?.trim();
+    if plan.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    if let Some(name) = params.get("name").and_then(Value::as_str) {
+        let name = name.trim();
+        if !name.is_empty() {
+            out.push_str("# ");
+            out.push_str(name);
+            out.push_str("\n\n");
+        }
+    }
+    if let Some(overview) = params.get("overview").and_then(Value::as_str) {
+        let overview = overview.trim();
+        if !overview.is_empty() {
+            out.push_str(overview);
+            out.push_str("\n\n");
+        }
+    }
+    out.push_str(plan);
+    Some(out)
+}
+
+/// Headless JSON-RPC `result` for [`cursor/create_plan`](https://cursor.com/docs/cli/acp).
+pub fn headless_cursor_create_plan_reply() -> Value {
+    json!({
+        "outcome": {
+            "outcome": "accepted"
+        }
+    })
+}
+
+/// Headless JSON-RPC `result` for [`cursor/ask_question`](https://cursor.com/docs/cli/acp).
 pub fn headless_cursor_ask_question_reply(params: &Value) -> Value {
     if let Some(opts) = params.get("options").and_then(|v| v.as_array())
         && let Some(first) = opts.first()
@@ -93,19 +128,93 @@ pub fn headless_cursor_ask_question_reply(params: &Value) -> Value {
             .or_else(|| first.get("option_id"))
             .and_then(|v| v.as_str())
     {
-        return json!({ "selectedOptionId": id });
+        return json!({
+            "outcome": {
+                "outcome": "answered",
+                "answers": [{
+                    "questionId": params
+                        .get("questions")
+                        .and_then(|v| v.as_array())
+                        .and_then(|q| q.first())
+                        .and_then(|q| q.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("q1"),
+                    "selectedOptionIds": [id]
+                }]
+            }
+        });
     }
-    if params.get("choices").and_then(|v| v.as_array()).is_some() {
-        return json!({ "selectedIndex": 0 });
+    if let Some(questions) = params.get("questions").and_then(|v| v.as_array())
+        && let Some(first_q) = questions.first()
+        && let Some(qid) = first_q.get("id").and_then(|v| v.as_str())
+        && let Some(opts) = first_q.get("options").and_then(|v| v.as_array())
+        && let Some(first_opt) = opts.first()
+        && let Some(oid) = first_opt.get("id").and_then(|v| v.as_str())
+    {
+        return json!({
+            "outcome": {
+                "outcome": "answered",
+                "answers": [{
+                    "questionId": qid,
+                    "selectedOptionIds": [oid]
+                }]
+            }
+        });
     }
-    json!({ "selectedIndex": 0 })
+    json!({
+        "outcome": {
+            "outcome": "answered",
+            "answers": [{
+                "questionId": "q1",
+                "selectedOptionIds": ["0"]
+            }]
+        }
+    })
+}
+
+fn headless_cursor_extension_reply(method: &str, params: &Value) -> Value {
+    match method {
+        "cursor/create_plan" => headless_cursor_create_plan_reply(),
+        "cursor/ask_question" => headless_cursor_ask_question_reply(params),
+        "cursor/update_todos" => json!({
+            "outcome": {
+                "outcome": "accepted",
+                "todos": params.get("todos").cloned().unwrap_or_else(|| json!([]))
+            }
+        }),
+        "cursor/task" => json!({
+            "outcome": {
+                "outcome": "completed"
+            }
+        }),
+        "cursor/generate_image" => json!({
+            "outcome": {
+                "outcome": "generated",
+                "filePath": params
+                    .get("filePath")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            }
+        }),
+        other => {
+            warn!(
+                target: "potlatch::acp_cursor",
+                "auto-accepting unhandled Cursor extension request `{other}`"
+            );
+            json!({
+                "outcome": {
+                    "outcome": "accepted"
+                }
+            })
+        }
+    }
 }
 
 fn cursor_extension_headless_reply(method: &str, params: &Value) -> Option<Value> {
-    match method {
-        "cursor/create_plan" => Some(json!({ "approved": true })),
-        "cursor/ask_question" => Some(headless_cursor_ask_question_reply(params)),
-        _ => None,
+    if method.starts_with("cursor/") {
+        Some(headless_cursor_extension_reply(method, params))
+    } else {
+        None
     }
 }
 
@@ -137,8 +246,7 @@ pub fn headless_agent_request_result(method: &str, params: &Value) -> Value {
     if method.starts_with("cursor/") {
         warn!(
             target: "potlatch::acp_cursor",
-            %method,
-            "unhandled Cursor extension request; returning empty result (agent may stall)"
+            "unhandled Cursor extension request `{method}`; returning empty result (agent may stall)"
         );
     }
 
@@ -508,7 +616,20 @@ mod tests {
     #[test]
     fn headless_cursor_create_plan_approves() {
         let r = headless_agent_request_result("cursor/create_plan", &json!({ "sessionId": "s" }));
-        assert_eq!(r["approved"], true);
+        assert_eq!(r["outcome"]["outcome"], "accepted");
+    }
+
+    #[test]
+    fn extract_cursor_create_plan_text_includes_name_overview_and_plan() {
+        let text = extract_cursor_create_plan_text(&json!({
+            "name": "Issue triage",
+            "overview": "Split into focused sub-issues.",
+            "plan": "SUB_ISSUE_1:\nTITLE: Add tests\nPRIORITY: 2\nDESCRIPTION:\nDo it."
+        }))
+        .unwrap();
+        assert!(text.contains("# Issue triage"));
+        assert!(text.contains("Split into focused sub-issues."));
+        assert!(text.contains("SUB_ISSUE_1:"));
     }
 
     #[test]
@@ -520,7 +641,8 @@ mod tests {
                 "options": [{ "id": "opt-a", "label": "A" }, { "id": "opt-b" }]
             }),
         );
-        assert_eq!(r["selectedOptionId"], "opt-a");
+        assert_eq!(r["outcome"]["outcome"], "answered");
+        assert_eq!(r["outcome"]["answers"][0]["selectedOptionIds"][0], "opt-a");
     }
 
     fn from_line_transport(

@@ -16,6 +16,7 @@ use crate::core::periodic::run_periodic_scheduler;
 pub struct InvokeOptions {
     pub cancel_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub cursor_ask_question_handler: Option<Arc<dyn CursorAskQuestionHandler>>,
+    pub activity_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
