@@ -12,7 +12,7 @@ use crate::agents::settings;
 use crate::agents::workspace::{
     ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
 };
-use crate::core::agent::AgentHandoff;
+use crate::core::agent::{AgentHandoff, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
@@ -458,7 +458,23 @@ fn review_merge_request(
         sessions_dir,
     )?;
 
-    let agent_output = model.complete_prompt(&prompt)?;
+    info!(
+        "{}: Reviewer agent reviewing MR !{}",
+        model.agent_id(),
+        mr.iid
+    );
+    let agent_output = model.complete(
+        &prompt,
+        &InvokeOptions {
+            activity_label: Some(format!("{} reviewing MR !{}", model.agent_id(), mr.iid)),
+            ..InvokeOptions::default()
+        },
+    )?;
+    info!(
+        "{}: Reviewer agent finished MR !{}",
+        model.agent_id(),
+        mr.iid
+    );
 
     git_repo.checkout_remote_branch(&mr.target_branch)?;
 

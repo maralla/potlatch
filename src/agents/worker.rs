@@ -17,7 +17,7 @@ use crate::agents::settings;
 use crate::agents::workspace::{
     ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
 };
-use crate::core::agent::AgentHandoff;
+use crate::core::agent::{AgentHandoff, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
@@ -1135,9 +1135,20 @@ fn process_issue(
         build_implementation_prompt(state, issue, &gl_comments)?
     };
 
-    let agent_output = match model.complete_with_cancel(
+    info!(
+        "{}: Worker agent implementing issue #{}",
+        &state.agent_id, issue.iid
+    );
+    let agent_output = match model.complete(
         &prompt,
-        worker_issue_cancel_check(state.glab.clone(), issue.iid),
+        &InvokeOptions {
+            cancel_check: Some(worker_issue_cancel_check(state.glab.clone(), issue.iid)),
+            activity_label: Some(format!(
+                "{} implementing issue #{}",
+                &state.agent_id, issue.iid
+            )),
+            ..InvokeOptions::default()
+        },
     ) {
         Ok(output) => output,
         Err(e) if handle_worker_issue_processing_cancelled(state, issue.iid, &e) => {
@@ -1145,6 +1156,10 @@ fn process_issue(
         }
         Err(e) => return Err(e),
     };
+    info!(
+        "{}: Worker agent finished issue #{}",
+        &state.agent_id, issue.iid
+    );
 
     if output_signals_cannot_implement(&agent_output) {
         let reason = if output_needs_split(&agent_output) {
@@ -1447,18 +1462,52 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     );
 
     let agent_output = if let Some(issue_iid) = issue_number {
-        match model.complete_with_cancel(
+        info!(
+            "{}: Worker agent addressing MR !{} feedback for issue #{}",
+            &state.agent_id, latest_mr.iid, issue_iid
+        );
+        let output = match model.complete(
             &prompt,
-            worker_issue_cancel_check(state.glab.clone(), issue_iid),
+            &InvokeOptions {
+                cancel_check: Some(worker_issue_cancel_check(state.glab.clone(), issue_iid)),
+                activity_label: Some(format!(
+                    "{} addressing MR !{} feedback",
+                    &state.agent_id, latest_mr.iid
+                )),
+                ..InvokeOptions::default()
+            },
         ) {
             Ok(output) => output,
             Err(e) if handle_worker_issue_processing_cancelled(state, issue_iid, &e) => {
                 return Ok(false);
             }
             Err(e) => return Err(e),
-        }
+        };
+        info!(
+            "{}: Worker agent finished MR !{} feedback",
+            &state.agent_id, latest_mr.iid
+        );
+        output
     } else {
-        model.complete_prompt(&prompt)?
+        info!(
+            "{}: Worker agent addressing MR !{} feedback",
+            &state.agent_id, latest_mr.iid
+        );
+        let output = model.complete(
+            &prompt,
+            &InvokeOptions {
+                activity_label: Some(format!(
+                    "{} addressing MR !{} feedback",
+                    &state.agent_id, latest_mr.iid
+                )),
+                ..InvokeOptions::default()
+            },
+        )?;
+        info!(
+            "{}: Worker agent finished MR !{} feedback",
+            &state.agent_id, latest_mr.iid
+        );
+        output
     };
 
     if output_signals_cannot_resolve(&agent_output) {

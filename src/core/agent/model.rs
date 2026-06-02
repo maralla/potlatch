@@ -94,24 +94,6 @@ impl AgentModel {
         self.invoke(prompt, options).map(|r| r.handoff)
     }
 
-    pub fn complete_prompt(&self, prompt: &str) -> Result<AgentHandoff> {
-        self.complete(prompt, &InvokeOptions::default())
-    }
-
-    pub fn complete_with_cancel(
-        &self,
-        prompt: &str,
-        cancel_check: Arc<dyn Fn() -> bool + Send + Sync>,
-    ) -> Result<AgentHandoff> {
-        self.complete(
-            prompt,
-            &InvokeOptions {
-                cancel_check: Some(cancel_check),
-                ..InvokeOptions::default()
-            },
-        )
-    }
-
     #[cfg(test)]
     pub(crate) fn from_section_for_test(
         section: &crate::core::config::AgentSection,
