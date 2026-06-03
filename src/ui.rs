@@ -160,11 +160,7 @@ fn init_spinner(enabled: bool) {
                     .ok()
                     .and_then(|label| label.clone())
                     .unwrap_or_else(|| "agents".to_string());
-                let text = if active == 1 {
-                    format!("{label} working")
-                } else {
-                    format!("{active} agents working")
-                };
+                let text = activity_text(active, &label);
                 let text = truncate_to_terminal_width(&text, SPINNER_PREFIX_WIDTH);
                 let _ = write!(out, "{SPINNER_CLEAR}  {} {}{}", frames[idx], DIM, text);
                 let _ = write!(out, "{RESET}");
@@ -423,6 +419,14 @@ fn truncate_to_terminal_width(text: &str, prefix_width: usize) -> String {
     truncate_to_width(&text, available)
 }
 
+fn activity_text(active: usize, label: &str) -> String {
+    if active == 1 {
+        label.to_string()
+    } else {
+        format!("{active} agents working")
+    }
+}
+
 fn truncate_to_width(text: &str, width: usize) -> String {
     let text = text.replace(['\r', '\n'], " ");
     if display_width(&text) <= width {
@@ -530,6 +534,18 @@ mod tests {
         assert_eq!(
             truncate_to_width("/very/long/path/to/repository", 14),
             "/very/…ository"
+        );
+    }
+
+    #[test]
+    fn activity_text_uses_single_agent_label_as_is() {
+        assert_eq!(
+            activity_text(1, "worker-0 addressing MR !83 feedback"),
+            "worker-0 addressing MR !83 feedback"
+        );
+        assert_eq!(
+            activity_text(2, "worker-0 implementing issue #1"),
+            "2 agents working"
         );
     }
 }
