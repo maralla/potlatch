@@ -424,7 +424,7 @@ fn review_merge_request(
     let source_sha = git_repo.rev_parse("HEAD")?;
     let target_sha = git_repo.rev_parse(&format!("origin/{}", mr.target_branch))?;
     info!(
-        "Reviewing MR !{}: {} ({}) -> {} ({})",
+        "MR !{} diff: {} ({}) -> {} ({})",
         mr.iid, mr.source_branch, source_sha, mr.target_branch, target_sha
     );
 
@@ -458,11 +458,6 @@ fn review_merge_request(
         sessions_dir,
     )?;
 
-    info!(
-        "{}: Reviewer agent reviewing MR !{}",
-        model.agent_id(),
-        mr.iid
-    );
     let agent_output = model.complete(
         &prompt,
         &InvokeOptions {

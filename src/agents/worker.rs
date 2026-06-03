@@ -1135,10 +1135,6 @@ fn process_issue(
         build_implementation_prompt(state, issue, &gl_comments)?
     };
 
-    info!(
-        "{}: Worker agent implementing issue #{}",
-        &state.agent_id, issue.iid
-    );
     let agent_output = match model.complete(
         &prompt,
         &InvokeOptions {
