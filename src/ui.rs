@@ -19,13 +19,11 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
-const MAGENTA: &str = "\x1b[35m";
-const BLUE: &str = "\x1b[34m";
 
 const BADGE_WIDTH: usize = 11;
+const SYSTEM_BADGE: &str = "potlatch";
 const SPINNER_CLEAR: &str = "\r\x1b[2K\r";
 const LOG_PREFIX_WIDTH: usize = 18;
 const SPINNER_PREFIX_WIDTH: usize = 4;
@@ -280,11 +278,9 @@ where
         let agent = prefix_agent
             .or_else(|| extract_embedded_agent(&message))
             .or(context_agent.as_deref());
-        let badge = agent
-            .map(agent_badge_label)
-            .unwrap_or_else(|| badge_from_target(target));
+        let badge = badge_for_agent(agent);
         let icon = level_icon(level);
-        let badge_color = agent_badge_color(agent, target, self.use_color);
+        let badge_color = badge_color(agent.is_some(), self.use_color);
         let text = truncate_to_terminal_width(text, LOG_PREFIX_WIDTH);
 
         write!(writer, "  {icon} ")?;
@@ -341,7 +337,11 @@ fn is_agent_id(part: &str) -> bool {
     let Some((role, n)) = part.split_once('-') else {
         return false;
     };
-    matches!(role, "worker" | "reviewer" | "pmo" | "ops") && n.parse::<u32>().is_ok()
+    !role.is_empty()
+        && role
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && n.parse::<u32>().is_ok()
 }
 
 fn split_agent_prefix(message: &str) -> (Option<&str>, &str) {
@@ -353,50 +353,15 @@ fn split_agent_prefix(message: &str) -> (Option<&str>, &str) {
     (None, message)
 }
 
-fn agent_badge_label(agent: &str) -> String {
-    agent.to_string()
+fn badge_for_agent(agent: Option<&str>) -> String {
+    agent.unwrap_or(SYSTEM_BADGE).to_string()
 }
 
-fn badge_from_target(target: &str) -> String {
-    if target.contains("::agents::gitlab") {
-        "gitlab".to_string()
-    } else if target.contains("::agents::") {
-        target.rsplit("::").next().unwrap_or("agent").to_string()
-    } else if target.contains("::acp") {
-        "acp".to_string()
-    } else if target.contains("::config") {
-        "config".to_string()
-    } else {
-        "potlatch".to_string()
-    }
-}
-
-fn agent_badge_color(agent: Option<&str>, target: &str, use_color: bool) -> &'static str {
+fn badge_color(is_agent: bool, use_color: bool) -> &'static str {
     if !use_color {
         return "";
     }
-    let role = agent
-        .and_then(|a| a.split_once('-').map(|(r, _)| r))
-        .or_else(|| {
-            if target.contains("::worker") {
-                Some("worker")
-            } else if target.contains("::reviewer") {
-                Some("reviewer")
-            } else if target.contains("::pmo") {
-                Some("pmo")
-            } else {
-                None
-            }
-        });
-    match role {
-        Some("worker") => CYAN,
-        Some("reviewer") => MAGENTA,
-        Some("pmo") => YELLOW,
-        Some("ops") => BLUE,
-        _ if target.contains("::gitlab") => GREEN,
-        _ if target.contains("::acp") => DIM,
-        _ => BOLD,
-    }
+    if is_agent { CYAN } else { BOLD }
 }
 
 fn terminal_width() -> Option<usize> {
@@ -514,7 +479,10 @@ mod tests {
     fn is_agent_id_recognizes_roles() {
         assert!(is_agent_id("worker-0"));
         assert!(is_agent_id("reviewer-2"));
+        assert!(is_agent_id("pmo-0"));
+        assert!(is_agent_id("custom_agent-12"));
         assert!(!is_agent_id("worker"));
+        assert!(!is_agent_id("worker-next"));
     }
 
     #[test]
@@ -524,6 +492,12 @@ mod tests {
         assert_eq!(agent_badge_from_context().as_deref(), Some("worker-0"));
         drop(_guard);
         assert!(agent_badge_from_context().is_none());
+    }
+
+    #[test]
+    fn badge_for_agent_uses_agent_or_system_badge() {
+        assert_eq!(badge_for_agent(Some("worker-0")), "worker-0");
+        assert_eq!(badge_for_agent(None), SYSTEM_BADGE);
     }
 
     #[test]
