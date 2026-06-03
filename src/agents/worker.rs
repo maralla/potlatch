@@ -1218,20 +1218,10 @@ fn process_issue(
 
     if !state.git_repo.has_diff_against(&default_branch)? {
         warn!(
-            "Issue #{}: agent produced no code changes, rejecting",
+            "Issue #{}: agent produced no code changes, retrying",
             issue.iid
         );
-        let reason = "The implementation produced no code changes. The issue may need more detail or a different approach.";
-        state.glab.add_issue_comment(issue.iid, reason)?;
-        let _ = state.git_repo.reset_hard();
-        let _ = state.git_repo.checkout_remote_branch(&default_branch);
-        let _ = state.git_repo.delete_local_branch(&branch_name);
-        state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL)?;
-        state
-            .glab
-            .add_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
-        current.branch_name = None;
-        return Ok(None);
+        anyhow::bail!("{}", no_code_changes_retry_error_message(issue.iid));
     }
 
     state.git_repo.push(&branch_name)?;
@@ -2073,6 +2063,13 @@ fn extract_issue_number_from_branch(branch_name: &str) -> Result<u64> {
     } else {
         anyhow::bail!("Branch name does not match issue-<number> format")
     }
+}
+
+fn no_code_changes_retry_error_message(issue_iid: u64) -> String {
+    format!(
+        "Worker produced no code changes for issue #{}; retrying without marking action-required",
+        issue_iid
+    )
 }
 
 fn load_issue_context(gitlab: &GitLabClient, issue_number: u64) -> Result<String> {
@@ -3213,6 +3210,15 @@ mod tests {
     #[test]
     fn extract_issue_number_from_branch_for_mr_source() {
         assert_eq!(extract_issue_number_from_branch("issue-42").unwrap(), 42);
+    }
+
+    #[test]
+    fn no_code_changes_retry_message_stays_internal() {
+        let message = no_code_changes_retry_error_message(42);
+        assert!(message.contains("retrying"));
+        assert!(message.contains("without marking action-required"));
+        assert!(!message.contains("may need more detail"));
+        assert!(!message.contains("different approach"));
     }
 
     #[test]
