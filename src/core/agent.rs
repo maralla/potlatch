@@ -9,6 +9,8 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 
+use crate::core::banner::Banner;
+use crate::core::config::Config;
 use crate::core::model::acp::client::CursorAskQuestionHandler;
 use crate::core::periodic::run_periodic_scheduler;
 
@@ -27,6 +29,8 @@ pub struct ModelResponse {
 pub trait CoreAgent: Sized {
     type SpawnContext;
 
+    fn name() -> &'static str;
+
     fn model(&self) -> &AgentModel;
 
     fn agent_id(&self) -> &str {
@@ -40,6 +44,8 @@ pub trait CoreAgent: Sized {
     fn periodic_tasks(&self) -> Vec<crate::core::periodic::PeriodicTaskSpec> {
         vec![]
     }
+
+    fn banner(_config: &Config, _banner: &mut Banner) {}
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()>;
 

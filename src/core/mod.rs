@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod banner;
 pub mod config;
 pub mod model;
 pub mod periodic;

@@ -1,10 +1,6 @@
-use anyhow::{Context, Result};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::flag;
+use anyhow::Result;
 
-use crate::core::config::Config;
-use crate::core::registry::AgentRegistry;
-use crate::core::workflow::{Workflow, WorkflowContext};
+use crate::core::workflow::Workflow;
 
 pub mod claim;
 pub mod git;
@@ -12,7 +8,6 @@ pub mod gitlab;
 pub mod labels;
 pub mod pmo;
 pub mod pmo_cursor_ask;
-pub mod register;
 pub mod reviewer;
 pub mod settings;
 pub mod worker;
@@ -24,16 +19,6 @@ use crate::agents::gitlab::{Issue, MergeRequest};
 pub fn scope_label_filter(scope_label: &str) -> Option<&str> {
     let t = scope_label.trim();
     if t.is_empty() { None } else { Some(t) }
-}
-
-fn prepare_potlatch_workflow(ctx: &WorkflowContext) -> Result<()> {
-    flag::register(SIGINT, ctx.shutdown.clone()).context("Failed to register SIGINT handler")?;
-    flag::register(SIGTERM, ctx.shutdown.clone()).context("Failed to register SIGTERM handler")?;
-    flag::register_conditional_shutdown(SIGINT, 1, ctx.shutdown.clone())
-        .context("Failed to register conditional shutdown")?;
-    flag::register_conditional_shutdown(SIGTERM, 1, ctx.shutdown.clone())
-        .context("Failed to register conditional shutdown")?;
-    Ok(())
 }
 
 /// Stable machine-readable block for public GitLab comments embedded in agent text output.
@@ -116,19 +101,21 @@ pub(crate) fn mr_in_scope(mr: &MergeRequest, scope_label: Option<&str>) -> bool 
     }
 }
 
-pub fn run(config: Config, agent_settings: settings::AgentSettings) -> Result<()> {
-    settings::init(agent_settings);
-    let mut registry = AgentRegistry::new();
-    register::register_potlatch_agents(&mut registry);
-    Workflow::run(config, &registry, prepare_potlatch_workflow)
+pub fn register(workflow: &mut Workflow) {
+    workflow.register_agent::<worker::WorkerAgent>();
+    workflow.register_agent::<reviewer::ReviewerAgent>();
+    workflow.register_agent::<pmo::PmoAgent>();
 }
 
 #[cfg(test)]
 mod scope_tests {
     use super::{
-        extract_public_comment_block, issue_in_scope, mr_in_scope, strip_public_comment_blocks,
+        extract_public_comment_block, issue_in_scope, mr_in_scope, register,
+        strip_public_comment_blocks,
     };
     use crate::agents::gitlab::{Issue, MergeRequest};
+    use crate::core::config::Config;
+    use crate::core::workflow::Workflow;
 
     fn sample_issue(labels: Vec<&str>) -> Issue {
         Issue {
@@ -154,6 +141,16 @@ mod scope_tests {
             labels: labels.map(|v| v.into_iter().map(String::from).collect()),
             has_conflicts: false,
         }
+    }
+
+    #[test]
+    fn register_adds_potlatch_agents_to_workflow() {
+        let config = Config::from_toml_str("").unwrap();
+        let mut workflow = Workflow::new(config, "potlatch.toml");
+        register(&mut workflow);
+        let mut names: Vec<_> = workflow.registered_agent_names().collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["pmo", "reviewer", "worker"]);
     }
 
     #[test]

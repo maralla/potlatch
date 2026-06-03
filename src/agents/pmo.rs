@@ -19,6 +19,8 @@ use crate::agents::workspace::{
 };
 use crate::core::agent::{AgentHandoff, HandoffSubIssue, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::banner::Banner;
+use crate::core::config::Config;
 use crate::core::model::acp::workspace_read::read_text_file_under_workspace;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
@@ -68,7 +70,7 @@ struct AgentState {
 impl AgentState {
     fn ensure_sessions_dir(&self) -> Result<()> {
         let ctx_dir = path::Path::new(&self.sessions_dir);
-        fs::create_dir_all(&ctx_dir).context("Failed to create .potlatch-context directory")?;
+        fs::create_dir_all(ctx_dir).context("Failed to create .potlatch-context directory")?;
 
         Ok(())
     }
@@ -86,7 +88,6 @@ impl AgentState {
         let json = format!(r#"{{"claimed_issue_iid":{}}}"#, issue_iid);
         if let Err(e) = fs::write(&path, json) {
             warn!("Failed to save PMO state: {}", e);
-            return;
         }
     }
 
@@ -121,8 +122,18 @@ pub(crate) struct PmoAgent {
 impl CoreAgent for PmoAgent {
     type SpawnContext = crate::core::workflow::AgentSpawnContext;
 
+    fn name() -> &'static str {
+        "pmo"
+    }
+
     fn model(&self) -> &AgentModel {
         &self.model
+    }
+
+    fn banner(_config: &Config, banner: &mut Banner) {
+        if let Some(repo) = settings::settings().gitlab_repo() {
+            banner.set_once("repo", repo);
+        }
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
@@ -150,10 +161,9 @@ impl CoreAgent for PmoAgent {
                     Arc::clone(&shutdown),
                     scope,
                     &self.config,
-                ) {
-                    if !shutdown.load(Ordering::SeqCst) {
-                        error!("{}: Cycle error: {}", self.state.agent_id, e);
-                    }
+                ) && !shutdown.load(Ordering::SeqCst)
+                {
+                    error!("{}: Cycle error: {}", self.state.agent_id, e);
                 }
                 Ok(())
             }
@@ -295,7 +305,7 @@ fn pmo_cycle(
                 match gitlab.list_issues() {
                     Ok(issues) => {
                         if let Err(e) =
-                            refresh_pmo_issue_context_file(&state, gitlab, &issue, &issues)
+                            refresh_pmo_issue_context_file(state, gitlab, &issue, &issues)
                         {
                             warn!(
                                 "{}: Could not refresh PMO context file while pmo-pending on #{}: {}",
@@ -352,7 +362,7 @@ fn pmo_cycle(
         ) {
             (Ok(parent_issue), Ok(issues)) => {
                 if let Err(e) =
-                    refresh_pmo_issue_context_file(&state, gitlab, &parent_issue, &issues)
+                    refresh_pmo_issue_context_file(state, gitlab, &parent_issue, &issues)
                 {
                     warn!(
                         "{}: Could not refresh PMO context file before pending split on #{}: {}",
@@ -1930,7 +1940,7 @@ fn resume_split(
             &created_issue_ids_by_sub_index,
         );
 
-        match gitlab.create_issue(&sub_issue_title, &resolved_description) {
+        match gitlab.create_issue(sub_issue_title, &resolved_description) {
             Ok(sub_issue_iid) => {
                 info!(
                     "PMO: Created sub-issue #{}: {}",

@@ -14,6 +14,8 @@ use crate::agents::workspace::{
 };
 use crate::core::agent::{AgentHandoff, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::banner::Banner;
+use crate::core::config::Config;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const REVIEWER_APPROVED_LABEL: &str = "reviewer-approved";
@@ -66,8 +68,18 @@ pub(crate) struct ReviewerAgent {
 impl CoreAgent for ReviewerAgent {
     type SpawnContext = crate::core::workflow::AgentSpawnContext;
 
+    fn name() -> &'static str {
+        "reviewer"
+    }
+
     fn model(&self) -> &AgentModel {
         &self.model
+    }
+
+    fn banner(_config: &Config, banner: &mut Banner) {
+        if let Some(repo) = settings::settings().gitlab_repo() {
+            banner.set_once("repo", repo);
+        }
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
@@ -99,10 +111,9 @@ impl CoreAgent for ReviewerAgent {
                     &mut self.claimed_mr_iid,
                     &shutdown,
                     scope,
-                ) {
-                    if !shutdown.load(Ordering::SeqCst) {
-                        error!("{}: Cycle error: {}", self.agent_id, e);
-                    }
+                ) && !shutdown.load(Ordering::SeqCst)
+                {
+                    error!("{}: Cycle error: {}", self.agent_id, e);
                 }
                 Ok(())
             }
@@ -447,16 +458,16 @@ fn review_merge_request(
     let diff_stat = git_repo.diff_stat_against(&mr.target_branch)?;
     let changed_files = git_repo.changed_files_against(&mr.target_branch)?;
 
-    let prompt = build_review_prompt(
+    let prompt = build_review_prompt(ReviewPromptInput {
         project_name,
         gitlab,
         mr,
-        &diff_stat,
-        &changed_files,
+        diff_stat: &diff_stat,
+        changed_files: &changed_files,
         issue_iid,
         is_need_ai_worker_mr,
         sessions_dir,
-    )?;
+    })?;
 
     let agent_output = model.complete(
         &prompt,
@@ -532,17 +543,22 @@ fn review_merge_request(
     Ok(ReviewOutcome::NeedsChanges)
 }
 
-fn build_review_prompt(
-    project_name: &str,
-    gitlab: &GitLabClient,
-    mr: &MergeRequest,
-    diff_stat: &str,
-    changed_files: &[String],
+struct ReviewPromptInput<'a> {
+    project_name: &'a str,
+    gitlab: &'a GitLabClient,
+    mr: &'a MergeRequest,
+    diff_stat: &'a str,
+    changed_files: &'a [String],
     issue_iid: Option<u64>,
     is_need_ai_worker_mr: bool,
-    sessions_dir: &str,
-) -> Result<String> {
-    let comments = gitlab.get_mr_comments(mr.iid).unwrap_or_default();
+    sessions_dir: &'a str,
+}
+
+fn build_review_prompt(input: ReviewPromptInput<'_>) -> Result<String> {
+    let comments = input
+        .gitlab
+        .get_mr_comments(input.mr.iid)
+        .unwrap_or_default();
 
     let comments_text = if comments.is_empty() {
         "No comments yet.".to_string()
@@ -554,34 +570,34 @@ fn build_review_prompt(
             .join("\n")
     };
 
-    let diff_stat_text = if diff_stat.is_empty() {
+    let diff_stat_text = if input.diff_stat.is_empty() {
         "No diff stat detected.".to_string()
     } else {
-        diff_stat.to_string()
+        input.diff_stat.to_string()
     };
 
-    let changed_files_text = if changed_files.is_empty() {
+    let changed_files_text = if input.changed_files.is_empty() {
         "No changed files detected.".to_string()
     } else {
-        changed_files.join("\n")
+        input.changed_files.join("\n")
     };
 
-    let issue_context = if let Some(iid) = issue_iid {
-        build_issue_context(gitlab, iid)
+    let issue_context = if let Some(iid) = input.issue_iid {
+        build_issue_context(input.gitlab, iid)
     } else {
         String::new()
     };
     let context_path = write_task_context_file(
-        sessions_dir,
-        &format!("reviewer-mr-{}.md", mr.iid),
+        input.sessions_dir,
+        &format!("reviewer-mr-{}.md", input.mr.iid),
         &format!(
             "# Review Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n## MR description\n{mr_description}\n\n## Linked issue context\n{issue_context}\n\n## Diff summary against {target_branch}\n{diff_stat}\n\n## Changed files\n{changed_files}\n\n## Comment history\n{comments}\n",
-            project_name = project_name,
-            mr_iid = mr.iid,
-            mr_title = mr.title,
-            source_branch = mr.source_branch,
-            target_branch = mr.target_branch,
-            mr_description = mr.description,
+            project_name = input.project_name,
+            mr_iid = input.mr.iid,
+            mr_title = input.mr.title,
+            source_branch = input.mr.source_branch,
+            target_branch = input.mr.target_branch,
+            mr_description = input.mr.description,
             issue_context = if issue_context.is_empty() {
                 "No linked issue context.".to_string()
             } else {
@@ -593,7 +609,7 @@ fn build_review_prompt(
         ),
     )?;
 
-    let completeness_line = if is_need_ai_worker_mr {
+    let completeness_line = if input.is_need_ai_worker_mr {
         "8. COMPLETENESS CHECK (STRICT): For `need-ai-worker` MRs, evaluate completeness against the current MR title, MR description, diff, and comment history (do not require linked issue context). Treat later comments as updates to the requested work. If the current scope implied by those sources is missing or partial, list missing items and REQUEST_CHANGES.".to_string()
     } else {
         "8. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the CURRENT linked issue requirements: issue title, issue description, issue comments, MR description, and MR comment history. Later comments may clarify, narrow, expand, or supersede earlier issue text. Every current requirement MUST be addressed in the implementation, but do not request changes for an older constraint that later comments removed, changed, or accepted as intentionally out of scope. If any current requirement is missing or only partially implemented, list the missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.".to_string()
@@ -693,11 +709,11 @@ PUBLIC_COMMENT_END
 
 Proceed with the review autonomously. Do not ask for any user input.
 "#,
-        project_name,
-        mr.iid,
-        mr.title,
-        mr.source_branch,
-        mr.target_branch,
+        input.project_name,
+        input.mr.iid,
+        input.mr.title,
+        input.mr.source_branch,
+        input.mr.target_branch,
         context_path,
         completeness_line
     );

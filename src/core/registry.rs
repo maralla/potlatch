@@ -1,10 +1,14 @@
 use anyhow::Result;
 
-use crate::core::workflow::WorkflowContext;
+use crate::core::agent::CoreAgent;
+use crate::core::banner::Banner;
+use crate::core::config::Config;
+use crate::core::workflow::{AgentSpawnContext, WorkflowContext, spawn_core_agent};
 
-pub struct AgentRegistration {
+pub(crate) struct AgentRegistration {
     pub name: &'static str,
     pub spawn: fn(WorkflowContext, instance_id: usize) -> Result<()>,
+    pub banner: fn(&Config, &mut Banner),
 }
 
 pub struct AgentRegistry {
@@ -18,12 +22,26 @@ impl AgentRegistry {
         }
     }
 
-    pub fn register(&mut self, registration: AgentRegistration) {
-        self.registrations.push(registration);
+    pub fn register_agent<A>(&mut self)
+    where
+        A: CoreAgent<SpawnContext = AgentSpawnContext> + 'static,
+    {
+        self.registrations.push(AgentRegistration {
+            name: A::name(),
+            spawn: spawn_core_agent::<A>,
+            banner: A::banner,
+        });
     }
 
-    pub fn find(&self, name: &str) -> Option<&AgentRegistration> {
+    pub(crate) fn find(&self, name: &str) -> Option<&AgentRegistration> {
         self.registrations.iter().find(|r| r.name == name)
+    }
+
+    #[cfg(test)]
+    pub fn agent_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.registrations
+            .iter()
+            .map(|registration| registration.name)
     }
 }
 
@@ -36,19 +54,37 @@ impl Default for AgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agent::{AgentModel, CoreAgent};
     use crate::core::config::Config;
 
-    fn noop_spawn(_ctx: WorkflowContext, _id: usize) -> Result<()> {
-        Ok(())
+    struct WorkerAgentForTest;
+
+    impl CoreAgent for WorkerAgentForTest {
+        type SpawnContext = AgentSpawnContext;
+
+        fn name() -> &'static str {
+            "worker"
+        }
+
+        fn model(&self) -> &AgentModel {
+            unreachable!("test agent is never run")
+        }
+
+        fn run_periodic_task(&mut self, _task_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
+            Ok(Self)
+        }
+
+        fn on_shutdown(&mut self) {}
     }
 
     #[test]
     fn find_by_name() {
         let mut reg = AgentRegistry::new();
-        reg.register(AgentRegistration {
-            name: "worker",
-            spawn: noop_spawn,
-        });
+        reg.register_agent::<WorkerAgentForTest>();
         assert!(reg.find("worker").is_some());
         assert!(reg.find("reviewer").is_none());
     }

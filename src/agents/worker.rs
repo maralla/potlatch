@@ -19,6 +19,8 @@ use crate::agents::workspace::{
 };
 use crate::core::agent::{AgentHandoff, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::banner::Banner;
+use crate::core::config::Config;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const WORKING_ON_LABEL: &str = "in-progress";
@@ -230,8 +232,18 @@ pub(crate) struct WorkerAgent {
 impl CoreAgent for WorkerAgent {
     type SpawnContext = crate::core::workflow::AgentSpawnContext;
 
+    fn name() -> &'static str {
+        "worker"
+    }
+
     fn model(&self) -> &AgentModel {
         &self.model
+    }
+
+    fn banner(_config: &Config, banner: &mut Banner) {
+        if let Some(repo) = settings::settings().gitlab_repo() {
+            banner.set_once("repo", repo);
+        }
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
@@ -251,10 +263,9 @@ impl CoreAgent for WorkerAgent {
                 let model = &self.model;
                 let shutdown = Arc::clone(model.shutdown());
                 if let Err(e) = worker_cycle(&self.state, model, &mut self.active, &shutdown, scope)
+                    && !shutdown.load(Ordering::SeqCst)
                 {
-                    if !shutdown.load(Ordering::SeqCst) {
-                        error!("{}: Cycle error: {}", self.state.agent_id, e);
-                    }
+                    error!("{}: Cycle error: {}", self.state.agent_id, e);
                 }
                 Ok(())
             }

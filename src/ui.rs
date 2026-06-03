@@ -15,6 +15,8 @@ use tracing_subscriber::fmt::format::{FormatEvent, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 
+use crate::core::banner::Banner;
+
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -180,7 +182,7 @@ fn init_spinner(enabled: bool) {
 }
 
 /// Startup banner shown once before agents begin polling.
-pub fn print_banner(config_path: &str, gitlab_repo: Option<&str>, agents: &[String]) {
+pub fn print_banner(banner: &Banner) {
     let use_color = io::stdout().is_terminal();
     let _terminal = OUTPUT_LOCK.lock().ok();
     let mut out = io::stdout().lock();
@@ -195,19 +197,10 @@ pub fn print_banner(config_path: &str, gitlab_repo: Option<&str>, agents: &[Stri
         let _ = writeln!(out, "  Potlatch  Fully automatic agentic platform");
     }
 
-    let _ = write!(out, "  ");
-    let _ = label_value(&mut out, use_color, "config", config_path);
-    if let Some(repo) = gitlab_repo {
+    for field in banner.fields() {
         let _ = write!(out, "  ");
-        let _ = label_value(&mut out, use_color, "repo", repo);
+        let _ = label_value(&mut out, use_color, &field.key, &field.value);
     }
-    let agents_line = if agents.is_empty() {
-        "(none configured)".to_string()
-    } else {
-        agents.join(", ")
-    };
-    let _ = write!(out, "  ");
-    let _ = label_value(&mut out, use_color, "agents", &agents_line);
     let _ = writeln!(out);
 }
 

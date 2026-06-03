@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use std::path::Path;
 
 mod agents;
 mod core;
@@ -8,6 +7,7 @@ mod ui;
 mod util;
 
 use core::config::Config;
+use core::workflow::Workflow;
 
 use agents::settings::AgentSettings;
 
@@ -66,16 +66,9 @@ fn main() -> Result<()> {
 
     let (config, content) = Config::load_with_content(Some(&config_path))?;
     let agent_settings = AgentSettings::from_toml_str(&content)?;
+    agents::settings::init(agent_settings);
 
-    let agent_names: Vec<String> = config.agent_names().map(str::to_string).collect();
-    ui::print_banner(
-        Path::new(&config_path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&config_path),
-        agent_settings.gitlab_repo(),
-        &agent_names,
-    );
-
-    agents::run(config, agent_settings)
+    let mut workflow = Workflow::new(config, config_path);
+    agents::register(&mut workflow);
+    workflow.run()
 }

@@ -61,7 +61,7 @@ pub fn settings() -> Arc<AgentSettings> {
     Arc::clone(
         SETTINGS
             .get()
-            .expect("agents::run must call init before accessing settings"),
+            .expect("main must call agents::settings::init before accessing settings"),
     )
 }
 
