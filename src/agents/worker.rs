@@ -1455,7 +1455,8 @@ INSTRUCTIONS:
    The public reply must exactly match the committed changes from this run. Mention only feedback items you actually resolved in code or MR metadata. If you did not change code/metadata for an item, say so with MARK_DISCUSSIONS_RESOLVED: no instead of implying it was fixed.
 16. Control whether GitLab should mark open review discussions as resolved after your reply:
    - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
-   - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not fix the comment (e.g. explaining why the current code already satisfies it, partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
+   - `MARK_DISCUSSIONS_RESOLVED: yes` is also correct when you verified that no code change is needed because the branch already satisfies the reviewer request. In that case, PUBLIC_COMMENT must explain the existing behavior specifically instead of saying only "no changes needed".
+   - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not resolve the comment (e.g. partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
    - If you omit this line: the system assumes `yes` only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set `MARK_DISCUSSIONS_RESOLVED: yes` explicitly when the feedback is resolved.
    - Plain MR comments cannot be marked resolved. If you addressed a plain MR comment, mention that in PUBLIC_COMMENT; the system will post it as a normal MR comment, not as a resolved thread reply.
 17. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR_DESCRIPTION, MR_TITLE, PUBLIC_COMMENT, or any GitLab field.
@@ -2562,7 +2563,6 @@ fn extract_no_change_resolution_reason(agent_output: &AgentHandoff) -> Option<St
             return Some(cleaned);
         }
     }
-
     None
 }
 
@@ -3452,6 +3452,24 @@ mod tests {
             ..Default::default()
         };
         assert!(should_resolve_mr_feedback_discussions(&out_yes, false));
+    }
+
+    #[test]
+    fn no_change_reply_text_requires_structured_reason_marker() {
+        let out = AgentHandoff {
+            response: "No new code changes were needed in this run. The branch already satisfies the requested behavior.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(build_feedback_resolution_reply(&out, false, None), None);
+
+        let explicit = AgentHandoff {
+            response: "REASON: No new code changes were needed in this run. The branch already satisfies the requested behavior.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_feedback_resolution_reply(&explicit, false, None),
+            Some("Resolved without code changes:\n\nNo new code changes were needed in this run. The branch already satisfies the requested behavior.".to_string())
+        );
     }
 
     #[test]
