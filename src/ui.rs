@@ -266,14 +266,14 @@ where
             write!(writer, "{SPINNER_CLEAR}")?;
         }
 
-        let (prefix_agent, text) = split_agent_prefix(&message);
+        let (prefix_badge, text) = split_badge_prefix(&message);
         let context_agent = agent_badge_from_context();
-        let agent = prefix_agent
-            .or_else(|| extract_embedded_agent(&message))
+        let badge_source = prefix_badge
+            .or_else(|| extract_embedded_badge(&message))
             .or(context_agent.as_deref());
-        let badge = badge_for_agent(agent);
+        let badge = badge_for_source(badge_source);
         let icon = level_icon(level);
-        let badge_color = badge_color(agent.is_some(), self.use_color);
+        let badge_color = badge_color(badge_source, self.use_color);
         let text = truncate_to_terminal_width(text, LOG_PREFIX_WIDTH);
 
         write!(writer, "  {icon} ")?;
@@ -303,8 +303,8 @@ where
     }
 }
 
-fn extract_embedded_agent(message: &str) -> Option<&str> {
-    message.split_whitespace().find(|word| is_agent_id(word))
+fn extract_embedded_badge(message: &str) -> Option<&str> {
+    message.split_whitespace().find(|word| is_badge_id(word))
 }
 
 fn level_icon(level: Level) -> &'static str {
@@ -327,34 +327,55 @@ fn strip_debug_quotes(s: &str) -> String {
 }
 
 fn is_agent_id(part: &str) -> bool {
-    let Some((role, n)) = part.split_once('-') else {
+    let Some((role, _)) = split_badge_id(part) else {
         return false;
     };
-    !role.is_empty()
-        && role
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        && n.parse::<u32>().is_ok()
+    !is_non_agent_badge_role(role)
 }
 
-fn split_agent_prefix(message: &str) -> (Option<&str>, &str) {
+fn is_badge_id(part: &str) -> bool {
+    split_badge_id(part).is_some()
+}
+
+fn split_badge_id(part: &str) -> Option<(&str, u32)> {
+    let (role, n) = part.split_once('-')?;
+    if role.is_empty()
+        || !role
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    let n = n.parse::<u32>().ok()?;
+    Some((role, n))
+}
+
+fn is_non_agent_badge_role(role: &str) -> bool {
+    role.eq_ignore_ascii_case("issue")
+}
+
+fn split_badge_prefix(message: &str) -> (Option<&str>, &str) {
     if let Some((head, tail)) = message.split_once(": ")
-        && is_agent_id(head)
+        && is_badge_id(head)
     {
         return (Some(head), tail);
     }
     (None, message)
 }
 
-fn badge_for_agent(agent: Option<&str>) -> String {
-    agent.unwrap_or(SYSTEM_BADGE).to_string()
+fn badge_for_source(source: Option<&str>) -> String {
+    source.unwrap_or(SYSTEM_BADGE).to_string()
 }
 
-fn badge_color(is_agent: bool, use_color: bool) -> &'static str {
+fn badge_color(source: Option<&str>, use_color: bool) -> &'static str {
     if !use_color {
         return "";
     }
-    if is_agent { CYAN } else { BOLD }
+    if source.is_some_and(is_agent_id) {
+        CYAN
+    } else {
+        DIM
+    }
 }
 
 fn terminal_width() -> Option<usize> {
@@ -455,16 +476,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_agent_prefix_extracts_agent_id() {
-        let (agent, text) = split_agent_prefix("worker-0: Polling for new issues...");
-        assert_eq!(agent, Some("worker-0"));
+    fn split_badge_prefix_extracts_agent_id() {
+        let (badge, text) = split_badge_prefix("worker-0: Polling for new issues...");
+        assert_eq!(badge, Some("worker-0"));
         assert_eq!(text, "Polling for new issues...");
     }
 
     #[test]
-    fn split_agent_prefix_leaves_unprefixed_messages() {
-        let (agent, text) = split_agent_prefix("GitLab client ready");
-        assert_eq!(agent, None);
+    fn split_badge_prefix_extracts_non_agent_id() {
+        let (badge, text) = split_badge_prefix("issue-79: MR !101 diff");
+        assert_eq!(badge, Some("issue-79"));
+        assert_eq!(text, "MR !101 diff");
+    }
+
+    #[test]
+    fn split_badge_prefix_leaves_unprefixed_messages() {
+        let (badge, text) = split_badge_prefix("GitLab client ready");
+        assert_eq!(badge, None);
         assert_eq!(text, "GitLab client ready");
     }
 
@@ -474,8 +502,17 @@ mod tests {
         assert!(is_agent_id("reviewer-2"));
         assert!(is_agent_id("pmo-0"));
         assert!(is_agent_id("custom_agent-12"));
+        assert!(!is_agent_id("issue-79"));
         assert!(!is_agent_id("worker"));
         assert!(!is_agent_id("worker-next"));
+    }
+
+    #[test]
+    fn extract_embedded_badge_finds_non_agent_badge() {
+        assert_eq!(
+            extract_embedded_badge("MR !101 diff: issue-79 (1a8fd2e) -> main"),
+            Some("issue-79")
+        );
     }
 
     #[test]
@@ -488,9 +525,17 @@ mod tests {
     }
 
     #[test]
-    fn badge_for_agent_uses_agent_or_system_badge() {
-        assert_eq!(badge_for_agent(Some("worker-0")), "worker-0");
-        assert_eq!(badge_for_agent(None), SYSTEM_BADGE);
+    fn badge_for_source_uses_source_or_system_badge() {
+        assert_eq!(badge_for_source(Some("worker-0")), "worker-0");
+        assert_eq!(badge_for_source(None), SYSTEM_BADGE);
+    }
+
+    #[test]
+    fn badge_color_uses_system_color_for_non_agent_badges() {
+        assert_eq!(badge_color(Some("worker-0"), true), CYAN);
+        assert_eq!(badge_color(Some("issue-79"), true), DIM);
+        assert_eq!(badge_color(None, true), DIM);
+        assert_eq!(badge_color(Some("issue-79"), false), "");
     }
 
     #[test]
