@@ -77,6 +77,8 @@ pub struct Comment {
     pub author: String,
     pub discussion_id: String,
     #[serde(default)]
+    pub discussion_resolvable: bool,
+    #[serde(default)]
     pub location: Option<String>,
     #[serde(default)]
     pub location_details: Option<String>,
@@ -139,6 +141,7 @@ fn issue_thread_notes_as_comments(notes: Vec<IssueThreadNote>) -> Vec<Comment> {
                 body: n.body,
                 author,
                 discussion_id: format!("issue_{}", n.id),
+                discussion_resolvable: false,
                 location: None,
                 location_details: None,
             }
@@ -662,6 +665,7 @@ impl GitLabClient {
         let mut comments = Vec::new();
         for discussion in &discussions {
             let discussion_id = discussion["id"].as_str().unwrap_or("").to_string();
+            let discussion_resolvable = Self::discussion_resolution(discussion).is_some();
             let discussion_location = Self::discussion_location(discussion);
             if let Some(notes) = discussion["notes"].as_array() {
                 for note in notes {
@@ -679,6 +683,7 @@ impl GitLabClient {
                             .unwrap_or("unknown")
                             .to_string(),
                         discussion_id: discussion_id.clone(),
+                        discussion_resolvable,
                         location: note_location,
                         location_details: note_location_details,
                     });

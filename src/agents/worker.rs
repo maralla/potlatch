@@ -1283,8 +1283,17 @@ fn handle_mr_comments(
 ) -> Result<bool> {
     let latest_mr = state.glab.get_merge_request(mr.iid)?;
     let unresolved_ids = state.glab.get_unresolved_discussion_ids(latest_mr.iid)?;
+    let all_comments = state.glab.get_mr_comments(latest_mr.iid)?;
+    let plain_comments: Vec<_> = all_comments
+        .iter()
+        .filter(|c| !c.discussion_resolvable)
+        .cloned()
+        .collect();
 
-    if unresolved_ids.is_empty() && (comments_only_mode || !latest_mr.has_conflicts) {
+    if unresolved_ids.is_empty()
+        && plain_comments.is_empty()
+        && (comments_only_mode || !latest_mr.has_conflicts)
+    {
         return Ok(false);
     }
 
@@ -1300,7 +1309,6 @@ fn handle_mr_comments(
         info!("MR !{} has merge conflicts to resolve", latest_mr.iid);
     }
 
-    let all_comments = state.glab.get_mr_comments(latest_mr.iid)?;
     let unresolved_comments = if unresolved_ids.is_empty() {
         Vec::new()
     } else {
@@ -1367,6 +1375,7 @@ fn handle_mr_comments(
         .unwrap_or_else(|| "No previous implementation summary available.".to_string());
 
     let unresolved_comments_text = format_comments_for_prompt(&unresolved_comments);
+    let plain_comments_text = format_comments_for_prompt(&plain_comments);
     let all_comments_text = format_comments_for_prompt(&all_comments);
 
     let combined_context_path = write_task_context_file(
@@ -1381,6 +1390,7 @@ fn handle_mr_comments(
             &issue_context,
             &implementation_summary,
             &unresolved_comments_text,
+            &plain_comments_text,
             &all_comments_text,
             &diff_context_content,
         ),
@@ -1405,7 +1415,7 @@ CRITICAL REQUIREMENTS:
 - Leave staging, committing, pushing, and merge request creation to the system
 - Review ALL comments to understand the full conversation
 - Identify which feedback items still need to be addressed
-- Address all unresolved feedback autonomously
+- Address all unresolved thread feedback and actionable plain MR comments autonomously
 - Make all necessary code changes to resolve the comments
 - Keep the original issue requirements in mind while addressing feedback
 - If the workspace has merge conflict markers (<<<<<<< / ======= / >>>>>>>), resolve ALL of them before doing anything else. Edit each conflicted file to keep the correct version.
@@ -1414,13 +1424,13 @@ CRITICAL REQUIREMENTS:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly.
-2. Read the task context file above before making any changes, including both "Unresolved MR comments to address" and "Full MR comment history for context".
+2. Read the task context file above before making any changes, including "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context".
 3. In that combined file, use inline comment locations (`path:line` or `path:start-end`) to find corresponding hunks in the diff section and make targeted fixes.
 4. First, check for merge conflicts. If any exist, resolve ALL conflicts in every file before proceeding.
 5. Review the original issue and what was implemented
 6. Review ALL comments to understand the full conversation and context, including simple comments that do not require resolution.
-7. Identify which feedback items are still unresolved. Treat only comments in "Unresolved MR comments to address" as actionable feedback; use the full comment history only for context, clarification, and avoiding stale assumptions.
-8. Make the necessary code changes to address all unresolved feedback
+7. Identify which feedback items still need action. Treat comments in "Unresolved MR comments to address" as actionable threaded feedback. Also consider comments in "Plain MR comments to consider" actionable when they ask for changes, but remember they are plain MR comments and cannot be marked resolved. Use the full comment history only for context, clarification, and avoiding stale assumptions.
+8. Make the necessary code changes to address all unresolved threaded feedback and any actionable plain MR comments
 9. If the reviewer asked you to delete, rename, or move files, make those file changes.
 10. Ensure changes align with both the original requirements and reviewer feedback
 11. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
@@ -1447,6 +1457,7 @@ INSTRUCTIONS:
    - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
    - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not fix the comment (e.g. explaining why the current code already satisfies it, partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
    - If you omit this line: the system assumes `yes` only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set `MARK_DISCUSSIONS_RESOLVED: yes` explicitly when the feedback is resolved.
+   - Plain MR comments cannot be marked resolved. If you addressed a plain MR comment, mention that in PUBLIC_COMMENT; the system will post it as a normal MR comment, not as a resolved thread reply.
 17. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR_DESCRIPTION, MR_TITLE, PUBLIC_COMMENT, or any GitLab field.
 
 Proceed with addressing the feedback autonomously. Do not ask for any user input.
@@ -1660,6 +1671,15 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         {
             warn!("Failed to resolve discussion {}: {}", discussion_id, e);
         }
+    }
+
+    if !plain_comments.is_empty()
+        && let Err(e) = state.glab.add_mr_comment(latest_mr.iid, &reply_body)
+    {
+        warn!(
+            "Failed to post MR !{} reply for plain comments: {}",
+            latest_mr.iid, e
+        );
     }
 
     Ok(false)
@@ -2472,11 +2492,12 @@ fn build_combined_mr_feedback_context(
     issue_context: &str,
     implementation_summary: &str,
     unresolved_comments_text: &str,
+    plain_comments_text: &str,
     all_comments_text: &str,
     diff_context: &str,
 ) -> String {
     format!(
-        "# Merge Request Feedback + Diff Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n## Original issue context\n{issue_context}\n\n## Original implementation summary\n{implementation_summary}\n\n## MR description\n{mr_description}\n\n## Unresolved MR comments to address\n{unresolved_comments_text}\n\n## Full MR comment history for context\n{all_comments_text}\n\n## MR diff context\n{diff_context}\n",
+        "# Merge Request Feedback + Diff Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n## Original issue context\n{issue_context}\n\n## Original implementation summary\n{implementation_summary}\n\n## MR description\n{mr_description}\n\n## Unresolved MR comments to address\n{unresolved_comments_text}\n\n## Plain MR comments to consider\n{plain_comments_text}\n\n## Full MR comment history for context\n{all_comments_text}\n\n## MR diff context\n{diff_context}\n",
         project_name = project_name,
         mr_iid = mr.iid,
         mr_title = mr.title,
@@ -2489,6 +2510,11 @@ fn build_combined_mr_feedback_context(
             "No unresolved comments.".to_string()
         } else {
             unresolved_comments_text.to_string()
+        },
+        plain_comments_text = if plain_comments_text.trim().is_empty() {
+            "No plain MR comments.".to_string()
+        } else {
+            plain_comments_text.to_string()
         },
         all_comments_text = if all_comments_text.trim().is_empty() {
             "No MR comments.".to_string()
@@ -3350,13 +3376,16 @@ mod tests {
             "issue context",
             "implementation summary",
             "- reviewer (discussion d1): fix this",
+            "- reviewer (discussion d2): plain actionable note",
             "- reviewer (discussion d1): fix this\n- maintainer (discussion d2): simple context",
             "diff context",
         );
 
         assert!(ctx.contains("## Unresolved MR comments to address"));
+        assert!(ctx.contains("## Plain MR comments to consider"));
         assert!(ctx.contains("## Full MR comment history for context"));
         assert!(ctx.contains("fix this"));
+        assert!(ctx.contains("plain actionable note"));
         assert!(ctx.contains("simple context"));
     }
 
