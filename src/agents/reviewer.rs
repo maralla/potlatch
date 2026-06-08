@@ -610,9 +610,9 @@ fn build_review_prompt(input: ReviewPromptInput<'_>) -> Result<String> {
     )?;
 
     let completeness_line = if input.is_need_ai_worker_mr {
-        "8. COMPLETENESS CHECK (STRICT): For `need-ai-worker` MRs, evaluate completeness against the current MR title, MR description, diff, and comment history (do not require linked issue context). Treat later comments as updates to the requested work. If the current scope implied by those sources is missing or partial, list missing items and REQUEST_CHANGES.".to_string()
+        "9. COMPLETENESS CHECK (STRICT): For `need-ai-worker` MRs, evaluate completeness against the current MR title, MR description, diff, and comment history (do not require linked issue context). Treat later comments as updates to the requested work. If the current scope implied by those sources is missing or partial, list missing items and REQUEST_CHANGES.".to_string()
     } else {
-        "8. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the CURRENT linked issue requirements: issue title, issue description, issue comments, MR description, and MR comment history. Later comments may clarify, narrow, expand, or supersede earlier issue text. Every current requirement MUST be addressed in the implementation, but do not request changes for an older constraint that later comments removed, changed, or accepted as intentionally out of scope. If any current requirement is missing or only partially implemented, list the missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.".to_string()
+        "9. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the CURRENT linked issue requirements: issue title, issue description, issue comments, MR description, and MR comment history. Later comments may clarify, narrow, expand, or supersede earlier issue text. Every current requirement MUST be addressed in the implementation, but do not request changes for an older constraint that later comments removed, changed, or accepted as intentionally out of scope. If any current requirement is missing or only partially implemented, list missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.".to_string()
     };
     let prompt = format!(
         r#"You are reviewing a merge request for a software project in a fully automated, non-interactive environment.
@@ -646,19 +646,20 @@ GITLAB COMMENT STYLE (STRICT — for REQUEST_CHANGES and any posted feedback):
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before starting the review. Treat it as authoritative project policy.
-2. Read the task context file above before starting the review. For description quality, rely on the full text under `## MR description` there (do not judge from the MR title line alone).
-3. Review the full comment history to understand previous feedback, worker responses, and scope updates after the original issue was written
-4. The source branch has already been merged with the target branch locally - you are on the merged result
-5. Inspect the actual code changes in the merged local repository state instead of relying only on the summaries above.
-6. Review the code changes thoroughly using the local repository state
-7. Check if the implementation matches the current stated goal after considering the issue description, issue comments, MR description, and MR comment history
+2. Before inspecting or judging code, perform any repository setup or pre-review steps required by `AGENTS.md` (for example, updating submodules when the project policy says to do so). If a required setup command fails, REQUEST_CHANGES and include the failure as blocking review feedback.
+3. Read the task context file above before starting the review. For description quality, rely on the full text under `## MR description` there (do not judge from the MR title line alone).
+4. Review the full comment history to understand previous feedback, worker responses, and scope updates after the original issue was written
+5. The source branch has already been merged with the target branch locally - you are on the merged result
+6. Inspect the actual code changes in the merged local repository state instead of relying only on the summaries above.
+7. Review the code changes thoroughly using the local repository state
+8. Check if the implementation matches the current stated goal after considering the issue description, issue comments, MR description, and MR comment history
 {}
-9. Run tests locally to verify they pass (do NOT rely on CI/CD)
-10. Run linting locally to verify it passes (do NOT rely on CI/CD)
-11. Check code quality, best practices, and potential issues
-12. Only raise NEW issues not already covered in previous comments
-13. Readability and maintainability must be ensured
-14. Make autonomous decisions about approval or requesting changes
+10. Run tests locally to verify they pass (do NOT rely on CI/CD)
+11. Run linting locally to verify it passes (do NOT rely on CI/CD)
+12. Check code quality, best practices, and potential issues
+13. Only raise NEW issues not already covered in previous comments
+14. Readability and maintainability must be ensured
+15. Make autonomous decisions about approval or requesting changes
 
 MR TITLE AND DESCRIPTION (STRICT — reject if violated):
 - The MR title MUST be a concise, meaningful summary of the code changes. Reject if the title is generic (e.g. "Implementation changes", "Update", "Fix"), just an issue number, or contains markdown formatting like ** or backticks.
