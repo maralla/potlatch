@@ -249,6 +249,10 @@ fn mr_label_api_error_should_retry(err_msg: &str) -> bool {
     true
 }
 
+fn compact_cli_output(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl GitLabClient {
     pub fn new(repo_path: String, gitlab_repo: &str) -> Result<Self> {
         let (host, project_path) = parse_gitlab_repo(gitlab_repo)?;
@@ -345,11 +349,11 @@ impl GitLabClient {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         if stdout.trim().is_empty() {
-            stderr.into_owned()
+            compact_cli_output(&stderr)
         } else if stderr.trim().is_empty() {
-            stdout.into_owned()
+            compact_cli_output(&stdout)
         } else {
-            format!("{stderr}\n{stdout}")
+            compact_cli_output(&format!("{stderr}\n{stdout}"))
         }
     }
 
@@ -1180,7 +1184,7 @@ impl GitLabClient {
         if !output.status.success() {
             anyhow::bail!(
                 "glab api issue discussions failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                Self::glab_api_error_message(&output)
             );
         }
 
@@ -1274,8 +1278,9 @@ pub fn mr_description_closes_issue(description: &str, issue_iid: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, mr_create_error_is_duplicate,
-        mr_description_closes_issue, mr_label_api_error_should_retry, parse_gitlab_repo,
+        GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, compact_cli_output,
+        mr_create_error_is_duplicate, mr_description_closes_issue, mr_label_api_error_should_retry,
+        parse_gitlab_repo,
     };
     use serde_json::json;
 
@@ -1303,6 +1308,16 @@ mod tests {
         assert!(!mr_create_error_is_duplicate(
             "glab: HTTP 400\n{\"error\":\"target_branch is missing\"}"
         ));
+    }
+
+    #[test]
+    fn compact_cli_output_removes_glab_table_spacing() {
+        assert_eq!(
+            compact_cli_output(
+                "              ERROR                Get \"https://gitlab.example/api\": net/http: TLS handshake timeout.\n"
+            ),
+            "ERROR Get \"https://gitlab.example/api\": net/http: TLS handshake timeout."
+        );
     }
 
     #[test]
