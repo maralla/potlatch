@@ -1458,8 +1458,12 @@ INSTRUCTIONS:
    - `MARK_DISCUSSIONS_RESOLVED: yes` is also correct when you verified that no code change is needed because the branch already satisfies the reviewer request. In that case, PUBLIC_COMMENT must explain the existing behavior specifically instead of saying only "no changes needed".
    - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not resolve the comment (e.g. partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
    - If you omit this line: the system assumes `yes` only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set `MARK_DISCUSSIONS_RESOLVED: yes` explicitly when the feedback is resolved.
-   - Plain MR comments cannot be marked resolved. If you addressed a plain MR comment, mention that in PUBLIC_COMMENT; the system will post it as a normal MR comment, not as a resolved thread reply.
-17. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR_DESCRIPTION, MR_TITLE, PUBLIC_COMMENT, or any GitLab field.
+   - Plain MR comments cannot be marked resolved.
+17. Control whether GitLab should post a new normal MR comment for plain, non-resolvable MR comments:
+   - The system will NOT post normal MR comments for plain MR comments unless you explicitly include `POST_PLAIN_COMMENT: yes`.
+   - Use `POST_PLAIN_COMMENT: yes` only when a new public reply is necessary for a plain MR comment. Include PUBLIC_COMMENT with the exact comment body to post.
+   - If a plain MR comment needs no public reply, or if your response would only repeat that no further changes were needed, omit `POST_PLAIN_COMMENT` or set `POST_PLAIN_COMMENT: no`.
+18. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR_DESCRIPTION, MR_TITLE, PUBLIC_COMMENT, or any GitLab field.
 
 Proceed with addressing the feedback autonomously. Do not ask for any user input.
 "#,
@@ -1638,19 +1642,28 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         unresolved_ids
     };
 
-    let reply_raw = if let Some(block) = extract_public_comment_block(&agent_output.response) {
-        block
-    } else if let Some(reply) =
-        build_feedback_resolution_reply(&agent_output, has_new_changes, diff_highlights.as_deref())
-    {
-        reply
+    let should_post_plain_comment = should_post_plain_comment(&agent_output);
+    let needs_reply_body =
+        !ids_to_resolve.is_empty() || (!plain_comments.is_empty() && should_post_plain_comment);
+    let reply_body = if needs_reply_body {
+        let reply_raw = if let Some(block) = extract_public_comment_block(&agent_output.response) {
+            block
+        } else if let Some(reply) = build_feedback_resolution_reply(
+            &agent_output,
+            has_new_changes,
+            diff_highlights.as_deref(),
+        ) {
+            reply
+        } else {
+            return Err(anyhow::anyhow!(
+                "worker produced no source changes and no feedback reply for MR !{}",
+                latest_mr.iid
+            ));
+        };
+        Some(strip_worker_reply_boilerplate(&reply_raw))
     } else {
-        return Err(anyhow::anyhow!(
-            "worker produced no source changes and no feedback reply for MR !{}",
-            latest_mr.iid
-        ));
+        None
     };
-    let reply_body = strip_worker_reply_boilerplate(&reply_raw);
     let resolve_discussions =
         should_resolve_mr_feedback_discussions(&agent_output, implicit_resolve_discussions);
     if !resolve_discussions && !ids_to_resolve.is_empty() {
@@ -1661,9 +1674,12 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     }
 
     for discussion_id in &ids_to_resolve {
+        let Some(reply_body) = reply_body.as_deref() else {
+            continue;
+        };
         if let Err(e) = state
             .glab
-            .reply_to_discussion(latest_mr.iid, discussion_id, &reply_body)
+            .reply_to_discussion(latest_mr.iid, discussion_id, reply_body)
         {
             warn!("Failed to reply to discussion {}: {}", discussion_id, e);
         }
@@ -1675,7 +1691,9 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     }
 
     if !plain_comments.is_empty()
-        && let Err(e) = state.glab.add_mr_comment(latest_mr.iid, &reply_body)
+        && should_post_plain_comment
+        && let Some(reply_body) = reply_body.as_deref()
+        && let Err(e) = state.glab.add_mr_comment(latest_mr.iid, reply_body)
     {
         warn!(
             "Failed to post MR !{} reply for plain comments: {}",
@@ -2308,6 +2326,19 @@ fn parse_mark_discussions_resolved(agent_output: &AgentHandoff) -> Option<bool> 
         }
     }
     None
+}
+
+fn should_post_plain_comment(agent_output: &AgentHandoff) -> bool {
+    const KEY: &str = "post_plain_comment:";
+    for line in agent_output.response.lines() {
+        let lower = line.to_lowercase();
+        if let Some(idx) = lower.find(KEY) {
+            let val = line[idx + KEY.len()..].trim();
+            let v = val.to_lowercase();
+            return matches!(v.as_str(), "yes" | "true" | "1");
+        }
+    }
+    false
 }
 
 /// Whether to call GitLab `resolve` on discussions after posting the worker reply.
@@ -3049,7 +3080,9 @@ fn sanitize_mr_description_text(s: &str) -> String {
         .lines()
         .filter(|line| {
             let t = line.trim_start();
-            !t.starts_with("CHANGES_SUMMARY:") && !t.starts_with("MARK_DISCUSSIONS_RESOLVED:")
+            !t.starts_with("CHANGES_SUMMARY:")
+                && !t.starts_with("MARK_DISCUSSIONS_RESOLVED:")
+                && !t.starts_with("POST_PLAIN_COMMENT:")
         })
         .collect();
     filtered.join("\n").trim().to_string()
@@ -3455,6 +3488,28 @@ mod tests {
     }
 
     #[test]
+    fn plain_comment_posting_requires_explicit_marker() {
+        let out_default = AgentHandoff {
+            response: "PUBLIC_COMMENT_BEGIN\nNo further changes were needed.\nPUBLIC_COMMENT_END"
+                .to_string(),
+            ..Default::default()
+        };
+        assert!(!should_post_plain_comment(&out_default));
+
+        let out_no = AgentHandoff {
+            response: "POST_PLAIN_COMMENT: no\nPUBLIC_COMMENT_BEGIN\nNo further changes were needed.\nPUBLIC_COMMENT_END".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_post_plain_comment(&out_no));
+
+        let out_yes = AgentHandoff {
+            response: "post_plain_comment: YES\nPUBLIC_COMMENT_BEGIN\nPosted by request.\nPUBLIC_COMMENT_END".to_string(),
+            ..Default::default()
+        };
+        assert!(should_post_plain_comment(&out_yes));
+    }
+
+    #[test]
     fn no_change_reply_text_requires_structured_reason_marker() {
         let out = AgentHandoff {
             response: "No new code changes were needed in this run. The branch already satisfies the requested behavior.".to_string(),
@@ -3522,7 +3577,7 @@ mod tests {
     fn extract_mr_description_filters_control_markers() {
         let output = AgentHandoff {
             mr_description: Some(
-                "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\n## Testing\ncargo test"
+                "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\nPOST_PLAIN_COMMENT: yes\n## Testing\ncargo test"
                     .to_string(),
             ),
             ..Default::default()
@@ -3530,6 +3585,7 @@ mod tests {
         let desc = extract_mr_description(&output);
         assert!(!desc.contains("CHANGES_SUMMARY:"), "{desc}");
         assert!(!desc.contains("MARK_DISCUSSIONS_RESOLVED:"), "{desc}");
+        assert!(!desc.contains("POST_PLAIN_COMMENT:"), "{desc}");
         assert!(desc.contains("## Goal"), "{desc}");
         assert!(desc.contains("## Testing"), "{desc}");
     }
