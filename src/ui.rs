@@ -390,7 +390,7 @@ fn terminal_width() -> Option<usize> {
 }
 
 fn truncate_to_terminal_width(text: &str, prefix_width: usize) -> String {
-    let text = text.replace(['\r', '\n'], " ");
+    let text = compact_terminal_text(text);
     let Some(width) = terminal_width() else {
         return text;
     };
@@ -407,7 +407,7 @@ fn activity_text(active: usize, label: &str) -> String {
 }
 
 fn truncate_to_width(text: &str, width: usize) -> String {
-    let text = text.replace(['\r', '\n'], " ");
+    let text = compact_terminal_text(text);
     if display_width(&text) <= width {
         return text;
     }
@@ -457,6 +457,10 @@ fn take_display_suffix(text: &str, width: usize) -> String {
         used += w;
     }
     chars.into_iter().rev().collect()
+}
+
+fn compact_terminal_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn should_suppress(target: &str, level: Level) -> bool {
@@ -546,6 +550,22 @@ mod tests {
         assert_eq!(
             truncate_to_width("/very/long/path/to/repository", 14),
             "/very/…ository"
+        );
+    }
+
+    #[test]
+    fn compact_terminal_text_collapses_cli_error_spacing() {
+        assert_eq!(
+            compact_terminal_text(
+                "glab api issue list failed:               ERROR                Get \"https://example/api\": net/http: TLS      handshake timeout.\n"
+            ),
+            "glab api issue list failed: ERROR Get \"https://example/api\": net/http: TLS handshake timeout."
+        );
+        assert_eq!(
+            compact_terminal_text(
+                "Git fetch failed: Connection closed\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights."
+            ),
+            "Git fetch failed: Connection closed fatal: Could not read from remote repository. Please make sure you have the correct access rights."
         );
     }
 
