@@ -34,6 +34,11 @@ const MIN_LOG_BYTES_FOR_ANALYSIS: usize = 20;
 #[derive(Debug, Clone)]
 struct OpsConfig {
     poll_interval_secs: u64,
+    log_sources: Vec<OpsLogSource>,
+}
+
+#[derive(Debug, Clone)]
+struct OpsLogSource {
     ssh_user: String,
     ssh_host: String,
     log_path: String,
@@ -43,6 +48,15 @@ struct OpsConfig {
 struct OpsAgentSettings {
     #[serde(default = "default_ops_poll_interval")]
     poll_interval_secs: u64,
+    ssh_user: Option<String>,
+    ssh_host: Option<String>,
+    log_path: Option<String>,
+    #[serde(default)]
+    logs: Vec<OpsLogSourceSettings>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpsLogSourceSettings {
     ssh_user: String,
     ssh_host: String,
     log_path: String,
@@ -54,23 +68,64 @@ fn default_ops_poll_interval() -> u64 {
 
 impl OpsAgentSettings {
     fn from_raw(raw: &toml::Value) -> Result<Self> {
-        let settings: Self = raw
+        let mut settings: Self = raw
             .clone()
             .try_into()
             .context("ops agent settings from config")?;
+        let legacy_present = settings.ssh_user.is_some()
+            || settings.ssh_host.is_some()
+            || settings.log_path.is_some();
+        if legacy_present {
+            let source = OpsLogSourceSettings {
+                ssh_user: settings
+                    .ssh_user
+                    .take()
+                    .context("ssh_user is required for [agent.ops]")?,
+                ssh_host: settings
+                    .ssh_host
+                    .take()
+                    .context("ssh_host is required for [agent.ops]")?,
+                log_path: settings
+                    .log_path
+                    .take()
+                    .context("log_path is required for [agent.ops]")?,
+            };
+            settings.logs.push(source);
+        }
         ensure!(
-            !settings.ssh_user.trim().is_empty(),
-            "ssh_user is required for [agent.ops]"
+            !settings.logs.is_empty(),
+            "at least one log source is required for [agent.ops]"
         );
-        ensure!(
-            !settings.ssh_host.trim().is_empty(),
-            "ssh_host is required for [agent.ops]"
-        );
-        ensure!(
-            !settings.log_path.trim().is_empty(),
-            "log_path is required for [agent.ops]"
-        );
+        for (idx, source) in settings.logs.iter().enumerate() {
+            source.validate(idx)?;
+        }
         Ok(settings)
+    }
+}
+
+impl OpsLogSourceSettings {
+    fn validate(&self, idx: usize) -> Result<()> {
+        ensure!(
+            !self.ssh_user.trim().is_empty(),
+            "ssh_user is required for [agent.ops].logs[{idx}]"
+        );
+        ensure!(
+            !self.ssh_host.trim().is_empty(),
+            "ssh_host is required for [agent.ops].logs[{idx}]"
+        );
+        ensure!(
+            !self.log_path.trim().is_empty(),
+            "log_path is required for [agent.ops].logs[{idx}]"
+        );
+        Ok(())
+    }
+
+    fn into_source(self) -> OpsLogSource {
+        OpsLogSource {
+            ssh_user: self.ssh_user.trim().to_string(),
+            ssh_host: self.ssh_host.trim().to_string(),
+            log_path: self.log_path.trim().to_string(),
+        }
     }
 }
 
@@ -142,7 +197,9 @@ impl CoreAgent for OpsAgent {
     }
 
     fn validate_config(section: &crate::core::config::AgentSection) -> Result<()> {
-        validate_instance_count(section.core.instances)
+        validate_instance_count(section.core.instances)?;
+        OpsAgentSettings::from_raw(&section.raw)?;
+        Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
@@ -209,9 +266,11 @@ impl CoreAgent for OpsAgent {
         state.ensure_sessions_dir()?;
         let config = OpsConfig {
             poll_interval_secs: agent_settings.poll_interval_secs,
-            ssh_user: agent_settings.ssh_user.trim().to_string(),
-            ssh_host: agent_settings.ssh_host.trim().to_string(),
-            log_path: agent_settings.log_path.trim().to_string(),
+            log_sources: agent_settings
+                .logs
+                .into_iter()
+                .map(OpsLogSourceSettings::into_source)
+                .collect(),
         };
         let gitlab = GitLabClient::new(working_dir.clone(), &gitlab_repo)?;
         let model = AgentModel::connect(&ctx, "ops", working_dir, ModelPreferences::default())?;
@@ -263,24 +322,34 @@ fn ops_cycle(
         return Ok(());
     }
 
-    info!(
-        "{}: Fetching last {}h of logs from {}@{}:{}",
-        state.agent_id, LOG_WINDOW_HOURS, config.ssh_user, config.ssh_host, config.log_path
-    );
-
-    let raw_log = fetch_remote_log_tail(&config.ssh_user, &config.ssh_host, &config.log_path)?;
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
     let now = Utc::now();
-    let (window_log, parsed_timestamps) = filter_log_to_time_window(&raw_log, now);
-    if !parsed_timestamps {
-        warn!(
-            "{}: Could not parse timestamps in remote log tail; using full tail for analysis",
-            state.agent_id
+    let mut window_logs = Vec::new();
+    for source in &config.log_sources {
+        info!(
+            "{}: Fetching last {}h of logs from {}@{}:{}",
+            state.agent_id, LOG_WINDOW_HOURS, source.ssh_user, source.ssh_host, source.log_path
         );
+
+        let raw_log = fetch_remote_log_tail(&source.ssh_user, &source.ssh_host, &source.log_path)?;
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let (window_log, parsed_timestamps) = filter_log_to_time_window(&raw_log, now);
+        if !parsed_timestamps {
+            warn!(
+                "{}: Could not parse timestamps in remote log tail for {}@{}:{}; using full tail for analysis",
+                state.agent_id, source.ssh_user, source.ssh_host, source.log_path
+            );
+        }
+        if !window_log.trim().is_empty() {
+            window_logs.push(format!(
+                "===== Log source: {}@{}:{} =====\n{}",
+                source.ssh_user, source.ssh_host, source.log_path, window_log
+            ));
+        }
     }
+    let window_log = window_logs.join("\n\n");
 
     if window_log.trim().len() < MIN_LOG_BYTES_FOR_ANALYSIS {
         info!(
@@ -393,7 +462,7 @@ fn build_analysis_prompt(log_path: &str, history_path: &str, gitlab_context_path
 
 Read these context files before proposing any new GitLab issues:
 
-1. Log session file (primary analysis input):
+1. Log session file (primary analysis input; may contain multiple source sections):
 {log_path}
 
 2. Ops issue history (issues previously created by this agent, with related log lines):
@@ -819,8 +888,29 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(settings.ssh_user, "deploy");
-        assert_eq!(settings.log_path, "/var/log/app/app.log");
+        assert_eq!(settings.logs.len(), 1);
+        assert_eq!(settings.logs[0].ssh_user, "deploy");
+        assert_eq!(settings.logs[0].log_path, "/var/log/app/app.log");
+    }
+
+    #[test]
+    fn ops_settings_accept_multiple_log_sources() {
+        let settings = OpsAgentSettings::from_raw(
+            &toml::from_str(
+                r#"
+                logs = [
+                    { ssh_user = "deploy", ssh_host = "prod-1.example.com", log_path = "/var/log/app/app.log" },
+                    { ssh_user = "deploy", ssh_host = "prod-2.example.com", log_path = "/var/log/app/worker.log" },
+                ]
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(settings.logs.len(), 2);
+        assert_eq!(settings.logs[0].ssh_host, "prod-1.example.com");
+        assert_eq!(settings.logs[1].log_path, "/var/log/app/worker.log");
     }
 
     #[test]

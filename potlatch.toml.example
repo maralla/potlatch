@@ -28,6 +28,7 @@ cursor_ask_via_gitlab = false
 # model = "acp://cursor/composer-2"
 # Single-instance only; omit [agent.ops] entirely to disable.
 poll_interval_secs = 600
-ssh_user = "deploy"
-ssh_host = "prod.example.com"
-log_path = "/var/log/app/app.log"
+logs = [
+  { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app/app.log" },
+  # { ssh_user = "deploy", ssh_host = "worker.example.com", log_path = "/var/log/app/worker.log" },
+]
