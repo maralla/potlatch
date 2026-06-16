@@ -412,6 +412,10 @@ impl GitLabClient {
     }
 
     pub fn list_issues(&self) -> Result<Vec<Issue>> {
+        with_transient_api_retries("listing open issues", || self.list_issues_once())
+    }
+
+    fn list_issues_once(&self) -> Result<Vec<Issue>> {
         debug!("Fetching issues from GitLab");
         const PER_PAGE: usize = 100;
         let mut page = 1usize;
@@ -426,7 +430,7 @@ impl GitLabClient {
             if !output.status.success() {
                 anyhow::bail!(
                     "glab api issue list failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    Self::glab_api_error_message(&output)
                 );
             }
 
@@ -575,6 +579,12 @@ impl GitLabClient {
     }
 
     pub fn list_merge_requests(&self) -> Result<Vec<MergeRequest>> {
+        with_transient_api_retries("listing open merge requests", || {
+            self.list_merge_requests_once()
+        })
+    }
+
+    fn list_merge_requests_once(&self) -> Result<Vec<MergeRequest>> {
         debug!("Fetching merge requests from GitLab");
 
         let endpoint = self.api_path("merge_requests?state=opened&per_page=100");
@@ -583,7 +593,7 @@ impl GitLabClient {
         if !output.status.success() {
             anyhow::bail!(
                 "Failed to list merge requests: {}",
-                String::from_utf8_lossy(&output.stderr)
+                Self::glab_api_error_message(&output)
             );
         }
 
@@ -594,6 +604,12 @@ impl GitLabClient {
     }
 
     pub fn get_merge_request(&self, iid: u64) -> Result<MergeRequest> {
+        with_transient_api_retries(&format!("fetching MR !{iid}"), || {
+            self.get_merge_request_once(iid)
+        })
+    }
+
+    fn get_merge_request_once(&self, iid: u64) -> Result<MergeRequest> {
         debug!("Fetching merge request !{}", iid);
 
         let endpoint = self.api_path(&format!("merge_requests/{iid}"));
@@ -602,7 +618,7 @@ impl GitLabClient {
         if !output.status.success() {
             anyhow::bail!(
                 "glab api MR failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                Self::glab_api_error_message(&output)
             );
         }
 
@@ -615,6 +631,12 @@ impl GitLabClient {
     /// Fetches the exact MR diff payload as produced by GitLab for this MR.
     /// This is preferred for agent context because it matches the MR view.
     pub fn get_merge_request_changes(&self, iid: u64) -> Result<MergeRequestChangesSnapshot> {
+        with_transient_api_retries(&format!("fetching MR !{iid} changes"), || {
+            self.get_merge_request_changes_once(iid)
+        })
+    }
+
+    fn get_merge_request_changes_once(&self, iid: u64) -> Result<MergeRequestChangesSnapshot> {
         debug!("Fetching merge request !{} changes", iid);
 
         let endpoint = self.api_path(&format!("merge_requests/{iid}/changes"));
@@ -623,7 +645,7 @@ impl GitLabClient {
         if !output.status.success() {
             anyhow::bail!(
                 "glab api MR changes failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                Self::glab_api_error_message(&output)
             );
         }
 
