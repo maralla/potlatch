@@ -145,6 +145,8 @@ impl Workflow {
             let registration = self.registry.find(&agent_name).with_context(|| {
                 format!("no registration for configured agent [agent.{agent_name}]")
             })?;
+            (registration.validate_config)(section)
+                .with_context(|| format!("invalid config for [agent.{agent_name}]"))?;
 
             for instance_id in 0..section.core.instances {
                 let spawn_ctx = ctx.clone_for_spawn();

@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 
 use crate::core::banner::Banner;
-use crate::core::config::Config;
+use crate::core::config::{AgentSection, Config};
 use crate::core::model::acp::client::CursorAskQuestionHandler;
 use crate::core::periodic::run_periodic_scheduler;
 
@@ -46,6 +46,10 @@ pub trait CoreAgent: Sized {
     }
 
     fn banner(_config: &Config, _banner: &mut Banner) {}
+
+    fn validate_config(_section: &AgentSection) -> Result<()> {
+        Ok(())
+    }
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()>;
 

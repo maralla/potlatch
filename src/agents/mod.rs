@@ -6,6 +6,7 @@ pub mod claim;
 pub mod git;
 pub mod gitlab;
 pub mod labels;
+pub mod ops;
 pub mod pmo;
 pub mod pmo_cursor_ask;
 pub mod reviewer;
@@ -105,6 +106,7 @@ pub fn register(workflow: &mut Workflow) {
     workflow.register_agent::<worker::WorkerAgent>();
     workflow.register_agent::<reviewer::ReviewerAgent>();
     workflow.register_agent::<pmo::PmoAgent>();
+    workflow.register_agent::<ops::OpsAgent>();
 }
 
 #[cfg(test)]
@@ -150,7 +152,7 @@ mod scope_tests {
         register(&mut workflow);
         let mut names: Vec<_> = workflow.registered_agent_names().collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["pmo", "reviewer", "worker"]);
+        assert_eq!(names, vec!["ops", "pmo", "reviewer", "worker"]);
     }
 
     #[test]

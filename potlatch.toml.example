@@ -1,7 +1,7 @@
 # Potlatch Configuration File
 # Configure agents under [agent.<name>] sections. Only agents with a section are started.
 
-# GitLab repository URL (HTTPS). Required by GitLab agents (worker, reviewer, pmo).
+# GitLab repository URL (HTTPS). Required by GitLab agents (worker, reviewer, pmo, ops).
 gitlab_repo = "https://gitlab.com/group/project"
 
 # Optional: only process issues/MRs that include this label (exact name).
@@ -23,3 +23,11 @@ merge_when_approved = true
 poll_interval_secs = 180
 instances = 1
 cursor_ask_via_gitlab = false
+
+[agent.ops]
+# model = "acp://cursor/composer-2"
+# Single-instance only; omit [agent.ops] entirely to disable.
+poll_interval_secs = 600
+ssh_user = "deploy"
+ssh_host = "prod.example.com"
+log_path = "/var/log/app/app.log"

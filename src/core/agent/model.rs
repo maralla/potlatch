@@ -32,6 +32,10 @@ impl ModelPreferences {
             preferred_session_mode: Some(PREFERRED_SESSION_MODE_PMO),
         }
     }
+
+    pub fn ops() -> Self {
+        Self::default()
+    }
 }
 
 /// Agent-facing model API. Engine construction is internal to core.

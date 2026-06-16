@@ -2,13 +2,14 @@ use anyhow::Result;
 
 use crate::core::agent::CoreAgent;
 use crate::core::banner::Banner;
-use crate::core::config::Config;
+use crate::core::config::{AgentSection, Config};
 use crate::core::workflow::{AgentSpawnContext, WorkflowContext, spawn_core_agent};
 
 pub(crate) struct AgentRegistration {
     pub name: &'static str,
     pub spawn: fn(WorkflowContext, instance_id: usize) -> Result<()>,
     pub banner: fn(&Config, &mut Banner),
+    pub validate_config: fn(&AgentSection) -> Result<()>,
 }
 
 pub struct AgentRegistry {
@@ -30,6 +31,7 @@ impl AgentRegistry {
             name: A::name(),
             spawn: spawn_core_agent::<A>,
             banner: A::banner,
+            validate_config: A::validate_config,
         });
     }
 
@@ -70,6 +72,13 @@ mod tests {
             unreachable!("test agent is never run")
         }
 
+        fn validate_config(section: &AgentSection) -> Result<()> {
+            if section.core.instances > 1 {
+                anyhow::bail!("worker supports at most one instance");
+            }
+            Ok(())
+        }
+
         fn run_periodic_task(&mut self, _task_id: &str) -> Result<()> {
             Ok(())
         }
@@ -107,5 +116,22 @@ mod tests {
         assert_eq!(worker.core.instances, 1);
         let reviewer = cfg.agent("reviewer").unwrap();
         assert_eq!(reviewer.core.instances, 0);
+    }
+
+    #[test]
+    fn registration_dispatches_agent_config_validation() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [agent.worker]
+            instances = 2
+            "#,
+        )
+        .unwrap();
+        let mut reg = AgentRegistry::new();
+        reg.register_agent::<WorkerAgentForTest>();
+        let registration = reg.find("worker").unwrap();
+
+        let err = (registration.validate_config)(cfg.agent("worker").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("at most one instance"));
     }
 }
