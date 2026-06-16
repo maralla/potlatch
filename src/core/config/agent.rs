@@ -79,7 +79,7 @@ mod tests {
     fn splits_core_and_raw() {
         let doc: Value = toml::from_str(
             r#"
-            [agent.reviewer]
+            [agent.alpha]
             model = "acp://cursor/gpt-5.3-codex"
             instances = 2
             poll_interval_secs = 120
@@ -88,7 +88,7 @@ mod tests {
         )
         .unwrap();
         let agents = parse_agent_sections(&doc).unwrap();
-        let section = agents.get("reviewer").unwrap();
+        let section = agents.get("alpha").unwrap();
         assert_eq!(section.core.instances, 2);
         assert_eq!(section.core.model.as_ref().unwrap().model, "gpt-5.3-codex");
         assert_eq!(

@@ -21,6 +21,7 @@ use crate::core::agent::{AgentHandoff, HandoffSubIssue, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
+use crate::core::model::acp::ACP_SESSION_MODE_PLAN;
 use crate::core::model::acp::workspace_read::read_text_file_under_workspace;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
@@ -207,7 +208,9 @@ impl CoreAgent for PmoAgent {
             &ctx,
             "pmo",
             state.working_dir.clone(),
-            ModelPreferences::pmo(),
+            ModelPreferences {
+                preferred_session_mode: Some(ACP_SESSION_MODE_PLAN),
+            },
         )?;
         let agent_settings = settings::settings();
         let scope = agent_settings.scope_label_filter();

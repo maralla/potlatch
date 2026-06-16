@@ -214,7 +214,7 @@ impl CoreAgent for OpsAgent {
             log_path: agent_settings.log_path.trim().to_string(),
         };
         let gitlab = GitLabClient::new(working_dir.clone(), &gitlab_repo)?;
-        let model = AgentModel::connect(&ctx, "ops", working_dir, ModelPreferences::ops())?;
+        let model = AgentModel::connect(&ctx, "ops", working_dir, ModelPreferences::default())?;
         let global = settings::settings();
         Ok(Self {
             state,

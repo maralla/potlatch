@@ -15,7 +15,7 @@ pub struct AgentHandoff {
     #[serde(default)]
     pub response: String,
     /// True when ACP `session/prompt` returned non-empty final text (`message`/`output`).
-    /// PMO uses this to avoid parsing stream-only intermediate chunks.
+    /// Callers use this to avoid parsing stream-only intermediate chunks.
     #[serde(default)]
     pub has_final_result_text: bool,
     #[serde(default)]
@@ -42,7 +42,7 @@ pub struct AgentHandoff {
     pub lgtm: Option<String>,
     #[serde(default)]
     pub sub_issues: Vec<HandoffSubIssue>,
-    /// Absolute paths from Cursor plan-mode `tool_call_update` ("Plan saved to file://…"); PMO reads these files after ACP.
+    /// Absolute paths from Cursor plan-mode `tool_call_update` ("Plan saved to file://…").
     #[serde(default)]
     pub cursor_plan_paths: Vec<String>,
 }

@@ -4,38 +4,15 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context, Result};
 
 use super::AgentHandoff;
-use crate::core::model::acp::{PREFERRED_SESSION_MODE_PMO, PREFERRED_SESSION_MODE_REVIEWER};
 use crate::core::model::engine::{ModelEngine, ModelSessionOptions, spawn_model_engine};
 use crate::core::workflow::AgentSpawnContext;
 
 use super::{InvokeOptions, ModelResponse};
 
-/// Agent-specific model preferences (session mode, etc.). Does not expose engine construction.
+/// Model preferences selected by callers without exposing engine construction.
 #[derive(Debug, Clone, Default)]
 pub struct ModelPreferences {
     pub preferred_session_mode: Option<&'static str>,
-}
-
-impl ModelPreferences {
-    pub fn worker() -> Self {
-        Self::default()
-    }
-
-    pub fn reviewer() -> Self {
-        Self {
-            preferred_session_mode: Some(PREFERRED_SESSION_MODE_REVIEWER),
-        }
-    }
-
-    pub fn pmo() -> Self {
-        Self {
-            preferred_session_mode: Some(PREFERRED_SESSION_MODE_PMO),
-        }
-    }
-
-    pub fn ops() -> Self {
-        Self::default()
-    }
 }
 
 /// Agent-facing model API. Engine construction is internal to core.
@@ -130,39 +107,31 @@ mod tests {
 
     fn sample_section(model: Option<&str>) -> crate::core::config::AgentSection {
         let toml = match model {
-            Some(m) => format!("[agent.worker]\nmodel = \"{m}\"\ninstances = 1"),
-            None => "[agent.worker]\ninstances = 1".to_string(),
+            Some(m) => format!("[agent.alpha]\nmodel = \"{m}\"\ninstances = 1"),
+            None => "[agent.alpha]\ninstances = 1".to_string(),
         };
         Config::from_toml_str(&toml)
             .unwrap()
-            .agent("worker")
+            .agent("alpha")
             .unwrap()
             .clone()
     }
 
     #[test]
-    fn model_preferences_set_session_modes() {
-        assert_eq!(ModelPreferences::worker().preferred_session_mode, None);
-        assert_eq!(
-            ModelPreferences::reviewer().preferred_session_mode,
-            Some(PREFERRED_SESSION_MODE_REVIEWER)
-        );
-        assert_eq!(
-            ModelPreferences::pmo().preferred_session_mode,
-            Some(PREFERRED_SESSION_MODE_PMO)
-        );
+    fn model_preferences_default_has_no_session_mode() {
+        assert_eq!(ModelPreferences::default().preferred_session_mode, None);
     }
 
     #[test]
     fn from_section_for_test_connects_engine() {
         let model = AgentModel::from_section_for_test(
             &sample_section(Some("acp://cursor/composer-2")),
-            "worker-test",
+            "alpha-test",
             "/tmp/repo",
-            ModelPreferences::worker(),
+            ModelPreferences::default(),
         )
         .unwrap();
-        assert_eq!(model.agent_id(), "worker-test");
+        assert_eq!(model.agent_id(), "alpha-test");
         assert!(!model.shutdown().load(std::sync::atomic::Ordering::SeqCst));
     }
 }

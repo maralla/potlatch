@@ -16,4 +16,4 @@ pub mod types;
 pub mod workspace_read;
 
 pub(crate) use runtime::AcpRuntime;
-pub use runtime::{PREFERRED_SESSION_MODE_PMO, PREFERRED_SESSION_MODE_REVIEWER};
+pub use runtime::{ACP_SESSION_MODE_ASK, ACP_SESSION_MODE_PLAN};

@@ -124,12 +124,12 @@ mod tests {
 
     fn sample_section(model: Option<&str>) -> AgentSection {
         let toml = match model {
-            Some(m) => format!("[agent.worker]\nmodel = \"{m}\"\ninstances = 1"),
-            None => "[agent.worker]\ninstances = 1".to_string(),
+            Some(m) => format!("[agent.alpha]\nmodel = \"{m}\"\ninstances = 1"),
+            None => "[agent.alpha]\ninstances = 1".to_string(),
         };
         Config::from_toml_str(&toml)
             .unwrap()
-            .agent("worker")
+            .agent("alpha")
             .unwrap()
             .clone()
     }
@@ -146,7 +146,7 @@ mod tests {
     fn from_agent_section_without_model_uri() {
         ModelEngine::from_agent_section(
             &sample_section(None),
-            runtime("worker-0"),
+            runtime("alpha-0"),
             ModelSessionOptions::default(),
         )
         .unwrap();
@@ -156,7 +156,7 @@ mod tests {
     fn from_agent_section_with_acp_model_uri() {
         ModelEngine::from_agent_section(
             &sample_section(Some("acp://cursor/composer-2")),
-            runtime("worker-1"),
+            runtime("alpha-1"),
             ModelSessionOptions::default(),
         )
         .unwrap();
@@ -168,7 +168,7 @@ mod tests {
         spawn_model_engine(
             &section,
             "/tmp/repo",
-            "worker-2",
+            "alpha-2",
             Arc::new(AtomicBool::new(false)),
             ModelSessionOptions::default(),
         )
@@ -180,7 +180,7 @@ mod tests {
         let Err(error) = ModelEngine::build(
             &crate::core::config::ModelUri::parse("http://example/m").unwrap(),
             BackendOptions::Acp(AcpBuildOptions::default()),
-            runtime("worker-3"),
+            runtime("alpha-3"),
         ) else {
             panic!("expected unsupported scheme error");
         };

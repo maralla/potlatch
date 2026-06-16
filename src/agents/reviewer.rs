@@ -16,6 +16,7 @@ use crate::core::agent::{AgentHandoff, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
+use crate::core::model::acp::ACP_SESSION_MODE_ASK;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const REVIEWER_APPROVED_LABEL: &str = "reviewer-approved";
@@ -149,7 +150,9 @@ impl CoreAgent for ReviewerAgent {
             &ctx,
             "reviewer",
             reviewer_dir.clone(),
-            ModelPreferences::reviewer(),
+            ModelPreferences {
+                preferred_session_mode: Some(ACP_SESSION_MODE_ASK),
+            },
         )?;
         let agent_settings = settings::settings();
         let scope = agent_settings.scope_label_filter();

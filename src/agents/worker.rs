@@ -308,7 +308,7 @@ impl CoreAgent for WorkerAgent {
             &ctx,
             "worker",
             state.working_dir.clone(),
-            ModelPreferences::worker(),
+            ModelPreferences::default(),
         )?;
         let agent_settings = settings::settings();
         let scope = agent_settings.scope_label_filter();

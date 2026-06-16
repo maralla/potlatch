@@ -13,9 +13,8 @@
 //!   `cursor/ask_question`](https://cursor.com/docs/cli/acp) that expect a client response; a
 //!   headless client must answer or plan mode can block waiting for approval.
 //! - In **plan** mode, `session/update` may carry `tool_call_update` text such as
-//!   `Plan saved to file://…`. Potlatch records those absolute paths on [`AgentHandoff::cursor_plan_paths`];
-//!   the PMO role reads the files from the git workspace and merges their contents into the text it
-//!   parses (split markers, sub-issues, etc.).
+//!   `Plan saved to file://…`. Potlatch records those absolute paths on
+//!   [`AgentHandoff::cursor_plan_paths`] so callers can read and merge the plan files.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -43,7 +42,7 @@ pub struct StreamTextHooks {
     cursor_ask_question_handler: Mutex<Option<Arc<dyn CursorAskQuestionHandler>>>,
     /// Git clone root for ACP [`fs/read_text_file`](https://agentclientprotocol.com/protocol/file-system.md).
     workspace_root: Option<PathBuf>,
-    /// Plan-mode `tool_call_update` paths (`Plan saved to file://…`), taken into [`AgentHandoff`] for PMO.
+    /// Plan-mode `tool_call_update` paths (`Plan saved to file://…`), taken into [`AgentHandoff`].
     cursor_plan_paths: Mutex<Vec<String>>,
     /// Plan-mode `cursor/create_plan` markdown body (ACP extension RPC).
     cursor_create_plan_text: Mutex<String>,
@@ -186,7 +185,7 @@ impl StreamTextHooks {
     }
 
     /// When the session is in **plan** mode, record absolute paths from `tool_call_update` text
-    /// (`Plan saved to file://…`). PMO reads these files after the prompt completes.
+    /// (`Plan saved to file://…`) for callers to consume after the prompt completes.
     fn record_cursor_saved_plan_paths(&self, params: &Value) {
         if !self.session_current_mode_is_plan() {
             return;
@@ -417,7 +416,7 @@ impl AcpHooks for StreamTextHooks {
                 info!(
                     target: "potlatch::acp_cursor",
                     plan_len = plan.len(),
-                    "Captured cursor/create_plan markdown for PMO parsing"
+                    "Captured cursor/create_plan markdown"
                 );
                 *self.cursor_create_plan_text.lock().unwrap() = plan;
             }
@@ -481,7 +480,7 @@ mod tests {
         let h = StreamTextHooks::new();
         let params = json!({
             "toolCallId": "call_1",
-            "name": "PMO triage",
+            "name": "Plan triage",
             "plan": "GUIDE_WORKER\nINSTRUCTIONS:\nUse the existing loader."
         });
         let result = h.handle_agent_request("cursor/create_plan", &params, &json!(1));
@@ -669,7 +668,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("potlatch-plan-file-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join(".cursor/plans")).unwrap();
-        let plan_path = tmp.join(".cursor/plans/PMO.plan.md");
+        let plan_path = tmp.join(".cursor/plans/triage.plan.md");
         fs::write(&plan_path, "DECISION: SPLIT\nSUB_ISSUE_1 TITLE: A\n").unwrap();
         let ws = fs::canonicalize(&tmp).unwrap();
         let file_url = format!("file://{}", plan_path.display());
@@ -699,7 +698,7 @@ mod tests {
         assert!(h.take_text().is_empty());
         let paths = h.cursor_plan_paths_snapshot();
         assert_eq!(paths.len(), 1);
-        assert!(paths[0].ends_with("PMO.plan.md"), "{paths:?}");
+        assert!(paths[0].ends_with("triage.plan.md"), "{paths:?}");
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -748,10 +747,10 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("potlatch-plan-pct-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join(".cursor/plans")).unwrap();
-        let plan_path = tmp.join(".cursor/plans/PMO Issue.plan.md");
+        let plan_path = tmp.join(".cursor/plans/Triage Issue.plan.md");
         fs::write(&plan_path, "FROM_ENCODED_PATH").unwrap();
         let ws = fs::canonicalize(&tmp).unwrap();
-        let enc = ws.join(".cursor/plans/PMO%20Issue.plan.md");
+        let enc = ws.join(".cursor/plans/Triage%20Issue.plan.md");
         let file_url = format!("file://{}", enc.display());
 
         let h = StreamTextHooks::with_workspace(ws);
@@ -776,7 +775,7 @@ mod tests {
         assert!(h.take_text().is_empty());
         let paths = h.cursor_plan_paths_snapshot();
         assert_eq!(paths.len(), 1);
-        assert!(paths[0].contains("PMO Issue.plan.md"), "{paths:?}");
+        assert!(paths[0].contains("Triage Issue.plan.md"), "{paths:?}");
         let _ = fs::remove_dir_all(&tmp);
     }
 }

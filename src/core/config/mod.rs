@@ -84,7 +84,7 @@ mod tests {
     fn loads_agent_sections_only_when_present() {
         let cfg = Config::from_toml_str(
             r#"
-            [agent.worker]
+            [agent.alpha]
             model = "composer-2"
             instances = 1
             poll_interval_secs = 60
@@ -92,7 +92,7 @@ mod tests {
         )
         .unwrap();
         let names: Vec<_> = cfg.agent_names().collect();
-        assert_eq!(names, vec!["worker"]);
-        assert!(cfg.agent("reviewer").is_none());
+        assert_eq!(names, vec!["alpha"]);
+        assert!(cfg.agent("beta").is_none());
     }
 }

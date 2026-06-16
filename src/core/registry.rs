@@ -59,13 +59,13 @@ mod tests {
     use crate::core::agent::{AgentModel, CoreAgent};
     use crate::core::config::Config;
 
-    struct WorkerAgentForTest;
+    struct AlphaAgentForTest;
 
-    impl CoreAgent for WorkerAgentForTest {
+    impl CoreAgent for AlphaAgentForTest {
         type SpawnContext = AgentSpawnContext;
 
         fn name() -> &'static str {
-            "worker"
+            "alpha"
         }
 
         fn model(&self) -> &AgentModel {
@@ -74,7 +74,7 @@ mod tests {
 
         fn validate_config(section: &AgentSection) -> Result<()> {
             if section.core.instances > 1 {
-                anyhow::bail!("worker supports at most one instance");
+                anyhow::bail!("alpha supports at most one instance");
             }
             Ok(())
         }
@@ -93,45 +93,45 @@ mod tests {
     #[test]
     fn find_by_name() {
         let mut reg = AgentRegistry::new();
-        reg.register_agent::<WorkerAgentForTest>();
-        assert!(reg.find("worker").is_some());
-        assert!(reg.find("reviewer").is_none());
+        reg.register_agent::<AlphaAgentForTest>();
+        assert!(reg.find("alpha").is_some());
+        assert!(reg.find("beta").is_none());
     }
 
     #[test]
     fn workflow_spawns_only_configured_agents() {
         let cfg = Config::from_toml_str(
             r#"
-            [agent.worker]
+            [agent.alpha]
             instances = 1
-            [agent.reviewer]
+            [agent.beta]
             instances = 0
             "#,
         )
         .unwrap();
         let mut names: Vec<_> = cfg.agent_names().collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["reviewer", "worker"]);
-        let worker = cfg.agent("worker").unwrap();
-        assert_eq!(worker.core.instances, 1);
-        let reviewer = cfg.agent("reviewer").unwrap();
-        assert_eq!(reviewer.core.instances, 0);
+        assert_eq!(names, vec!["alpha", "beta"]);
+        let alpha = cfg.agent("alpha").unwrap();
+        assert_eq!(alpha.core.instances, 1);
+        let beta = cfg.agent("beta").unwrap();
+        assert_eq!(beta.core.instances, 0);
     }
 
     #[test]
     fn registration_dispatches_agent_config_validation() {
         let cfg = Config::from_toml_str(
             r#"
-            [agent.worker]
+            [agent.alpha]
             instances = 2
             "#,
         )
         .unwrap();
         let mut reg = AgentRegistry::new();
-        reg.register_agent::<WorkerAgentForTest>();
-        let registration = reg.find("worker").unwrap();
+        reg.register_agent::<AlphaAgentForTest>();
+        let registration = reg.find("alpha").unwrap();
 
-        let err = (registration.validate_config)(cfg.agent("worker").unwrap()).unwrap_err();
+        let err = (registration.validate_config)(cfg.agent("alpha").unwrap()).unwrap_err();
         assert!(err.to_string().contains("at most one instance"));
     }
 }

@@ -7,9 +7,9 @@
 //! send `available_commands_update`; [`StreamTextHooks`] records command names for future
 //! role-specific prompt logic (not wired into prompts yet).
 //!
-//! [Session modes](https://agentclientprotocol.com/protocol/session-modes): the reviewer may request
-//! **`ask`** and the PMO **`plan`**. Modes apply only when the agent advertises them (config-option `mode`
-//! value or non-empty legacy `availableModes`). Otherwise the agent default is kept; see
+//! [Session modes](https://agentclientprotocol.com/protocol/session-modes): callers may request
+//! **`ask`** or **`plan`**. Modes apply only when the agent advertises them (config-option `mode`
+//! value or non-empty legacy `availableModes`). Otherwise the agent default is kept;
 //! `current_mode_update` keeps hooks in sync.
 
 use std::io::Read;
@@ -39,10 +39,10 @@ Treat this assignment as a fresh task. Do not rely on prior chat history or assu
 
 "#;
 
-/// ACP session mode for the reviewer (read-oriented, permission before edits).
-pub const PREFERRED_SESSION_MODE_REVIEWER: &str = "ask";
-/// ACP session mode for the PMO (planning / decomposition for sub-issues and guidance).
-pub const PREFERRED_SESSION_MODE_PMO: &str = "plan";
+/// ACP session mode for read-oriented work, permission before edits.
+pub const ACP_SESSION_MODE_ASK: &str = "ask";
+/// ACP session mode for planning and decomposition work.
+pub const ACP_SESSION_MODE_PLAN: &str = "plan";
 
 struct AcpSession {
     client: Arc<AcpClient>,
@@ -74,7 +74,7 @@ fn close_acp_session_best_effort(client: &AcpClient, session_id: &str) {
 pub(crate) struct AcpRuntime {
     repo_path: String,
     model: Option<String>,
-    /// When set, applied after `session/new` via ACP mode APIs ([`PREFERRED_SESSION_MODE_REVIEWER`], [`PREFERRED_SESSION_MODE_PMO`]).
+    /// When set, applied after `session/new` via ACP mode APIs.
     preferred_session_mode: Option<&'static str>,
     shutdown: Arc<AtomicBool>,
     agent_id: String,
@@ -197,7 +197,7 @@ impl AcpRuntime {
 
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(Ok(pr)) => {
-                        self.wait_for_pmo_followup_updates(&hooks, cancel_check)?;
+                        self.wait_for_plan_followup_updates(&hooks, cancel_check)?;
                         break Ok(handoff_from_prompt_hooks(&hooks, pr));
                     }
                     Ok(Err(e)) => break Err(anyhow::anyhow!("ACP session/prompt: {}", e)),
@@ -237,12 +237,12 @@ impl AcpRuntime {
         }
     }
 
-    fn wait_for_pmo_followup_updates(
+    fn wait_for_plan_followup_updates(
         &self,
         hooks: &StreamTextHooks,
         cancel_check: Option<&dyn Fn() -> bool>,
     ) -> Result<()> {
-        if self.preferred_session_mode != Some(PREFERRED_SESSION_MODE_PMO) {
+        if self.preferred_session_mode != Some(ACP_SESSION_MODE_PLAN) {
             return Ok(());
         }
 
