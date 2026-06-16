@@ -406,7 +406,11 @@ Analyze ONLY the log session file for new errors, exceptions, panics, fatal fail
 
 Use the issue history and GitLab context files to avoid creating duplicate issues for problems that are already tracked, discussed, or being addressed.
 
-Use the project codebase in your workspace only as auxiliary context: map log errors to likely code paths, root causes, and concrete remediation steps. Do not rely on production host, deployment, or infrastructure details beyond what appears in the log file.
+For each candidate problem, inspect the current project codebase in your workspace before proposing an issue. Use the code to decide whether the logged failure is still actionable.
+
+If the current code appears to already fix or guard against the logged failure, do not propose an issue for it unless the log evidence clearly shows the fixed code path is still failing. Treat those cases as already addressed.
+
+Use the project codebase to map log errors to likely code paths, root causes, and concrete remediation steps. Do not rely on production host, deployment, or infrastructure details beyond what appears in the log file.
 
 For each NEW distinct problem that is not already covered, propose one GitLab issue.
 
@@ -426,8 +430,9 @@ Return ONLY a machine-readable block:
 Rules:
 - Return an empty JSON array [] if there are no NEW actionable errors.
 - Do not propose issues for errors already represented in the history or GitLab context files.
+- Do not propose issues for errors that appear already fixed in the current codebase.
 - Titles must be specific and actionable.
-- Descriptions must cite log evidence and, when helpful, relevant code context from the repository.
+- Descriptions must cite log evidence and relevant code context from the repository.
 "#,
         log_path = log_path,
         history_path = history_path,
@@ -962,6 +967,9 @@ mod tests {
         assert!(!prompt.contains("fingerprint"));
         assert!(prompt.contains("Log session file"));
         assert!(prompt.contains("GitLab context"));
+        assert!(prompt.contains("inspect the current project codebase"));
+        assert!(prompt.contains("already fixed in the current codebase"));
+        assert!(prompt.contains("Descriptions must cite log evidence and relevant code context"));
     }
 
     #[test]
