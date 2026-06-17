@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
+
+use super::retry::with_transient_retries;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
-use std::thread;
-use std::time::Duration;
 use tracing::{debug, info};
 
 pub const PRIORITY_LABEL_PREFIX: &str = "priority::";
@@ -231,56 +231,6 @@ fn mr_create_error_is_duplicate(err_msg: &str) -> bool {
     err_msg.to_ascii_lowercase().contains("already exists")
 }
 
-/// Returns `true` when the glab/API error string suggests a transient problem worth retrying.
-fn glab_api_error_should_retry(err_msg: &str) -> bool {
-    let m = err_msg.to_lowercase();
-    // Permanent client / validation errors — repeating the request is unlikely to help.
-    if m.contains("http 401")
-        || m.contains("http 403")
-        || m.contains("http 404")
-        || m.contains("http 400")
-        || m.contains("http 405")
-        || m.contains("http 422")
-        || m.contains("unauthorized")
-        || m.contains("not found")
-    {
-        return false;
-    }
-    true
-}
-
-fn with_transient_api_retries<T, F>(context: &str, mut operation: F) -> Result<T>
-where
-    F: FnMut() -> Result<T>,
-{
-    let mut attempt = 0u32;
-    let mut delay = Duration::from_secs(1);
-    const MAX_DELAY: Duration = Duration::from_secs(60);
-    loop {
-        attempt += 1;
-        match operation() {
-            Ok(value) => {
-                if attempt > 1 {
-                    info!("{} succeeded after {} attempts", context, attempt);
-                }
-                return Ok(value);
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if !glab_api_error_should_retry(&msg) {
-                    return Err(e);
-                }
-                debug!(
-                    "Transient failure {} (attempt {}), retrying in {:?}: {}",
-                    context, attempt, delay, msg
-                );
-                thread::sleep(delay);
-                delay = (delay * 2).min(MAX_DELAY);
-            }
-        }
-    }
-}
-
 fn compact_cli_output(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -306,6 +256,12 @@ impl GitLabClient {
     }
 
     fn run_api(&self, endpoint: &str, extra_args: &[&str]) -> Result<std::process::Output> {
+        with_transient_retries(&format!("glab api GET {endpoint}"), || {
+            self.run_api_once(endpoint, extra_args)
+        })
+    }
+
+    fn run_api_once(&self, endpoint: &str, extra_args: &[&str]) -> Result<std::process::Output> {
         Command::new("glab")
             .arg("api")
             .arg("--hostname")
@@ -412,10 +368,6 @@ impl GitLabClient {
     }
 
     pub fn list_issues(&self) -> Result<Vec<Issue>> {
-        with_transient_api_retries("listing open issues", || self.list_issues_once())
-    }
-
-    fn list_issues_once(&self) -> Result<Vec<Issue>> {
         debug!("Fetching issues from GitLab");
         const PER_PAGE: usize = 100;
         let mut page = 1usize;
@@ -579,12 +531,6 @@ impl GitLabClient {
     }
 
     pub fn list_merge_requests(&self) -> Result<Vec<MergeRequest>> {
-        with_transient_api_retries("listing open merge requests", || {
-            self.list_merge_requests_once()
-        })
-    }
-
-    fn list_merge_requests_once(&self) -> Result<Vec<MergeRequest>> {
         debug!("Fetching merge requests from GitLab");
 
         let endpoint = self.api_path("merge_requests?state=opened&per_page=100");
@@ -604,12 +550,6 @@ impl GitLabClient {
     }
 
     pub fn get_merge_request(&self, iid: u64) -> Result<MergeRequest> {
-        with_transient_api_retries(&format!("fetching MR !{iid}"), || {
-            self.get_merge_request_once(iid)
-        })
-    }
-
-    fn get_merge_request_once(&self, iid: u64) -> Result<MergeRequest> {
         debug!("Fetching merge request !{}", iid);
 
         let endpoint = self.api_path(&format!("merge_requests/{iid}"));
@@ -631,12 +571,6 @@ impl GitLabClient {
     /// Fetches the exact MR diff payload as produced by GitLab for this MR.
     /// This is preferred for agent context because it matches the MR view.
     pub fn get_merge_request_changes(&self, iid: u64) -> Result<MergeRequestChangesSnapshot> {
-        with_transient_api_retries(&format!("fetching MR !{iid} changes"), || {
-            self.get_merge_request_changes_once(iid)
-        })
-    }
-
-    fn get_merge_request_changes_once(&self, iid: u64) -> Result<MergeRequestChangesSnapshot> {
         debug!("Fetching merge request !{} changes", iid);
 
         let endpoint = self.api_path(&format!("merge_requests/{iid}/changes"));
@@ -753,12 +687,6 @@ impl GitLabClient {
     }
 
     fn fetch_discussions(&self, iid: u64) -> Result<Vec<serde_json::Value>> {
-        with_transient_api_retries(&format!("fetching MR !{iid} discussions"), || {
-            self.fetch_discussions_once(iid)
-        })
-    }
-
-    fn fetch_discussions_once(&self, iid: u64) -> Result<Vec<serde_json::Value>> {
         const PER_PAGE: usize = 100;
         let mut page = 1usize;
         let mut discussions = Vec::new();
@@ -1061,7 +989,7 @@ impl GitLabClient {
     /// sleeps with exponential backoff (capped) and retries until success. Returns `Err` only when
     /// the error looks permanent (e.g. 401/403/404/400/422) so the caller can log and continue.
     pub fn add_mr_label_with_transient_retries(&self, iid: u64, label: &str) -> Result<()> {
-        with_transient_api_retries(&format!("adding label {label:?} to MR !{iid}"), || {
+        with_transient_retries(&format!("adding label {label:?} to MR !{iid}"), || {
             self.add_mr_label(iid, label)
         })
     }
@@ -1212,12 +1140,6 @@ impl GitLabClient {
     }
 
     fn fetch_issue_discussions_via_api(&self, issue_iid: u64) -> Result<Vec<IssueThreadNote>> {
-        with_transient_api_retries(&format!("fetching issue #{issue_iid} discussions"), || {
-            self.fetch_issue_discussions_via_api_once(issue_iid)
-        })
-    }
-
-    fn fetch_issue_discussions_via_api_once(&self, issue_iid: u64) -> Result<Vec<IssueThreadNote>> {
         let endpoint = self.api_path(&format!("issues/{issue_iid}/discussions"));
         let output = self.run_api(&endpoint, &[])?;
 
@@ -1319,8 +1241,7 @@ pub fn mr_description_closes_issue(description: &str, issue_iid: u64) -> bool {
 mod tests {
     use super::{
         GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, compact_cli_output,
-        glab_api_error_should_retry, mr_create_error_is_duplicate, mr_description_closes_issue,
-        parse_gitlab_repo,
+        mr_create_error_is_duplicate, mr_description_closes_issue, parse_gitlab_repo,
     };
     use serde_json::json;
 
@@ -1469,30 +1390,6 @@ mod tests {
         assert_eq!(parsed.base_sha.as_deref(), Some("base123"));
         assert_eq!(parsed.start_sha.as_deref(), Some("start123"));
         assert_eq!(parsed.head_sha.as_deref(), Some("head123"));
-    }
-
-    #[test]
-    fn glab_api_error_retry_heuristic_matches_glab_500() {
-        assert!(glab_api_error_should_retry(
-            "Failed to add label to MR: glab: 500 Internal Server Error (HTTP 500)"
-        ));
-    }
-
-    #[test]
-    fn glab_api_error_retry_heuristic_matches_tls_handshake_timeout() {
-        assert!(glab_api_error_should_retry(
-            "glab api issue discussions failed: ERROR Get \"https://gitlab.example/api\": net/http: TLS handshake timeout."
-        ));
-    }
-
-    #[test]
-    fn glab_api_error_retry_skips_permanent_http_codes() {
-        assert!(!glab_api_error_should_retry(
-            "Failed to add label to MR: glab: 404 Not Found (HTTP 404)"
-        ));
-        assert!(!glab_api_error_should_retry(
-            "Failed to add label to MR: HTTP 403 Forbidden"
-        ));
     }
 
     /// Matches a single note object inside GitLab issue discussions API JSON.

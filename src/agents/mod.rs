@@ -11,6 +11,7 @@ pub mod pmo;
 pub mod pmo_cursor_ask;
 pub mod reviewer;
 pub mod settings;
+pub(crate) mod retry;
 pub mod worker;
 pub mod workspace;
 

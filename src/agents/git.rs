@@ -3,6 +3,8 @@ use std::path::Path;
 use std::process::Command;
 use tracing::debug;
 
+use super::retry::with_transient_retries;
+
 pub struct GitRepo {
     pub path: String,
 }
@@ -16,41 +18,51 @@ impl GitRepo {
         Path::new(&self.path).join(".git").exists()
     }
 
-    pub fn clone(&self, repo_url: &str) -> Result<()> {
-        debug!("Cloning repository {} to {}", repo_url, self.path);
-
-        let output = Command::new("git")
-            .args(["clone", repo_url, &self.path])
-            .output()
-            .context("Failed to execute git clone")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "Git clone failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+    fn command_error(output: &std::process::Output) -> String {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stderr.trim().is_empty() {
+            stdout.to_string()
+        } else if stdout.trim().is_empty() {
+            stderr.to_string()
+        } else {
+            format!("{stderr}{stdout}")
         }
+    }
 
-        Ok(())
+    pub fn clone(&self, repo_url: &str) -> Result<()> {
+        with_transient_retries(&format!("git clone into {}", self.path), || {
+            debug!("Cloning repository {} to {}", repo_url, self.path);
+
+            let output = Command::new("git")
+                .args(["clone", repo_url, &self.path])
+                .output()
+                .context("Failed to execute git clone")?;
+
+            if !output.status.success() {
+                anyhow::bail!("Git clone failed: {}", Self::command_error(&output));
+            }
+
+            Ok(())
+        })
     }
 
     pub fn fetch(&self) -> Result<()> {
-        debug!("Fetching latest changes in {}", self.path);
+        with_transient_retries(&format!("git fetch in {}", self.path), || {
+            debug!("Fetching latest changes in {}", self.path);
 
-        let output = Command::new("git")
-            .args(["fetch", "origin"])
-            .current_dir(&self.path)
-            .output()
-            .context("Failed to execute git fetch")?;
+            let output = Command::new("git")
+                .args(["fetch", "origin"])
+                .current_dir(&self.path)
+                .output()
+                .context("Failed to execute git fetch")?;
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "Git fetch failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+            if !output.status.success() {
+                anyhow::bail!("Git fetch failed: {}", Self::command_error(&output));
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn get_default_branch(&self) -> Result<String> {
@@ -303,19 +315,18 @@ impl GitRepo {
     }
 
     pub fn delete_remote_branch(&self, branch_name: &str) -> Result<()> {
-        debug!("Deleting remote branch origin/{}", branch_name);
-        let output = Command::new("git")
-            .args(["push", "origin", "--delete", branch_name])
-            .current_dir(&self.path)
-            .output()
-            .context("Failed to delete remote branch")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "Git push --delete failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Ok(())
+        with_transient_retries(&format!("git push --delete origin {branch_name}"), || {
+            debug!("Deleting remote branch origin/{}", branch_name);
+            let output = Command::new("git")
+                .args(["push", "origin", "--delete", branch_name])
+                .current_dir(&self.path)
+                .output()
+                .context("Failed to delete remote branch")?;
+            if !output.status.success() {
+                anyhow::bail!("Git push --delete failed: {}", Self::command_error(&output));
+            }
+            Ok(())
+        })
     }
 
     pub fn has_staged_changes(&self) -> Result<bool> {
@@ -364,22 +375,21 @@ impl GitRepo {
     }
 
     pub fn push(&self, branch: &str) -> Result<()> {
-        debug!("Pushing branch {}", branch);
+        with_transient_retries(&format!("git push origin {branch}"), || {
+            debug!("Pushing branch {}", branch);
 
-        let output = Command::new("git")
-            .args(["push", "--force", "-u", "origin", branch])
-            .current_dir(&self.path)
-            .output()
-            .context("Failed to git push")?;
+            let output = Command::new("git")
+                .args(["push", "--force", "-u", "origin", branch])
+                .current_dir(&self.path)
+                .output()
+                .context("Failed to git push")?;
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "Git push failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+            if !output.status.success() {
+                anyhow::bail!("Git push failed: {}", Self::command_error(&output));
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn reset_hard(&self) -> Result<()> {
