@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub const PRIORITY_LABEL_PREFIX: &str = "priority::";
 pub const DEFAULT_PRIORITY: u8 = 3;
@@ -270,7 +270,7 @@ where
                 if !glab_api_error_should_retry(&msg) {
                     return Err(e);
                 }
-                warn!(
+                debug!(
                     "Transient failure {} (attempt {}), retrying in {:?}: {}",
                     context, attempt, delay, msg
                 );
