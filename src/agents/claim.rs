@@ -13,6 +13,10 @@ const CLAIM_SETTLE_SECS: u64 = 5;
 
 const CLAIM_LABEL_PREFIX: &str = "claimed:";
 
+pub fn claim_label(agent_id: &str) -> String {
+    format!("{CLAIM_LABEL_PREFIX}{agent_id}")
+}
+
 /// Attempt to atomically claim a task (issue or MR) using the
 /// claim-and-verify protocol with double-check.
 ///
@@ -30,7 +34,7 @@ pub fn try_claim_issue(
     agent_id: &str,
     shutdown: &AtomicBool,
 ) -> Result<bool> {
-    let claim_label = format!("{}{}", CLAIM_LABEL_PREFIX, agent_id);
+    let claim_label = claim_label(agent_id);
 
     debug!("{}: Attempting to claim issue #{}", agent_id, issue_iid);
 
@@ -102,7 +106,7 @@ fn resolve_contention(
 
 /// Release a claim on an issue by removing the claim label.
 pub fn release_claim(gitlab: &GitLabClient, issue_iid: u64, agent_id: &str) -> Result<()> {
-    let claim_label = format!("{}{}", CLAIM_LABEL_PREFIX, agent_id);
+    let claim_label = claim_label(agent_id);
     debug!("{}: Releasing claim on issue #{}", agent_id, issue_iid);
     gitlab.remove_issue_label(issue_iid, &claim_label)?;
     Ok(())
@@ -120,46 +124,54 @@ pub fn try_claim_mr(
     agent_id: &str,
     shutdown: &AtomicBool,
 ) -> Result<bool> {
-    let claim_label = format!("{}{}", CLAIM_LABEL_PREFIX, agent_id);
+    let claim_label = claim_label(agent_id);
 
     debug!("{}: Attempting to claim MR !{}", agent_id, mr_iid);
 
     gitlab.add_mr_label(mr_iid, &claim_label)?;
 
-    if sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
-        let _ = gitlab.remove_mr_label(mr_iid, &claim_label);
-        anyhow::bail!("Shutdown during claim settle for MR !{}", mr_iid);
+    let claim_result = (|| -> Result<bool> {
+        if sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
+            anyhow::bail!("Shutdown during claim settle for MR !{}", mr_iid);
+        }
+
+        let mr = gitlab.get_merge_request(mr_iid)?;
+        let mr_labels = mr.labels.as_deref().unwrap_or(&[]);
+        let claim_labels: Vec<&String> = mr_labels
+            .iter()
+            .filter(|l| l.starts_with(CLAIM_LABEL_PREFIX))
+            .collect();
+
+        if claim_labels.len() > 1 {
+            return resolve_mr_contention(gitlab, mr_iid, agent_id, &claim_label, &claim_labels);
+        }
+
+        if sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
+            anyhow::bail!("Shutdown during claim settle for MR !{}", mr_iid);
+        }
+
+        let mr = gitlab.get_merge_request(mr_iid)?;
+        let mr_labels = mr.labels.as_deref().unwrap_or(&[]);
+        let claim_labels: Vec<&String> = mr_labels
+            .iter()
+            .filter(|l| l.starts_with(CLAIM_LABEL_PREFIX))
+            .collect();
+
+        if claim_labels.len() > 1 {
+            return resolve_mr_contention(gitlab, mr_iid, agent_id, &claim_label, &claim_labels);
+        }
+
+        info!("{}: Successfully claimed MR !{}", agent_id, mr_iid);
+        Ok(true)
+    })();
+
+    match claim_result {
+        Ok(won) => Ok(won),
+        Err(e) => {
+            let _ = gitlab.remove_mr_label(mr_iid, &claim_label);
+            Err(e)
+        }
     }
-
-    let mr = gitlab.get_merge_request(mr_iid)?;
-    let mr_labels = mr.labels.as_deref().unwrap_or(&[]);
-    let claim_labels: Vec<&String> = mr_labels
-        .iter()
-        .filter(|l| l.starts_with(CLAIM_LABEL_PREFIX))
-        .collect();
-
-    if claim_labels.len() > 1 {
-        return resolve_mr_contention(gitlab, mr_iid, agent_id, &claim_label, &claim_labels);
-    }
-
-    if sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
-        let _ = gitlab.remove_mr_label(mr_iid, &claim_label);
-        anyhow::bail!("Shutdown during claim settle for MR !{}", mr_iid);
-    }
-
-    let mr = gitlab.get_merge_request(mr_iid)?;
-    let mr_labels = mr.labels.as_deref().unwrap_or(&[]);
-    let claim_labels: Vec<&String> = mr_labels
-        .iter()
-        .filter(|l| l.starts_with(CLAIM_LABEL_PREFIX))
-        .collect();
-
-    if claim_labels.len() > 1 {
-        return resolve_mr_contention(gitlab, mr_iid, agent_id, &claim_label, &claim_labels);
-    }
-
-    info!("{}: Successfully claimed MR !{}", agent_id, mr_iid);
-    Ok(true)
 }
 
 fn resolve_mr_contention(
@@ -192,7 +204,7 @@ fn resolve_mr_contention(
 
 /// Release a claim on an MR by removing the claim label.
 pub fn release_mr_claim(gitlab: &GitLabClient, mr_iid: u64, agent_id: &str) -> Result<()> {
-    let claim_label = format!("{}{}", CLAIM_LABEL_PREFIX, agent_id);
+    let claim_label = claim_label(agent_id);
     debug!("{}: Releasing claim on MR !{}", agent_id, mr_iid);
     gitlab.remove_mr_label(mr_iid, &claim_label)?;
     Ok(())
@@ -204,4 +216,34 @@ pub fn is_mr_claimed(labels: &Option<Vec<String>>) -> bool {
         .as_ref()
         .map(|l| l.iter().any(|l| l.starts_with(CLAIM_LABEL_PREFIX)))
         .unwrap_or(false)
+}
+
+/// Returns true when this agent's claim label is present on the MR.
+pub fn has_our_mr_claim(labels: &Option<Vec<String>>, agent_id: &str) -> bool {
+    let claim_label = claim_label(agent_id);
+    labels
+        .as_ref()
+        .is_some_and(|labels| labels.iter().any(|label| label == &claim_label))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_our_mr_claim_detects_matching_label() {
+        let labels = Some(vec![
+            "reviewer-approved".to_string(),
+            "claimed:reviewer-0".to_string(),
+        ]);
+        assert!(has_our_mr_claim(&labels, "reviewer-0"));
+        assert!(!has_our_mr_claim(&labels, "reviewer-1"));
+    }
+
+    #[test]
+    fn has_our_mr_claim_ignores_other_agents() {
+        let labels = Some(vec!["claimed:reviewer-1".to_string()]);
+        assert!(!has_our_mr_claim(&labels, "reviewer-0"));
+        assert!(is_mr_claimed(&labels));
+    }
 }

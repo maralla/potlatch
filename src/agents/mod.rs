@@ -9,9 +9,9 @@ pub mod labels;
 pub mod ops;
 pub mod pmo;
 pub mod pmo_cursor_ask;
+pub(crate) mod retry;
 pub mod reviewer;
 pub mod settings;
-pub(crate) mod retry;
 pub mod worker;
 pub mod workspace;
 

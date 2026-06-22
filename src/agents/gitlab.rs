@@ -257,7 +257,14 @@ impl GitLabClient {
 
     fn run_api(&self, endpoint: &str, extra_args: &[&str]) -> Result<std::process::Output> {
         with_transient_retries(&format!("glab api GET {endpoint}"), || {
-            self.run_api_once(endpoint, extra_args)
+            let output = self.run_api_once(endpoint, extra_args)?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "glab api GET {endpoint} failed: {}",
+                    Self::glab_api_error_message(&output)
+                );
+            }
+            Ok(output)
         })
     }
 
@@ -351,13 +358,6 @@ impl GitLabClient {
             "merge_requests?source_branch={source_branch}&state=opened&per_page=1"
         ));
         let output = self.run_api(&endpoint, &[])?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "Failed to find merge request for branch {}: {}",
-                source_branch,
-                Self::glab_api_error_message(&output)
-            );
-        }
         #[derive(Deserialize)]
         struct MrHit {
             iid: u64,
@@ -368,6 +368,10 @@ impl GitLabClient {
     }
 
     pub fn list_issues(&self) -> Result<Vec<Issue>> {
+        with_transient_retries("listing open issues", || self.list_issues_pages())
+    }
+
+    fn list_issues_pages(&self) -> Result<Vec<Issue>> {
         debug!("Fetching issues from GitLab");
         const PER_PAGE: usize = 100;
         let mut page = 1usize;
@@ -378,13 +382,6 @@ impl GitLabClient {
                 "issues?state=opened&per_page={PER_PAGE}&page={page}"
             ));
             let output = self.run_api(&endpoint, &[])?;
-
-            if !output.status.success() {
-                anyhow::bail!(
-                    "glab api issue list failed: {}",
-                    Self::glab_api_error_message(&output)
-                );
-            }
 
             let batch: Vec<Issue> =
                 serde_json::from_slice(&output.stdout).context("Failed to parse issues JSON")?;
@@ -408,13 +405,6 @@ impl GitLabClient {
 
         let endpoint = self.api_path(&format!("issues/{iid}"));
         let output = self.run_api(&endpoint, &[])?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "glab api issue view failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
 
         let issue: Issue =
             serde_json::from_slice(&output.stdout).context("Failed to parse issue JSON")?;
@@ -536,13 +526,6 @@ impl GitLabClient {
         let endpoint = self.api_path("merge_requests?state=opened&per_page=100");
         let output = self.run_api(&endpoint, &[])?;
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "Failed to list merge requests: {}",
-                Self::glab_api_error_message(&output)
-            );
-        }
-
         let mrs: Vec<MergeRequest> = serde_json::from_slice(&output.stdout)
             .context("Failed to parse merge requests JSON")?;
 
@@ -554,13 +537,6 @@ impl GitLabClient {
 
         let endpoint = self.api_path(&format!("merge_requests/{iid}"));
         let output = self.run_api(&endpoint, &[])?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "glab api MR failed: {}",
-                Self::glab_api_error_message(&output)
-            );
-        }
 
         let mr: MergeRequest =
             serde_json::from_slice(&output.stdout).context("Failed to parse merge request JSON")?;
@@ -575,13 +551,6 @@ impl GitLabClient {
 
         let endpoint = self.api_path(&format!("merge_requests/{iid}/changes"));
         let output = self.run_api(&endpoint, &[])?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "glab api MR changes failed: {}",
-                Self::glab_api_error_message(&output)
-            );
-        }
 
         let payload: serde_json::Value =
             serde_json::from_slice(&output.stdout).context("Failed to parse MR changes JSON")?;
@@ -687,6 +656,12 @@ impl GitLabClient {
     }
 
     fn fetch_discussions(&self, iid: u64) -> Result<Vec<serde_json::Value>> {
+        with_transient_retries(&format!("fetching MR !{iid} discussions"), || {
+            self.fetch_discussions_pages(iid)
+        })
+    }
+
+    fn fetch_discussions_pages(&self, iid: u64) -> Result<Vec<serde_json::Value>> {
         const PER_PAGE: usize = 100;
         let mut page = 1usize;
         let mut discussions = Vec::new();
@@ -696,14 +671,6 @@ impl GitLabClient {
                 "merge_requests/{iid}/discussions?per_page={PER_PAGE}&page={page}"
             ));
             let output = self.run_api(&endpoint, &[])?;
-
-            if !output.status.success() {
-                anyhow::bail!(
-                    "Failed to fetch MR discussions page {}: {}",
-                    page,
-                    Self::glab_api_error_message(&output)
-                );
-            }
 
             let batch: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
                 .with_context(|| format!("Failed to parse MR discussions JSON page {page}"))?;
@@ -1142,13 +1109,6 @@ impl GitLabClient {
     fn fetch_issue_discussions_via_api(&self, issue_iid: u64) -> Result<Vec<IssueThreadNote>> {
         let endpoint = self.api_path(&format!("issues/{issue_iid}/discussions"));
         let output = self.run_api(&endpoint, &[])?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "glab api issue discussions failed: {}",
-                Self::glab_api_error_message(&output)
-            );
-        }
 
         #[derive(Deserialize)]
         struct DiscussionJson {

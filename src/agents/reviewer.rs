@@ -214,6 +214,11 @@ fn reviewer_cycle(
     let _ = git_repo.reset_hard();
     git_repo.checkout_remote_branch(&default_branch)?;
 
+    // Recover orphaned claims from GitLab when in-memory state was lost (e.g. release failed).
+    if claimed_mr_iid.is_none() {
+        *claimed_mr_iid = find_claimed_mr(agent_id, gitlab, scope_label);
+    }
+
     // If we still hold a claim from a previous cycle, release it now.
     // Do not proceed to claim a new MR if the release fails.
     if let Some(held_iid) = *claimed_mr_iid {
@@ -282,13 +287,27 @@ fn reviewer_cycle(
             continue;
         }
 
-        if claim::is_mr_claimed(&mr.labels) {
+        if claim::has_our_mr_claim(&mr.labels, agent_id) {
+            warn!(
+                "{}: MR !{} still has our claim label, releasing before retry",
+                agent_id, mr.iid
+            );
+            release_mr_claim_or_warn(gitlab, mr.iid, agent_id);
+        } else if claim::is_mr_claimed(&mr.labels) {
             debug!("{}: MR !{} already claimed, skipping", agent_id, mr.iid);
             continue;
         }
 
-        if has_unresolved_comments(gitlab, mr.iid) {
-            continue;
+        match has_unresolved_comments(gitlab, mr.iid) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    "{}: Could not check discussions for MR !{}: {}, skipping this cycle",
+                    agent_id, mr.iid, e
+                );
+                continue;
+            }
         }
 
         if !claim::try_claim_mr(gitlab, mr.iid, agent_id, shutdown)? {
@@ -297,7 +316,7 @@ fn reviewer_cycle(
         }
 
         if shutdown.load(Ordering::SeqCst) {
-            let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
+            release_mr_claim_or_warn(gitlab, mr.iid, agent_id);
             return Ok(());
         }
 
@@ -317,7 +336,7 @@ fn reviewer_cycle(
             Ok(ReviewOutcome::Merged) => {
                 info!("{}: MR !{} approved and merged", agent_id, mr.iid);
                 merged_mrs.insert(mr.iid);
-                let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
+                release_mr_claim_or_warn(gitlab, mr.iid, agent_id);
                 *claimed_mr_iid = None;
             }
             Ok(ReviewOutcome::ApprovedWithoutMerge) => {
@@ -325,7 +344,7 @@ fn reviewer_cycle(
                     "{}: MR !{} approved without merge, releasing claim",
                     agent_id, mr.iid
                 );
-                let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
+                release_mr_claim_or_warn(gitlab, mr.iid, agent_id);
                 *claimed_mr_iid = None;
             }
             Ok(ReviewOutcome::NeedsChanges) => {
@@ -333,12 +352,12 @@ fn reviewer_cycle(
                     "{}: MR !{} reviewed with feedback, releasing claim",
                     agent_id, mr.iid
                 );
-                let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
+                release_mr_claim_or_warn(gitlab, mr.iid, agent_id);
                 *claimed_mr_iid = None;
             }
             Err(e) => {
                 error!("{}: Failed to review MR !{}: {}", agent_id, mr.iid, e);
-                let _ = claim::release_mr_claim(gitlab, mr.iid, agent_id);
+                release_mr_claim_or_warn(gitlab, mr.iid, agent_id);
                 *claimed_mr_iid = None;
                 if shutdown.load(Ordering::SeqCst) {
                     return Ok(());
@@ -354,11 +373,11 @@ fn reviewer_cycle(
 
 /// Check if the MR has any resolvable discussion threads that are still unresolved,
 /// using the GitLab discussions API `resolved` / `resolvable` fields.
-fn has_unresolved_comments(gitlab: &GitLabClient, mr_iid: u64) -> bool {
+fn has_unresolved_comments(gitlab: &GitLabClient, mr_iid: u64) -> Result<bool> {
     match gitlab.get_unresolved_discussion_count(mr_iid) {
         Ok((unresolved, total)) => {
             if unresolved > 0 {
-                return true;
+                return Ok(true);
             }
             if total > 0 {
                 info!(
@@ -366,15 +385,18 @@ fn has_unresolved_comments(gitlab: &GitLabClient, mr_iid: u64) -> bool {
                     mr_iid, total
                 );
             }
-            false
+            Ok(false)
         }
-        Err(e) => {
-            warn!(
-                "Failed to fetch discussions for MR !{}: {}, skipping to be safe",
-                mr_iid, e
-            );
-            true
-        }
+        Err(e) => Err(e.context(format!("Failed to fetch discussions for MR !{mr_iid}"))),
+    }
+}
+
+fn release_mr_claim_or_warn(gitlab: &GitLabClient, mr_iid: u64, agent_id: &str) {
+    if let Err(e) = claim::release_mr_claim(gitlab, mr_iid, agent_id) {
+        warn!(
+            "{}: Failed to release claim on MR !{}: {}",
+            agent_id, mr_iid, e
+        );
     }
 }
 
@@ -492,12 +514,21 @@ fn review_merge_request(
 
         // Re-check for unresolved discussions before merging — another reviewer
         // or the worker may have left new comments during the review.
-        if has_unresolved_comments(gitlab, mr.iid) {
-            warn!(
-                "MR !{} approved but has unresolved discussions, skipping merge",
-                mr.iid
-            );
-            return Ok(ReviewOutcome::NeedsChanges);
+        match has_unresolved_comments(gitlab, mr.iid) {
+            Ok(true) => {
+                warn!(
+                    "MR !{} approved but has unresolved discussions, skipping merge",
+                    mr.iid
+                );
+                return Ok(ReviewOutcome::NeedsChanges);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(e.context(format!(
+                    "Could not verify discussions are resolved for MR !{} before merge",
+                    mr.iid
+                )));
+            }
         }
 
         if config.merge_when_approved {
@@ -968,7 +999,7 @@ fn find_claimed_mr(
     gitlab: &GitLabClient,
     scope_label: Option<&str>,
 ) -> Option<u64> {
-    let claim_label = format!("claimed:{}", agent_id);
+    let claim_label = claim::claim_label(agent_id);
 
     match gitlab.list_merge_requests() {
         Ok(mrs) => {
