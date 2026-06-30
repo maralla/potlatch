@@ -65,6 +65,43 @@ impl GitRepo {
         })
     }
 
+    /// Fetch the latest tips for specific remote branches (e.g. MR source and target).
+    pub fn fetch_branches(&self, branches: &[&str]) -> Result<()> {
+        if branches.is_empty() {
+            return self.fetch();
+        }
+
+        let spec: Vec<String> = branches
+            .iter()
+            .map(|branch| format!("{branch}:refs/remotes/origin/{branch}"))
+            .collect();
+        let mut args = vec!["fetch", "origin"];
+        args.extend(spec.iter().map(String::as_str));
+
+        with_transient_retries(
+            &format!("git fetch branches {:?} in {}", branches, self.path),
+            || {
+                debug!("Fetching branches {:?} in {}", branches, self.path);
+
+                let output = Command::new("git")
+                    .args(&args)
+                    .current_dir(&self.path)
+                    .output()
+                    .context("Failed to execute git fetch for branches")?;
+
+                if !output.status.success() {
+                    anyhow::bail!("Git fetch failed: {}", Self::command_error(&output));
+                }
+
+                Ok(())
+            },
+        )
+    }
+
+    pub fn remote_short_sha(&self, branch: &str) -> Result<String> {
+        self.rev_parse(&format!("origin/{branch}"))
+    }
+
     pub fn get_default_branch(&self) -> Result<String> {
         let output = Command::new("git")
             .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
@@ -183,6 +220,142 @@ impl GitRepo {
             .context("Failed to execute git merge")?;
 
         Ok(output.status.success())
+    }
+
+    /// Paths with unmerged index entries (merge/rebase in progress).
+    pub fn list_unmerged_paths(&self) -> Result<Vec<String>> {
+        let output = Command::new("git")
+            .args(["diff", "--name-only", "--diff-filter=U"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to list unmerged paths")?;
+
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    /// Tracked or untracked files that still contain Git conflict markers.
+    pub fn list_conflict_marker_files(&self) -> Result<Vec<String>> {
+        let output = Command::new("git")
+            .args(["grep", "-l", "^<<<<<<<"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to scan for conflict markers")?;
+
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect());
+        }
+
+        // git grep exits 1 when there are no matches.
+        if output.status.code() == Some(1) {
+            return Ok(Vec::new());
+        }
+
+        anyhow::bail!(
+            "git grep for conflict markers failed: {}",
+            Self::command_error(&output)
+        );
+    }
+
+    /// True when the working tree still has an in-progress merge or conflict markers.
+    pub fn merge_conflicts_present(&self) -> Result<bool> {
+        Ok(!self.list_unmerged_paths()?.is_empty()
+            || !self.list_conflict_marker_files()?.is_empty())
+    }
+
+    /// True when `git merge` left a merge in progress (`.git/MERGE_HEAD` exists).
+    pub fn is_merge_in_progress(&self) -> Result<bool> {
+        let output = Command::new("git")
+            .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to check merge in progress")?;
+        Ok(output.status.success())
+    }
+
+    /// Returns true when `origin/<branch>` is an ancestor of `descendant_rev`.
+    pub fn remote_branch_is_ancestor_of(&self, branch: &str, descendant_rev: &str) -> Result<bool> {
+        let output = Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &format!("origin/{branch}"),
+                descendant_rev,
+            ])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to check branch ancestry")?;
+        Ok(output.status.success())
+    }
+
+    /// Ensure `HEAD` contains all commits from `origin/<target>`, merging if needed.
+    /// Returns `Ok(true)` when the branch is mergeable/up-to-date, `Ok(false)` when conflicts remain.
+    pub fn verify_up_to_date_with_target(&self, target: &str) -> Result<bool> {
+        if self.merge_conflicts_present()? || self.is_merge_in_progress()? {
+            return Ok(false);
+        }
+        if self.remote_branch_is_ancestor_of(target, "HEAD")? {
+            return Ok(true);
+        }
+        self.try_merge(target)
+    }
+
+    /// When a merge is in progress and conflict markers are gone, stage unmerged paths
+    /// so Git treats them as resolved (common when the agent edits files but does not run `git add`).
+    pub fn stage_resolved_unmerged_paths(&self) -> Result<bool> {
+        if !self.is_merge_in_progress()? {
+            return Ok(false);
+        }
+        if !self.list_conflict_marker_files()?.is_empty() {
+            return Ok(false);
+        }
+        let unmerged = self.list_unmerged_paths()?;
+        if unmerged.is_empty() {
+            return Ok(false);
+        }
+        for path in &unmerged {
+            let output = Command::new("git")
+                .args(["add", "--", path])
+                .current_dir(&self.path)
+                .output()
+                .with_context(|| format!("Failed to git add resolved merge path {path}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "Git add failed for {path}: {}",
+                    Self::command_error(&output)
+                );
+            }
+        }
+        Ok(self.list_unmerged_paths()?.is_empty())
+    }
+
+    /// Conclude an in-progress merge when conflict markers are gone and all paths are staged.
+    pub fn complete_merge_if_ready(&self, message: &str) -> Result<bool> {
+        if !self.is_merge_in_progress()? {
+            return Ok(false);
+        }
+        let _ = self.stage_resolved_unmerged_paths()?;
+        self.add_all()?;
+        if !self.list_conflict_marker_files()?.is_empty() {
+            return Ok(false);
+        }
+        if !self.list_unmerged_paths()?.is_empty() {
+            return Ok(false);
+        }
+        if !self.has_staged_changes()? {
+            return Ok(false);
+        }
+        self.commit(message)?;
+        Ok(true)
     }
 
     pub fn rev_parse(&self, rev: &str) -> Result<String> {
@@ -441,5 +614,90 @@ impl GitRepo {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            GitRepo::command_error(&output)
+        );
+    }
+
+    #[test]
+    fn list_conflict_marker_files_detects_leftover_markers() {
+        let dir =
+            std::env::temp_dir().join(format!("potlatch-git-conflict-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        run_git(&dir, &["init"]);
+        run_git(&dir, &["config", "user.email", "test@example.com"]);
+        run_git(&dir, &["config", "user.name", "test"]);
+        fs::write(dir.join("conflicted.rs"), "fn main() {\n<<<<<<< HEAD\n}\n").unwrap();
+        run_git(&dir, &["add", "conflicted.rs"]);
+        run_git(&dir, &["commit", "-m", "add conflict markers"]);
+
+        let repo = GitRepo::new(dir.to_string_lossy().into_owned());
+        let files = repo.list_conflict_marker_files().unwrap();
+        assert_eq!(files, vec!["conflicted.rs".to_string()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_resolved_unmerged_paths_stages_clean_unmerged_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-git-stage-unmerged-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        run_git(&dir, &["init", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "test@example.com"]);
+        run_git(&dir, &["config", "user.name", "test"]);
+        fs::write(dir.join("file.txt"), "base\n").unwrap();
+        run_git(&dir, &["add", "file.txt"]);
+        run_git(&dir, &["commit", "-m", "base"]);
+
+        run_git(&dir, &["checkout", "-b", "feature"]);
+        fs::write(dir.join("file.txt"), "feature\n").unwrap();
+        run_git(&dir, &["commit", "-am", "feature"]);
+
+        run_git(&dir, &["checkout", "main"]);
+        fs::write(dir.join("file.txt"), "main\n").unwrap();
+        run_git(&dir, &["commit", "-am", "main"]);
+
+        let merge = Command::new("git")
+            .args(["merge", "feature", "--no-edit"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(!merge.status.success());
+
+        fs::write(dir.join("file.txt"), "resolved\n").unwrap();
+
+        let repo = GitRepo::new(dir.to_string_lossy().into_owned());
+        assert!(repo.is_merge_in_progress().unwrap());
+        assert!(!repo.list_unmerged_paths().unwrap().is_empty());
+        assert!(repo.stage_resolved_unmerged_paths().unwrap());
+        assert!(repo.list_unmerged_paths().unwrap().is_empty());
+        assert!(repo.complete_merge_if_ready("Merge feature").unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

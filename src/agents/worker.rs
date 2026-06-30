@@ -1320,7 +1320,10 @@ fn handle_mr_comments(
             .collect()
     };
 
-    state.git_repo.fetch()?;
+    state.git_repo.fetch_branches(&[
+        latest_mr.target_branch.as_str(),
+        latest_mr.source_branch.as_str(),
+    ])?;
     let _ = state.git_repo.reset_hard();
 
     state
@@ -1351,13 +1354,20 @@ fn handle_mr_comments(
     );
 
     // Merge the latest target branch so the worker has up-to-date upstream code.
-    let merge_ok = state.git_repo.merge_no_abort(&latest_mr.target_branch)?;
-    if !merge_ok {
+    let local_merge_clean = state.git_repo.merge_no_abort(&latest_mr.target_branch)?;
+    if !local_merge_clean {
         warn!(
             "MR !{}: source branch has conflicts with {}, worker agent will resolve them",
             latest_mr.iid, latest_mr.target_branch
         );
     }
+    let requires_conflict_resolution = latest_mr.has_conflicts || !local_merge_clean;
+    let merge_conflict_status = build_merge_conflict_status_section(
+        &latest_mr,
+        requires_conflict_resolution,
+        local_merge_clean,
+        &state.git_repo,
+    )?;
 
     let issue_number = linked_issue_iid
         .or_else(|| extract_issue_number_from_branch(&latest_mr.source_branch).ok());
@@ -1384,16 +1394,17 @@ fn handle_mr_comments(
             "{}-mr-feedback-and-diff-{}.md",
             &state.agent_id, latest_mr.iid
         ),
-        &build_combined_mr_feedback_context(
-            &state.project_name,
-            &latest_mr,
-            &issue_context,
-            &implementation_summary,
-            &unresolved_comments_text,
-            &plain_comments_text,
-            &all_comments_text,
-            &diff_context_content,
-        ),
+        &build_combined_mr_feedback_context(CombinedMrFeedbackContextInput {
+            project_name: &state.project_name,
+            mr: &latest_mr,
+            issue_context: &issue_context,
+            implementation_summary: &implementation_summary,
+            merge_conflict_status: &merge_conflict_status,
+            unresolved_comments_text: &unresolved_comments_text,
+            plain_comments_text: &plain_comments_text,
+            all_comments_text: &all_comments_text,
+            diff_context: &diff_context_content,
+        }),
     )?;
 
     let feedback_scope_rules = get_feedback_scope_rules();
@@ -1419,6 +1430,9 @@ CRITICAL REQUIREMENTS:
 - Make all necessary code changes to resolve the comments
 - Keep the original issue requirements in mind while addressing feedback
 - If the workspace has merge conflict markers (<<<<<<< / ======= / >>>>>>>), resolve ALL of them before doing anything else. Edit each conflicted file to keep the correct version.
+- Read the **Merge conflict status** section in the task context file. It is verified by Potlatch. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
+- Potlatch will refuse to mark review threads resolved while GitLab still reports merge conflicts or conflict markers remain in the branch.
+- Potlatch already fetched `origin/{}` and merged it into your workspace when conflicts were reported. Edit the listed conflicted files, remove all conflict markers, and leave committing/pushing to Potlatch. Do not claim the conflict is fixed until the **Merge conflict status** section shows a clean merge with the fetched target tip.
 
 {}
 
@@ -1426,7 +1440,7 @@ INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly.
 2. Read the task context file above before making any changes, including "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context".
 3. In that combined file, use inline comment locations (`path:line` or `path:start-end`) to find corresponding hunks in the diff section and make targeted fixes.
-4. First, check for merge conflicts. If any exist, resolve ALL conflicts in every file before proceeding.
+4. First, check for merge conflicts using the **Merge conflict status** section and your workspace. If any exist, resolve ALL conflicts in every file, commit the resolution, and verify the target branch merges cleanly before claiming completion.
 5. Review the original issue and what was implemented
 6. Review ALL comments to understand the full conversation and context, including simple comments that do not require resolution.
 7. Identify which feedback items still need action. Treat comments in "Unresolved MR comments to address" as actionable threaded feedback. Also consider comments in "Plain MR comments to consider" actionable when they ask for changes, but remember they are plain MR comments and cannot be marked resolved. Use the full comment history only for context, clarification, and avoiding stale assumptions.
@@ -1455,6 +1469,7 @@ INSTRUCTIONS:
    The public reply must exactly match the committed changes from this run. Mention only feedback items you actually resolved in code or MR metadata. If you did not change code/metadata for an item, say so with MARK_DISCUSSIONS_RESOLVED: no instead of implying it was fixed.
 16. Control whether GitLab should mark open review discussions as resolved after your reply:
    - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
+   - For merge-conflict feedback: use `yes` only after you committed and pushed a branch that merges cleanly with `origin/{}` with no conflict markers left. If conflicts remain, use `no`.
    - `MARK_DISCUSSIONS_RESOLVED: yes` is also correct when you verified that no code change is needed because the branch already satisfies the reviewer request. In that case, PUBLIC_COMMENT must explain the existing behavior specifically instead of saying only "no changes needed".
    - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not resolve the comment (e.g. partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
    - If you omit this line: the system assumes `yes` only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set `MARK_DISCUSSIONS_RESOLVED: yes` explicitly when the feedback is resolved.
@@ -1471,7 +1486,9 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         latest_mr.iid,
         latest_mr.title,
         combined_context_path,
-        feedback_scope_rules
+        latest_mr.target_branch,
+        feedback_scope_rules,
+        latest_mr.target_branch
     );
 
     let agent_output = if let Some(issue_iid) = issue_number {
@@ -1578,12 +1595,22 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
 
     // Detect all changes the agent made: working tree, staged, or committed
     // (even if the agent disobeyed and ran git commit/push itself).
-    // Re-fetch in case the agent pushed.
-    state.git_repo.fetch()?;
-    let has_new_changes = state.git_repo.has_changes_since(&pre_agent_sha)?;
+    state.git_repo.fetch_branches(&[
+        latest_mr.target_branch.as_str(),
+        latest_mr.source_branch.as_str(),
+    ])?;
+    let mut has_new_changes = state.git_repo.has_changes_since(&pre_agent_sha)?;
 
-    if has_new_changes {
-        // Stage and commit any uncommitted leftovers
+    if state.git_repo.is_merge_in_progress()? {
+        if state.git_repo.stage_resolved_unmerged_paths()? {
+            info!(
+                "MR !{}: staged merge-conflict files with no remaining conflict markers",
+                latest_mr.iid
+            );
+        }
+        state.git_repo.add_all()?;
+        has_new_changes = state.git_repo.has_changes_since(&pre_agent_sha)?;
+    } else if has_new_changes {
         state.git_repo.add_all()?;
         let summary_for_commit = extract_changes_summary(&agent_output);
         if state.git_repo.has_staged_changes()? {
@@ -1592,13 +1619,61 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         }
     }
 
+    let merge_commit_msg = build_commit_message(
+        &format!(
+            "Merge origin/{} into {}",
+            latest_mr.target_branch, latest_mr.source_branch
+        ),
+        issue_number.unwrap_or(0),
+    );
+    if state.git_repo.complete_merge_if_ready(&merge_commit_msg)? {
+        has_new_changes = true;
+        info!(
+            "MR !{}: concluded in-progress merge with origin/{}",
+            latest_mr.iid, latest_mr.target_branch
+        );
+    }
+
+    let mut conflicts_unresolved = state.git_repo.merge_conflicts_present()?;
+    if requires_conflict_resolution {
+        state.git_repo.fetch_branches(&[
+            latest_mr.target_branch.as_str(),
+            latest_mr.source_branch.as_str(),
+        ])?;
+        if !state
+            .git_repo
+            .verify_up_to_date_with_target(&latest_mr.target_branch)?
+        {
+            conflicts_unresolved = true;
+            warn!(
+                "MR !{}: branch still does not merge cleanly with origin/{} (fetched latest target and source)",
+                latest_mr.iid, latest_mr.target_branch
+            );
+        } else if state.git_repo.has_changes_since(&pre_agent_sha)? {
+            has_new_changes = true;
+            state.git_repo.add_all()?;
+            if state.git_repo.has_staged_changes()? {
+                state.git_repo.commit(&merge_commit_msg)?;
+            }
+        }
+    }
+
+    if !conflicts_unresolved {
+        conflicts_unresolved = state.git_repo.merge_conflicts_present()?;
+    }
+
     let diff_highlights = if has_new_changes {
         build_diff_highlights_since(&state.git_repo, &pre_agent_sha)
     } else {
         None
     };
 
-    if has_new_changes {
+    if has_new_changes && conflicts_unresolved {
+        warn!(
+            "MR !{}: not pushing — merge conflicts with origin/{} are still unresolved",
+            latest_mr.iid, latest_mr.target_branch
+        );
+    } else if has_new_changes {
         state.git_repo.push(&latest_mr.source_branch)?;
         info!(
             "Pushed changes addressing feedback for MR !{}",
@@ -1611,17 +1686,23 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         );
     }
 
+    let mr_now = state.glab.get_merge_request(latest_mr.iid)?;
+    if mr_now.has_conflicts {
+        conflicts_unresolved = true;
+        warn!(
+            "MR !{}: GitLab still reports merge conflicts after worker run",
+            latest_mr.iid
+        );
+    }
+    let mr_gitlab_surface_changed = merge_request_surface_changed(&latest_mr, &mr_now);
+
+    // Only auto-resolve when the branch tip actually changed. MR metadata-only
+    // changes (title/description/labels) can happen without addressing feedback.
     let post_origin_head = state
         .git_repo
         .rev_parse(&format!("origin/{}", latest_mr.source_branch))
         .unwrap_or_else(|_| pre_agent_sha.clone());
     let branch_tip_changed = post_origin_head.trim() != pre_agent_sha.trim();
-
-    let mr_now = state.glab.get_merge_request(latest_mr.iid)?;
-    let mr_gitlab_surface_changed = merge_request_surface_changed(&latest_mr, &mr_now);
-
-    // Only auto-resolve when the branch tip actually changed. MR metadata-only
-    // changes (title/description/labels) can happen without addressing feedback.
     let implicit_resolve_discussions = has_new_changes || branch_tip_changed;
     if mr_gitlab_surface_changed && !implicit_resolve_discussions {
         info!(
@@ -1645,6 +1726,15 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     let should_post_plain_comment = should_post_plain_comment(&agent_output);
     let needs_reply_body =
         !ids_to_resolve.is_empty() || (!plain_comments.is_empty() && should_post_plain_comment);
+
+    if requires_conflict_resolution && conflicts_unresolved {
+        info!(
+            "MR !{}: merge conflicts with origin/{} remain; skipping GitLab replies until the branch merges cleanly",
+            latest_mr.iid, latest_mr.target_branch
+        );
+        return Ok(false);
+    }
+
     let reply_body = if needs_reply_body {
         let reply_raw = if let Some(block) = extract_public_comment_block(&agent_output.response) {
             block
@@ -1664,8 +1754,17 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     } else {
         None
     };
-    let resolve_discussions =
-        should_resolve_mr_feedback_discussions(&agent_output, implicit_resolve_discussions);
+    let resolve_discussions = feedback_discussions_may_be_resolved(
+        &agent_output,
+        implicit_resolve_discussions,
+        conflicts_unresolved,
+    );
+    if conflicts_unresolved && parse_mark_discussions_resolved(&agent_output) == Some(true) {
+        warn!(
+            "MR !{}: ignoring agent request to mark discussions resolved while merge conflicts remain",
+            latest_mr.iid
+        );
+    }
     if !resolve_discussions && !ids_to_resolve.is_empty() {
         info!(
             "MR !{}: posting feedback replies without resolving discussions (MARK_DISCUSSIONS_RESOLVED: no and no implicit resolving actions)",
@@ -2518,43 +2617,141 @@ fn format_comments_for_prompt(comments: &[crate::agents::gitlab::Comment]) -> St
         .join("\n")
 }
 
-fn build_combined_mr_feedback_context(
-    project_name: &str,
-    mr: &crate::agents::gitlab::MergeRequest,
-    issue_context: &str,
-    implementation_summary: &str,
-    unresolved_comments_text: &str,
-    plain_comments_text: &str,
-    all_comments_text: &str,
-    diff_context: &str,
-) -> String {
+struct CombinedMrFeedbackContextInput<'a> {
+    project_name: &'a str,
+    mr: &'a crate::agents::gitlab::MergeRequest,
+    issue_context: &'a str,
+    implementation_summary: &'a str,
+    merge_conflict_status: &'a str,
+    unresolved_comments_text: &'a str,
+    plain_comments_text: &'a str,
+    all_comments_text: &'a str,
+    diff_context: &'a str,
+}
+
+fn build_combined_mr_feedback_context(input: CombinedMrFeedbackContextInput<'_>) -> String {
     format!(
-        "# Merge Request Feedback + Diff Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n## Original issue context\n{issue_context}\n\n## Original implementation summary\n{implementation_summary}\n\n## MR description\n{mr_description}\n\n## Unresolved MR comments to address\n{unresolved_comments_text}\n\n## Plain MR comments to consider\n{plain_comments_text}\n\n## Full MR comment history for context\n{all_comments_text}\n\n## MR diff context\n{diff_context}\n",
-        project_name = project_name,
-        mr_iid = mr.iid,
-        mr_title = mr.title,
-        source_branch = mr.source_branch,
-        target_branch = mr.target_branch,
-        issue_context = issue_context,
-        implementation_summary = implementation_summary,
-        mr_description = mr.description,
-        unresolved_comments_text = if unresolved_comments_text.trim().is_empty() {
+        "# Merge Request Feedback + Diff Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n{merge_conflict_status}\n\n## Original issue context\n{issue_context}\n\n## Original implementation summary\n{implementation_summary}\n\n## MR description\n{mr_description}\n\n## Unresolved MR comments to address\n{unresolved_comments_text}\n\n## Plain MR comments to consider\n{plain_comments_text}\n\n## Full MR comment history for context\n{all_comments_text}\n\n## MR diff context\n{diff_context}\n",
+        project_name = input.project_name,
+        mr_iid = input.mr.iid,
+        mr_title = input.mr.title,
+        source_branch = input.mr.source_branch,
+        target_branch = input.mr.target_branch,
+        merge_conflict_status = input.merge_conflict_status,
+        issue_context = input.issue_context,
+        implementation_summary = input.implementation_summary,
+        mr_description = input.mr.description,
+        unresolved_comments_text = if input.unresolved_comments_text.trim().is_empty() {
             "No unresolved comments.".to_string()
         } else {
-            unresolved_comments_text.to_string()
+            input.unresolved_comments_text.to_string()
         },
-        plain_comments_text = if plain_comments_text.trim().is_empty() {
+        plain_comments_text = if input.plain_comments_text.trim().is_empty() {
             "No plain MR comments.".to_string()
         } else {
-            plain_comments_text.to_string()
+            input.plain_comments_text.to_string()
         },
-        all_comments_text = if all_comments_text.trim().is_empty() {
+        all_comments_text = if input.all_comments_text.trim().is_empty() {
             "No MR comments.".to_string()
         } else {
-            all_comments_text.to_string()
+            input.all_comments_text.to_string()
         },
-        diff_context = diff_context
+        diff_context = input.diff_context
     )
+}
+
+fn build_merge_conflict_status_section(
+    mr: &crate::agents::gitlab::MergeRequest,
+    requires_conflict_resolution: bool,
+    local_merge_clean: bool,
+    git_repo: &GitRepo,
+) -> Result<String> {
+    let unmerged = git_repo.list_unmerged_paths()?;
+    let marker_files = git_repo.list_conflict_marker_files()?;
+    let target_sha = git_repo
+        .remote_short_sha(&mr.target_branch)
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    let source_sha = git_repo
+        .remote_short_sha(&mr.source_branch)
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    let mut lines = vec![
+        "## Merge conflict status (verified by Potlatch — trust this section)".to_string(),
+        format!(
+            "- Fetched `origin/{}` at commit: {}",
+            mr.target_branch, target_sha
+        ),
+        format!(
+            "- Fetched `origin/{}` at commit: {}",
+            mr.source_branch, source_sha
+        ),
+        format!(
+            "- GitLab reports merge conflicts on this MR: {}",
+            if mr.has_conflicts { "yes" } else { "no" }
+        ),
+        format!(
+            "- Local merge of `origin/{}` into `origin/{}` at task start: {}",
+            mr.target_branch,
+            mr.source_branch,
+            if local_merge_clean {
+                "clean (no conflict markers introduced locally)"
+            } else {
+                "FAILED — conflict markers and/or unmerged paths are present in your workspace"
+            }
+        ),
+        format!(
+            "- Merge currently in progress in workspace: {}",
+            if git_repo.is_merge_in_progress().unwrap_or(false) {
+                "yes — resolve every unmerged file, then Potlatch will conclude the merge commit"
+            } else {
+                "no"
+            }
+        ),
+        format!(
+            "- Conflict resolution required this run: {}",
+            if requires_conflict_resolution {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+    ];
+
+    if unmerged.is_empty() {
+        lines.push("- Unmerged paths in workspace: none".to_string());
+    } else {
+        lines.push("- Unmerged paths in workspace:".to_string());
+        for path in &unmerged {
+            lines.push(format!("  - {path}"));
+        }
+    }
+
+    if marker_files.is_empty() {
+        lines.push("- Files containing `<<<<<<<` conflict markers: none".to_string());
+    } else {
+        lines.push("- Files containing `<<<<<<<` conflict markers:".to_string());
+        for path in &marker_files {
+            lines.push(format!("  - {path}"));
+        }
+    }
+
+    if requires_conflict_resolution {
+        lines.push(
+            "- After editing conflicted files, remove every conflict marker. Potlatch will `git add` resolved files and conclude the merge commit; you do not need to run git commands.".to_string(),
+        );
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn feedback_discussions_may_be_resolved(
+    agent_output: &AgentHandoff,
+    implicit_from_actions: bool,
+    conflicts_unresolved: bool,
+) -> bool {
+    if conflicts_unresolved {
+        return false;
+    }
+    should_resolve_mr_feedback_discussions(agent_output, implicit_from_actions)
 }
 
 fn extract_no_change_resolution_reason(agent_output: &AgentHandoff) -> Option<String> {
@@ -3391,6 +3588,16 @@ mod tests {
     }
 
     #[test]
+    fn feedback_discussions_may_be_resolved_blocks_while_conflicts_remain() {
+        let out = AgentHandoff {
+            response: "MARK_DISCUSSIONS_RESOLVED: yes\n".to_string(),
+            ..Default::default()
+        };
+        assert!(!feedback_discussions_may_be_resolved(&out, true, true));
+        assert!(feedback_discussions_may_be_resolved(&out, true, false));
+    }
+
+    #[test]
     fn combined_mr_feedback_context_separates_unresolved_and_full_history() {
         let mr = crate::agents::gitlab::MergeRequest {
             iid: 287,
@@ -3403,17 +3610,19 @@ mod tests {
             labels: None,
             has_conflicts: false,
         };
-        let ctx = build_combined_mr_feedback_context(
-            "project",
-            &mr,
-            "issue context",
-            "implementation summary",
-            "- reviewer (discussion d1): fix this",
-            "- reviewer (discussion d2): plain actionable note",
-            "- reviewer (discussion d1): fix this\n- maintainer (discussion d2): simple context",
-            "diff context",
-        );
+        let ctx = build_combined_mr_feedback_context(CombinedMrFeedbackContextInput {
+            project_name: "project",
+            mr: &mr,
+            issue_context: "issue context",
+            implementation_summary: "implementation summary",
+            merge_conflict_status: "## Merge conflict status\n- GitLab reports merge conflicts on this MR: no",
+            unresolved_comments_text: "- reviewer (discussion d1): fix this",
+            plain_comments_text: "- reviewer (discussion d2): plain actionable note",
+            all_comments_text: "- reviewer (discussion d1): fix this\n- maintainer (discussion d2): simple context",
+            diff_context: "diff context",
+        });
 
+        assert!(ctx.contains("## Merge conflict status"));
         assert!(ctx.contains("## Unresolved MR comments to address"));
         assert!(ctx.contains("## Plain MR comments to consider"));
         assert!(ctx.contains("## Full MR comment history for context"));
