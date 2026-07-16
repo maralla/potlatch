@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::retry::with_transient_retries;
 
@@ -489,17 +489,34 @@ impl GitRepo {
 
     pub fn delete_remote_branch(&self, branch_name: &str) -> Result<()> {
         with_transient_retries(&format!("git push --delete origin {branch_name}"), || {
-            debug!("Deleting remote branch origin/{}", branch_name);
-            let output = Command::new("git")
-                .args(["push", "origin", "--delete", branch_name])
-                .current_dir(&self.path)
-                .output()
-                .context("Failed to delete remote branch")?;
-            if !output.status.success() {
-                anyhow::bail!("Git push --delete failed: {}", Self::command_error(&output));
-            }
-            Ok(())
+            self.delete_remote_branch_once(branch_name)
         })
+    }
+
+    /// Best-effort remote branch delete for cleanup paths that must not block the agent loop.
+    pub fn delete_remote_branch_best_effort(&self, branch_name: &str) {
+        match self.delete_remote_branch_once(branch_name) {
+            Ok(()) => {}
+            Err(e) => {
+                warn!(
+                    "Best-effort delete of remote branch {} failed: {}",
+                    branch_name, e
+                );
+            }
+        }
+    }
+
+    fn delete_remote_branch_once(&self, branch_name: &str) -> Result<()> {
+        debug!("Deleting remote branch origin/{}", branch_name);
+        let output = Command::new("git")
+            .args(["push", "origin", "--delete", branch_name])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to delete remote branch")?;
+        if !output.status.success() {
+            anyhow::bail!("Git push --delete failed: {}", Self::command_error(&output));
+        }
+        Ok(())
     }
 
     pub fn has_staged_changes(&self) -> Result<bool> {

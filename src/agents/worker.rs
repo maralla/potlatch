@@ -60,6 +60,7 @@ impl WorkerAgentSettings {
 }
 
 /// The single issue a worker is pinned to for its full lifecycle.
+#[derive(Clone)]
 struct ActiveIssue {
     issue_iid: u64,
     mr_iid: Option<u64>,
@@ -195,7 +196,7 @@ impl AgentState {
         let _ = self.git_repo.reset_hard();
         let _ = self.git_repo.checkout_remote_branch(&default_branch);
         let _ = self.git_repo.delete_local_branch(&branch);
-        let _ = self.git_repo.delete_remote_branch(&branch);
+        self.git_repo.delete_remote_branch_best_effort(&branch);
         let _ = claim::release_claim(&self.glab, issue_iid, &self.agent_id);
         let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
@@ -375,6 +376,15 @@ fn clear_resumed_issue_if_ignored(
         return None;
     }
 
+    if issue.state != "opened" {
+        info!(
+            "{}: Resumed issue #{} is {}, dropping resume state",
+            &state.agent_id, issue.iid, issue.state
+        );
+        state.abandon_closed_issue(issue.iid, active_issue.mr_iid);
+        return None;
+    }
+
     if issue_has_worker_pending_label(&issue.labels) {
         info!(
             "{}: Resumed issue #{} has `{}` label; releasing worker hold",
@@ -403,6 +413,66 @@ fn clear_resumed_issue_if_ignored(
     Some(active_issue)
 }
 
+/// Returns `true` when the worker should keep watching the active MR issue.
+/// On release, clears `active` and returns `false` so the cycle can poll for new work.
+fn retain_active_mr_issue(
+    state: &AgentState,
+    active_issue: &ActiveIssue,
+    active: &mut Option<ActiveIssue>,
+    scope_label: Option<&str>,
+) -> bool {
+    let Some(mr_iid) = active_issue.mr_iid else {
+        return true;
+    };
+
+    let issue = match state.glab.get_issue(active_issue.issue_iid) {
+        Ok(issue) => issue,
+        Err(e) => {
+            warn!(
+                "{}: Failed to verify active issue #{}: {}, releasing worker state",
+                &state.agent_id, active_issue.issue_iid, e
+            );
+            state.clear_resumed_issue_state(active_issue.issue_iid);
+            *active = None;
+            return false;
+        }
+    };
+
+    if issue.state != "opened" {
+        state.abandon_closed_issue(active_issue.issue_iid, Some(mr_iid));
+        *active = None;
+        return false;
+    }
+
+    if !issue_in_scope(&issue, scope_label) {
+        info!(
+            "{}: Issue #{} left scope label {:?}, releasing worker state",
+            &state.agent_id, active_issue.issue_iid, scope_label
+        );
+        state.clear_resumed_issue_state(active_issue.issue_iid);
+        *active = None;
+        return false;
+    }
+
+    if issue_has_worker_pending_label(&issue.labels) {
+        info!(
+            "{}: Issue #{} has `{}` — stopping MR watch (issue stays open)",
+            &state.agent_id, active_issue.issue_iid, WORKER_PENDING_LABEL
+        );
+        state.clear_resumed_issue_state(active_issue.issue_iid);
+        *active = None;
+        return false;
+    }
+
+    if issue_has_worker_review_only_label(&issue.labels) {
+        state.release_worker_hold_review_only(active_issue.issue_iid);
+        *active = None;
+        return false;
+    }
+
+    true
+}
+
 fn worker_cycle(
     state: &AgentState,
     model: &AgentModel,
@@ -410,119 +480,92 @@ fn worker_cycle(
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Result<()> {
-    // If we have an active issue with an MR, watch the MR
-    if let Some(a) = &*active
-        && let Some(mr_iid) = a.mr_iid
+    // If we have an active issue with an MR, watch the MR unless it should be released.
+    if let Some(a) = active.clone()
+        && a.mr_iid.is_some()
     {
-        // Check if the issue was closed externally (e.g. by PMO stale cleanup)
-        // or no longer matches the configured scope label.
-        if let Ok(issue) = state.glab.get_issue(a.issue_iid) {
-            if issue.state != "opened" {
-                state.abandon_closed_issue(a.issue_iid, Some(mr_iid));
-                *active = None;
-                return Ok(());
-            }
-
-            if !issue_in_scope(&issue, scope_label) {
-                info!(
-                    "{}: Issue #{} left scope label {:?}, releasing worker state",
-                    &state.agent_id, a.issue_iid, scope_label
-                );
-
-                state.clear_resumed_issue_state(a.issue_iid);
-                *active = None;
-                return Ok(());
-            }
-
-            if issue_has_worker_pending_label(&issue.labels) {
-                info!(
-                    "{}: Issue #{} has `{}` — stopping MR watch (issue stays open)",
-                    &state.agent_id, a.issue_iid, WORKER_PENDING_LABEL
-                );
-
-                state.clear_resumed_issue_state(a.issue_iid);
-                *active = None;
-                return Ok(());
-            }
-
-            if issue_has_worker_review_only_label(&issue.labels) {
-                state.release_worker_hold_review_only(a.issue_iid);
-                *active = None;
-                return Ok(());
-            }
-        }
-
-        match state.glab.get_merge_request(mr_iid) {
-            Ok(mr) => {
-                if mr.state == "merged" || mr.state == "closed" {
-                    info!(
-                        "{}: MR !{} is {}, releasing issue #{}",
-                        &state.agent_id, mr_iid, mr.state, a.issue_iid
-                    );
-
-                    let branch = format!("issue-{}", a.issue_iid);
-                    let default_branch = state
-                        .git_repo
-                        .get_default_branch()
-                        .unwrap_or("main".to_string());
-
-                    let _ = state.git_repo.reset_hard();
-                    let _ = state.git_repo.checkout_remote_branch(&default_branch);
-                    let _ = state.git_repo.delete_local_branch(&branch);
-
-                    if mr.state == "merged" {
-                        let _ = state.git_repo.delete_remote_branch(&branch);
-                    }
-
-                    let _ = claim::release_claim(&state.glab, a.issue_iid, &state.agent_id);
-                    let _ = state.glab.remove_issue_label(a.issue_iid, WORKING_ON_LABEL);
-
-                    state.cleanup_session(a.issue_iid);
-
-                    if mr.state == "merged" {
-                        close_issue_best_effort(&state.glab, a.issue_iid);
-                    }
-
-                    *active = None;
-                    return Ok(());
-                }
-
-                match handle_mr_comments(state, model, &mr, Some(a.issue_iid), false) {
-                    Ok(true) => {
+        let still_tracking = retain_active_mr_issue(state, &a, active, scope_label);
+        if still_tracking
+            && let Some(a) = &*active
+            && let Some(mr_iid) = a.mr_iid
+        {
+            match state.glab.get_merge_request(mr_iid) {
+                Ok(mr) => {
+                    if mr.state == "merged" || mr.state == "closed" {
                         info!(
-                            "{}: Issue #{} abandoned, MR !{} closed",
-                            &state.agent_id, a.issue_iid, mr_iid
+                            "{}: MR !{} is {}, releasing issue #{}",
+                            &state.agent_id, mr_iid, mr.state, a.issue_iid
                         );
+
+                        let branch = format!("issue-{}", a.issue_iid);
+                        let default_branch = state
+                            .git_repo
+                            .get_default_branch()
+                            .unwrap_or("main".to_string());
+
+                        let _ = state.git_repo.reset_hard();
+                        let _ = state.git_repo.checkout_remote_branch(&default_branch);
+                        let _ = state.git_repo.delete_local_branch(&branch);
+
+                        if mr.state == "merged" {
+                            state.git_repo.delete_remote_branch_best_effort(&branch);
+                        }
 
                         let _ = claim::release_claim(&state.glab, a.issue_iid, &state.agent_id);
+                        let _ = state.glab.remove_issue_label(a.issue_iid, WORKING_ON_LABEL);
 
                         state.cleanup_session(a.issue_iid);
+
+                        if mr.state == "merged" {
+                            close_issue_best_effort(&state.glab, a.issue_iid);
+                        }
+
                         *active = None;
+                    } else {
+                        match handle_mr_comments(state, model, &mr, Some(a.issue_iid), false) {
+                            Ok(true) => {
+                                info!(
+                                    "{}: Issue #{} abandoned, MR !{} closed",
+                                    &state.agent_id, a.issue_iid, mr_iid
+                                );
+
+                                let _ =
+                                    claim::release_claim(&state.glab, a.issue_iid, &state.agent_id);
+
+                                state.cleanup_session(a.issue_iid);
+                                *active = None;
+                            }
+                            Err(e) => {
+                                if shutdown.load(Ordering::SeqCst) {
+                                    return Ok(());
+                                }
+                                if handle_worker_issue_processing_cancelled(state, a.issue_iid, &e)
+                                {
+                                    *active = None;
+                                    return Ok(());
+                                }
+
+                                error!(
+                                    "{}: Failed to handle comments for MR !{}: {}",
+                                    &state.agent_id, mr_iid, e
+                                );
+                            }
+                            Ok(false) => {}
+                        }
+
+                        if active.is_some() {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("{}: Failed to check MR !{}: {}", &state.agent_id, mr_iid, e);
+                    if active.is_some() {
                         return Ok(());
                     }
-                    Err(e) => {
-                        if shutdown.load(Ordering::SeqCst) {
-                            return Ok(());
-                        }
-                        if handle_worker_issue_processing_cancelled(state, a.issue_iid, &e) {
-                            *active = None;
-                            return Ok(());
-                        }
-
-                        error!(
-                            "{}: Failed to handle comments for MR !{}: {}",
-                            &state.agent_id, mr_iid, e
-                        );
-                    }
-                    Ok(false) => {}
                 }
             }
-            Err(e) => {
-                warn!("{}: Failed to check MR !{}: {}", &state.agent_id, mr_iid, e);
-            }
         }
-
-        return Ok(());
     }
 
     // If we have an active issue without an MR, we were interrupted before
@@ -534,110 +577,118 @@ fn worker_cycle(
         let issue_iid = a.issue_iid;
 
         // Check if the issue was closed externally or left the scope label.
-        if let Ok(issue) = state.glab.get_issue(issue_iid) {
-            if issue.state != "opened" {
+        let mut released = false;
+        match state.glab.get_issue(issue_iid) {
+            Ok(issue) if issue.state != "opened" => {
                 state.abandon_closed_issue(issue_iid, None);
-                *active = None;
-                return Ok(());
+                released = true;
             }
-            if !issue_in_scope(&issue, scope_label) {
+            Ok(issue) if !issue_in_scope(&issue, scope_label) => {
                 info!(
                     "{}: Active issue #{} left scope label {:?}, releasing",
                     &state.agent_id, issue_iid, scope_label
                 );
-
                 state.clear_resumed_issue_state(issue_iid);
-                *active = None;
-                return Ok(());
+                released = true;
             }
-            if issue_has_worker_pending_label(&issue.labels) {
+            Ok(issue) if issue_has_worker_pending_label(&issue.labels) => {
                 info!(
                     "{}: Active issue #{} has `{}` — yielding (issue stays open)",
                     &state.agent_id, issue_iid, WORKER_PENDING_LABEL
                 );
-
                 state.clear_resumed_issue_state(issue_iid);
-                *active = None;
-                return Ok(());
+                released = true;
             }
-
-            if issue_has_worker_review_only_label(&issue.labels) {
+            Ok(issue) if issue_has_worker_review_only_label(&issue.labels) => {
                 state.release_worker_hold_review_only(issue_iid);
-                *active = None;
-                return Ok(());
-            }
-        }
-
-        info!(
-            "{}: Active issue #{} has no MR, re-attempting implementation",
-            &state.agent_id, issue_iid
-        );
-
-        match state.glab.get_issue(issue_iid) {
-            Ok(issue) => {
-                let mut current = ActiveIssue {
-                    issue_iid,
-                    mr_iid: None,
-                    branch_name: None,
-                    mr_created: false,
-                };
-
-                match process_issue(state, model, &issue, &mut current, scope_label) {
-                    Ok(_) => {
-                        if current.mr_created {
-                            if should_track_worker_issue(state, issue_iid) {
-                                *active = Some(current);
-                            } else {
-                                *active = None;
-                            }
-                        } else {
-                            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
-                            state.cleanup_session(issue_iid);
-                            *active = None;
-                        }
-                    }
-                    Err(e) => {
-                        if shutdown.load(Ordering::SeqCst) {
-                            *active = Some(current);
-                            return Ok(());
-                        }
-                        if handle_worker_issue_processing_cancelled(state, issue_iid, &e) {
-                            *active = None;
-                            return Ok(());
-                        }
-                        error!(
-                            "{}: Failed to re-process issue #{}: {}",
-                            &state.agent_id, issue_iid, e
-                        );
-
-                        let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
-                        let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-                        state.cleanup_session(issue_iid);
-                        *active = None;
-                        if let Some(ref branch) = current.branch_name {
-                            let default_branch = state
-                                .git_repo
-                                .get_default_branch()
-                                .unwrap_or("main".to_string());
-                            let _ = state.git_repo.reset_hard();
-                            let _ = state.git_repo.checkout_remote_branch(&default_branch);
-                            let _ = state.git_repo.delete_local_branch(branch);
-                        }
-                    }
-                }
-
-                return Ok(());
+                released = true;
             }
             Err(e) => {
                 warn!(
-                    "{}: Failed to fetch issue #{} for re-attempt: {}, releasing",
+                    "{}: Failed to verify active issue #{}: {}, releasing",
                     &state.agent_id, issue_iid, e
                 );
+                state.clear_resumed_issue_state(issue_iid);
+                released = true;
+            }
+            Ok(_) => {}
+        }
 
-                let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
-                let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-                state.cleanup_session(issue_iid);
-                *active = None;
+        if released {
+            *active = None;
+        } else {
+            info!(
+                "{}: Active issue #{} has no MR, re-attempting implementation",
+                &state.agent_id, issue_iid
+            );
+
+            match state.glab.get_issue(issue_iid) {
+                Ok(issue) => {
+                    let mut current = ActiveIssue {
+                        issue_iid,
+                        mr_iid: None,
+                        branch_name: None,
+                        mr_created: false,
+                    };
+
+                    match process_issue(state, model, &issue, &mut current, scope_label) {
+                        Ok(_) => {
+                            if current.mr_created {
+                                if should_track_worker_issue(state, issue_iid) {
+                                    *active = Some(current);
+                                } else {
+                                    *active = None;
+                                }
+                            } else {
+                                let _ =
+                                    claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                                state.cleanup_session(issue_iid);
+                                *active = None;
+                            }
+                        }
+                        Err(e) => {
+                            if shutdown.load(Ordering::SeqCst) {
+                                *active = Some(current);
+                                return Ok(());
+                            }
+                            if handle_worker_issue_processing_cancelled(state, issue_iid, &e) {
+                                *active = None;
+                                return Ok(());
+                            }
+                            error!(
+                                "{}: Failed to re-process issue #{}: {}",
+                                &state.agent_id, issue_iid, e
+                            );
+
+                            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                            let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+                            state.cleanup_session(issue_iid);
+                            *active = None;
+                            if let Some(ref branch) = current.branch_name {
+                                let default_branch = state
+                                    .git_repo
+                                    .get_default_branch()
+                                    .unwrap_or("main".to_string());
+                                let _ = state.git_repo.reset_hard();
+                                let _ = state.git_repo.checkout_remote_branch(&default_branch);
+                                let _ = state.git_repo.delete_local_branch(branch);
+                            }
+                        }
+                    }
+
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        "{}: Failed to fetch issue #{} for re-attempt: {}, releasing",
+                        &state.agent_id, issue_iid, e
+                    );
+
+                    let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                    let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+                    state.cleanup_session(issue_iid);
+                    *active = None;
+                }
             }
         }
     }
@@ -1821,6 +1872,7 @@ struct SessionFile {
 /// Checks the stored agent_id first, then falls back to checking GitLab labels.
 fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<ActiveIssue> {
     let claim_label = format!("claimed:{}", &state.agent_id);
+    let issue_prefix = format!("{}_issue_", &state.agent_id);
 
     let entries = match fs::read_dir(&state.sessions_dir) {
         Ok(e) => e,
@@ -1834,12 +1886,12 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
         let Ok(file_name) = entry.file_name().into_string() else {
             continue;
         };
-        if !file_name.starts_with("issue_") || !file_name.ends_with(".json") {
+        if !file_name.starts_with(&issue_prefix) || !file_name.ends_with(".json") {
             continue;
         }
 
         let Some(issue_str) = file_name
-            .strip_prefix("issue_")
+            .strip_prefix(&issue_prefix)
             .and_then(|s| s.strip_suffix(".json"))
         else {
             continue;
@@ -1866,6 +1918,12 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                         continue;
                     }
                 };
+
+                if issue.state != "opened" {
+                    let mr_iid = (session.mr_iid > 0).then_some(session.mr_iid);
+                    state.abandon_closed_issue(issue_iid, mr_iid);
+                    continue;
+                }
 
                 if !issue_in_scope(&issue, scope_label) {
                     continue;
@@ -1925,6 +1983,10 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
 
         // Fallback for old session files without agent_id: check GitLab labels
         match state.glab.get_issue(issue_iid) {
+            Ok(issue) if issue.state != "opened" => {
+                let mr_iid = (session.mr_iid > 0).then_some(session.mr_iid);
+                state.abandon_closed_issue(issue_iid, mr_iid);
+            }
             Ok(issue)
                 if issue.labels.contains(&claim_label) && issue_in_scope(&issue, scope_label) =>
             {
@@ -2120,6 +2182,11 @@ fn try_adopt_orphaned_session(
         let Ok(issue) = state.glab.get_issue(issue_iid) else {
             continue;
         };
+
+        if issue.state != "opened" {
+            state.cleanup_session(issue_iid);
+            continue;
+        }
 
         if !issue_in_scope(&issue, scope_label) {
             continue;
