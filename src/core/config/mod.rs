@@ -1,8 +1,12 @@
+mod acp;
 mod agent;
 mod uri;
 
+pub use acp::{
+    AcpClientProfile, AcpSpawnConfig, build_acp_spawn_command, build_profile_command,
+    default_acp_command, parse_acp_profiles, resolve_profile_env,
+};
 pub use agent::{AgentSection, parse_agent_sections};
-pub use uri::ModelUri;
 
 use std::collections::HashMap;
 use std::fs;
@@ -15,6 +19,7 @@ use tracing::{debug, info};
 #[derive(Debug, Clone)]
 pub struct Config {
     agents: HashMap<String, AgentSection>,
+    acp_clients: HashMap<String, AcpClientProfile>,
 }
 
 impl Config {
@@ -33,6 +38,7 @@ impl Config {
             return Ok((
                 Config {
                     agents: HashMap::new(),
+                    acp_clients: HashMap::new(),
                 },
                 String::new(),
             ));
@@ -45,9 +51,18 @@ impl Config {
     pub fn from_toml_str(content: &str) -> Result<Self> {
         let root: Value = toml::from_str(content).context("Failed to parse config file")?;
         let agents = parse_agent_sections(&root)?;
-        debug!("Config loaded: {} agent section(s)", agents.len());
+        let acp_clients = parse_acp_profiles(&root)?;
 
-        Ok(Config { agents })
+        debug!(
+            "Config loaded: {} agent section(s), {} acp client profile(s)",
+            agents.len(),
+            acp_clients.len()
+        );
+
+        Ok(Config {
+            agents,
+            acp_clients,
+        })
     }
 
     fn find_config_file() -> Result<PathBuf> {
@@ -74,6 +89,48 @@ impl Config {
     pub fn agent(&self, name: &str) -> Option<&AgentSection> {
         self.agents.get(name)
     }
+
+    /// Resolve the ACP executable/args, subprocess env, and model for an agent role.
+    pub fn resolve_acp_spawn(&self, section: &AgentSection) -> Result<AcpSpawnConfig> {
+        let model_uri = section
+            .core
+            .model
+            .as_ref()
+            .map(|uri| uri.as_configured().to_string());
+        let endpoint_model = section
+            .core
+            .model
+            .as_ref()
+            .map(|uri| uri.endpoint_model_name().to_string());
+
+        let Some(client_name) = section.core.acp_client.as_deref() else {
+            return Ok(AcpSpawnConfig {
+                command: default_acp_command(),
+                model_uri,
+                endpoint_model: endpoint_model.clone(),
+                spawn_model: endpoint_model,
+                env: HashMap::new(),
+            });
+        };
+
+        let profile = self
+            .acp_clients
+            .get(client_name)
+            .with_context(|| format!("unknown acp_client `{client_name}`"))?;
+
+        let custom_endpoint = profile.base_url.is_some();
+        Ok(AcpSpawnConfig {
+            command: build_profile_command(profile),
+            model_uri,
+            endpoint_model: endpoint_model.clone(),
+            spawn_model: if custom_endpoint {
+                None
+            } else {
+                endpoint_model
+            },
+            env: resolve_profile_env(profile)?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -94,5 +151,85 @@ mod tests {
         let names: Vec<_> = cfg.agent_names().collect();
         assert_eq!(names, vec!["alpha"]);
         assert!(cfg.agent("beta").is_none());
+    }
+
+    #[test]
+    fn agent_without_acp_client_uses_default_command() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [agent.worker]
+            model = "acp://cursor/composer-2"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let section = cfg.agent("worker").unwrap();
+        let spawn = cfg.resolve_acp_spawn(section).unwrap();
+        assert_eq!(spawn.command[0], "agent");
+        assert_eq!(spawn.model_uri.as_deref(), Some("acp://cursor/composer-2"));
+        assert_eq!(spawn.endpoint_model.as_deref(), Some("composer-2"));
+        assert_eq!(spawn.spawn_model.as_deref(), Some("composer-2"));
+        assert!(spawn.env.is_empty());
+    }
+
+    #[test]
+    fn agent_with_acp_client_uses_profile() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.cursor-local]
+            base_url = "http://prod-model1.example/v1"
+            api_key = "EMPTY"
+            acp_command = ["agent-local", "--print", "--trust", "--force", "--approve-mcps", "acp"]
+            env = [
+                "CURSOR_LOCAL_AGENT_BASE_URL={base_url}",
+                "CURSOR_LOCAL_AGENT_API_KEY={api_key}",
+            ]
+
+            [agent.worker]
+            model = "acp://cursor/model1-fp8"
+            acp_client = "cursor-local"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let section = cfg.agent("worker").unwrap();
+        let spawn = cfg.resolve_acp_spawn(section).unwrap();
+        assert_eq!(spawn.command[0], "agent-local");
+        assert_eq!(spawn.model_uri.as_deref(), Some("acp://cursor/model1-fp8"));
+        assert_eq!(spawn.endpoint_model.as_deref(), Some("model1-fp8"));
+        assert!(spawn.spawn_model.is_none());
+        assert_eq!(spawn.command[1], "--base-url");
+        assert_eq!(spawn.command[2], "http://prod-model1.example/v1");
+        assert_eq!(spawn.command[3], "--local-agent-api-key");
+        assert_eq!(spawn.command[4], "EMPTY");
+        assert_eq!(
+            spawn
+                .env
+                .get("CURSOR_LOCAL_AGENT_BASE_URL")
+                .map(String::as_str),
+            Some("http://prod-model1.example/v1")
+        );
+        assert_eq!(
+            spawn
+                .env
+                .get("CURSOR_LOCAL_AGENT_API_KEY")
+                .map(String::as_str),
+            Some("EMPTY")
+        );
+    }
+
+    #[test]
+    fn unknown_acp_client_errors() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [agent.worker]
+            acp_client = "missing"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let section = cfg.agent("worker").unwrap();
+        let err = cfg.resolve_acp_spawn(section).unwrap_err();
+        assert!(err.to_string().contains("unknown acp_client"));
     }
 }

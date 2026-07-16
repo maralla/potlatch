@@ -7,8 +7,19 @@ gitlab_repo = "https://gitlab.com/group/project"
 # Optional: only process issues/MRs that include this label (exact name).
 # scope_label = "potlatch"
 
+# Self-hosted / custom ACP client profile (referenced by agent `acp_client`).
+# [acp.cursor-local]
+# base_url = "http://.."
+# api_key = "EMPTY"
+# acp_command = ["agent-local", "--print", "--trust", "--force", "--approve-mcps", "acp"]
+# env = [
+#   "CURSOR_LOCAL_AGENT_BASE_URL={base_url}",
+#   "CURSOR_LOCAL_AGENT_API_KEY={api_key}",
+# ]
+
 [agent.worker]
 # model = "acp://cursor/composer-2"
+# acp_client = "cursor-local"
 poll_interval_secs = 60
 instances = 1
 

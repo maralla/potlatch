@@ -1208,10 +1208,9 @@ mod tests {
     #[test]
     fn parse_gitlab_repo_ssh_url() {
         let (host, path) =
-            parse_gitlab_repo("git@git.example.com:platform/projects/data-worker.git")
-                .unwrap();
-        assert_eq!(host, "git.example.com");
-        assert_eq!(path, "platform/projects/data-worker");
+            parse_gitlab_repo("git@gitlab.example.com:group/tool/example-project.git").unwrap();
+        assert_eq!(host, "gitlab.example.com");
+        assert_eq!(path, "group/tool/example-project");
     }
 
     #[test]

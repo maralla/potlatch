@@ -1,4 +1,5 @@
-//! Cursor **`agent acp`** runs as **one long-lived subprocess** per Potlatch agent role. Each task
+//! Configurable ACP server command (default: `agent acp`) runs as **one long-lived subprocess**
+//! per Potlatch agent role. Each task
 //! calls **`session/close`** (best effort) then **`session/new`** on the same stdio connection so
 //! the model does not keep prior in-agent transcript; workflow continuity stays in Potlatch’s
 //! state files and token use stays lower than reusing one session for every task.
@@ -14,7 +15,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,6 +34,7 @@ use super::types::{
     session_mode_config_option,
 };
 use crate::core::agent::AgentHandoff;
+use crate::core::config::build_acp_spawn_command;
 
 const TASK_CONTEXT_RESET_GUIDANCE: &str = r#"IMPORTANT CONTEXT HANDLING:
 Treat this assignment as a fresh task. Do not rely on prior chat history or assumptions from earlier assignments unless this prompt explicitly refers to them. Use only the repository state, issue/MR context, and instructions present in this task.
@@ -73,7 +75,11 @@ fn close_acp_session_best_effort(client: &AcpClient, session_id: &str) {
 
 pub(crate) struct AcpRuntime {
     repo_path: String,
-    model: Option<String>,
+    model_uri: Option<String>,
+    endpoint_model: Option<String>,
+    spawn_model: Option<String>,
+    acp_command: Vec<String>,
+    acp_env: std::collections::HashMap<String, String>,
     /// When set, applied after `session/new` via ACP mode APIs.
     preferred_session_mode: Option<&'static str>,
     shutdown: Arc<AtomicBool>,
@@ -85,14 +91,22 @@ pub(crate) struct AcpRuntime {
 impl AcpRuntime {
     pub fn new(
         repo_path: String,
-        model: Option<String>,
+        model_uri: Option<String>,
+        endpoint_model: Option<String>,
+        spawn_model: Option<String>,
+        acp_command: Vec<String>,
+        acp_env: std::collections::HashMap<String, String>,
         preferred_session_mode: Option<&'static str>,
         shutdown: Arc<AtomicBool>,
         agent_id: String,
     ) -> Self {
         Self {
             repo_path,
-            model,
+            model_uri,
+            endpoint_model,
+            spawn_model,
+            acp_command,
+            acp_env,
             preferred_session_mode,
             shutdown,
             agent_id,
@@ -117,11 +131,12 @@ impl AcpRuntime {
     ) -> Result<AgentHandoff> {
         let prompt = prepare_task_prompt(prompt);
         const MAX_UNFINISHED_TASK_RETRIES: u32 = 5;
-        if let Some(model) = &self.model {
+        if let Some(model_uri) = &self.model_uri {
             info!(
-                "Running ACP agent {} model={:?} prompt_len={} (new session per task, same process)",
+                "Running ACP agent {} model={:?} endpoint_model={:?} prompt_len={} (new session per task, same process)",
                 self.agent_id(),
-                model,
+                model_uri,
+                self.endpoint_model,
                 prompt.len()
             );
         } else {
@@ -396,18 +411,20 @@ impl AcpRuntime {
         })
     }
 
-    /// Spawns `agent acp`, attaches stdio, `initialize`, and Cursor `authenticate` when advertised — no `session/new` yet.
+    /// Spawns the configured ACP server command, attaches stdio, `initialize`, and Cursor
+    /// `authenticate` when advertised — no `session/new` yet.
     fn spawn_acp_connection(&self) -> Result<(Arc<AcpClient>, Child, Arc<StreamTextHooks>)> {
-        let mut cmd = Command::new("agent");
-        // Global flags like `--model` should come before the `acp` subcommand.
-        if let Some(model) = &self.model {
-            cmd.arg("--model").arg(model);
-        }
-        cmd.arg("--print");
-        cmd.arg("--trust");
-        cmd.arg("--force");
-        cmd.arg("--approve-mcps");
-        cmd.arg("acp");
+        let program = self
+            .acp_command
+            .first()
+            .map(String::as_str)
+            .unwrap_or("agent");
+        let mut cmd = build_acp_spawn_command(
+            &self.acp_command,
+            self.spawn_model.as_deref(),
+            &self.acp_env,
+        )
+        .with_context(|| format!("build ACP spawn command for {program}"))?;
 
         let mut child = cmd
             .current_dir(&self.repo_path)
@@ -415,7 +432,7 @@ impl AcpRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("Failed to spawn `agent acp` process")?;
+            .with_context(|| format!("Failed to spawn `{program}` ACP process"))?;
 
         let stderr = child.stderr.take();
         if let Some(mut err) = stderr {
@@ -426,6 +443,9 @@ impl AcpRuntime {
                 if n > 0 {
                     let preview = String::from_utf8_lossy(&buf[..n.min(2048)]);
                     debug!(target: "potlatch::agent_stderr", agent_id = %aid, "stderr: {}", preview);
+                    if preview.contains("Cannot use this model") {
+                        warn!(target: "potlatch::agent_stderr", agent_id = %aid, "ACP server stderr: {}", preview);
+                    }
                 }
             });
         }
@@ -515,7 +535,7 @@ impl AcpRuntime {
 
         self.try_apply_preferred_session_mode(client, &session, hooks);
 
-        if let Some(model) = &self.model {
+        if let Some(model) = &self.endpoint_model {
             let mut applied = false;
             if let Some(cfg) = session.config_options.as_deref()
                 && let Some(opt) = model_selector_for_session(cfg)

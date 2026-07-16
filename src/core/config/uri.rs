@@ -1,49 +1,64 @@
 use anyhow::{Context, Result};
 
+/// Parsed model URI: `<protocol>://<vendor-label>/<model-name>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelUri {
-    pub scheme: String,
-    pub name: String,
-    pub model: String,
+    /// Value as written in config (full URI or legacy bare `<model-name>`).
+    pub original: String,
+    pub protocol: String,
+    pub vendor: String,
+    pub model_name: String,
 }
 
 impl ModelUri {
-    /// Parse `scheme://name/model` or legacy bare model id (treated as `acp://cursor/<id>`).
+    /// Parse `<protocol>://<vendor-label>/<model-name>`.
+    ///
+    /// Legacy bare ids (no `://`) are treated as `acp://cursor/<model-name>`.
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
         if s.is_empty() {
             anyhow::bail!("model URI must not be empty");
         }
         if let Some(rest) = s.strip_prefix("acp://") {
-            return Self::parse_slash_pair("acp", rest);
+            return Self::parse_vendor_model(s, "acp", rest);
         }
         if s.contains("://") {
-            let (scheme, rest) = s.split_once("://").context("invalid model URI")?;
-            return Self::parse_slash_pair(scheme, rest);
+            let (protocol, rest) = s.split_once("://").context("invalid model URI")?;
+            return Self::parse_vendor_model(s, protocol, rest);
         }
         Ok(Self {
-            scheme: "acp".to_string(),
-            name: "cursor".to_string(),
-            model: s.to_string(),
+            original: s.to_string(),
+            protocol: "acp".to_string(),
+            vendor: "cursor".to_string(),
+            model_name: s.to_string(),
         })
     }
 
-    fn parse_slash_pair(scheme: &str, rest: &str) -> Result<Self> {
-        let (name, model) = rest.split_once('/').with_context(|| {
-            format!("model URI missing provider/model segment: {scheme}://{rest}")
+    fn parse_vendor_model(original: &str, protocol: &str, rest: &str) -> Result<Self> {
+        let (vendor, model_name) = rest.split_once('/').with_context(|| {
+            format!(
+                "model URI must be <protocol>://<vendor-label>/<model-name>, got `{protocol}://{rest}`"
+            )
         })?;
-        if name.is_empty() || model.is_empty() {
-            anyhow::bail!("model URI provider and model must be non-empty");
+        if vendor.is_empty() || model_name.is_empty() {
+            anyhow::bail!("model URI vendor-label and model-name must be non-empty");
         }
         Ok(Self {
-            scheme: scheme.to_string(),
-            name: name.to_string(),
-            model: model.to_string(),
+            original: original.to_string(),
+            protocol: protocol.to_string(),
+            vendor: vendor.to_string(),
+            model_name: model_name.to_string(),
         })
     }
 
-    pub fn bare_model(&self) -> &str {
-        &self.model
+    /// Model URI exactly as configured.
+    pub fn as_configured(&self) -> &str {
+        &self.original
+    }
+
+    /// `<model-name>` segment passed to the ACP CLI and inference endpoint.
+    pub fn endpoint_model_name(&self) -> &str {
+        &self.model_name
     }
 }
 
@@ -54,16 +69,27 @@ mod tests {
     #[test]
     fn parse_full_uri() {
         let u = ModelUri::parse("acp://cursor/composer-2").unwrap();
-        assert_eq!(u.scheme, "acp");
-        assert_eq!(u.name, "cursor");
-        assert_eq!(u.model, "composer-2");
+        assert_eq!(u.as_configured(), "acp://cursor/composer-2");
+        assert_eq!(u.protocol, "acp");
+        assert_eq!(u.vendor, "cursor");
+        assert_eq!(u.model_name, "composer-2");
+        assert_eq!(u.endpoint_model_name(), "composer-2");
     }
 
     #[test]
-    fn parse_legacy_bare_model() {
+    fn endpoint_model_name_from_uri() {
+        let u = ModelUri::parse("acp://cursor/model1-fp8").unwrap();
+        assert_eq!(u.as_configured(), "acp://cursor/model1-fp8");
+        assert_eq!(u.endpoint_model_name(), "model1-fp8");
+    }
+
+    #[test]
+    fn parse_legacy_bare_model_name() {
         let u = ModelUri::parse("gpt-5.3-codex").unwrap();
-        assert_eq!(u.scheme, "acp");
-        assert_eq!(u.name, "cursor");
-        assert_eq!(u.model, "gpt-5.3-codex");
+        assert_eq!(u.as_configured(), "gpt-5.3-codex");
+        assert_eq!(u.protocol, "acp");
+        assert_eq!(u.vendor, "cursor");
+        assert_eq!(u.model_name, "gpt-5.3-codex");
+        assert_eq!(u.endpoint_model_name(), "gpt-5.3-codex");
     }
 }

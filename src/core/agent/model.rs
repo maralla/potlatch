@@ -38,6 +38,7 @@ impl AgentModel {
         let agent_id = format!("{role}-{}", ctx.instance_id);
         let shutdown = Arc::clone(&ctx.workflow.shutdown);
         let engine = spawn_model_engine(
+            &ctx.workflow.config,
             section,
             repo_path,
             agent_id.clone(),
@@ -77,6 +78,7 @@ impl AgentModel {
 
     #[cfg(test)]
     pub(crate) fn from_section_for_test(
+        config: &crate::core::config::Config,
         section: &crate::core::config::AgentSection,
         agent_id: &str,
         repo_path: &str,
@@ -84,6 +86,7 @@ impl AgentModel {
     ) -> Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let engine = spawn_model_engine(
+            config,
             section,
             repo_path,
             agent_id,
@@ -117,6 +120,14 @@ mod tests {
             .clone()
     }
 
+    fn sample_config(model: Option<&str>) -> Config {
+        let toml = match model {
+            Some(m) => format!("[agent.alpha]\nmodel = \"{m}\"\ninstances = 1"),
+            None => "[agent.alpha]\ninstances = 1".to_string(),
+        };
+        Config::from_toml_str(&toml).unwrap()
+    }
+
     #[test]
     fn model_preferences_default_has_no_session_mode() {
         assert_eq!(ModelPreferences::default().preferred_session_mode, None);
@@ -124,8 +135,11 @@ mod tests {
 
     #[test]
     fn from_section_for_test_connects_engine() {
+        let config = sample_config(Some("acp://cursor/composer-2"));
+        let section = sample_section(Some("acp://cursor/composer-2"));
         let model = AgentModel::from_section_for_test(
-            &sample_section(Some("acp://cursor/composer-2")),
+            &config,
+            &section,
             "alpha-test",
             "/tmp/repo",
             ModelPreferences::default(),
