@@ -133,10 +133,9 @@ impl AcpRuntime {
         const MAX_UNFINISHED_TASK_RETRIES: u32 = 5;
         if let Some(model_uri) = &self.model_uri {
             info!(
-                "Running ACP agent {} model={:?} endpoint_model={:?} prompt_len={} (new session per task, same process)",
+                "Running ACP agent {} model={:?} prompt_len={} (new session per task, same process)",
                 self.agent_id(),
                 model_uri,
-                self.endpoint_model,
                 prompt.len()
             );
         } else {
