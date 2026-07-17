@@ -1,29 +1,63 @@
 //! LLM client: trait + OpenAI-compatible implementation with streaming.
 
 use std::io::{BufRead, BufReader};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use tracing::info;
 
 /// Callback for streaming chunks.
 pub type StreamCallback = dyn Fn(&str) + Send + Sync;
 
+/// Callback invoked when the LLM response is fully received but before
+/// `chat()` returns. Allows the caller to start executing tool calls while
+/// the client finishes parsing trailing SSE data (usage, [DONE]).
+/// Receives `(tool_calls, finish_reason)` and returns a vector of result
+/// strings (one per tool call, in order).
+pub type ToolExecCallback<'a> = dyn Fn(&[Value], &str) -> Vec<String> + Send + Sync + 'a;
+
 /// Abstraction over LLM chat completion backends. Enables test doubles.
 pub trait ChatClient: Send + Sync {
     /// Send a chat completion request with tools. Calls `on_chunk` for each streamed delta.
-    /// Returns the full accumulated response.
+    /// If `on_tool_calls` is provided, it is invoked as soon as the complete tool-call list
+    /// is known (when `finish_reason` arrives), overlapping tool execution with the tail of
+    /// the SSE stream.
     fn chat(
         &self,
         model: &str,
         messages: &[Value],
         tools: &[Value],
         on_chunk: Option<&StreamCallback>,
+        on_tool_calls: Option<&ToolExecCallback<'_>>,
     ) -> Result<ChatResponse>;
 
     /// List available models from the backend. Returns empty if unsupported.
     fn list_models(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+}
+
+/// Token usage reported by the model API for a single chat completion.
+#[derive(Debug, Clone, Default)]
+pub struct Usage {
+    /// Input (prompt) tokens.
+    pub input_tokens: u64,
+    /// Output (completion) tokens.
+    pub output_tokens: u64,
+    /// Input tokens served from the prefix cache (a subset of `input_tokens`).
+    pub cached_tokens: u64,
+}
+
+impl Usage {
+    fn from_json(usage: &Value) -> Self {
+        Self {
+            input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
+            output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
+            cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+        }
     }
 }
 
@@ -38,6 +72,11 @@ pub struct ChatResponse {
     pub tool_calls: Vec<Value>,
     /// `"stop"`, `"tool_calls"`, or other finish reasons.
     pub finish_reason: String,
+    /// Token usage for this completion, if reported by the backend.
+    pub usage: Usage,
+    /// Pre-computed tool results, populated when `on_tool_calls` is used.
+    /// Indexes align with `tool_calls`. Empty if no overlap execution was used.
+    pub tool_results: Vec<String>,
 }
 
 /// OpenAI-compatible LLM client using reqwest blocking.
@@ -102,6 +141,7 @@ impl ChatClient for OpenAiClient {
         messages: &[Value],
         tools: &[Value],
         on_chunk: Option<&StreamCallback>,
+        on_tool_calls: Option<&ToolExecCallback<'_>>,
     ) -> Result<ChatResponse> {
         let url = self.url("/chat/completions");
 
@@ -109,11 +149,14 @@ impl ChatClient for OpenAiClient {
             "model": model,
             "messages": messages,
             "stream": true,
+            // Ask the backend to include token usage in the final SSE chunk.
+            "stream_options": {"include_usage": true},
         });
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
 
+        let started = Instant::now();
         let resp = self
             .client
             .post(&url)
@@ -134,6 +177,9 @@ impl ChatClient for OpenAiClient {
         let mut reasoning = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut finish_reason = String::new();
+        let mut usage = Usage::default();
+        // Tool results computed via overlap execution (populated when finish_reason arrives).
+        let mut tool_results: Vec<String> = Vec::new();
 
         let reader = BufReader::new(resp);
         for line in reader.lines() {
@@ -153,6 +199,11 @@ impl ChatClient for OpenAiClient {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+
+            // Token usage (arrives in the final chunk when include_usage is set)
+            if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+                usage = Usage::from_json(u);
+            }
 
             let delta = &chunk["choices"][0]["delta"];
 
@@ -200,23 +251,39 @@ impl ChatClient for OpenAiClient {
                 }
             }
 
-            // Finish reason
+            // Finish reason — when this arrives, all tool calls are complete.
+            // Kick off tool execution immediately to overlap with the stream tail
+            // (usage chunk, [DONE]).
             if let Some(fr) = chunk["choices"][0]["finish_reason"].as_str()
                 && !fr.is_empty()
             {
                 finish_reason = fr.to_string();
+                if let Some(exec) = on_tool_calls
+                    && !tool_calls.is_empty()
+                {
+                    tool_results = exec(&tool_calls, &finish_reason);
+                }
             }
         }
 
+        let elapsed = started.elapsed();
+
         // Fallback: if no SSE data was received, the endpoint may not support streaming
         if content.is_empty() && tool_calls.is_empty() && finish_reason.is_empty() {
-            // The response was already consumed by the BufReader; we can't re-read it.
-            // This fallback only triggers when the endpoint returns no SSE lines at all,
-            // which indicates a misconfigured endpoint. Log and return empty.
             tracing::warn!(
                 "harness: LLM endpoint returned no SSE data; check if streaming is supported"
             );
         }
+
+        info!(
+            "harness: LLM call model={} elapsed_ms={} input_tokens={} output_tokens={} cached_tokens={} finish={}",
+            model,
+            elapsed.as_millis(),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_tokens,
+            finish_reason
+        );
 
         Ok(ChatResponse {
             content,
@@ -227,6 +294,8 @@ impl ChatClient for OpenAiClient {
             },
             tool_calls,
             finish_reason,
+            usage,
+            tool_results,
         })
     }
 }
@@ -254,6 +323,7 @@ impl ChatClient for FakeChatClient {
         _messages: &[Value],
         _tools: &[Value],
         _on_chunk: Option<&StreamCallback>,
+        _on_tool_calls: Option<&ToolExecCallback<'_>>,
     ) -> Result<ChatResponse> {
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
@@ -262,6 +332,8 @@ impl ChatClient for FakeChatClient {
                 reasoning: None,
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
+                usage: Usage::default(),
+                tool_results: vec![],
             });
         }
         Ok(responses.remove(0))
@@ -284,21 +356,55 @@ mod tests {
                     "function": {"name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
                 })],
                 finish_reason: "tool_calls".into(),
+                usage: Usage::default(),
+                tool_results: vec![],
             },
             ChatResponse {
                 content: "Done!".into(),
                 reasoning: None,
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
+                usage: Usage::default(),
+                tool_results: vec![],
             },
         ]);
 
-        let resp1 = client.chat("m", &[], &[], None).unwrap();
+        let resp1 = client.chat("m", &[], &[], None, None).unwrap();
         assert_eq!(resp1.finish_reason, "tool_calls");
         assert_eq!(resp1.tool_calls.len(), 1);
 
-        let resp2 = client.chat("m", &[], &[], None).unwrap();
+        let resp2 = client.chat("m", &[], &[], None, None).unwrap();
         assert_eq!(resp2.finish_reason, "stop");
         assert_eq!(resp2.content, "Done!");
+    }
+
+    #[test]
+    fn usage_from_json_parses_standard_fields() {
+        let v = json!({
+            "prompt_tokens": 1200,
+            "completion_tokens": 350,
+            "prompt_tokens_details": {"cached_tokens": 800}
+        });
+        let u = Usage::from_json(&v);
+        assert_eq!(u.input_tokens, 1200);
+        assert_eq!(u.output_tokens, 350);
+        assert_eq!(u.cached_tokens, 800);
+    }
+
+    #[test]
+    fn usage_from_json_defaults_missing_fields() {
+        let v = json!({"prompt_tokens": 100});
+        let u = Usage::from_json(&v);
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.cached_tokens, 0);
+    }
+
+    #[test]
+    fn usage_from_json_handles_empty() {
+        let u = Usage::from_json(&json!({}));
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.cached_tokens, 0);
     }
 }

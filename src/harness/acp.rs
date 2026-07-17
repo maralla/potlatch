@@ -291,12 +291,15 @@ mod tests {
             _messages: &[Value],
             _tools: &[Value],
             _on_chunk: Option<&super::super::client::StreamCallback>,
+            _on_tool_calls: Option<&super::super::client::ToolExecCallback<'_>>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
                 content: "Task completed successfully.".into(),
                 reasoning: None,
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
             })
         }
     }

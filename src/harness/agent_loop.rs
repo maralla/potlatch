@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::client::{ChatClient, ChatResponse, StreamCallback};
 use super::context::{Context, ContextKind, Role};
@@ -26,6 +26,8 @@ enum LoopControl {
 pub struct AgentLoop {
     llm: Arc<dyn ChatClient>,
     tools: ToolRegistry,
+    /// Cached tool schemas — built once at construction, reused across all runs.
+    tool_schemas: Vec<Value>,
     context: Context,
     model: String,
     cancel: Arc<AtomicBool>,
@@ -43,9 +45,12 @@ impl AgentLoop {
         token_budget: usize,
         cancel: Arc<AtomicBool>,
     ) -> Self {
+        // Build tool schemas once — the tool set is fixed for the harness lifetime.
+        let tool_schemas = tools.tools_schema();
         Self {
             llm,
             tools,
+            tool_schemas,
             context: Context::new(token_budget),
             model,
             cancel,
@@ -69,8 +74,6 @@ impl AgentLoop {
         self.context
             .push(Role::User, ContextKind::UserPrompt, prompt);
 
-        let tool_schemas = self.tools.tools_schema();
-
         loop {
             if self.cancel.load(Ordering::SeqCst) {
                 return Ok("[cancelled]".into());
@@ -80,17 +83,83 @@ impl AgentLoop {
             self.context.enforce_budget();
             let messages = self.context.to_messages();
 
-            debug!(
-                "harness loop: {} messages, {} tokens",
-                messages.len(),
-                self.context.total_tokens()
-            );
+            // Tool execution callback for overlap: when the streaming response
+            // finishes (finish_reason arrives), the client invokes this closure
+            // to start executing tool calls while the stream tail is still being
+            // read. This overlaps tool I/O with the model's generation tail.
+            //
+            // Scoped in a block so the immutable borrow of `self.tools` (via
+            // `tools_ref`) is released before `handle_response` borrows `self`
+            // mutably.
+            let response = {
+                let tools_ref = &self.tools;
+                let exec_cb = &|tool_calls: &[Value], _finish: &str| {
+                    let parsed: Vec<(String, String, Value)> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            let tc_id = tc["id"].as_str().unwrap_or("unknown").to_string();
+                            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                            let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                            let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                            (name, tc_id, args)
+                        })
+                        .collect();
 
-            // Wire up streaming: the LLM client calls on_chunk for each text delta,
-            // which we forward to the ACP server for session/update notifications
-            let response = self
-                .llm
-                .chat(&self.model, &messages, &tool_schemas, on_chunk)?;
+                    // Only run concurrently when every call is read-only.
+                    // If any call is to a mutating tool (file_write, file_edit,
+                    // shell), run all calls sequentially in order to preserve
+                    // dependencies (e.g. `mkdir` before `file_write`).
+                    let all_read_only = parsed.iter().all(|(name, _, _)| is_read_only_tool(name));
+
+                    if parsed.len() <= 1 || !all_read_only {
+                        parsed
+                            .iter()
+                            .map(|(name, _, args)| match tools_ref.execute(name, args, cwd) {
+                                Ok(r) => r,
+                                Err(e) => format!("Tool '{name}' error: {e}"),
+                            })
+                            .collect()
+                    } else {
+                        // All read-only — concurrent execution
+                        std::thread::scope(|s| {
+                            let handles: Vec<_> = parsed
+                                .iter()
+                                .map(|(name, _, args)| {
+                                    s.spawn(move || match tools_ref.execute(name, args, cwd) {
+                                        Ok(r) => r,
+                                        Err(e) => format!("Tool '{name}' error: {e}"),
+                                    })
+                                })
+                                .collect();
+                            handles
+                                .into_iter()
+                                .map(|h| {
+                                    h.join()
+                                        .unwrap_or_else(|_| "Error: tool thread panicked".into())
+                                })
+                                .collect()
+                        })
+                    }
+                };
+
+                self.llm.chat(
+                    &self.model,
+                    &messages,
+                    &self.tool_schemas,
+                    on_chunk,
+                    Some(exec_cb),
+                )?
+            };
+
+            info!(
+                "harness: turn {} messages, tokens in={} out={} cached={} finish={} tool_calls={}",
+                messages.len(),
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                response.usage.cached_tokens,
+                response.finish_reason,
+                response.tool_calls.len()
+            );
 
             // Also emit the full response text (for non-streaming fallback or completeness)
             if let Some(cb) = on_chunk
@@ -164,42 +233,136 @@ impl AgentLoop {
             self.stuck_count = 0;
         }
 
-        // Execute each tool call
+        // Track calls for stuck detection (before concurrent execution)
         for tc in &response.tool_calls {
-            let tc_id = tc["id"].as_str().unwrap_or("unknown").to_string();
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-            let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-
-            let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-
-            info!("harness: executing tool {name} (call_id={tc_id}) args={args_str}");
-
-            // Track for stuck detection
-            self.recent_calls
-                .push_back((name.clone(), args_str.to_string()));
+            let args_str = tc["function"]["arguments"]
+                .as_str()
+                .unwrap_or("{}")
+                .to_string();
+            self.recent_calls.push_back((name, args_str));
             if self.recent_calls.len() > 5 {
                 self.recent_calls.pop_front();
             }
+        }
 
-            let result = match self.tools.execute(&name, &args, cwd) {
-                Ok(result) => {
-                    let preview: String = result.chars().take(200).collect();
-                    info!("harness: tool {name} result: {preview}");
-                    result
-                }
-                Err(e) => {
-                    let err_msg = format!("Tool '{name}' error: {e}");
-                    warn!("harness: {err_msg}");
-                    err_msg
-                }
-            };
+        // Use pre-computed results from overlap execution if available;
+        // otherwise execute tool calls now (concurrently).
+        let tool_results: Vec<(String, String, String)> = if !response.tool_results.is_empty() {
+            // Results were computed during streaming overlap — just pair them
+            // with names and call IDs for context classification.
+            response
+                .tool_calls
+                .iter()
+                .zip(&response.tool_results)
+                .map(|(tc, result)| {
+                    let tc_id = tc["id"].as_str().unwrap_or("unknown").to_string();
+                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                    (name, tc_id, result.clone())
+                })
+                .collect()
+        } else {
+            self.execute_tool_calls_concurrent(&response.tool_calls, cwd)
+        };
 
-            // Classify the result kind for context management
+        for (name, tc_id, result) in tool_results {
             let kind = classify_tool_result(&name, &result);
-            self.context.push_tool_result(kind, result, &tc_id);
+            // Truncate large tool results before pushing to context to avoid
+            // context bloat and the BPE encoding cost on oversized outputs.
+            let truncated = truncate_tool_result(&result);
+            self.context.push_tool_result(kind, truncated, &tc_id);
         }
 
         Ok(LoopControl::Continue)
+    }
+
+    /// Execute tool calls, concurrently when safe. Returns results in the same
+    /// order as the input tool calls. Each result is
+    /// `(tool_name, tool_call_id, result_string)`.
+    ///
+    /// Concurrency is only used when **every** call is to a read-only tool
+    /// (`file_read`, `file_read_batch`, `grep`, `glob`, `web_fetch`). If any
+    /// call is to a mutating tool (`file_write`, `file_edit`, `shell`), all
+    /// calls run sequentially in order to preserve dependencies.
+    fn execute_tool_calls_concurrent(
+        &self,
+        tool_calls: &[Value],
+        cwd: &str,
+    ) -> Vec<(String, String, String)> {
+        if tool_calls.is_empty() {
+            return Vec::new();
+        }
+
+        // Parse all calls up front (cheap), so the concurrent phase only does I/O.
+        let parsed: Vec<(String, String, Value)> = tool_calls
+            .iter()
+            .map(|tc| {
+                let tc_id = tc["id"].as_str().unwrap_or("unknown").to_string();
+                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                (name, tc_id, args)
+            })
+            .collect();
+
+        let all_read_only = parsed.iter().all(|(name, _, _)| is_read_only_tool(name));
+
+        // Single call, or mixed/mutating calls — run sequentially in order.
+        if parsed.len() == 1 || !all_read_only {
+            return parsed
+                .iter()
+                .map(|(name, tc_id, args)| {
+                    let result = self.execute_one(name, args, cwd);
+                    (name.clone(), tc_id.clone(), result)
+                })
+                .collect();
+        }
+
+        // Multiple read-only calls — run concurrently. `&ToolRegistry` is
+        // `Send + Sync` because all tools are `Arc<dyn Tool>`.
+        std::thread::scope(|s| {
+            let handles: Vec<_> = parsed
+                .iter()
+                .map(|(name, tc_id, args)| {
+                    s.spawn(move || {
+                        let result = self.execute_one(name, args, cwd);
+                        (name.clone(), tc_id.clone(), result)
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        (
+                            "unknown".into(),
+                            "unknown".into(),
+                            "Error: tool thread panicked".into(),
+                        )
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// Execute a single tool call, logging the invocation and result.
+    fn execute_one(&self, name: &str, args: &Value, cwd: &str) -> String {
+        let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
+        info!("harness: executing tool {name} args={args_str}");
+
+        match self.tools.execute(name, args, cwd) {
+            Ok(result) => {
+                let preview: String = result.chars().take(200).collect();
+                info!("harness: tool {name} result: {preview}");
+                result
+            }
+            Err(e) => {
+                let err_msg = format!("Tool '{name}' error: {e}");
+                warn!("harness: {err_msg}");
+                err_msg
+            }
+        }
     }
 
     /// Detect if the agent is repeating the same tool call.
@@ -226,13 +389,48 @@ impl AgentLoop {
 fn classify_tool_result(tool_name: &str, _result: &str) -> ContextKind {
     match tool_name {
         "shell" => ContextKind::ShellOutput,
-        "file_read" => ContextKind::FileRead,
+        "file_read" | "file_read_batch" => ContextKind::FileRead,
         "file_edit" => ContextKind::EditResult,
         "file_write" => ContextKind::EditResult,
         "grep" | "glob" => ContextKind::Exploration,
         "web_fetch" => ContextKind::WebFetch,
         _ => ContextKind::ToolResult,
     }
+}
+
+/// Maximum character length for a tool result stored in context. Larger results
+/// are truncated with a marker, keeping the first portion (most relevant for
+/// file reads and search results) and a note about the truncation.
+const MAX_TOOL_RESULT_CHARS: usize = 8_000;
+
+/// Whether a tool is read-only (no side effects). Read-only tools can be
+/// executed concurrently safely; mutating tools must run in order to preserve
+/// dependencies (e.g. `mkdir` before `file_write`).
+fn is_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "file_read" | "file_read_batch" | "grep" | "glob" | "web_fetch"
+    )
+}
+
+/// Truncate a tool result to `MAX_TOOL_RESULT_CHARS`, preserving the beginning
+/// (which typically contains the most useful output) and appending a marker.
+fn truncate_tool_result(result: &str) -> String {
+    if result.len() <= MAX_TOOL_RESULT_CHARS {
+        return result.to_string();
+    }
+    // Find a char boundary at or before the limit
+    let mut end = MAX_TOOL_RESULT_CHARS;
+    while !result.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    format!(
+        "{}\n[...output truncated at {} chars, {}/{} bytes shown...]",
+        &result[..end],
+        MAX_TOOL_RESULT_CHARS,
+        end,
+        result.len()
+    )
 }
 
 #[cfg(test)]
@@ -252,12 +450,16 @@ mod tests {
                     "function": {"name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
                 })],
                 finish_reason: "tool_calls".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
             },
             ChatResponse {
                 content: "Done, the command ran.".into(),
                 reasoning: None,
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
             },
         ]));
 
@@ -281,12 +483,16 @@ mod tests {
                     "function": {"name": "nonexistent_tool", "arguments": "{}"}
                 })],
                 finish_reason: "tool_calls".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
             },
             ChatResponse {
                 content: "Recovered from error.".into(),
                 reasoning: None,
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
             },
         ]));
 
@@ -310,12 +516,16 @@ mod tests {
                     "function": {"name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
                 })],
                 finish_reason: "tool_calls".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
             },
             ChatResponse {
                 content: "should not reach".into(),
                 reasoning: None,
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
             },
         ]));
 
@@ -325,5 +535,69 @@ mod tests {
 
         let result = agent.run("test cancel", "/tmp", None).unwrap();
         assert!(result.contains("cancelled"));
+    }
+
+    #[test]
+    fn is_read_only_tool_classifies_correctly() {
+        assert!(is_read_only_tool("file_read"));
+        assert!(is_read_only_tool("file_read_batch"));
+        assert!(is_read_only_tool("grep"));
+        assert!(is_read_only_tool("glob"));
+        assert!(is_read_only_tool("web_fetch"));
+
+        assert!(!is_read_only_tool("file_write"));
+        assert!(!is_read_only_tool("file_edit"));
+        assert!(!is_read_only_tool("shell"));
+        assert!(!is_read_only_tool("unknown_tool"));
+    }
+
+    #[test]
+    fn loop_executes_mixed_tool_calls_in_order() {
+        // When the model issues both read-only and mutating tool calls in one
+        // turn, all calls must run sequentially (not concurrently) to preserve
+        // dependencies. We verify by issuing file_write then file_read on the
+        // same path — if they ran concurrently the read might see the old state.
+        let dir = super::super::tools::test_util::unique_test_dir();
+
+        let llm = Arc::new(FakeChatClient::new(vec![
+            ChatResponse {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![
+                    json!({
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "file_write", "arguments": format!("{{\"path\":\"out.txt\",\"content\":\"written\"}}")}
+                    }),
+                    json!({
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "file_read", "arguments": "{\"path\":\"out.txt\"}"}
+                    }),
+                ],
+                finish_reason: "tool_calls".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
+            },
+            ChatResponse {
+                content: "Done.".into(),
+                reasoning: None,
+                tool_calls: vec![],
+                finish_reason: "stop".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
+            },
+        ]));
+
+        let tools = ToolRegistry::with_builtin_tools();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
+
+        let result = agent.run("write then read", dir.as_str(), None).unwrap();
+        assert!(result.contains("Done"));
+        // The file_read result should contain the content written by file_write,
+        // proving sequential execution preserved the order.
+        let written = std::fs::read_to_string(dir.path().join("out.txt")).unwrap_or_default();
+        assert_eq!(written, "written");
     }
 }

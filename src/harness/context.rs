@@ -89,6 +89,7 @@ impl Context {
         }
     }
 
+    #[cfg(test)]
     pub fn total_tokens(&self) -> usize {
         self.total_tokens
     }
@@ -180,55 +181,26 @@ impl Context {
         self.push(Role::Assistant, ContextKind::AssistantText, text);
     }
 
-    /// Enforce the token budget using tiered retention:
-    /// 1. Compact large tool outputs into summaries
-    /// 2. Truncate exploration artifacts
-    /// 3. Evict oldest evictable entries
+    /// Enforce the token budget using tiered retention.
+    ///
+    /// When the total exceeds 75% of the budget, evicts the oldest evictable
+    /// entries (exploration artifacts, shell output, file reads, web fetches,
+    /// reasoning) until back under threshold. Non-evictable entries (system
+    /// prompt, user prompt, assistant text, tool calls, edit results) are never
+    /// removed.
+    ///
+    /// In-place compaction and truncation are intentionally avoided: rewriting
+    /// entry content mid-context invalidates the LLM backend's prefix cache,
+    /// causing re-processing of everything from the first modified entry
+    /// forward. Eviction from the front preserves the prefix of all surviving
+    /// entries, maximizing `cached_tokens` on subsequent API calls.
     pub fn enforce_budget(&mut self) {
         let threshold = (self.token_budget as f64 * 0.75) as usize;
         if self.total_tokens <= threshold {
             return;
         }
 
-        // Phase 1: Compact large ShellOutput / FileRead / WebFetch entries
-        for entry in &mut self.entries {
-            if !entry.kind.is_evictable() {
-                continue;
-            }
-            if entry.tokens < 500 {
-                continue;
-            }
-            if matches!(
-                entry.kind,
-                ContextKind::ShellOutput | ContextKind::FileRead | ContextKind::WebFetch
-            ) {
-                let summary = compact_summary(&entry.content, &entry.kind);
-                let new_tokens = Self::estimate_tokens(&summary) + 4;
-                self.total_tokens = self.total_tokens - entry.tokens + new_tokens;
-                entry.content = summary;
-                entry.tokens = new_tokens;
-            }
-            if self.total_tokens <= threshold {
-                return;
-            }
-        }
-
-        // Phase 2: Truncate Exploration entries
-        for entry in &mut self.entries {
-            if entry.kind != ContextKind::Exploration || entry.tokens < 200 {
-                continue;
-            }
-            let truncated = truncate_lines(&entry.content, 20);
-            let new_tokens = Self::estimate_tokens(&truncated) + 4;
-            self.total_tokens = self.total_tokens - entry.tokens + new_tokens;
-            entry.content = truncated;
-            entry.tokens = new_tokens;
-            if self.total_tokens <= threshold {
-                return;
-            }
-        }
-
-        // Phase 3: Evict oldest evictable entries
+        // Evict oldest evictable entries until under threshold.
         let mut i = 0;
         while self.total_tokens > threshold && i < self.entries.len() {
             if self.entries[i].kind.is_evictable() {
@@ -289,50 +261,6 @@ impl Context {
     }
 }
 
-fn compact_summary(content: &str, kind: &ContextKind) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let char_count = content.len();
-    let label = match kind {
-        ContextKind::ShellOutput => "shell output",
-        ContextKind::FileRead => "file read",
-        ContextKind::WebFetch => "web fetch",
-        _ => "tool result",
-    };
-    let first_lines: Vec<&str> = lines.iter().take(5).copied().collect();
-    let last_lines: Vec<&str> = if lines.len() > 10 {
-        lines.iter().rev().take(3).rev().copied().collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut summary = format!(
-        "[compacted {label}, {char_count} chars, {} lines]\n",
-        lines.len()
-    );
-    summary.push_str(&first_lines.join("\n"));
-    if !last_lines.is_empty() {
-        summary.push_str("\n[...truncated...]\n");
-        summary.push_str(&last_lines.join("\n"));
-    }
-    summary
-}
-
-fn truncate_lines(content: &str, keep: usize) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.len() <= keep * 2 {
-        return content.to_string();
-    }
-    let first: Vec<&str> = lines.iter().take(keep).copied().collect();
-    let last: Vec<&str> = lines.iter().rev().take(keep).rev().copied().collect();
-    let dropped = lines.len() - keep * 2;
-    format!(
-        "{}\n[...truncated {} lines...]\n{}",
-        first.join("\n"),
-        dropped,
-        last.join("\n")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_reduces_large_entries() {
+    fn eviction_reduces_tokens() {
         let mut ctx = Context::new(500);
         ctx.push(Role::System, ContextKind::System, "sys");
         ctx.push(
@@ -382,7 +310,7 @@ mod tests {
         let before = ctx.total_tokens();
         ctx.enforce_budget();
         let after = ctx.total_tokens();
-        assert!(after < before, "compaction should reduce tokens");
+        assert!(after < before, "eviction should reduce tokens");
     }
 
     #[test]
