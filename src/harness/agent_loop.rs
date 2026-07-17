@@ -114,10 +114,7 @@ impl AgentLoop {
                     if parsed.len() <= 1 || !all_read_only {
                         parsed
                             .iter()
-                            .map(|(name, _, args)| match tools_ref.execute(name, args, cwd) {
-                                Ok(r) => r,
-                                Err(e) => format!("Tool '{name}' error: {e}"),
-                            })
+                            .map(|(name, _, args)| execute_and_log(tools_ref, name, args, cwd))
                             .collect()
                     } else {
                         // All read-only — concurrent execution
@@ -125,10 +122,7 @@ impl AgentLoop {
                             let handles: Vec<_> = parsed
                                 .iter()
                                 .map(|(name, _, args)| {
-                                    s.spawn(move || match tools_ref.execute(name, args, cwd) {
-                                        Ok(r) => r,
-                                        Err(e) => format!("Tool '{name}' error: {e}"),
-                                    })
+                                    s.spawn(move || execute_and_log(tools_ref, name, args, cwd))
                                 })
                                 .collect();
                             handles
@@ -152,8 +146,10 @@ impl AgentLoop {
             };
 
             info!(
-                "harness: turn {} messages, tokens in={} out={} cached={} finish={} tool_calls={}",
+                "harness: turn {} messages, model={}, elapsed={}ms, tokens in={} out={} cached={} finish={} tool_calls={}",
                 messages.len(),
+                self.model,
+                response.elapsed_ms,
                 response.usage.input_tokens,
                 response.usage.output_tokens,
                 response.usage.cached_tokens,
@@ -348,21 +344,7 @@ impl AgentLoop {
 
     /// Execute a single tool call, logging the invocation and result.
     fn execute_one(&self, name: &str, args: &Value, cwd: &str) -> String {
-        let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
-        info!("harness: executing tool {name} args={args_str}");
-
-        match self.tools.execute(name, args, cwd) {
-            Ok(result) => {
-                let preview: String = result.chars().take(200).collect();
-                info!("harness: tool {name} result: {preview}");
-                result
-            }
-            Err(e) => {
-                let err_msg = format!("Tool '{name}' error: {e}");
-                warn!("harness: {err_msg}");
-                err_msg
-            }
-        }
+        execute_and_log(&self.tools, name, args, cwd)
     }
 
     /// Detect if the agent is repeating the same tool call.
@@ -413,6 +395,27 @@ fn is_read_only_tool(name: &str) -> bool {
     )
 }
 
+/// Execute a single tool call against the registry, logging the invocation and
+/// result. Used by both the overlap execution callback and the fallback
+/// sequential executor so that tool call details are always logged.
+fn execute_and_log(tools: &ToolRegistry, name: &str, args: &Value, cwd: &str) -> String {
+    let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
+    info!("harness: executing tool {name} args={args_str}");
+
+    match tools.execute(name, args, cwd) {
+        Ok(result) => {
+            let preview: String = result.chars().take(200).collect();
+            info!("harness: tool {name} result: {preview}");
+            result
+        }
+        Err(e) => {
+            let err_msg = format!("Tool '{name}' error: {e}");
+            warn!("harness: {err_msg}");
+            err_msg
+        }
+    }
+}
+
 /// Truncate a tool result to `MAX_TOOL_RESULT_CHARS`, preserving the beginning
 /// (which typically contains the most useful output) and appending a marker.
 fn truncate_tool_result(result: &str) -> String {
@@ -452,6 +455,7 @@ mod tests {
                 finish_reason: "tool_calls".into(),
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
             ChatResponse {
                 content: "Done, the command ran.".into(),
@@ -460,6 +464,7 @@ mod tests {
                 finish_reason: "stop".into(),
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
         ]));
 
@@ -485,6 +490,7 @@ mod tests {
                 finish_reason: "tool_calls".into(),
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
             ChatResponse {
                 content: "Recovered from error.".into(),
@@ -493,6 +499,7 @@ mod tests {
                 finish_reason: "stop".into(),
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
         ]));
 
@@ -518,6 +525,7 @@ mod tests {
                 finish_reason: "tool_calls".into(),
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
             ChatResponse {
                 content: "should not reach".into(),
@@ -526,6 +534,7 @@ mod tests {
                 finish_reason: "stop".into(),
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
         ]));
 
@@ -578,6 +587,7 @@ mod tests {
                 finish_reason: "tool_calls".into(),
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
             ChatResponse {
                 content: "Done.".into(),
@@ -586,6 +596,7 @@ mod tests {
                 finish_reason: "stop".into(),
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
         ]));
 

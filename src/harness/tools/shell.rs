@@ -32,7 +32,7 @@ impl Tool for ShellTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Run a shell command in the repo directory. Returns stdout, stderr, and exit code. Use for build, test, git, and any system command. Commands have a timeout (default 120s).",
+            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s).",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -300,6 +300,7 @@ mod tests {
                 finish_reason: "stop".into(),
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             })
         }
     }

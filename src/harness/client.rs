@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use tracing::info;
 
 /// Callback for streaming chunks.
 pub type StreamCallback = dyn Fn(&str) + Send + Sync;
@@ -77,6 +76,8 @@ pub struct ChatResponse {
     /// Pre-computed tool results, populated when `on_tool_calls` is used.
     /// Indexes align with `tool_calls`. Empty if no overlap execution was used.
     pub tool_results: Vec<String>,
+    /// Wall-clock time for the API call, in milliseconds.
+    pub elapsed_ms: u128,
 }
 
 /// OpenAI-compatible LLM client using reqwest blocking.
@@ -275,16 +276,6 @@ impl ChatClient for OpenAiClient {
             );
         }
 
-        info!(
-            "harness: LLM call model={} elapsed_ms={} input_tokens={} output_tokens={} cached_tokens={} finish={}",
-            model,
-            elapsed.as_millis(),
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cached_tokens,
-            finish_reason
-        );
-
         Ok(ChatResponse {
             content,
             reasoning: if reasoning.is_empty() {
@@ -296,6 +287,7 @@ impl ChatClient for OpenAiClient {
             finish_reason,
             usage,
             tool_results,
+            elapsed_ms: elapsed.as_millis(),
         })
     }
 }
@@ -334,6 +326,7 @@ impl ChatClient for FakeChatClient {
                 finish_reason: "stop".into(),
                 usage: Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             });
         }
         Ok(responses.remove(0))
@@ -358,6 +351,7 @@ mod tests {
                 finish_reason: "tool_calls".into(),
                 usage: Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
             ChatResponse {
                 content: "Done!".into(),
@@ -366,6 +360,7 @@ mod tests {
                 finish_reason: "stop".into(),
                 usage: Usage::default(),
                 tool_results: vec![],
+                elapsed_ms: 0,
             },
         ]);
 
