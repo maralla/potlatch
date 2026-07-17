@@ -66,20 +66,25 @@ struct SpinnerState {
     running: AtomicBool,
     visible: AtomicBool,
     enabled: bool,
-    label: Mutex<Option<String>>,
+    /// Active labels as `(slot_id, label)` pairs. Each `activity()` call
+    /// registers an entry; the `ActivityGuard` removes it on drop. When only
+    /// one entry remains, the spinner shows its label directly.
+    labels: Mutex<Vec<(usize, String)>>,
+    next_slot: AtomicUsize,
 }
 
 pub struct ActivityGuard {
     state: Option<Arc<SpinnerState>>,
+    slot: usize,
 }
 
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
-        if let Some(state) = &self.state
-            && state.active.fetch_sub(1, Ordering::SeqCst) == 1
-            && let Ok(mut label) = state.label.lock()
-        {
-            *label = None;
+        if let Some(state) = &self.state {
+            state.active.fetch_sub(1, Ordering::SeqCst);
+            if let Ok(mut labels) = state.labels.lock() {
+                labels.retain(|(id, _)| *id != self.slot);
+            }
         }
     }
 }
@@ -87,17 +92,27 @@ impl Drop for ActivityGuard {
 /// Show the activity spinner until the returned guard is dropped.
 pub fn activity(label: impl Into<String>) -> ActivityGuard {
     let Some(state) = SPINNER.get().cloned() else {
-        return ActivityGuard { state: None };
+        return ActivityGuard {
+            state: None,
+            slot: 0,
+        };
     };
     if !state.enabled {
-        return ActivityGuard { state: None };
+        return ActivityGuard {
+            state: None,
+            slot: 0,
+        };
     }
 
-    if let Ok(mut current) = state.label.lock() {
-        *current = Some(label.into());
+    let slot = state.next_slot.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut labels) = state.labels.lock() {
+        labels.push((slot, label.into()));
     }
     state.active.fetch_add(1, Ordering::SeqCst);
-    ActivityGuard { state: Some(state) }
+    ActivityGuard {
+        state: Some(state),
+        slot,
+    }
 }
 
 /// Install the Potlatch terminal log formatter.
@@ -136,7 +151,8 @@ fn init_spinner(enabled: bool) {
                 running: AtomicBool::new(false),
                 visible: AtomicBool::new(false),
                 enabled,
-                label: Mutex::new(None),
+                labels: Mutex::new(Vec::new()),
+                next_slot: AtomicUsize::new(0),
             })
         })
         .clone();
@@ -155,10 +171,16 @@ fn init_spinner(enabled: bool) {
             let mut out = io::stdout().lock();
             if active > 0 {
                 let label = state
-                    .label
+                    .labels
                     .lock()
                     .ok()
-                    .and_then(|label| label.clone())
+                    .and_then(|labels| {
+                        if labels.len() == 1 {
+                            Some(labels[0].1.clone())
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_else(|| "agents".to_string());
                 let text = activity_text(active, &label);
                 let text = truncate_to_terminal_width(&text, SPINNER_PREFIX_WIDTH);
@@ -579,5 +601,72 @@ mod tests {
             activity_text(2, "worker-0 implementing issue #1"),
             "2 agents working"
         );
+    }
+
+    #[test]
+    fn activity_guard_shows_remaining_label_after_others_drop() {
+        // Simulate: ops-0 starts, then worker-0 and worker-1 start, then both
+        // workers finish. The spinner should show ops-0's label, not a stale
+        // worker label.
+        let state = Arc::new(SpinnerState {
+            active: AtomicUsize::new(0),
+            running: AtomicBool::new(false),
+            visible: AtomicBool::new(false),
+            enabled: true,
+            labels: Mutex::new(Vec::new()),
+            next_slot: AtomicUsize::new(0),
+        });
+
+        // Ops starts
+        let _ops_guard = ActivityGuard {
+            state: Some(Arc::clone(&state)),
+            slot: 0,
+        };
+        state.active.fetch_add(1, Ordering::SeqCst);
+        state
+            .labels
+            .lock()
+            .unwrap()
+            .push((0, "ops-0 analyzing logs".into()));
+
+        // Worker-0 starts
+        let w0_guard = ActivityGuard {
+            state: Some(Arc::clone(&state)),
+            slot: 1,
+        };
+        state.active.fetch_add(1, Ordering::SeqCst);
+        state
+            .labels
+            .lock()
+            .unwrap()
+            .push((1, "worker-0 implementing issue #570".into()));
+
+        // Worker-1 starts
+        let w1_guard = ActivityGuard {
+            state: Some(Arc::clone(&state)),
+            slot: 2,
+        };
+        state.active.fetch_add(1, Ordering::SeqCst);
+        state
+            .labels
+            .lock()
+            .unwrap()
+            .push((2, "worker-1 implementing issue #572".into()));
+
+        // Three active — generic label
+        assert_eq!(state.active.load(Ordering::SeqCst), 3);
+        let labels = state.labels.lock().unwrap();
+        assert_eq!(labels.len(), 3);
+        drop(labels);
+
+        // Workers finish (drop their guards)
+        drop(w0_guard);
+        drop(w1_guard);
+
+        // Only ops remains — its label should be the one shown
+        assert_eq!(state.active.load(Ordering::SeqCst), 1);
+        let labels = state.labels.lock().unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].1, "ops-0 analyzing logs");
     }
 }
