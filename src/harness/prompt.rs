@@ -36,7 +36,8 @@ Your workspace is the current working directory. It is the root of the repositor
 ## Tool Usage
 
 - **grep**: Always use this first to find relevant code. It returns file paths and line numbers so you can read specific sections.
-- **file_read**: Read files with line numbers. Use `start_line` and `end_line` for large files to read only what you need.
+- **file_read**: Read a single file with line numbers. Use `start_line` and `end_line` for large files to read only what you need.
+- **file_read_batch**: Read multiple files concurrently in one call. Prefer this over multiple `file_read` calls when you need several files — it is faster and uses fewer round-trips. Per-file errors are reported inline and do not block the other reads.
 - **file_edit**: Replace exact strings in files. The `old_string` must match uniquely. If it doesn't match, the error shows near-matches with line numbers — use these to re-read and retry.
 - **file_write**: Create new files or overwrite entirely. Creates parent directories automatically.
 - **shell**: Run any command — build, test, git, etc. Returns stdout, stderr, and exit code. Runs in the workspace directory.
