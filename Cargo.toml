@@ -16,3 +16,12 @@ toml = "0.8"
 rand = "0.10.0"
 signal-hook = "0.4.3"
 terminal_size = "0.4.4"
+reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
+glob = "0.3"
+uuid = { version = "1.0", features = ["v4"] }
+tiktoken-rs = "0.6"
+html2text = "0.17"
+ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+libc = "0.2"

@@ -8,10 +8,22 @@ gitlab_repo = "https://gitlab.com/group/project"
 # scope_label = "potlatch"
 
 # Self-hosted / custom ACP client profile (referenced by agent `acp_client`).
-# [acp.cursor-local]
-# base_url = "http://.."
+#
+# Potlatch harness (built-in, talks directly to OpenAI-compatible endpoints):
+# [acp.potlatch]
+# base_url = "http://localhost:11434/v1"
 # api_key = "EMPTY"
-# acp_command = ["agent-local", "--print", "--trust", "--force", "--approve-mcps", "acp"]
+# acp_command = ["potlatch", "harness"]
+# env = [
+#   "BREEZE_BASE_URL={base_url}",
+#   "BREEZE_API_KEY={api_key}",
+# ]
+#
+# agent-local (Cursor CLI, requires explicit CLI args in acp_command):
+# [acp.cursor-local]
+# base_url = "http://localhost:8080/v1"
+# api_key = "EMPTY"
+# acp_command = ["agent-local", "--base-url", "{base_url}", "--local-agent-api-key", "{api_key}", "--print", "--trust", "--force", "--approve-mcps", "acp"]
 # env = [
 #   "CURSOR_LOCAL_AGENT_BASE_URL={base_url}",
 #   "CURSOR_LOCAL_AGENT_API_KEY={api_key}",

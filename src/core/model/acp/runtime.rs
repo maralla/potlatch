@@ -77,7 +77,6 @@ pub(crate) struct AcpRuntime {
     repo_path: String,
     model_uri: Option<String>,
     endpoint_model: Option<String>,
-    spawn_model: Option<String>,
     acp_command: Vec<String>,
     acp_env: std::collections::HashMap<String, String>,
     /// When set, applied after `session/new` via ACP mode APIs.
@@ -93,7 +92,6 @@ impl AcpRuntime {
         repo_path: String,
         model_uri: Option<String>,
         endpoint_model: Option<String>,
-        spawn_model: Option<String>,
         acp_command: Vec<String>,
         acp_env: std::collections::HashMap<String, String>,
         preferred_session_mode: Option<&'static str>,
@@ -104,7 +102,6 @@ impl AcpRuntime {
             repo_path,
             model_uri,
             endpoint_model,
-            spawn_model,
             acp_command,
             acp_env,
             preferred_session_mode,
@@ -418,12 +415,8 @@ impl AcpRuntime {
             .first()
             .map(String::as_str)
             .unwrap_or("agent");
-        let mut cmd = build_acp_spawn_command(
-            &self.acp_command,
-            self.spawn_model.as_deref(),
-            &self.acp_env,
-        )
-        .with_context(|| format!("build ACP spawn command for {program}"))?;
+        let mut cmd = build_acp_spawn_command(&self.acp_command, &self.acp_env)
+            .with_context(|| format!("build ACP spawn command for {program}"))?;
 
         let mut child = cmd
             .current_dir(&self.repo_path)
@@ -480,17 +473,16 @@ impl AcpRuntime {
                 auth_methods = init_result.auth_methods.len(),
                 "initialize result includes authMethods; calling authenticate(cursor_login)"
             );
+            client.authenticate_cursor_login().context(
+                "ACP authenticate (cursor_login). Run `agent login` or set CURSOR_API_KEY / CURSOR_AUTH_TOKEN; see https://cursor.com/docs/cli/acp",
+            )?;
         } else {
-            warn!(
+            debug!(
                 target: "potlatch::acp",
                 agent_id = %self.agent_id,
-                "initialize result has no recognizable cursor_login authMethods; still calling authenticate(cursor_login) (required by Cursor ACP before session/new)"
+                "initialize result has no authMethods; skipping authenticate"
             );
         }
-
-        client.authenticate_cursor_login().context(
-            "ACP authenticate (cursor_login). Run `agent login` or set CURSOR_API_KEY / CURSOR_AUTH_TOKEN; see https://cursor.com/docs/cli/acp",
-        )?;
 
         Ok((client, child, hooks))
     }

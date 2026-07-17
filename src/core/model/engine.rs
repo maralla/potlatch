@@ -71,7 +71,6 @@ impl ModelEngine {
             runtime.repo_path,
             acp_spawn.model_uri,
             acp_spawn.endpoint_model,
-            acp_spawn.spawn_model,
             acp_spawn.command,
             acp_spawn.env,
             opts.preferred_session_mode,

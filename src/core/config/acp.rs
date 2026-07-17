@@ -32,9 +32,6 @@ pub struct AcpSpawnConfig {
     pub model_uri: Option<String>,
     /// Parsed `<model-name>` for `session/set_model` after `session/new`.
     pub endpoint_model: Option<String>,
-    /// `--model` at spawn time. Omitted for custom-endpoint profiles because
-    /// `agent-local acp` rejects non-catalog models during `authenticate`.
-    pub spawn_model: Option<String>,
     pub env: HashMap<String, String>,
 }
 
@@ -90,9 +87,6 @@ pub fn validate_acp_command(command: &[String]) -> Result<()> {
     if command[0].trim().is_empty() {
         bail!("acp_command executable must be non-empty");
     }
-    if !command.iter().any(|arg| arg == "acp") {
-        bail!("acp_command must include the \"acp\" subcommand");
-    }
     Ok(())
 }
 
@@ -143,38 +137,23 @@ fn substitute_profile_placeholders(value: &str, profile: &AcpClientProfile) -> R
     Ok(out)
 }
 
-/// Build argv for an ACP profile, injecting endpoint CLI flags when configured.
+/// Return the argv for an ACP profile as configured. No injection — the config's
+/// `acp_command` is used verbatim. Any CLI flags the agent needs (e.g. `--base-url`)
+/// must be explicitly specified in the config file.
 pub fn build_profile_command(profile: &AcpClientProfile) -> Vec<String> {
-    let mut cmd = profile.acp_command.clone();
-    if let Some(base_url) = &profile.base_url {
-        let api_key = profile.api_key.as_deref().unwrap_or("EMPTY");
-        cmd.splice(
-            1..1,
-            [
-                "--base-url".to_string(),
-                base_url.clone(),
-                "--local-agent-api-key".to_string(),
-                api_key.to_string(),
-            ],
-        );
-    }
-    cmd
+    profile.acp_command.clone()
 }
 
 /// Build the subprocess `Command` for an ACP server.
 ///
-/// `--model` is injected immediately after the executable, before other flags, matching CLI
-/// expectations for global options that must precede the `acp` subcommand.
+/// No `--model` injection — the model is passed via the ACP `session/set_model` call.
+/// Any CLI flags the agent needs must be explicitly specified in the config's `acp_command`.
 pub fn build_acp_spawn_command(
     command: &[String],
-    model: Option<&str>,
     env: &HashMap<String, String>,
 ) -> Result<Command> {
     validate_acp_command(command)?;
     let mut cmd = Command::new(&command[0]);
-    if let Some(model) = model {
-        cmd.arg("--model").arg(model);
-    }
     for arg in &command[1..] {
         cmd.arg(arg);
     }
@@ -197,22 +176,20 @@ mod tests {
     }
 
     #[test]
-    fn build_injects_model_after_executable() {
+    fn build_uses_command_verbatim_no_model_injection() {
+        // No --model injection — the model is passed via ACP session/set_model.
         let argv = vec![
             "agent-local".into(),
             "--print".into(),
             "--trust".into(),
             "acp".into(),
         ];
-        let cmd = build_acp_spawn_command(&argv, Some("model1-fp8"), &HashMap::new()).unwrap();
+        let cmd = build_acp_spawn_command(&argv, &HashMap::new()).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            args,
-            vec!["--model", "model1-fp8", "--print", "--trust", "acp"]
-        );
+        assert_eq!(args, vec!["--print", "--trust", "acp"]);
     }
 
     #[test]
@@ -223,7 +200,7 @@ mod tests {
             "http://example/v1".to_string(),
         );
         env.insert("EXAMPLE_API_KEY".to_string(), "secret".to_string());
-        let cmd = build_acp_spawn_command(&default_acp_command(), None, &env).unwrap();
+        let cmd = build_acp_spawn_command(&default_acp_command(), &env).unwrap();
         assert_eq!(
             cmd.get_envs()
                 .find(|(k, _)| *k == "EXAMPLE_BASE_URL")
@@ -241,9 +218,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_command_without_acp_subcommand() {
-        let err = validate_acp_command(&["agent-local".into(), "--print".into()]).unwrap_err();
-        assert!(err.to_string().contains("acp"));
+    fn accepts_command_without_acp_subcommand() {
+        // After relaxing validation, commands without the "acp" literal are accepted
+        // (e.g. ["potlatch", "harness"]).
+        validate_acp_command(&["potlatch".into(), "harness".into()]).unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_executable() {
+        let err = validate_acp_command(&["".into(), "acp".into()]).unwrap_err();
+        assert!(err.to_string().contains("non-empty"));
     }
 
     #[test]
@@ -281,12 +265,18 @@ mod tests {
     }
 
     #[test]
-    fn build_profile_command_injects_endpoint_flags() {
+    fn build_profile_command_returns_verbatim() {
+        // No injection — the config's acp_command is used as-is.
+        // Any CLI flags must be explicitly specified in the config.
         let profile = AcpClientProfile {
             base_url: Some("http://prod-model1.example/v1".into()),
             api_key: Some("EMPTY".into()),
             acp_command: vec![
                 "agent-local".into(),
+                "--base-url".into(),
+                "http://prod-model1.example/v1".into(),
+                "--local-agent-api-key".into(),
+                "EMPTY".into(),
                 "--print".into(),
                 "--trust".into(),
                 "acp".into(),
@@ -294,19 +284,7 @@ mod tests {
             env: vec![],
         };
         let cmd = build_profile_command(&profile);
-        assert_eq!(
-            cmd,
-            vec![
-                "agent-local",
-                "--base-url",
-                "http://prod-model1.example/v1",
-                "--local-agent-api-key",
-                "EMPTY",
-                "--print",
-                "--trust",
-                "acp",
-            ]
-        );
+        assert_eq!(cmd, profile.acp_command);
     }
 
     #[test]

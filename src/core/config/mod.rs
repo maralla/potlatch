@@ -107,8 +107,7 @@ impl Config {
             return Ok(AcpSpawnConfig {
                 command: default_acp_command(),
                 model_uri,
-                endpoint_model: endpoint_model.clone(),
-                spawn_model: endpoint_model,
+                endpoint_model,
                 env: HashMap::new(),
             });
         };
@@ -118,16 +117,10 @@ impl Config {
             .get(client_name)
             .with_context(|| format!("unknown acp_client `{client_name}`"))?;
 
-        let custom_endpoint = profile.base_url.is_some();
         Ok(AcpSpawnConfig {
             command: build_profile_command(profile),
             model_uri,
-            endpoint_model: endpoint_model.clone(),
-            spawn_model: if custom_endpoint {
-                None
-            } else {
-                endpoint_model
-            },
+            endpoint_model,
             env: resolve_profile_env(profile)?,
         })
     }
@@ -168,7 +161,6 @@ mod tests {
         assert_eq!(spawn.command[0], "agent");
         assert_eq!(spawn.model_uri.as_deref(), Some("acp://cursor/composer-2"));
         assert_eq!(spawn.endpoint_model.as_deref(), Some("composer-2"));
-        assert_eq!(spawn.spawn_model.as_deref(), Some("composer-2"));
         assert!(spawn.env.is_empty());
     }
 
@@ -197,11 +189,12 @@ mod tests {
         assert_eq!(spawn.command[0], "agent-local");
         assert_eq!(spawn.model_uri.as_deref(), Some("acp://cursor/model1-fp8"));
         assert_eq!(spawn.endpoint_model.as_deref(), Some("model1-fp8"));
-        assert!(spawn.spawn_model.is_none());
-        assert_eq!(spawn.command[1], "--base-url");
-        assert_eq!(spawn.command[2], "http://prod-model1.example/v1");
-        assert_eq!(spawn.command[3], "--local-agent-api-key");
-        assert_eq!(spawn.command[4], "EMPTY");
+        // Command is used verbatim from config — no injection
+        assert_eq!(spawn.command[1], "--print");
+        assert_eq!(spawn.command[2], "--trust");
+        assert_eq!(spawn.command[3], "--force");
+        assert_eq!(spawn.command[4], "--approve-mcps");
+        assert_eq!(spawn.command[5], "acp");
         assert_eq!(
             spawn
                 .env
