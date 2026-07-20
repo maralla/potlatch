@@ -149,7 +149,6 @@ impl ToolRegistry {
         let mut reg = Self::new();
         reg.register(Arc::new(shell::ShellTool::new()));
         reg.register(Arc::new(file_read::FileReadTool));
-        reg.register(Arc::new(file_read::FileReadBatchTool));
         reg.register(Arc::new(file_edit::FileEditTool));
         reg.register(Arc::new(file_write::FileWriteTool));
         reg.register(Arc::new(search::GrepTool));

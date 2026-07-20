@@ -1,14 +1,10 @@
-//! File edit tool: str_replace with line-number anchored errors, fuzzy
-//! near-match suggestions, multi-file/multi-edit batch support, and
-//! read-after-edit verification.
+//! File edit tool: str_replace one or more edits, with line-number anchored
+//! errors, fuzzy near-match suggestions, and read-after-edit verification.
 //!
-//! [`FileEditTool`] supports two invocation modes:
-//! - **Single edit**: pass `path`, `old_string`, `new_string`.
-//! - **Multi edit**: pass an `edits` array of `{path, old_string, new_string}`
-//!   objects to apply multiple edits across one or more files in one call.
-//!   Edits to the same file apply in order (an earlier edit may shift text a
-//!   later edit references); edits to different files run concurrently.
-//!   Per-edit errors are reported inline and do not block the other edits.
+//! [`FileEditTool`] takes an `edits` array of `{path, old_string, new_string}`
+//! objects. Edits to the same file apply in order (an earlier edit may shift
+//! text a later edit references); edits to different files run concurrently.
+//! Per-edit errors are reported inline and do not block the other edits.
 //!
 //! When an exact `old_string` is not found, the error includes the best fuzzy
 //! near-matches (computed via the `dissimilar` crate) with line numbers, so the
@@ -46,25 +42,13 @@ impl Tool for FileEditTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Edit files by replacing exact strings. Two modes: (1) single edit — pass path, old_string, new_string; (2) multi edit — pass an 'edits' array of {path, old_string, new_string} objects to apply multiple edits across one or more files in one call. In multi-edit mode, edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The old_string must match uniquely within its file. On failure, the error includes line numbers and similarity scores of fuzzy near-matches so you can retry with a more specific match. After editing, the edited region is read back and included in the result so you can verify the change.",
+            "description": "Edit files by replacing exact strings. Pass an 'edits' array of {path, old_string, new_string} objects. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The old_string must match uniquely within its file. On failure, the error includes line numbers and similarity scores of fuzzy near-matches so you can retry with a more specific match. After editing, the edited region is read back and included in the result so you can verify the change.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file to edit. Used in single-edit mode; ignored when 'edits' is present."
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "The exact string to find in the file. Must match uniquely. Used in single-edit mode; ignored when 'edits' is present."
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "The replacement string. Used in single-edit mode; ignored when 'edits' is present."
-                    },
                     "edits": {
                         "type": "array",
-                        "description": "List of edits to apply in multi-edit mode. When present, path/old_string/new_string are ignored. Each entry is {path, old_string, new_string}.",
+                        "description": "List of edits to apply.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -85,148 +69,125 @@ impl Tool for FileEditTool {
                         },
                         "minItems": 1
                     }
-                }
+                },
+                "required": ["edits"]
             }
         })
     }
 
     fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
-        // Multi-edit mode: an 'edits' array is present.
-        if let Some(edits) = args.get("edits").and_then(Value::as_array) {
-            return execute_multi_edit(edits, cwd);
+        let edits = args["edits"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing or invalid 'edits' array argument"))?;
+
+        if edits.is_empty() {
+            anyhow::bail!("'edits' array must contain at least one entry");
         }
 
-        // Single-edit mode: path/old_string/new_string.
-        let path = args["path"].as_str().ok_or_else(|| {
-            anyhow::anyhow!("missing 'path' argument (or 'edits' array for multi-edit mode)")
-        })?;
-        let old_string = args["old_string"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'old_string' argument"))?;
-        let new_string = args["new_string"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'new_string' argument"))?;
+        // Parse + validate each entry up front (cheap, no I/O). Group by resolved
+        // path so we can apply multiple edits to the same file in order, while
+        // independent files run concurrently.
+        let mut groups: Vec<EditGroup> = Vec::new();
+        for (idx, entry) in edits.iter().enumerate() {
+            let path = entry["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("each edit requires a 'path' string"))?;
+            let old_string = entry["old_string"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("each edit requires an 'old_string' string"))?;
+            let new_string = entry["new_string"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("each edit requires a 'new_string' string"))?;
 
-        let full_path = match super::resolve_workspace_path(path, cwd) {
-            Ok(p) => p,
-            Err(msg) => return Ok(format!("Error: {msg}")),
-        };
+            let full_path = match super::resolve_workspace_path(path, cwd) {
+                Ok(p) => p,
+                Err(msg) => {
+                    // Pre-validation failure: record a synthetic group with a
+                    // single error result so it's surfaced inline.
+                    groups.push(EditGroup {
+                        path_label: path.to_string(),
+                        full_path: None,
+                        edits: vec![ParsedEdit {
+                            original_index: idx,
+                            old_string: old_string.to_string(),
+                            new_string: new_string.to_string(),
+                        }],
+                        results: vec![format!("Error: {msg}")],
+                    });
+                    continue;
+                }
+            };
 
-        Ok(apply_single_edit(&full_path, path, old_string, new_string))
-    }
-}
-
-/// Execute a multi-edit call. Parses + groups edits by resolved file path,
-/// then applies each group (sequentially within a file, concurrently across
-/// files) and returns a combined result string.
-fn execute_multi_edit(edits: &[Value], cwd: &str) -> Result<String> {
-    if edits.is_empty() {
-        anyhow::bail!("'edits' array must contain at least one entry");
-    }
-
-    // Parse + validate each entry up front (cheap, no I/O). Group by resolved
-    // path so we can apply multiple edits to the same file in order, while
-    // independent files run concurrently.
-    let mut groups: Vec<EditGroup> = Vec::new();
-    for (idx, entry) in edits.iter().enumerate() {
-        let path = entry["path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("each edit requires a 'path' string"))?;
-        let old_string = entry["old_string"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("each edit requires an 'old_string' string"))?;
-        let new_string = entry["new_string"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("each edit requires a 'new_string' string"))?;
-
-        let full_path = match super::resolve_workspace_path(path, cwd) {
-            Ok(p) => p,
-            Err(msg) => {
-                // Pre-validation failure: record a synthetic group with a
-                // single error result so it's surfaced inline.
-                groups.push(EditGroup {
+            // Find or create the group for this resolved file path.
+            let group = groups
+                .iter_mut()
+                .find(|g| g.full_path.as_deref() == Some(full_path.as_path()));
+            match group {
+                Some(g) => g.edits.push(ParsedEdit {
+                    original_index: idx,
+                    old_string: old_string.to_string(),
+                    new_string: new_string.to_string(),
+                }),
+                None => groups.push(EditGroup {
                     path_label: path.to_string(),
-                    full_path: None,
+                    full_path: Some(full_path),
                     edits: vec![ParsedEdit {
                         original_index: idx,
                         old_string: old_string.to_string(),
                         new_string: new_string.to_string(),
                     }],
-                    results: vec![format!("Error: {msg}")],
-                });
-                continue;
+                    results: Vec::new(),
+                }),
             }
-        };
-
-        // Find or create the group for this resolved file path.
-        let group = groups
-            .iter_mut()
-            .find(|g| g.full_path.as_deref() == Some(full_path.as_path()));
-        match group {
-            Some(g) => g.edits.push(ParsedEdit {
-                original_index: idx,
-                old_string: old_string.to_string(),
-                new_string: new_string.to_string(),
-            }),
-            None => groups.push(EditGroup {
-                path_label: path.to_string(),
-                full_path: Some(full_path),
-                edits: vec![ParsedEdit {
-                    original_index: idx,
-                    old_string: old_string.to_string(),
-                    new_string: new_string.to_string(),
-                }],
-                results: Vec::new(),
-            }),
         }
-    }
 
-    // Apply groups concurrently. Each group processes its edits sequentially
-    // against a single in-memory buffer, so within-file ordering is preserved
-    // while different files run in parallel.
-    let group_results: Vec<(String, Vec<usize>, Vec<String>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = groups
-            .iter_mut()
-            .map(|g| {
-                let indices: Vec<usize> = g.edits.iter().map(|e| e.original_index).collect();
-                let label = g.path_label.clone();
-                let results = apply_group(g);
-                s.spawn(move || (label, indices, results))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join().unwrap_or_else(|_| {
-                    (
-                        "unknown".to_string(),
-                        vec![],
-                        vec!["Error: edit group thread panicked".to_string()],
-                    )
+        // Apply groups concurrently. Each group processes its edits sequentially
+        // against a single in-memory buffer, so within-file ordering is preserved
+        // while different files run in parallel.
+        let group_results: Vec<(String, Vec<usize>, Vec<String>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = groups
+                .iter_mut()
+                .map(|g| {
+                    let indices: Vec<usize> = g.edits.iter().map(|e| e.original_index).collect();
+                    let label = g.path_label.clone();
+                    let results = apply_group(g);
+                    s.spawn(move || (label, indices, results))
                 })
-            })
-            .collect()
-    });
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        (
+                            "unknown".to_string(),
+                            vec![],
+                            vec!["Error: edit group thread panicked".to_string()],
+                        )
+                    })
+                })
+                .collect()
+        });
 
-    // Re-order results by the original edit index so the output reads in the
-    // order the model issued the edits.
-    let mut indexed: Vec<(usize, String, String)> = Vec::new();
-    for (path_label, indices, results) in group_results {
-        for (i, result) in results.into_iter().enumerate() {
-            let orig = indices.get(i).copied().unwrap_or(i);
-            indexed.push((orig, path_label.clone(), result));
+        // Re-order results by the original edit index so the output reads in the
+        // order the model issued the edits.
+        let mut indexed: Vec<(usize, String, String)> = Vec::new();
+        for (path_label, indices, results) in group_results {
+            for (i, result) in results.into_iter().enumerate() {
+                let orig = indices.get(i).copied().unwrap_or(i);
+                indexed.push((orig, path_label.clone(), result));
+            }
         }
-    }
-    indexed.sort_by_key(|(i, _, _)| *i);
+        indexed.sort_by_key(|(i, _, _)| *i);
 
-    let mut output = format!("Applied {} edit(s):\n\n", indexed.len());
-    for (i, (orig, path_label, result)) in indexed.iter().enumerate() {
-        if i > 0 {
-            output.push_str("\n---\n\n");
+        let mut output = format!("Applied {} edit(s):\n\n", indexed.len());
+        for (i, (orig, path_label, result)) in indexed.iter().enumerate() {
+            if i > 0 {
+                output.push_str("\n---\n\n");
+            }
+            output.push_str(&format!("[edit {orig}] {path_label}: {result}\n"));
         }
-        output.push_str(&format!("[edit {orig}] {path_label}: {result}\n"));
+        Ok(output)
     }
-    Ok(output)
 }
 
 /// One parsed edit entry, with its position in the original `edits` array.
@@ -346,28 +307,6 @@ fn apply_edit_to_buffer(
 
     let verification = verify_edit(content, new_string);
     format!("Successfully edited {path_label}.\n{verification}")
-}
-
-/// Apply a single edit to a file on disk. Reads, edits, writes, verifies.
-/// Returns the user-facing result string.
-fn apply_single_edit(
-    full_path: &std::path::Path,
-    path_label: &str,
-    old_string: &str,
-    new_string: &str,
-) -> String {
-    let mut content = match fs::read_to_string(full_path) {
-        Ok(c) => c,
-        Err(e) => return format!("Error: failed to read {}: {e}", full_path.display()),
-    };
-
-    let result = apply_edit_to_buffer(&mut content, path_label, old_string, new_string);
-    if result.starts_with("Successfully edited")
-        && let Err(e) = fs::write(full_path, &content)
-    {
-        return format!("Error: failed to write {}: {e}", full_path.display());
-    }
-    result
 }
 
 /// Find the line number and snippet of each occurrence of `needle`.
@@ -649,7 +588,7 @@ mod tests {
         assert!(matches[0].0 == 1, "should match starting at line 1");
     }
 
-    // --- single-edit mode tests ---
+    // --- edit tests (all via the 'edits' array form) ---
 
     #[test]
     fn edits_file_successfully() {
@@ -657,9 +596,9 @@ mod tests {
         let name = make_test_file(&dir, "test.txt", "hello world\nfoo bar\n");
         let tool = FileEditTool;
         let args = json!({
-            "path": name,
-            "old_string": "hello world",
-            "new_string": "hello universe"
+            "edits": [
+                {"path": name, "old_string": "hello world", "new_string": "hello universe"}
+            ]
         });
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("Successfully edited"));
@@ -675,9 +614,9 @@ mod tests {
         let name = make_test_file(&dir, "test.txt", "hello world\n");
         let tool = FileEditTool;
         let args = json!({
-            "path": name,
-            "old_string": "nonexistent text",
-            "new_string": "replacement"
+            "edits": [
+                {"path": name, "old_string": "nonexistent text", "new_string": "replacement"}
+            ]
         });
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("not found"));
@@ -692,9 +631,9 @@ mod tests {
         let name = make_test_file(&dir, "test.txt", "dup\ndup\ndup\n");
         let tool = FileEditTool;
         let args = json!({
-            "path": name,
-            "old_string": "dup",
-            "new_string": "unique"
+            "edits": [
+                {"path": name, "old_string": "dup", "new_string": "unique"}
+            ]
         });
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("matches 3 times"));
@@ -706,9 +645,9 @@ mod tests {
         let name = make_test_file(&dir, "test.txt", "fn old_name() {}\n");
         let tool = FileEditTool;
         let args = json!({
-            "path": name,
-            "old_string": "fn old_name() {}",
-            "new_string": "fn new_name() {\n    // renamed\n}"
+            "edits": [
+                {"path": name, "old_string": "fn old_name() {}", "new_string": "fn new_name() {\n    // renamed\n}"}
+            ]
         });
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("Verified"));
@@ -720,9 +659,9 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let tool = FileEditTool;
         let args = json!({
-            "path": "/etc/passwd",
-            "old_string": "x",
-            "new_string": "y"
+            "edits": [
+                {"path": "/etc/passwd", "old_string": "x", "new_string": "y"}
+            ]
         });
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("absolute paths are not allowed"));
@@ -739,9 +678,9 @@ mod tests {
         let tool = FileEditTool;
         // Small typo: calculat_total vs calculate_total
         let args = json!({
-            "path": name,
-            "old_string": "fn calculat_total() -> i32 {",
-            "new_string": "fn compute_total() -> i32 {"
+            "edits": [
+                {"path": name, "old_string": "fn calculat_total() -> i32 {", "new_string": "fn compute_total() -> i32 {"}
+            ]
         });
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("not found"));
@@ -749,10 +688,8 @@ mod tests {
         assert!(result.contains("similarity"));
     }
 
-    // --- multi-edit mode tests ---
-
     #[test]
-    fn multi_edits_single_file_multiple_edits_in_order() {
+    fn edits_single_file_multiple_edits_in_order() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "alpha\nbeta\ngamma\n");
         let tool = FileEditTool;
@@ -772,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_edits_multiple_files_concurrently() {
+    fn edits_multiple_files_concurrently() {
         let dir = test_util::unique_test_dir();
         let a = make_test_file(&dir, "a.txt", "one\ntwo\n");
         let b = make_test_file(&dir, "b.txt", "three\nfour\n");
@@ -793,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_edits_reports_per_edit_errors_without_blocking_others() {
+    fn reports_per_edit_errors_without_blocking_others() {
         let dir = test_util::unique_test_dir();
         let ok = make_test_file(&dir, "ok.txt", "good content\n");
         let bad = make_test_file(&dir, "bad.txt", "other content\n");
@@ -816,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_edits_sequential_within_file_compose_correctly() {
+    fn sequential_edits_within_file_compose_correctly() {
         // An earlier edit can shift text that a later edit references. Verify
         // the second edit still applies correctly because both run against the
         // same in-memory buffer in order.
@@ -838,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_edits_rejects_empty_edits_array() {
+    fn rejects_empty_edits_array() {
         let dir = test_util::unique_test_dir();
         let tool = FileEditTool;
         let args = json!({"edits": []});
@@ -847,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_edits_rejects_absolute_path_inline() {
+    fn rejects_absolute_path_inline() {
         let dir = test_util::unique_test_dir();
         let ok = make_test_file(&dir, "ok.txt", "good\n");
         let tool = FileEditTool;
@@ -868,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_edits_preserves_edit_order_in_output() {
+    fn preserves_edit_order_in_output() {
         let dir = test_util::unique_test_dir();
         let a = make_test_file(&dir, "a.txt", "1\n");
         let b = make_test_file(&dir, "b.txt", "2\n");
@@ -888,25 +825,5 @@ mod tests {
         let b_pos = result.find("[edit 2]").unwrap();
         assert!(c_pos < a_pos);
         assert!(a_pos < b_pos);
-    }
-
-    #[test]
-    fn multi_edits_no_match_includes_fuzzy_near_matches() {
-        let dir = test_util::unique_test_dir();
-        let name = make_test_file(
-            &dir,
-            "test.txt",
-            "fn calculate_total() -> i32 {\n    42\n}\n",
-        );
-        let tool = FileEditTool;
-        let args = json!({
-            "edits": [
-                {"path": name, "old_string": "fn calculat_total() -> i32 {", "new_string": "fn compute_total() -> i32 {"}
-            ]
-        });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
-        assert!(result.contains("not found"));
-        assert!(result.contains("Near matches"));
-        assert!(result.contains("similarity"));
     }
 }

@@ -431,9 +431,9 @@ impl AgentLoop {
     /// `(tool_name, tool_call_id, result_string)`.
     ///
     /// Concurrency is only used when **every** call is to a read-only tool
-    /// (`file_read`, `file_read_batch`, `grep`, `glob`, `web_fetch`). If any
-    /// call is to a mutating tool (`file_write`, `file_edit`, `shell`), all
-    /// calls run sequentially in order to preserve dependencies.
+    /// (`file_read`, `grep`, `glob`, `web_fetch`). If any call is to a mutating
+    /// tool (`file_write`, `file_edit`, `shell`), all calls run sequentially in
+    /// order to preserve dependencies.
     fn execute_tool_calls_concurrent(
         &self,
         tool_calls: &[Value],
@@ -525,7 +525,7 @@ impl AgentLoop {
 fn classify_tool_result(tool_name: &str, _result: &str) -> ContextKind {
     match tool_name {
         "shell" => ContextKind::ShellOutput,
-        "file_read" | "file_read_batch" => ContextKind::FileRead,
+        "file_read" => ContextKind::FileRead,
         "file_edit" => ContextKind::EditResult,
         "file_write" => ContextKind::EditResult,
         "grep" | "glob" => ContextKind::Exploration,
@@ -544,10 +544,7 @@ const MAX_TOOL_RESULT_CHARS: usize = 4_000;
 /// executed concurrently safely; mutating tools must run in order to preserve
 /// dependencies (e.g. `mkdir` before `file_write`).
 fn is_read_only_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "file_read" | "file_read_batch" | "grep" | "glob" | "web_fetch"
-    )
+    matches!(name, "file_read" | "grep" | "glob" | "web_fetch")
 }
 
 /// Fallback compaction when the LLM summarizer is unavailable (e.g. API error).
@@ -723,7 +720,6 @@ mod tests {
     #[test]
     fn is_read_only_tool_classifies_correctly() {
         assert!(is_read_only_tool("file_read"));
-        assert!(is_read_only_tool("file_read_batch"));
         assert!(is_read_only_tool("grep"));
         assert!(is_read_only_tool("glob"));
         assert!(is_read_only_tool("web_fetch"));
@@ -755,7 +751,7 @@ mod tests {
                     json!({
                         "id": "call_2",
                         "type": "function",
-                        "function": {"name": "file_read", "arguments": "{\"path\":\"out.txt\"}"}
+                        "function": {"name": "file_read", "arguments": "{\"files\":[{\"path\":\"out.txt\"}]}"}
                     }),
                 ],
                 finish_reason: "tool_calls".into(),

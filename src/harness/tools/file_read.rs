@@ -1,5 +1,12 @@
-//! File read tool with line range support, plus a batch variant for reading
-//! multiple files concurrently in a single tool call.
+//! File read tool: read one or more files with line numbers.
+//!
+//! [`FileReadTool`] takes a `files` array of `{path, start_line?, end_line?}`
+//! objects. Reads run concurrently; per-file errors are reported inline and do
+//! not block the other reads. Very large files are truncated with a marker.
+//!
+//! Reads are not sandboxed: absolute paths and paths outside the working
+//! directory are allowed when a file is explicitly referenced in the task
+//! context.
 
 use std::fs;
 use std::path::PathBuf;
@@ -18,54 +25,7 @@ impl Tool for FileReadTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Read the contents of a single file. Supports optional line range (start_line and end_line, 1-indexed). Very large files are truncated with a marker. Always prefer grep to find relevant code before reading entire files. Use file_read_batch instead when you need multiple files at once.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file to read. May be relative to the working directory, or an absolute path to a file explicitly referenced in the task context."
-                    },
-                    "start_line": {
-                        "type": "integer",
-                        "description": "Starting line number (1-indexed). Optional."
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "description": "Ending line number (1-indexed, inclusive). Optional."
-                    }
-                },
-                "required": ["path"]
-            }
-        })
-    }
-
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
-        let path = args["path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'path' argument"))?;
-        let start_line = args["start_line"].as_u64();
-        let end_line = args["end_line"].as_u64();
-        let result = read_single_file(path, start_line, end_line, cwd);
-        // The single-file tool propagates read/path errors as Err so the agent
-        // loop logs them as tool errors. The batch tool instead reports them inline.
-        match result.strip_prefix("Error: ") {
-            Some(msg) => anyhow::bail!(msg.to_string()),
-            None => Ok(result),
-        }
-    }
-}
-
-pub struct FileReadBatchTool;
-
-impl Tool for FileReadBatchTool {
-    fn name(&self) -> &str {
-        "file_read_batch"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "description": "Read multiple files concurrently in a single tool call. Each entry can specify its own path and optional line range. Use this instead of calling file_read multiple times when you need several files at once — it is faster and uses fewer round-trips. Per-file errors are reported inline; a failure on one file does not block the others.",
+            "description": "Read file contents with line numbers. Pass a 'files' array of {path, start_line?, end_line?} objects; reads run concurrently. Per-file errors are reported inline and do not block the other reads. Very large files are truncated with a marker. Always prefer grep to find relevant code before reading entire files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -108,7 +68,7 @@ impl Tool for FileReadBatchTool {
         }
 
         // Resolve and validate each entry up front (cheap, no file I/O), so the
-        // concurrent phase just needs the resolved args.
+        // concurrent phase just needs the parsed args.
         let entries: Vec<FileEntry> = files
             .iter()
             .map(|entry| {
@@ -159,10 +119,9 @@ struct FileEntry {
     end_line: Option<u64>,
 }
 
-/// Read a single file and format it with line numbers. Used by both
-/// `FileReadTool` and `FileReadBatchTool`. Returns a user-facing string;
-/// errors are formatted as `Error: ...` strings (not `Err`) so a batch read
-/// can report per-file failures inline without aborting the whole call.
+/// Read a single file and format it with line numbers. Returns a user-facing
+/// string; errors are formatted as `Error: ...` strings (not `Err`) so a batch
+/// read can report per-file failures inline without aborting the whole call.
 fn read_single_file(
     path: &str,
     start_line: Option<u64>,
@@ -248,7 +207,7 @@ mod tests {
         writeln!(f, "line three").unwrap();
 
         let tool = FileReadTool;
-        let args = json!({"path": "test.txt"});
+        let args = json!({"files": [{"path": "test.txt"}]});
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("line one"));
         assert!(result.contains("line two"));
@@ -266,7 +225,9 @@ mod tests {
         }
 
         let tool = FileReadTool;
-        let args = json!({"path": "range.txt", "start_line": 3, "end_line": 5});
+        let args = json!({
+            "files": [{"path": "range.txt", "start_line": 3, "end_line": 5}]
+        });
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("line 3"));
         assert!(result.contains("line 4"));
@@ -280,9 +241,11 @@ mod tests {
     fn errors_on_missing_file() {
         let dir = test_util::unique_test_dir();
         let tool = FileReadTool;
-        let args = json!({"path": "nonexistent.txt"});
-        let result = tool.execute(&args, dir.as_str());
-        assert!(result.is_err());
+        let args = json!({"files": [{"path": "nonexistent.txt"}]});
+        // The tool itself returns Ok with an inline "Error:" — a missing file
+        // is a per-file failure, not a whole-call failure.
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Error"));
     }
 
     #[test]
@@ -292,7 +255,7 @@ mod tests {
 
         let cwd = test_util::unique_test_dir();
         let abs = external.path().join("external.txt");
-        let args = json!({"path": abs.to_str().unwrap()});
+        let args = json!({"files": [{"path": abs.to_str().unwrap()}]});
         let result = FileReadTool.execute(&args, cwd.as_str()).unwrap();
         assert!(result.contains("external content"));
     }
@@ -301,19 +264,19 @@ mod tests {
     fn errors_on_missing_absolute_path() {
         let dir = test_util::unique_test_dir();
         let tool = FileReadTool;
-        let args = json!({"path": "/nonexistent/path/file.txt"});
-        let result = tool.execute(&args, dir.as_str());
-        assert!(result.is_err());
+        let args = json!({"files": [{"path": "/nonexistent/path/file.txt"}]});
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Error"));
     }
 
     #[test]
-    fn batch_reads_multiple_files_concurrently() {
+    fn reads_multiple_files_concurrently() {
         let dir = test_util::unique_test_dir();
         std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
         std::fs::write(dir.path().join("b.txt"), "beta\nbeta2\n").unwrap();
         std::fs::write(dir.path().join("c.rs"), "fn main() {}\n").unwrap();
 
-        let tool = FileReadBatchTool;
+        let tool = FileReadTool;
         let args = json!({
             "files": [
                 {"path": "a.txt"},
@@ -330,11 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn batch_reports_per_file_errors_without_aborting() {
+    fn reports_per_file_errors_without_aborting() {
         let dir = test_util::unique_test_dir();
         std::fs::write(dir.path().join("ok.txt"), "good\n").unwrap();
 
-        let tool = FileReadBatchTool;
+        let tool = FileReadTool;
         let args = json!({
             "files": [
                 {"path": "ok.txt"},
@@ -348,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_supports_per_file_line_ranges() {
+    fn supports_per_file_line_ranges() {
         let dir = test_util::unique_test_dir();
         let p = dir.path().join("nums.txt");
         let mut f = std::fs::File::create(&p).unwrap();
@@ -356,7 +319,7 @@ mod tests {
             writeln!(f, "line {i}").unwrap();
         }
 
-        let tool = FileReadBatchTool;
+        let tool = FileReadTool;
         let args = json!({
             "files": [
                 {"path": "nums.txt", "start_line": 1, "end_line": 2},
@@ -372,18 +335,18 @@ mod tests {
     }
 
     #[test]
-    fn batch_rejects_empty_files_array() {
+    fn rejects_empty_files_array() {
         let dir = test_util::unique_test_dir();
-        let tool = FileReadBatchTool;
+        let tool = FileReadTool;
         let args = json!({"files": []});
         let result = tool.execute(&args, dir.as_str());
         assert!(result.is_err());
     }
 
     #[test]
-    fn batch_rejects_missing_files_array() {
+    fn rejects_missing_files_array() {
         let dir = test_util::unique_test_dir();
-        let tool = FileReadBatchTool;
+        let tool = FileReadTool;
         let args = json!({});
         let result = tool.execute(&args, dir.as_str());
         assert!(result.is_err());
