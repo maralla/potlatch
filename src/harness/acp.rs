@@ -189,7 +189,7 @@ impl AcpServer {
 
         let tools = ToolRegistry::with_builtin_tools();
 
-        let mut agent = AgentLoop::new(Arc::clone(&self.llm), tools, model, 100_000, cancel);
+        let mut agent = AgentLoop::new(Arc::clone(&self.llm), tools, model, 80_000, cancel);
 
         // Collect progress text; the agent loop calls this callback after each LLM response.
         // We emit notifications by writing to the writer after collection.

@@ -3,8 +3,10 @@
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod memory;
 pub mod search;
 pub mod shell;
+pub mod todo;
 pub mod web_fetch;
 
 use std::collections::HashMap;

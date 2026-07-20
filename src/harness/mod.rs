@@ -13,7 +13,9 @@ pub mod acp;
 pub mod agent_loop;
 pub mod client;
 pub mod context;
+pub mod memory;
 pub mod prompt;
+pub mod todo;
 pub mod tools;
 
 use std::io::{BufRead, Write};
@@ -109,8 +111,13 @@ fn init_logging() -> Arc<SwappableWriter> {
 
     let writer = Arc::new(SwappableWriter::new(file));
 
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::Level::DEBUG.into())
+        .from_env_lossy()
+        .add_directive("hyper_util=warn".parse().expect("valid directive"));
+
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(filter)
         .with_writer(SwappableWriterMaker(Arc::clone(&writer)))
         .with_ansi(false)
         .finish();

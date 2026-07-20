@@ -130,7 +130,8 @@ pub fn init() {
             "potlatch::agent_stderr=warn"
                 .parse()
                 .expect("valid directive"),
-        );
+        )
+        .add_directive("hyper_util=warn".parse().expect("valid directive"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::client::{ChatClient, ChatResponse, StreamCallback};
-use super::context::{Context, ContextKind, Role};
+use super::context::{Context, ContextEntry, ContextKind, Role};
 use super::prompt;
 use super::tools::ToolRegistry;
 
@@ -31,6 +31,9 @@ pub struct AgentLoop {
     context: Context,
     model: String,
     cancel: Arc<AtomicBool>,
+    /// Task checklist that survives context compaction and collapse.
+    /// Injected as a system message before every API call.
+    todo: Arc<super::todo::TodoList>,
     /// Sliding window of recent tool calls for stuck detection.
     recent_calls: VecDeque<(String, String)>,
     /// Number of stuck signals encountered.
@@ -40,11 +43,18 @@ pub struct AgentLoop {
 impl AgentLoop {
     pub fn new(
         llm: Arc<dyn ChatClient>,
-        tools: ToolRegistry,
+        mut tools: ToolRegistry,
         model: String,
         token_budget: usize,
         cancel: Arc<AtomicBool>,
     ) -> Self {
+        let todo = Arc::new(super::todo::TodoList::new());
+        // Register the todo tool so the model can manage its task checklist.
+        tools.register(Arc::new(super::tools::todo::TodoTool::new(Arc::clone(
+            &todo,
+        ))));
+        // Register the memory tool so the model can save fundamental project facts.
+        tools.register(Arc::new(super::tools::memory::MemoryTool));
         // Build tool schemas once — the tool set is fixed for the harness lifetime.
         let tool_schemas = tools.tools_schema();
         Self {
@@ -54,6 +64,7 @@ impl AgentLoop {
             context: Context::new(token_budget),
             model,
             cancel,
+            todo,
             recent_calls: VecDeque::with_capacity(8),
             stuck_count: 0,
         }
@@ -71,6 +82,17 @@ impl AgentLoop {
         let system_prompt = prompt::system_prompt();
         self.context
             .push(Role::System, ContextKind::System, system_prompt);
+
+        // Load persistent project facts (if any) and inject as a system message.
+        // These are fundamental facts about the project that were extracted during
+        // previous sessions' context compaction — build commands, architecture,
+        // key file locations, conventions. They survive across sessions.
+        if let Some(facts) = super::memory::load_facts(cwd) {
+            let facts_prompt = format!("## Project Facts\n\n{facts}");
+            self.context
+                .push(Role::System, ContextKind::System, &facts_prompt);
+        }
+
         self.context
             .push(Role::User, ContextKind::UserPrompt, prompt);
 
@@ -79,9 +101,130 @@ impl AgentLoop {
                 return Ok("[cancelled]".into());
             }
 
-            // Build messages and enforce context budget
-            self.context.enforce_budget();
-            let messages = self.context.to_messages();
+            // Build messages and enforce context budget. When compacting, use
+            // the LLM to summarize all large entries in a single call so the
+            // most important info (errors, key results, file paths) is preserved.
+            // The same call also produces a fresh, complete set of project facts
+            // that overwrites the persistent memory.
+            let model = &self.model;
+            let llm = &self.llm;
+            let tool_schemas = &self.tool_schemas;
+            let compactor: &super::context::Compactor<'_> = &|entries: &[(String, String)]| {
+                if entries.is_empty() {
+                    return Vec::new();
+                }
+
+                // Build a single prompt: summarize each output.
+                let mut prompt = String::from(
+                    "Summarize each of the following tool outputs concisely. \
+                     For each one, keep all errors, warnings, file paths, line numbers, \
+                     function/class names, and key results. Remove redundant lines, \
+                     repetition, and verbose output. Preserve the essential information \
+                     the agent would need to continue working.\n\n\
+                     Respond with one summary per output, separated by a line containing \
+                     exactly '---SUMMARY---'. Do not include the original output.\n",
+                );
+                for (i, (label, content)) in entries.iter().enumerate() {
+                    prompt.push_str(&format!("\n=== OUTPUT {i} ({label}) ===\n{content}\n"));
+                }
+
+                let messages = vec![json!({
+                    "role": "user",
+                    "content": prompt
+                })];
+                match llm.chat(model, &messages, tool_schemas, None, None) {
+                    Ok(resp) if !resp.content.is_empty() => {
+                        let summaries: Vec<String> = resp
+                            .content
+                            .split("---SUMMARY---")
+                            .map(|s| s.trim().to_string())
+                            .collect();
+                        let mut result = Vec::with_capacity(entries.len());
+                        for i in 0..entries.len() {
+                            if i < summaries.len() && !summaries[i].is_empty() {
+                                result.push(format!(
+                                    "[llm-compacted {}]\n{}",
+                                    entries[i].0, summaries[i]
+                                ));
+                            } else {
+                                result.push(compact_summary_fallback(&entries[i].1, &entries[i].0));
+                            }
+                        }
+                        result
+                    }
+                    _ => entries
+                        .iter()
+                        .map(|(label, content)| compact_summary_fallback(content, label))
+                        .collect(),
+                }
+            };
+
+            // Conversation summarizer: when non-evictable entries (tool calls,
+            // edit results) exceed the budget, collapse the entire conversation
+            // into a single summary. This breaks the tool-call chain and starts
+            // fresh: system prompt + summary + original user prompt.
+            let summarizer: &super::context::Summarizer<'_> = &|entries: &[ContextEntry]| {
+                // Build a text representation of the conversation for the LLM.
+                let mut transcript = String::new();
+                for entry in entries {
+                    let role_label = match entry.role {
+                        Role::System => "SYSTEM",
+                        Role::User => "USER",
+                        Role::Assistant => "ASSISTANT",
+                        Role::Tool => "TOOL",
+                    };
+                    transcript.push_str(&format!("[{role_label}]\n{}\n\n", entry.content));
+                }
+
+                let prompt = format!(
+                    "Summarize the following agent conversation. Focus on:\n\
+                     - What task the agent is working on and its current progress\n\
+                     - What files were read, created, or edited (with paths)\n\
+                     - What commands were run and their results (builds, tests, errors)\n\
+                     - What decisions were made and what remains to be done\n\
+                     - Any errors or blockers encountered\n\n\
+                     Be concise but complete — the agent will use this summary to continue \
+                     working without access to the original tool outputs.\n\n{transcript}"
+                );
+
+                let messages = vec![json!({
+                    "role": "user",
+                    "content": prompt
+                })];
+                match llm.chat(model, &messages, tool_schemas, None, None) {
+                    Ok(resp) if !resp.content.is_empty() => resp.content,
+                    _ => {
+                        // Fallback: naive summary of first/last entries
+                        let mut parts = Vec::new();
+                        for entry in entries.iter().take(5) {
+                            let preview: String = entry.content.chars().take(200).collect();
+                            parts.push(preview);
+                        }
+                        format!("[fallback summary]\n{}", parts.join("\n---\n"))
+                    }
+                }
+            };
+            let action = self
+                .context
+                .enforce_budget(Some(compactor), Some(summarizer));
+            if action != super::context::BudgetAction::None {
+                info!(
+                    "harness: context {action:?}, {} tokens after",
+                    self.context.total_tokens()
+                );
+            }
+
+            // Inject the todo checklist as a temporary system message.
+            // This is added fresh every turn (after compaction) so it always
+            // reflects the current state and survives any compaction/collapse.
+            let todo_snapshot = self.todo.render();
+            let mut messages = self.context.to_messages();
+            if let Some(todo_text) = todo_snapshot {
+                messages.push(json!({
+                    "role": "system",
+                    "content": todo_text
+                }));
+            }
 
             // Tool execution callback for overlap: when the streaming response
             // finishes (finish_reason arrives), the client invokes this closure
@@ -185,13 +328,9 @@ impl AgentLoop {
     }
 
     fn handle_response(&mut self, response: &ChatResponse, cwd: &str) -> Result<LoopControl> {
-        // Store reasoning if present
-        if let Some(reasoning) = &response.reasoning
-            && !reasoning.trim().is_empty()
-        {
-            self.context
-                .push(Role::System, ContextKind::Reasoning, reasoning);
-        }
+        // Reasoning content is not stored in context — it's intermediate thinking
+        // already reflected in the subsequent tool calls and actions. Storing it
+        // wastes tokens on every turn.
 
         if response.finish_reason == "stop" || response.tool_calls.is_empty() {
             // Model is done — store the final text
@@ -262,6 +401,21 @@ impl AgentLoop {
         };
 
         for (name, tc_id, result) in tool_results {
+            // Skip storing todo tool results in context — the todo list is
+            // already injected as a system message every turn, so storing the
+            // tool response would be pure duplication.
+            if name == "todo" || name == "memory" {
+                continue;
+            }
+            // Compress empty search results to a short note — the full
+            // "No matches found for pattern '...' in ..." output has no value.
+            let result = if (name == "grep" || name == "glob")
+                && (result.contains("No matches") || result.contains("No files matching"))
+            {
+                "[no results]".to_string()
+            } else {
+                result
+            };
             let kind = classify_tool_result(&name, &result);
             // Truncate large tool results before pushing to context to avoid
             // context bloat and the BPE encoding cost on oversized outputs.
@@ -376,6 +530,7 @@ fn classify_tool_result(tool_name: &str, _result: &str) -> ContextKind {
         "file_write" => ContextKind::EditResult,
         "grep" | "glob" => ContextKind::Exploration,
         "web_fetch" => ContextKind::WebFetch,
+        "todo" | "memory" => ContextKind::ToolResult,
         _ => ContextKind::ToolResult,
     }
 }
@@ -383,7 +538,7 @@ fn classify_tool_result(tool_name: &str, _result: &str) -> ContextKind {
 /// Maximum character length for a tool result stored in context. Larger results
 /// are truncated with a marker, keeping the first portion (most relevant for
 /// file reads and search results) and a note about the truncation.
-const MAX_TOOL_RESULT_CHARS: usize = 8_000;
+const MAX_TOOL_RESULT_CHARS: usize = 4_000;
 
 /// Whether a tool is read-only (no side effects). Read-only tools can be
 /// executed concurrently safely; mutating tools must run in order to preserve
@@ -393,6 +548,25 @@ fn is_read_only_tool(name: &str) -> bool {
         name,
         "file_read" | "file_read_batch" | "grep" | "glob" | "web_fetch"
     )
+}
+
+/// Fallback compaction when the LLM summarizer is unavailable (e.g. API error).
+/// Uses the naive first/last-lines heuristic.
+fn compact_summary_fallback(content: &str, label: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let first_lines: Vec<&str> = lines.iter().take(5).copied().collect();
+    let last_lines: Vec<&str> = if lines.len() > 10 {
+        lines.iter().rev().take(3).rev().copied().collect()
+    } else {
+        Vec::new()
+    };
+    let mut summary = format!("[compacted {label}, {} lines]\n", lines.len());
+    summary.push_str(&first_lines.join("\n"));
+    if !last_lines.is_empty() {
+        summary.push_str("\n[...truncated...]\n");
+        summary.push_str(&last_lines.join("\n"));
+    }
+    summary
 }
 
 /// Execute a single tool call against the registry, logging the invocation and

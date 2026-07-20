@@ -46,6 +46,8 @@ Your workspace is the current working directory. It is the root of the repositor
 - **shell**: Run any command — build, test, git, etc. Returns stdout, stderr, and exit code. Runs in the workspace directory.
 - **glob**: Find files by name pattern.
 - **web_fetch**: Fetch web pages for documentation or references.
+- **todo**: Manage a task checklist that persists across context compaction. When a task has multiple steps, use `todo` with action `set` to create the list, then `start`/`complete` as you progress. The checklist is always visible to you in the system prompt — check it before deciding what to do next. This is optional — use it only when the task is complex enough to benefit from tracking.
+- **memory**: Save fundamental project facts that survive across sessions. Use this when you discover something permanently true about the project (language, build commands, architecture rules) that would help any future task. Be extremely selective — only save facts that belong in a README's first paragraph, not implementation details.
 
 ## Important Notes
 
