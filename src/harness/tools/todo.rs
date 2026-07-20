@@ -1,5 +1,10 @@
-//! Todo list management tool. Lets the model track task progress with a list
-//! that survives context compaction.
+//! Todo tool: manage a task checklist that survives context compaction.
+//!
+//! The wire format mirrors the mainstream agent todo format (Cursor TodoWrite,
+//! ACP, etc.): the model sends the full list of `{description, status}` items
+//! on every call. This is a replace-all API — indices stay stable across
+//! updates, and there are no separate `start`/`complete` actions to drift out
+//! of sync when items are inserted or reordered.
 
 use std::sync::Arc;
 
@@ -8,7 +13,7 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::Tool;
-use crate::harness::todo::TodoList;
+use crate::harness::todo::{TodoItem, TodoList, TodoStatus};
 
 pub struct TodoTool {
     todo: Arc<TodoList>,
@@ -27,88 +32,72 @@ impl Tool for TodoTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Manage a task checklist that persists across context compaction. Use 'set' to create the full list at the start, 'start' to mark an item in-progress, and 'complete' to mark it done. The checklist is always visible to you in the system prompt — check it before deciding what to do next.",
+            "description": "Manage a task checklist that persists across context compaction. Send the FULL desired list of items on every call — this replaces the entire list (a replace-all API). Each item is {description, status} where status is 'pending', 'in_progress', or 'completed'. Mark exactly one item 'in_progress' at a time (the one you're currently working on). The checklist is always visible to you in the system prompt — check it before deciding what to do next. Use this only when the task is complex enough to benefit from tracking.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["set", "start", "complete"],
-                        "description": "Action: 'set' replaces the entire list (all items start pending), 'start' marks an item in-progress, 'complete' marks an item done."
-                    },
                     "items": {
                         "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of task descriptions. Required for 'set' action. Ignored for 'start'/'complete'."
-                    },
-                    "index": {
-                        "type": "integer",
-                        "description": "0-based index of the item to start/complete. Required for 'start'/'complete' actions."
+                        "description": "Full list of todo items. Replaces the entire list on every call.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "description": {
+                                    "type": "string",
+                                    "description": "Short description of the task."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Current status of the task."
+                                }
+                            },
+                            "required": ["description", "status"]
+                        },
+                        "minItems": 1
                     }
                 },
-                "required": ["action"]
+                "required": ["items"]
             }
         })
     }
 
     fn execute(&self, args: &Value, _cwd: &str) -> Result<String> {
-        let action = args["action"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'action' argument"))?;
-
-        match action {
-            "set" => {
-                let items = args["items"]
-                    .as_array()
-                    .ok_or_else(|| anyhow::anyhow!("'set' action requires 'items' array"))?;
-                let texts: Vec<String> = items
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-                if texts.is_empty() {
-                    return Ok("Error: 'items' array must not be empty".into());
-                }
-                self.todo.set_items(texts);
-                let rendered = self.todo.render().unwrap_or_default();
-                info!("harness: todo set\n{rendered}");
-                let count = rendered
-                    .lines()
-                    .filter(|l| l.starts_with(|c: char| c.is_numeric()))
-                    .count();
-                Ok(format!("Todo list set with {count} item(s).\n{rendered}"))
-            }
-            "start" => {
-                let index = args["index"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("'start' action requires 'index'"))?
-                    as usize;
-                match self.todo.start(index) {
-                    Ok(()) => {
-                        let rendered = self.todo.render().unwrap_or_default();
-                        info!("harness: todo start item {index}\n{rendered}");
-                        Ok(format!("Started item {index}.\n{rendered}"))
-                    }
-                    Err(e) => Ok(format!("Error: {e}")),
-                }
-            }
-            "complete" => {
-                let index = args["index"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("'complete' action requires 'index'"))?
-                    as usize;
-                match self.todo.complete(index) {
-                    Ok(()) => {
-                        let rendered = self.todo.render().unwrap_or_default();
-                        info!("harness: todo complete item {index}\n{rendered}");
-                        Ok(format!("Completed item {index}.\n{rendered}"))
-                    }
-                    Err(e) => Ok(format!("Error: {e}")),
-                }
-            }
-            other => Ok(format!(
-                "Error: unknown action '{other}'. Use 'set', 'start', or 'complete'."
-            )),
+        let items = args["items"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing or invalid 'items' array argument"))?;
+        if items.is_empty() {
+            anyhow::bail!("'items' array must contain at least one entry");
         }
+
+        let mut parsed: Vec<TodoItem> = Vec::with_capacity(items.len());
+        for (i, entry) in items.iter().enumerate() {
+            let description = entry["description"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("item {i} is missing a 'description' string"))?;
+            let status_str = entry["status"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("item {i} is missing a 'status' string"))?;
+            let status = TodoStatus::parse(status_str).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "item {i} has invalid status '{status_str}'. \
+                     Use 'pending', 'in_progress', or 'completed'."
+                )
+            })?;
+            parsed.push(TodoItem {
+                description: description.to_string(),
+                status,
+            });
+        }
+
+        self.todo.replace_all(parsed);
+        let rendered = self.todo.render().unwrap_or_default();
+        info!("harness: todo updated\n{rendered}");
+        let count = rendered
+            .lines()
+            .filter(|l| l.starts_with(|c: char| c.is_numeric()))
+            .count();
+        Ok(format!("Todo list updated ({count} item(s)).\n{rendered}"))
     }
 }
 
@@ -118,53 +107,135 @@ mod tests {
     use crate::harness::todo::TodoList;
 
     #[test]
-    fn set_creates_list() {
+    fn set_creates_list_with_statuses() {
         let todo = Arc::new(TodoList::new());
         let tool = TodoTool::new(Arc::clone(&todo));
-        let args = json!({"action": "set", "items": ["task A", "task B"]});
+        let args = json!({
+            "items": [
+                {"description": "task A", "status": "in_progress"},
+                {"description": "task B", "status": "pending"}
+            ]
+        });
         let result = tool.execute(&args, "/tmp").unwrap();
         assert!(result.contains("2 item(s)"));
         let rendered = todo.render().unwrap();
-        assert!(rendered.contains("[ ] task A"));
+        assert!(rendered.contains("[~] task A"));
         assert!(rendered.contains("[ ] task B"));
     }
 
     #[test]
-    fn start_marks_in_progress() {
+    fn replace_all_overwrites_previous_list() {
         let todo = Arc::new(TodoList::new());
         let tool = TodoTool::new(Arc::clone(&todo));
         tool.execute(
-            &json!({"action": "set", "items": ["task A", "task B"]}),
+            &json!({
+                "items": [
+                    {"description": "old task", "status": "in_progress"}
+                ]
+            }),
             "/tmp",
         )
         .unwrap();
         let result = tool
-            .execute(&json!({"action": "start", "index": 0}), "/tmp")
+            .execute(
+                &json!({
+                    "items": [
+                        {"description": "new task 1", "status": "pending"},
+                        {"description": "new task 2", "status": "pending"}
+                    ]
+                }),
+                "/tmp",
+            )
             .unwrap();
-        assert!(result.contains("[~] task A"));
+        assert!(result.contains("2 item(s)"));
+        let rendered = todo.render().unwrap();
+        assert!(!rendered.contains("old task"));
+        assert!(rendered.contains("[ ] new task 1"));
+        assert!(rendered.contains("[ ] new task 2"));
     }
 
     #[test]
-    fn complete_marks_done() {
+    fn marks_item_completed_via_full_replace() {
         let todo = Arc::new(TodoList::new());
         let tool = TodoTool::new(Arc::clone(&todo));
-        tool.execute(&json!({"action": "set", "items": ["task A"]}), "/tmp")
-            .unwrap();
-        let result = tool
-            .execute(&json!({"action": "complete", "index": 0}), "/tmp")
-            .unwrap();
-        assert!(result.contains("[x] task A"));
+        tool.execute(
+            &json!({
+                "items": [
+                    {"description": "task A", "status": "in_progress"},
+                    {"description": "task B", "status": "pending"}
+                ]
+            }),
+            "/tmp",
+        )
+        .unwrap();
+        tool.execute(
+            &json!({
+                "items": [
+                    {"description": "task A", "status": "completed"},
+                    {"description": "task B", "status": "in_progress"}
+                ]
+            }),
+            "/tmp",
+        )
+        .unwrap();
+        let rendered = todo.render().unwrap();
+        assert!(rendered.contains("[x] task A"));
+        assert!(rendered.contains("[~] task B"));
     }
 
     #[test]
-    fn out_of_range_error() {
+    fn rejects_invalid_status() {
         let todo = Arc::new(TodoList::new());
         let tool = TodoTool::new(Arc::clone(&todo));
-        tool.execute(&json!({"action": "set", "items": ["only"]}), "/tmp")
-            .unwrap();
-        let result = tool
-            .execute(&json!({"action": "complete", "index": 5}), "/tmp")
-            .unwrap();
-        assert!(result.contains("Error"));
+        let args = json!({
+            "items": [
+                {"description": "task A", "status": "done"}
+            ]
+        });
+        let result = tool.execute(&args, "/tmp");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid status 'done'")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_description() {
+        let todo = Arc::new(TodoList::new());
+        let tool = TodoTool::new(Arc::clone(&todo));
+        let args = json!({
+            "items": [
+                {"status": "pending"}
+            ]
+        });
+        let result = tool.execute(&args, "/tmp");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing a 'description'")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_items_array() {
+        let todo = Arc::new(TodoList::new());
+        let tool = TodoTool::new(Arc::clone(&todo));
+        let args = json!({"items": []});
+        let result = tool.execute(&args, "/tmp");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_missing_items_array() {
+        let todo = Arc::new(TodoList::new());
+        let tool = TodoTool::new(Arc::clone(&todo));
+        let args = json!({});
+        let result = tool.execute(&args, "/tmp");
+        assert!(result.is_err());
     }
 }
