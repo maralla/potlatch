@@ -102,8 +102,9 @@ impl Tool for GrepTool {
             }
 
             let path = entry.path();
+            let display_path = super::display_path(path, cwd);
             let mut sink = CollectorSink {
-                path: path.to_string_lossy().to_string(),
+                path: display_path,
                 collector: &collector,
             };
 
@@ -236,7 +237,7 @@ impl Tool for GlobTool {
         let mut results = Vec::new();
         for entry in walker.flatten() {
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                results.push(entry.path().to_string_lossy().to_string());
+                results.push(super::display_path(entry.path(), cwd));
             }
         }
 
@@ -305,7 +306,7 @@ mod tests {
     #[test]
     fn grep_searches_absolute_path_outside_workspace() {
         // Searching an absolute path outside the cwd must be allowed when the
-        // location is explicitly provided.
+        // location is explicitly provided. Paths outside the cwd stay absolute.
         let external = test_util::unique_test_dir();
         std::fs::write(external.path().join("target.rs"), "fn needle() {}\n").unwrap();
 
@@ -315,6 +316,8 @@ mod tests {
         let result = tool.execute(&args, cwd.as_str()).unwrap();
         assert!(result.contains("needle"));
         assert!(result.contains("target.rs"));
+        // External path is shown absolute (not stripped to a relative path).
+        assert!(result.contains(external.as_str()));
     }
 
     #[test]
@@ -327,5 +330,39 @@ mod tests {
         let args = json!({"pattern": "*.rs", "path": external.as_str()});
         let result = tool.execute(&args, cwd.as_str()).unwrap();
         assert!(result.contains("match.rs"));
+        // External path is shown absolute.
+        assert!(result.contains(external.as_str()));
+    }
+
+    #[test]
+    fn grep_strips_cwd_prefix_from_in_workspace_paths() {
+        // Matches inside the workspace are shown relative to cwd, not absolute.
+        let dir = test_util::unique_test_dir();
+        std::fs::create_dir_all(dir.path().join("taskapp/tasks")).unwrap();
+        std::fs::write(
+            dir.path().join("taskapp/tasks/handler.go"),
+            "func handleIndex() {}\n",
+        )
+        .unwrap();
+
+        let tool = GrepTool;
+        let args = json!({"pattern": "handleIndex"});
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("taskapp/tasks/handler.go:1:"));
+        // The absolute path must NOT appear in the output.
+        assert!(!result.contains(dir.as_str()));
+    }
+
+    #[test]
+    fn glob_strips_cwd_prefix_from_in_workspace_paths() {
+        let dir = test_util::unique_test_dir();
+        std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        std::fs::File::create(dir.path().join("src/nested/mod.rs")).unwrap();
+
+        let tool = GlobTool;
+        let args = json!({"pattern": "**/*.rs"});
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("src/nested/mod.rs"));
+        assert!(!result.contains(dir.as_str()));
     }
 }

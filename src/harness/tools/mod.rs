@@ -91,6 +91,26 @@ pub fn resolve_read_path(path: &str, cwd: &str) -> Result<PathBuf, String> {
     Ok(resolved.canonicalize().unwrap_or(resolved))
 }
 
+/// Format `path` for display in tool output. When `path` is inside `cwd`,
+/// returns the path relative to `cwd` (e.g. `taskapp/tasks/handler.go` instead of
+/// `/home/user/project/taskapp/tasks/handler.go`). When `path` is outside `cwd`
+/// (or `cwd` can't be resolved), returns the path as-is. This keeps tool output
+/// short and workspace-relative for in-repo files while still showing full
+/// paths for files the agent reads from outside the workspace.
+pub fn display_path(path: &Path, cwd: &str) -> String {
+    let cwd_path = Path::new(cwd);
+    let cwd_canonical = cwd_path
+        .canonicalize()
+        .unwrap_or_else(|_| cwd_path.to_path_buf());
+    if let Ok(rel) = path.strip_prefix(&cwd_canonical) {
+        // Don't return an empty string for the cwd itself.
+        let s = rel.to_string_lossy().to_string();
+        if s.is_empty() { ".".to_string() } else { s }
+    } else {
+        path.to_string_lossy().to_string()
+    }
+}
+
 /// Lexically normalize a path (resolve `.` and `..` without filesystem access).
 fn resolve_lexical(path: &Path, base: &Path) -> PathBuf {
     let mut result = PathBuf::new();
@@ -326,6 +346,31 @@ mod tests {
         let result = resolve_read_path("inside.txt", dir.as_str());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), dir.path().join("inside.txt"));
+    }
+
+    #[test]
+    fn display_path_strips_cwd_prefix() {
+        let dir = test_util::unique_test_dir();
+        std::fs::create_dir_all(dir.path().join("taskapp/tasks")).unwrap();
+        let file = dir.path().join("taskapp/tasks/handler.go");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(display_path(&file, dir.as_str()), "taskapp/tasks/handler.go");
+    }
+
+    #[test]
+    fn display_path_returns_dot_for_cwd_itself() {
+        let dir = test_util::unique_test_dir();
+        assert_eq!(display_path(dir.path(), dir.as_str()), ".");
+    }
+
+    #[test]
+    fn display_path_keeps_absolute_for_external_paths() {
+        let dir = test_util::unique_test_dir();
+        let external = test_util::unique_test_dir();
+        std::fs::write(external.path().join("outside.txt"), "x").unwrap();
+        let file = external.path().join("outside.txt");
+        // Path outside cwd is returned as-is (absolute).
+        assert_eq!(display_path(&file, dir.as_str()), file.to_string_lossy());
     }
 
     #[test]
