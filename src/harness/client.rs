@@ -103,24 +103,10 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: String,
     client: reqwest::blocking::Client,
-    /// Per-request `max_tokens` cap. `None` lets the backend decide. When set,
-    /// the model stops at this many output tokens per turn (finish_reason
-    /// `"length"`), and the agent loop continues the conversation so the model
-    /// resumes from where it stopped. This keeps each streaming response short
-    /// so slow decoders stay responsive instead of blocking for 30-60s on a
-    /// single long generation.
-    max_tokens: Option<u32>,
 }
 
 impl OpenAiClient {
     pub fn new(base_url: String, api_key: String) -> Self {
-        // Optional cap on output tokens per turn. Set BREEZE_MAX_TOKENS to a
-        // number (e.g. 1024) to bound each streaming response; unset disables
-        // the cap and lets the backend decide.
-        let max_tokens = std::env::var("BREEZE_MAX_TOKENS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|n: &u32| *n > 0);
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
@@ -129,7 +115,6 @@ impl OpenAiClient {
             base_url,
             api_key,
             client,
-            max_tokens,
         }
     }
 
@@ -186,9 +171,6 @@ impl ChatClient for OpenAiClient {
         });
         if !tools.is_empty() {
             body["tools"] = json!(tools);
-        }
-        if let Some(max_tokens) = self.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
         }
 
         let started = Instant::now();
