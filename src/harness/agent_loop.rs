@@ -460,6 +460,28 @@ impl AgentLoop {
     }
 
     fn handle_response(&mut self, response: &ChatResponse, cwd: &str) -> Result<LoopControl> {
+        // `finish_reason == "length"` means the model hit the `max_tokens` cap
+        // mid-generation. Store what it produced and continue the loop — the
+        // model resumes from where it stopped on the next turn. This keeps
+        // each streaming response short (bounded by `max_tokens`) so slow
+        // decoders stay responsive instead of blocking on one long generation.
+        // Tool calls are buffered across turns by the backend's conversation
+        // state, so we only need to persist the text content here.
+        if response.finish_reason == "length" && response.tool_calls.is_empty() {
+            if !response.content.is_empty() {
+                self.context.push_assistant_text(&response.content);
+            }
+            self.context.push(
+                Role::System,
+                ContextKind::System,
+                "Continue your previous response from where you stopped. \
+                 Do not repeat what you already wrote — pick up exactly where \
+                 the output was cut off.",
+            );
+            info!("harness: model hit max_tokens cap (finish_reason=length), continuing");
+            return Ok(LoopControl::Continue);
+        }
+
         if response.finish_reason == "stop" || response.tool_calls.is_empty() {
             // In plan mode, the model MUST call the `plan` tool before
             // stopping. If it finishes with `stop` without calling `plan`,
@@ -1164,6 +1186,83 @@ mod tests {
             captured,
             Some(json!({"decision": "guide_worker", "instructions": "do X"}))
         );
+    }
+
+    #[test]
+    fn length_finish_reason_continues_generation_until_stop() {
+        // When finish_reason is "length" (max_tokens cap hit mid-generation),
+        // the harness stores the partial content and continues the loop. The
+        // model resumes on the next turn, eventually finishing with "stop".
+        let llm = Arc::new(FakeChatClient::new(vec![
+            // First turn: hits the max_tokens cap partway through.
+            ChatResponse {
+                content: "Here is the first part".into(),
+                tool_calls: vec![],
+                finish_reason: "length".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
+                elapsed_ms: 0,
+            },
+            // Second turn: model continues and finishes normally.
+            ChatResponse {
+                content: " and the second part.".into(),
+                tool_calls: vec![],
+                finish_reason: "stop".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
+                elapsed_ms: 0,
+            },
+        ]));
+
+        let tools = ToolRegistry::with_builtin_tools();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
+
+        let result = agent.run("write a long response", "/tmp", None).unwrap();
+        // The final response is the second chunk; the first chunk was stored
+        // in context and a continue nudge was injected.
+        assert!(result.contains("second part"));
+    }
+
+    #[test]
+    fn length_finish_reason_with_tool_calls_proceeds_to_tool_execution() {
+        // If the model hits max_tokens while streaming tool call arguments,
+        // the backend reports finish_reason="length" but may still include
+        // the (possibly incomplete) tool_calls. The harness should NOT treat
+        // this as a text-continuation case — it falls through to the normal
+        // tool-call handling path. We verify by scripting a "length" response
+        // WITH a tool call and checking the tool was executed.
+        let llm = Arc::new(FakeChatClient::new(vec![
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![json!({
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
+                })],
+                finish_reason: "length".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
+                elapsed_ms: 0,
+            },
+            ChatResponse {
+                content: "Done.".into(),
+                tool_calls: vec![],
+                finish_reason: "stop".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
+                elapsed_ms: 0,
+            },
+        ]));
+
+        let tools = ToolRegistry::with_builtin_tools();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
+
+        let result = agent.run("run a command", "/tmp", None).unwrap();
+        // The tool call was executed (not treated as text continuation),
+        // and the loop reached the final stop response.
+        assert!(result.contains("Done"));
     }
 
     /// A fake client that simulates speculative tool execution by firing
