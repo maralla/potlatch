@@ -911,7 +911,9 @@ fn issue_has_worker_review_only_label(labels: &[String]) -> bool {
 }
 
 fn worker_should_cancel_issue_processing(issue: &Issue) -> bool {
-    issue.state != "opened" || issue_has_worker_review_only_label(&issue.labels)
+    issue.state != "opened"
+        || issue_has_worker_review_only_label(&issue.labels)
+        || issue_has_worker_pending_label(&issue.labels)
 }
 
 fn worker_issue_cancel_check(
@@ -929,8 +931,9 @@ fn is_worker_agent_cancelled(err: &anyhow::Error) -> bool {
     err.to_string().contains(WORKER_AGENT_CANCELLED_MSG)
 }
 
-/// Stop in-flight work when the issue was closed or switched to review-only.
-/// Returns true when the error was handled as an intentional stop.
+/// Stop in-flight work when the issue was closed, switched to review-only,
+/// or marked `pending` by a human. Returns true when the error was handled
+/// as an intentional stop.
 fn handle_worker_issue_processing_cancelled(
     state: &AgentState,
     issue_iid: u64,
@@ -941,6 +944,19 @@ fn handle_worker_issue_processing_cancelled(
     }
 
     match state.glab.get_issue(issue_iid) {
+        Ok(issue) if issue_has_worker_pending_label(&issue.labels) => {
+            info!(
+                "{}: Issue #{} marked `{}` mid-run — releasing worker hold (issue stays open)",
+                &state.agent_id, issue_iid, WORKER_PENDING_LABEL
+            );
+            // Leave the issue open and the `pending` label in place; just drop
+            // our claim and session so another worker can pick it up once a
+            // human removes `pending`.
+            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+            let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+            state.cleanup_session(issue_iid);
+            true
+        }
         Ok(issue) if issue_has_worker_review_only_label(&issue.labels) => {
             state.release_worker_hold_review_only(issue_iid);
             true
@@ -3511,7 +3527,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_should_cancel_issue_processing_for_review_only_or_closed() {
+    fn worker_should_cancel_issue_processing_for_review_only_closed_or_pending() {
         let mut issue = Issue {
             iid: 9,
             title: "Test".into(),
@@ -3527,7 +3543,13 @@ mod tests {
         issue.state = "closed".into();
         assert!(worker_should_cancel_issue_processing(&issue));
 
+        // `pending` label set by a human mid-run must cancel in-flight work.
         issue.state = "opened".into();
+        issue.labels = vec![WORKER_PENDING_LABEL.to_string()];
+        assert!(worker_should_cancel_issue_processing(&issue));
+
+        // Opened with no blocking labels → keep working.
+        issue.labels.clear();
         assert!(!worker_should_cancel_issue_processing(&issue));
     }
 
