@@ -43,29 +43,67 @@ impl Tool for PlanTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Emit a structured JSON plan that Potlatch reads as the canonical handoff. Call this with your decision and supporting details. The JSON shape depends on your role — for the PMO agent, use {decision, instructions?, sub_issues?, reason?, question?}. This is the primary output channel when available; streamed text is secondary.",
+            "description": "Emit your triage decision as a structured plan. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your decision and the fields relevant to it.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "plan": {
-                        "description": "The structured plan as a JSON object. Shape depends on role.",
-                        "type": "object"
+                    "decision": {
+                        "description": "Your triage decision. Must be exactly one of: \"guide_worker\", \"split\", \"already_done\", \"needs_clarification\".",
+                        "type": "string",
+                        "enum": ["guide_worker", "split", "already_done", "needs_clarification"]
+                    },
+                    "instructions": {
+                        "description": "For guide_worker: 3-5 sentences with one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.",
+                        "type": "string"
+                    },
+                    "sub_issues": {
+                        "description": "For split: the sub-issues to create. Each must have a title and description.",
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "description": "Concise sub-issue title.",
+                                    "type": "string"
+                                },
+                                "description": {
+                                    "description": "Scope and acceptance criteria. If this sub-issue depends on another, reference it by title.",
+                                    "type": "string"
+                                },
+                                "priority": {
+                                    "description": "Priority: 1 (critical/blocking), 2 (high/depended-on), 3 (normal/independent).",
+                                    "type": "integer",
+                                    "enum": [1, 2, 3]
+                                }
+                            },
+                            "required": ["title", "description"]
+                        }
+                    },
+                    "reason": {
+                        "description": "For already_done: why the codebase already satisfies the issue.",
+                        "type": "string"
+                    },
+                    "question": {
+                        "description": "For needs_clarification: specific questions for a human.",
+                        "type": "string"
                     }
                 },
-                "required": ["plan"]
+                "required": ["decision"]
             }
         })
     }
 
     fn execute(&self, args: &Value, _cwd: &str) -> Result<String> {
-        let plan = args
-            .get("plan")
-            .ok_or_else(|| anyhow::anyhow!("missing 'plan' argument"))?;
-        if !plan.is_object() {
-            anyhow::bail!("'plan' must be a JSON object");
+        // The model passes the fields directly as top-level arguments (no
+        // wrapping "plan" key). Store the entire args object as the plan.
+        if !args.is_object() {
+            anyhow::bail!("plan arguments must be a JSON object");
+        }
+        if args.get("decision").and_then(Value::as_str).is_none() {
+            anyhow::bail!("missing or invalid 'decision' field");
         }
         // Store in the side-channel cell (last call wins).
-        *self.cell.lock().unwrap() = Some(plan.clone());
+        *self.cell.lock().unwrap() = Some(args.clone());
         Ok("Plan recorded.".to_string())
     }
 }
@@ -82,7 +120,7 @@ mod tests {
     fn stores_plan_json() {
         let c = cell();
         let tool = PlanTool::new(Arc::clone(&c));
-        let args = json!({"plan": {"decision": "split", "sub_issues": [{"title": "A"}]}});
+        let args = json!({"decision": "split", "sub_issues": [{"title": "A"}]});
         let result = tool.execute(&args, "/tmp").unwrap();
         assert_eq!(result, "Plan recorded.");
         let captured = c.lock().unwrap().clone();
@@ -96,16 +134,14 @@ mod tests {
     fn second_call_overwrites_first() {
         let c = cell();
         let tool = PlanTool::new(Arc::clone(&c));
-        tool.execute(&json!({"plan": {"decision": "a"}}), "/tmp")
-            .unwrap();
-        tool.execute(&json!({"plan": {"decision": "b"}}), "/tmp")
-            .unwrap();
+        tool.execute(&json!({"decision": "a"}), "/tmp").unwrap();
+        tool.execute(&json!({"decision": "b"}), "/tmp").unwrap();
         let captured = PlanTool::take(&c);
         assert_eq!(captured, Some(json!({"decision": "b"})));
     }
 
     #[test]
-    fn rejects_missing_plan_field() {
+    fn rejects_missing_decision_field() {
         let c = cell();
         let tool = PlanTool::new(Arc::clone(&c));
         let result = tool.execute(&json!({}), "/tmp");
@@ -113,10 +149,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_object_plan() {
+    fn rejects_non_object_args() {
         let c = cell();
         let tool = PlanTool::new(Arc::clone(&c));
-        let result = tool.execute(&json!({"plan": "not an object"}), "/tmp");
+        let result = tool.execute(&json!("not an object"), "/tmp");
         assert!(result.is_err());
     }
 
@@ -130,9 +166,49 @@ mod tests {
     fn take_clears_cell() {
         let c = cell();
         let tool = PlanTool::new(Arc::clone(&c));
-        tool.execute(&json!({"plan": {"x": 1}}), "/tmp").unwrap();
+        tool.execute(&json!({"decision": "split"}), "/tmp").unwrap();
         assert!(PlanTool::take(&c).is_some());
         // Second take returns None — cell was cleared.
         assert_eq!(PlanTool::take(&c), None);
+    }
+
+    #[test]
+    fn schema_lists_explicit_properties() {
+        let c = cell();
+        let tool = PlanTool::new(Arc::clone(&c));
+        let schema = tool.schema();
+        let props = schema["parameters"]["properties"].as_object().unwrap();
+        // The decision field is required and has an enum.
+        assert!(props.contains_key("decision"));
+        assert_eq!(
+            schema["parameters"]["required"][0].as_str(),
+            Some("decision")
+        );
+        let decision = &props["decision"];
+        assert_eq!(decision["type"].as_str(), Some("string"));
+        let enums: Vec<&str> = decision["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            enums,
+            vec![
+                "guide_worker",
+                "split",
+                "already_done",
+                "needs_clarification"
+            ]
+        );
+        // Sub-issues have explicit title/description/priority.
+        let sub_issue_props = props["sub_issues"]["items"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(sub_issue_props.contains_key("title"));
+        assert!(sub_issue_props.contains_key("description"));
+        assert!(sub_issue_props.contains_key("priority"));
+        // No wrapping "plan" key — fields are top-level.
+        assert!(!props.contains_key("plan"));
     }
 }

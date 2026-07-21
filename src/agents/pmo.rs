@@ -1,19 +1,14 @@
 use anyhow::{Context, Result};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-use super::{
-    claim, extract_pmo_guidance_block, extract_public_comment_block, issue_in_scope, labels,
-    pmo_cursor_ask, wrap_pmo_guidance_block,
-};
+use super::{claim, issue_in_scope, labels, pmo_cursor_ask, strip_internal_markers};
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient, Issue};
 use crate::agents::settings;
@@ -25,7 +20,6 @@ use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::model::acp::ACP_SESSION_MODE_PLAN;
-use crate::core::model::acp::workspace_read::read_text_file_under_workspace;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
@@ -734,43 +728,46 @@ fn process_action_required_issue(
         "{}: PMO agent finished triaging issue #{}",
         &state.agent_id, issue.iid
     );
-    let had_plan_file_paths = !agent_output.cursor_plan_paths.is_empty();
-    agent_output = pmo_apply_cursor_plan_files(&state.working_dir, agent_output);
-    // Apply the structured plan JSON the model emitted via the `plan` tool
-    // (potlatch harness ACP backend, plan mode). Populates the handoff's
-    // structured fields (decision, sub_issues, instructions, etc.) so the
-    // decision functions below take the structured path first. Falls back to
-    // text-marker parsing when plan_output is None (Cursor backend or tool
-    // not called).
+    // Apply the structured plan JSON the model emitted via the `plan` tool.
+    // This populates the handoff's structured fields (decision, sub_issues,
+    // instructions, etc.) which the decision functions below read. The PMO
+    // runs in plan mode, so the model is expected to call the `plan` tool.
     let had_plan_output = agent_output.plan_output.is_some();
     agent_output = apply_pmo_plan_output(agent_output);
-    if !agent_output.has_final_result_text && !had_plan_file_paths && !had_plan_output {
+    // The model must call the `plan` tool. If it didn't, bail with a clear
+    // error rather than falling through to the decision predicates (which
+    // would all return false and hit the SPLIT path with a misleading
+    // "No sub-issues" error).
+    if !had_plan_output {
+        let preview = pmo_truncate_utf8_by_bytes(agent_output.response.trim(), 800);
         warn!(
-            "PMO: No canonical final output for issue #{} (no final response text, no plan file, no plan tool output), releasing claim for retry",
-            issue.iid
+            "PMO: Model did not call `plan` tool for issue #{} (response preview, {} bytes): {}",
+            issue.iid,
+            preview.len(),
+            preview
         );
         anyhow::bail!(
-            "PMO returned no canonical final output for issue #{}; retrying later",
+            "PMO did not call `plan` tool for issue #{}; retrying later",
             issue.iid
         );
     }
-    if agent_output.response.trim().is_empty()
-        && agent_output.sub_issues.is_empty()
-        && agent_output.decision.is_none()
-    {
+    if agent_output.decision.is_none() && agent_output.sub_issues.is_empty() {
+        let preview = pmo_truncate_utf8_by_bytes(agent_output.response.trim(), 800);
         warn!(
-            "PMO: Empty canonical output for issue #{} (no response text, no decision, no sub-issues), releasing claim for retry",
-            issue.iid
+            "PMO: Plan tool output had no decision and no sub-issues for issue #{} (response preview, {} bytes): {}",
+            issue.iid,
+            preview.len(),
+            preview
         );
         anyhow::bail!(
-            "PMO returned empty canonical output for issue #{}; retrying later",
+            "PMO plan output for issue #{} had no decision; retrying later",
             issue.iid
         );
     }
 
     // --- NEEDS_CLARIFICATION: PMO itself cannot decide, ask human ---
     if pmo_needs_clarification(&agent_output) {
-        let question = extract_clarification_question(&agent_output);
+        let question = strip_internal_markers(&extract_clarification_question(&agent_output));
         info!(
             "PMO: Issue #{} needs human clarification, marking pmo-pending",
             issue.iid
@@ -790,9 +787,8 @@ fn process_action_required_issue(
     }
 
     // --- ALREADY_DONE: work is already implemented, close the issue ---
-    // Require `ALREADY_DONE` then only whitespace before `REASON:` (avoids false positives from stray keywords).
     if is_pmo_already_done_response(&agent_output) {
-        let reason = extract_already_done_reason(&agent_output);
+        let reason = strip_internal_markers(&extract_already_done_reason(&agent_output));
         info!("PMO: Issue #{} is already implemented, closing", issue.iid);
         gitlab.add_issue_comment(
             issue.iid,
@@ -809,7 +805,7 @@ fn process_action_required_issue(
 
     // --- GUIDE_WORKER: single focused retry instruction ---
     if pmo_guides_worker(&agent_output) {
-        let guidance = extract_guidance(&agent_output);
+        let guidance = strip_internal_markers(&extract_guidance(&agent_output));
         if guidance.trim().is_empty() {
             warn!(
                 "PMO: GUIDE_WORKER output for issue #{} had no usable guidance, releasing claim for retry",
@@ -827,56 +823,16 @@ fn process_action_required_issue(
         return Ok(false);
     }
 
-    if pmo_no_split_needed(&agent_output) {
-        let guidance = extract_guidance(&agent_output);
-        if guidance.trim().is_empty() {
-            warn!(
-                "PMO: NO_SPLIT_NEEDED output for issue #{} had no usable guidance, releasing claim for retry",
-                issue.iid
-            );
-            anyhow::bail!(
-                "PMO NO_SPLIT_NEEDED output for issue #{} had no usable guidance; retrying later",
-                issue.iid
-            );
-        }
-        info!("PMO: Issue #{} does not need splitting", issue.iid);
-        gitlab.add_issue_comment(issue.iid, &format_pmo_guidance_comment(&guidance))?;
-        gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
-        let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
-        return Ok(false);
-    }
-
     // --- SPLIT: create sub-issues, close the parent as a task container ---
-    // Try extracting sub-issues directly from the streamed response first —
-    // the model may have emitted SUB_ISSUE_N blocks or a JSON array inline.
-    // Only fall back to the saved Cursor plan file when inline extraction
-    // comes up empty and a plan file was actually saved.
-    let sub_issues = extract_sub_issues(&agent_output);
-    let sub_issues = if !sub_issues.is_empty() {
-        sub_issues
-    } else if had_plan_file_paths {
-        let Some(plan_text) = pmo_extract_plan_file_text(&agent_output.response) else {
-            warn!(
-                "PMO: Split path for issue #{} had plan path indicator but unreadable plan content, releasing claim for retry",
-                issue.iid
-            );
-            anyhow::bail!(
-                "PMO split output for issue #{} had unreadable plan file content; retrying later",
-                issue.iid
-            );
-        };
-        // Re-run extraction scoped to the plan file text.
-        let mut scoped = agent_output.clone();
-        scoped.response = plan_text;
-        extract_sub_issues(&scoped)
-    } else {
-        Vec::new()
-    };
+    // Sub-issues come from the structured `plan` tool output (populated by
+    // `apply_pmo_plan_output` into `agent_output.sub_issues`). No text-marker
+    // parsing — the model must call the `plan` tool with a `sub_issues` array.
+    let sub_issues = agent_output.sub_issues.clone();
 
     if sub_issues.is_empty() {
         let preview = pmo_truncate_utf8_by_bytes(agent_output.response.trim(), 800);
         warn!(
-            "PMO: No sub-issues extracted from agent output for issue #{} (response preview, {} bytes): {}",
+            "PMO: No sub-issues from plan tool for issue #{} (response preview, {} bytes): {}",
             issue.iid,
             preview.len(),
             preview
@@ -1061,32 +1017,15 @@ CRITICAL REQUIREMENTS:
 
 ## Output — call the `plan` tool with your decision
 
-If the `plan` tool is available (potlatch harness ACP backend), call it with a JSON object as your canonical handoff. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Shape:
+Call the `plan` tool with your decision as its arguments. Potlatch reads the tool's arguments directly — your streamed text is ignored for decision parsing. This is the ONLY output channel; you MUST call `plan` with your decision. The tool's parameters are:
 
-  {{
-    "decision": "<guide_worker | split | already_done | needs_clarification>",
-    "instructions": "<for guide_worker: 3-5 sentences, one clear action for the worker — this text is posted to GitLab wrapped in PMO_GUIDANCE_BEGIN/PMO_GUIDANCE_END markers and the worker reads it verbatim, so keep it worker-facing and actionable; do NOT address it to humans>",
-    "sub_issues": [                                  // for split only
-      {{"title": "<concise title>", "description": "<scope and acceptance criteria; optionally one line: Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2>", "priority": <1-3>}}
-    ],
-    "reason": "<for already_done: why the codebase already satisfies the issue>",
-    "question": "<for needs_clarification: specific questions for a human>",
-    "public_comment": "<optional: human-facing comment text to post to GitLab — separate from `instructions`; use this when you also need to address a human reviewer>"
-  }}
+- `decision` (required): one of `guide_worker`, `split`, `already_done`, `needs_clarification`
+- `instructions` (for guide_worker): 3-5 sentences, one clear action for the worker — posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.
+- `sub_issues` (for split): array of `{{"title": "...", "description": "...", "priority": 1-3}}`
+- `reason` (for already_done): why the codebase already satisfies the issue
+- `question` (for needs_clarification): specific questions for a human
 
-Only fill the field(s) relevant to your decision; omit the others. For GUIDE_WORKER, prefer `instructions` alone; add `public_comment` only when a human-facing note is also needed.
-
-If the `plan` tool is NOT available (e.g. Cursor ACP backend), emit text markers as a fallback:
-- **GUIDE_WORKER** — lines: `GUIDE_WORKER` / `INSTRUCTIONS:` / `<3-5 sentences — posted to GitLab wrapped in PMO_GUIDANCE_BEGIN/PMO_GUIDANCE_END, worker-facing and actionable>`
-- **SPLIT** — repeat per sub-issue: `SUB_ISSUE_N:` / `TITLE:` / `PRIORITY:` / `DESCRIPTION:` / `<scope and criteria; optionally one line: Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2>`
-- **ALREADY_DONE** — lines: `ALREADY_DONE` / `REASON: <why already complete>`
-- **NEEDS_CLARIFICATION** — lines: `NEEDS_CLARIFICATION` / `QUESTION:` / `<precise questions>`
-- For any human-facing comment, wrap it in `PUBLIC_COMMENT_BEGIN` / `PUBLIC_COMMENT_END` lines (separate from the worker-facing `INSTRUCTIONS:` block).
-
-Dependency formatting (applies to both the `plan` tool's `sub_issues[].description` and the text-marker fallback):
-- If a sub-issue has NO dependencies, do NOT mention dependencies at all.
-- If it DOES depend on other sub-issues, include EXACTLY one single line: `Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2, ...`
-- Do not use alternative labels like `Dependencies:` or prose variants.
+Only fill the parameter(s) relevant to your decision. Everything you put in `instructions`, `reason`, or `question` is human-facing and posted to GitLab verbatim — do not include any internal markers, harness instructions, or meta-commentary.
 
 DECISION — choose EXACTLY ONE of the following:
 
@@ -1140,7 +1079,7 @@ INSTRUCTIONS:
 8. COMPLETION TEST: Does the worker's output, the comments in the file, or your direct inspection of the current project state indicate the work is already fully implemented in the codebase? If YES → ALREADY_DONE.
 9. Choose EXACTLY ONE of GUIDE_WORKER, SPLIT, ALREADY_DONE, or NEEDS_CLARIFICATION — never combine them.
 10. When in doubt between GUIDE_WORKER and SPLIT, prefer SPLIT — it's better to create focused sub-issues than to give the worker a laundry list.
-11. Emit your decision: call the `plan` tool with the JSON shape above if it's available; otherwise emit the text-marker fallback. This is the last step.
+11. Call the `plan` tool with the JSON shape above. This is the last step — your turn is not complete until you call `plan`.
 
 Proceed with analyzing the issue autonomously.
 "#,
@@ -1154,122 +1093,37 @@ Proceed with analyzing the issue autonomously.
     Ok(prompt)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SubIssue {
-    title: String,
-    description: String,
-    #[serde(default)]
-    priority: Option<u8>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingSplit {
     parent_issue_iid: u64,
     parent_issue_title: String,
     #[serde(default)]
     parent_priority: u8,
-    sub_issues: Vec<SubIssue>,
+    sub_issues: Vec<HandoffSubIssue>,
     created_issue_ids: Vec<u64>,
 }
 
-static ISSUE_DEPENDENCIES_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\s*Issue\s+Dependencies\s*:\s*(.+?)\s*$")
-        .expect("Issue Dependencies line pattern")
-});
-static SUB_ISSUE_DEP_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^SUB_ISSUE_(\d+)$").expect("SUB_ISSUE dependency token"));
-
-/// `ALREADY_DONE` followed only by whitespace (including newlines), then `REASON:`.
-static PMO_ALREADY_DONE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"ALREADY_DONE\s+REASON:").expect("PMO ALREADY_DONE pattern"));
+// --- Decision predicates (structured-fields only) ---
+// The PMO's decision is read from the `plan` tool's JSON via
+// `apply_pmo_plan_output`, which populates `AgentHandoff.decision` and the
+// supporting fields. No text-marker parsing — the harness guarantees the
+// structured path.
 
 fn pmo_needs_clarification(output: &AgentHandoff) -> bool {
-    output.needs_clarification.is_some()
-        || output.question.is_some()
-        || output
-            .decision
-            .as_deref()
-            .is_some_and(|d| d.eq_ignore_ascii_case("needs_clarification"))
-        || response_has_decision_marker(&output.response, "NEEDS_CLARIFICATION")
-}
-
-fn pmo_guides_worker(output: &AgentHandoff) -> bool {
-    output.instructions.is_some()
-        || output
-            .decision
-            .as_deref()
-            .is_some_and(|d| d.eq_ignore_ascii_case("guide_worker"))
-        || response_has_decision_marker(&output.response, "GUIDE_WORKER")
-}
-
-fn pmo_no_split_needed(output: &AgentHandoff) -> bool {
     output
         .decision
         .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("no_split_needed"))
-        || response_has_decision_marker(&output.response, "NO_SPLIT_NEEDED")
+        .is_some_and(|d| d.eq_ignore_ascii_case("needs_clarification"))
+        || output.needs_clarification.is_some()
+        || output.question.is_some()
 }
 
-fn response_has_decision_marker(response: &str, marker: &str) -> bool {
-    response
-        .lines()
-        .map(str::trim)
-        .any(|line| line_matches_decision_marker(line, marker))
-}
-
-/// Check whether a trimmed line is a decision marker like `GUIDE_WORKER`,
-/// tolerating common markdown formatting the model may add:
-/// - Bold/italic: `**GUIDE_WORKER**`, `__GUIDE_WORKER__`, `*GUIDE_WORKER*`
-/// - Headers: `## GUIDE_WORKER`, `### GUIDE_WORKER`
-/// - Blockquote: `> GUIDE_WORKER`
-/// - Inline code: `` `GUIDE_WORKER` ``
-/// - Same-line suffix: `**GUIDE_WORKER** INSTRUCTIONS: ...` (marker followed
-///   by whitespace or `:`)
-///
-/// The marker must appear as a whole word/line — `GUIDE_WORKER` as a
-/// substring of a longer line like `I chose GUIDE_WORKER because...` does NOT
-/// match (avoids false positives from prose mentions).
-fn line_matches_decision_marker(line: &str, marker: &str) -> bool {
-    let stripped = strip_markdown_wrapper(line);
-    if stripped == marker {
-        return true;
-    }
-    // Marker followed by whitespace or `:` (e.g. "GUIDE_WORKER INSTRUCTIONS:"
-    // or "GUIDE_WORKER: ..."). Only match when the marker is at the start.
-    if let Some(rest) = stripped.strip_prefix(marker) {
-        let next = rest.chars().next();
-        matches!(next, Some(' ') | Some('\t') | Some(':') | None)
-    } else {
-        false
-    }
-}
-
-/// Strip leading markdown decoration (header `#`, blockquote `>`, list `-`/`*`)
-/// and surrounding emphasis marks (`**`, `__`, `*`, `_`, `` ` ``) from a line.
-/// Leaves the inner text intact.
-fn strip_markdown_wrapper(line: &str) -> String {
-    let mut s = line.trim().to_string();
-
-    // Strip leading header hashes, blockquote markers, and list bullets.
-    while let Some(stripped) = s
-        .strip_prefix('#')
-        .or_else(|| s.strip_prefix('>'))
-        .or_else(|| s.strip_prefix('-'))
-        .or_else(|| s.strip_prefix('*'))
-    {
-        s = stripped.trim_start().to_string();
-    }
-
-    // Strip surrounding emphasis marks: **, __, *, _, `
-    loop {
-        let trimmed = s.trim_matches(|c: char| matches!(c, '*' | '_' | '`'));
-        if trimmed.len() == s.len() {
-            break;
-        }
-        s = trimmed.to_string();
-    }
-
-    s
+fn pmo_guides_worker(output: &AgentHandoff) -> bool {
+    output
+        .decision
+        .as_deref()
+        .is_some_and(|d| d.eq_ignore_ascii_case("guide_worker"))
+        || output.instructions.is_some()
 }
 
 fn is_pmo_already_done_response(output: &AgentHandoff) -> bool {
@@ -1277,27 +1131,13 @@ fn is_pmo_already_done_response(output: &AgentHandoff) -> bool {
         .decision
         .as_deref()
         .is_some_and(|d| d.eq_ignore_ascii_case("already_done"))
-        || PMO_ALREADY_DONE_RE.is_match(&output.response)
 }
 
+// --- Field extractors (structured-fields only) ---
+
 fn extract_already_done_reason(agent_output: &AgentHandoff) -> String {
-    if let Some(block) = extract_public_comment_block(&agent_output.response) {
-        return block;
-    }
     if let Some(reason) = &agent_output.reason {
         let trimmed = reason.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    static EXTRACT_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)ALREADY_DONE\s+REASON:\s*(.+)\z").expect("PMO ALREADY_DONE extract")
-    });
-    if let Some(cap) = EXTRACT_RE
-        .captures(&agent_output.response)
-        .and_then(|c| c.get(1))
-    {
-        let trimmed = cap.as_str().trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
@@ -1306,9 +1146,6 @@ fn extract_already_done_reason(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_clarification_question(agent_output: &AgentHandoff) -> String {
-    if let Some(block) = extract_public_comment_block(&agent_output.response) {
-        return block;
-    }
     if let Some(question) = &agent_output.question {
         let trimmed = question.trim();
         if !trimmed.is_empty() {
@@ -1321,59 +1158,15 @@ fn extract_clarification_question(agent_output: &AgentHandoff) -> String {
             return trimmed.to_string();
         }
     }
-    if let Some(pos) = agent_output.response.find("QUESTION:") {
-        let rest = &agent_output.response[pos + 9..];
-        let trimmed = rest.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
     "The PMO agent could not determine how to proceed with this issue. Please provide more details about the expected scope and acceptance criteria.".to_string()
 }
 
 fn extract_guidance(agent_output: &AgentHandoff) -> String {
-    // Preference order:
-    //   1. structured `instructions` field (plan tool, GUIDE_WORKER / NO_SPLIT)
-    //   2. `INSTRUCTIONS:` text marker (text-marker fallback, GUIDE_WORKER)
-    //   3. `PMO_GUIDANCE_BEGIN`/`_END` block (the block we post to GitLab —
-    //      useful when the model emitted it inline instead of via `plan`)
-    //   4. `REASON:` text marker (text-marker fallback, NO_SPLIT_NEEDED)
-    //   5. `reason` structured field (plan tool, NO_SPLIT_NEEDED)
-    //   6. `PUBLIC_COMMENT` block — LAST resort only, since that block is
-    //      human-facing and may have been written for a reviewer rather than
-    //      the worker. We keep it as a fallback so the text-marker path that
-    //      emits only a public comment still produces *some* guidance.
     if let Some(instructions) = &agent_output.instructions {
         let trimmed = instructions.trim();
         if !trimmed.is_empty() {
             return cap_guidance_length(trimmed);
         }
-    }
-    if let Some(pos) = agent_output.response.find("INSTRUCTIONS:") {
-        let rest = &agent_output.response[pos + 13..];
-        let trimmed = rest.trim();
-        if !trimmed.is_empty() {
-            return cap_guidance_length(trimmed);
-        }
-    }
-    if let Some(block) = extract_pmo_guidance_block(&agent_output.response) {
-        return cap_guidance_length(&block);
-    }
-    if let Some(pos) = agent_output.response.find("REASON:") {
-        let rest = &agent_output.response[pos + 7..];
-        let trimmed = rest.trim();
-        if !trimmed.is_empty() {
-            return cap_guidance_length(trimmed);
-        }
-    }
-    if let Some(reason) = &agent_output.reason {
-        let trimmed = reason.trim();
-        if !trimmed.is_empty() {
-            return cap_guidance_length(trimmed);
-        }
-    }
-    if let Some(block) = extract_public_comment_block(&agent_output.response) {
-        return cap_guidance_length(&block);
     }
     String::new()
 }
@@ -1394,139 +1187,35 @@ fn cap_guidance_length(raw: &str) -> String {
 }
 
 /// Format the worker-facing PMO guidance as a GitLab issue comment. The
-/// guidance body is wrapped in `PMO_GUIDANCE_BEGIN` / `PMO_GUIDANCE_END`
-/// markers so the worker agent can extract it reliably from the comment
-/// stream, regardless of any prose the PMO (or a human) added around it.
-/// The human-facing header outside the block gives reviewers context without
-/// polluting the machine-readable body.
+/// guidance body is posted as plain text (no markers) under a header that
+/// gives reviewers context. Both humans and the worker agent read it from
+/// the comment stream.
 fn format_pmo_guidance_comment(guidance: &str) -> String {
     let trimmed = guidance.trim();
-    let block = wrap_pmo_guidance_block(trimmed).unwrap_or_else(|| trimmed.to_string());
-    format!("**PMO guidance for the worker agent:**\n\n{block}")
+    format!("**PMO guidance for the worker agent:**\n\n{trimmed}")
 }
 
-/// Append contents of [`AgentHandoff::cursor_plan_paths`] (Cursor plan-mode `tool_call_update`) into
-/// `handoff.response` so triage markers and `extract_sub_issues` see the plan file text.
-fn pmo_apply_cursor_plan_files(working_dir: &str, mut handoff: AgentHandoff) -> AgentHandoff {
-    if handoff.cursor_plan_paths.is_empty() {
-        return handoff;
+fn pmo_truncate_utf8_by_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
     }
-
-    let root = path::Path::new(working_dir);
-    for plan_path in std::mem::take(&mut handoff.cursor_plan_paths) {
-        match pmo_read_plan_file_text(root, &plan_path) {
-            Ok(body) => {
-                if !handoff.response.is_empty() {
-                    handoff.response.push_str("\n\n");
-                }
-
-                handoff.response.push_str("=== PMO Cursor plan file ===\n");
-                handoff.response.push_str(body.trim_end());
-                handoff.response.push('\n');
-            }
-
-            Err(e) => {
-                warn!(
-                    target: "potlatch::pmo_plan_file",
-                    path = %plan_path,
-                    err = %e,
-                    "PMO could not read Cursor plan file from tool_call_update"
-                );
-            }
-        }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
     }
-
-    handoff
-}
-
-fn pmo_cursor_home_from_env() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
-}
-
-fn pmo_external_cursor_plans_root(home: &path::Path) -> path::PathBuf {
-    home.join(".cursor").join("plans")
-}
-
-fn pmo_is_allowed_external_plan_path_for_home(resolved: &path::Path, home: &path::Path) -> bool {
-    let Ok(allowed_root) = pmo_external_cursor_plans_root(home).canonicalize() else {
-        return false;
-    };
-    resolved.starts_with(allowed_root)
-}
-
-fn pmo_read_plan_file_text(working_root: &path::Path, plan_path: &str) -> Result<String, String> {
-    pmo_read_plan_file_text_with_home(working_root, plan_path, pmo_cursor_home_from_env())
-}
-
-fn pmo_read_plan_file_text_with_home(
-    working_root: &path::Path,
-    plan_path: &str,
-    home_override: Option<std::path::PathBuf>,
-) -> Result<String, String> {
-    match read_text_file_under_workspace(working_root, plan_path) {
-        Ok(body) => return Ok(body),
-        Err(e) if e != "path escapes workspace" => return Err(e),
-        Err(_) => {}
-    }
-
-    let candidate = path::Path::new(plan_path);
-    if !candidate.is_absolute() {
-        return Err("path escapes workspace".to_string());
-    }
-    let resolved = candidate
-        .canonicalize()
-        .map_err(|e| format!("path not found: {e}"))?;
-    let meta = fs::metadata(&resolved).map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err("not a regular file".to_string());
-    }
-    const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
-    if meta.len() > MAX_READ_BYTES {
-        return Err(format!(
-            "file larger than {} MiB",
-            MAX_READ_BYTES / 1024 / 1024
-        ));
-    }
-
-    let Some(home) = home_override else {
-        return Err("path escapes workspace".to_string());
-    };
-    if !pmo_is_allowed_external_plan_path_for_home(&resolved, &home) {
-        return Err("path escapes workspace".to_string());
-    }
-
-    fs::read_to_string(&resolved).map_err(|e| e.to_string())
-}
-
-fn pmo_extract_plan_file_text(response: &str) -> Option<String> {
-    const MARKER: &str = "=== PMO Cursor plan file ===";
-    let mut sections: Vec<String> = Vec::new();
-    for chunk in response.split(MARKER).skip(1) {
-        let section = chunk.trim();
-        if !section.is_empty() {
-            sections.push(section.to_string());
-        }
-    }
-    let joined = sections.join("\n\n").trim().to_string();
-    if joined.is_empty() {
-        None
-    } else {
-        Some(joined)
-    }
+    format!("{}…", &s[..end])
 }
 
 /// Apply the structured plan JSON the model emitted via the `plan` tool.
 /// Populates the handoff's structured fields (`decision`, `instructions`,
-/// `sub_issues`, `reason`, `question`, `needs_clarification`) from the JSON,
-/// so the decision functions take the structured path first. Returns the
-/// handoff unchanged when `plan_output` is `None` (Cursor backend or tool not
-/// called) so text-marker fallback parsers run.
+/// `sub_issues`, `reason`, `question`, `needs_clarification`) from the JSON.
+/// Returns the handoff unchanged when `plan_output` is `None` (tool not
+/// called or not in plan mode).
 fn apply_pmo_plan_output(mut handoff: AgentHandoff) -> AgentHandoff {
     let Some(plan) = handoff.plan_output.take() else {
         return handoff;
     };
 
-    // decision (lowercase snake_case for the matcher functions).
     if let Some(d) = plan.get("decision").and_then(Value::as_str) {
         let d = d.trim();
         if !d.is_empty() {
@@ -1560,12 +1249,19 @@ fn apply_pmo_plan_output(mut handoff: AgentHandoff) -> AgentHandoff {
         let parsed: Vec<HandoffSubIssue> = sub_issues
             .iter()
             .filter_map(|s| {
-                let title = s.get("title").and_then(Value::as_str)?.to_string();
+                let title = s.get("title").and_then(Value::as_str)?.trim().to_string();
+                if title.is_empty() {
+                    return None;
+                }
                 let description = s
                     .get("description")
                     .and_then(Value::as_str)
                     .unwrap_or("")
+                    .trim()
                     .to_string();
+                if description.is_empty() {
+                    return None;
+                }
                 let priority = s
                     .get("priority")
                     .and_then(Value::as_u64)
@@ -1583,21 +1279,6 @@ fn apply_pmo_plan_output(mut handoff: AgentHandoff) -> AgentHandoff {
         }
     }
 
-    if let Some(comment) = plan.get("public_comment").and_then(Value::as_str) {
-        let comment = comment.trim();
-        if !comment.is_empty() {
-            // Prepend as a PUBLIC_COMMENT block so extract_public_comment_block
-            // and other text-based extractors see it.
-            let mut new_response =
-                String::with_capacity(comment.len() + 32 + handoff.response.len());
-            new_response.push_str("PUBLIC_COMMENT_BEGIN\n");
-            new_response.push_str(comment);
-            new_response.push_str("\nPUBLIC_COMMENT_END\n");
-            new_response.push_str(&handoff.response);
-            handoff.response = new_response;
-        }
-    }
-
     info!(
         "PMO: applied structured plan_output (decision={:?}, sub_issues={})",
         handoff.decision.as_deref().unwrap_or(""),
@@ -1605,356 +1286,6 @@ fn apply_pmo_plan_output(mut handoff: AgentHandoff) -> AgentHandoff {
     );
 
     handoff
-}
-
-fn combined_pmo_handoff_text(h: &AgentHandoff) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    let r = h.response.trim();
-    if !r.is_empty() {
-        parts.push(r);
-    }
-    for s in [
-        h.instructions.as_deref(),
-        h.needs_split.as_deref(),
-        h.feedback.as_deref(),
-        h.decision.as_deref(),
-        h.changes_summary.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let t = s.trim();
-        if !t.is_empty() {
-            parts.push(t);
-        }
-    }
-    parts.join("\n\n")
-}
-
-fn pmo_truncate_utf8_by_bytes(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
-}
-
-fn pmo_strip_ordered_list_prefix(s: &str) -> &str {
-    let s = s.trim_start();
-    let Some(digits_end) = s
-        .char_indices()
-        .find(|(_, c)| !c.is_ascii_digit())
-        .map(|(i, _)| i)
-    else {
-        return s;
-    };
-    if digits_end == 0 {
-        return s;
-    }
-    if s[digits_end..].starts_with(". ") {
-        s[digits_end + 2..].trim_start()
-    } else {
-        s
-    }
-}
-
-/// Strip common markdown / list noise so `SUB_ISSUE_1` and `TITLE:` lines still match.
-fn pmo_normalize_issue_line(line: &str) -> &str {
-    let mut s = line.trim();
-    while s.starts_with('#') {
-        s = s[1..].trim_start();
-    }
-    while s.starts_with('>') {
-        s = s[1..].trim_start();
-    }
-    s = s.trim_start();
-    if let Some(rest) = s.strip_prefix("- ") {
-        s = rest;
-    } else if let Some(rest) = s.strip_prefix("* ") {
-        s = rest;
-    } else if let Some(rest) = s.strip_prefix("+ ") {
-        s = rest;
-    } else {
-        s = pmo_strip_ordered_list_prefix(s);
-    }
-    if s.len() >= 2 && s.starts_with('`') && s.ends_with('`') {
-        s = &s[1..s.len() - 1];
-    }
-    s.trim()
-}
-
-static PMO_SUB_ISSUE_LINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(SUB_ISSUE_\d+|SUB\s+ISSUE\s+\d+)\s*:?\s*(.*)$").expect("pmo SUB_ISSUE line")
-});
-
-enum PmoField<'a> {
-    Title(&'a str),
-    Priority(&'a str),
-    Description(&'a str),
-}
-
-fn pmo_field_value_ci<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let line = line.trim_start();
-    let kl = key.len();
-    if line.len() < kl {
-        return None;
-    }
-    if !line[..kl].eq_ignore_ascii_case(key) {
-        return None;
-    }
-    let rest = line[kl..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim();
-    Some(rest)
-}
-
-fn pmo_parse_field(line: &str) -> Option<PmoField<'_>> {
-    if let Some(v) = pmo_field_value_ci(line, "TITLE") {
-        return Some(PmoField::Title(v));
-    }
-    if let Some(v) = pmo_field_value_ci(line, "PRIORITY") {
-        return Some(PmoField::Priority(v));
-    }
-    if let Some(v) = pmo_field_value_ci(line, "DESCRIPTION") {
-        return Some(PmoField::Description(v));
-    }
-    None
-}
-
-fn extract_json_arrays_from_markdown_fences(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut s = text;
-    while let Some(start) = s.find("```") {
-        let mut cur = &s[start + 3..];
-        cur = cur.trim_start();
-        if cur.len() >= 4 && cur[..4].eq_ignore_ascii_case("json") {
-            cur = &cur[4..];
-        }
-        cur = cur.trim_start();
-        let Some(end) = cur.find("```") else {
-            break;
-        };
-        let body = cur[..end].trim();
-        if body.starts_with('[') {
-            out.push(body.to_string());
-        }
-        s = &cur[end + 3..];
-    }
-    out
-}
-
-fn try_parse_sub_issues_from_json_array(json: &str) -> Vec<SubIssue> {
-    let Ok(vals) = serde_json::from_str::<Vec<Value>>(json) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for v in vals {
-        let Some(obj) = v.as_object() else {
-            continue;
-        };
-        let title = obj
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        let description = obj
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        let priority = obj
-            .get("priority")
-            .and_then(|p| {
-                p.as_u64()
-                    .map(|u| u as u8)
-                    .or_else(|| p.as_str()?.parse().ok())
-            })
-            .filter(|p| (1..=3).contains(p));
-        if title.is_empty() || description.is_empty() {
-            continue;
-        }
-        out.push(SubIssue {
-            title: title.to_string(),
-            description: description.to_string(),
-            priority,
-        });
-    }
-    out
-}
-
-fn extract_sub_issues_from_text(text: &str) -> Vec<SubIssue> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut sub_issues = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let normalized = pmo_normalize_issue_line(lines[i]);
-        let Some(caps) = PMO_SUB_ISSUE_LINE.captures(normalized.trim()) else {
-            i += 1;
-            continue;
-        };
-        let tail = caps
-            .get(2)
-            .map(|m| m.as_str().trim())
-            .filter(|t| !t.is_empty())
-            .unwrap_or("");
-
-        let mut title = String::new();
-        let mut description = String::new();
-        let mut priority: Option<u8> = None;
-        let mut in_description = false;
-
-        let mut pending: Option<String> = if tail.is_empty() {
-            None
-        } else if pmo_parse_field(tail).is_some() {
-            Some(tail.to_string())
-        } else {
-            title = tail.to_string();
-            None
-        };
-
-        i += 1;
-
-        loop {
-            let cur: std::borrow::Cow<'_, str> = if let Some(p) = pending.take() {
-                std::borrow::Cow::Owned(p)
-            } else if i < lines.len() {
-                let nl = pmo_normalize_issue_line(lines[i]);
-                if PMO_SUB_ISSUE_LINE.is_match(nl.trim()) {
-                    break;
-                }
-                i += 1;
-                std::borrow::Cow::Borrowed(nl)
-            } else {
-                break;
-            };
-
-            if let Some(field) = pmo_parse_field(&cur) {
-                match field {
-                    PmoField::Title(t) => {
-                        title = t.to_string();
-                        in_description = false;
-                    }
-                    PmoField::Priority(p) => {
-                        if let Ok(v) = p.trim().parse::<u8>()
-                            && (1..=3).contains(&v)
-                        {
-                            priority = Some(v);
-                        }
-                        in_description = false;
-                    }
-                    PmoField::Description(d) => {
-                        in_description = true;
-                        if !d.is_empty() {
-                            if !description.is_empty() {
-                                description.push('\n');
-                            }
-                            description.push_str(d);
-                        }
-                    }
-                }
-            } else if in_description && !cur.trim().is_empty() {
-                if !description.is_empty() {
-                    description.push('\n');
-                }
-                description.push_str(cur.trim());
-            }
-        }
-
-        if !title.is_empty() && !description.is_empty() {
-            sub_issues.push(SubIssue {
-                title,
-                description,
-                priority,
-            });
-        }
-    }
-    sub_issues
-}
-
-fn extract_sub_issues(agent_output: &AgentHandoff) -> Vec<SubIssue> {
-    if !agent_output.sub_issues.is_empty() {
-        return agent_output
-            .sub_issues
-            .iter()
-            .map(|item: &HandoffSubIssue| SubIssue {
-                title: item.title.clone(),
-                description: item.description.clone(),
-                priority: item.priority,
-            })
-            .collect();
-    }
-
-    let text = combined_pmo_handoff_text(agent_output);
-    let mut sub_issues = extract_sub_issues_from_text(&text);
-    if sub_issues.is_empty() {
-        let t = text.trim();
-        if t.starts_with('[') {
-            let parsed = try_parse_sub_issues_from_json_array(t);
-            if !parsed.is_empty() {
-                sub_issues = parsed;
-            }
-        }
-    }
-    if sub_issues.is_empty() {
-        for block in extract_json_arrays_from_markdown_fences(&text) {
-            let parsed = try_parse_sub_issues_from_json_array(&block);
-            if !parsed.is_empty() {
-                sub_issues = parsed;
-                break;
-            }
-        }
-    }
-
-    debug!(
-        "Extracted {} sub-issues from agent output",
-        sub_issues.len()
-    );
-    sub_issues
-}
-
-/// Rewrites `Issue Dependencies: SUB_ISSUE_N, ...` into real issue references where known.
-/// Unknown placeholders are kept unchanged so intent is not lost.
-fn resolve_dependency_placeholders_in_description(
-    description: &str,
-    created_issue_ids_by_sub_index: &[Option<u64>],
-) -> String {
-    let mut out = Vec::new();
-    for raw_line in description.lines() {
-        let line = raw_line.trim();
-        let Some(caps) = ISSUE_DEPENDENCIES_LINE_RE.captures(line) else {
-            out.push(raw_line.to_string());
-            continue;
-        };
-        let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let deps: Vec<String> = body
-            .split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|token| {
-                let Some(dep_caps) = SUB_ISSUE_DEP_TOKEN_RE.captures(token) else {
-                    return token.to_string();
-                };
-                let idx = dep_caps
-                    .get(1)
-                    .and_then(|m| m.as_str().parse::<usize>().ok())
-                    .and_then(|n| n.checked_sub(1));
-                match idx
-                    .and_then(|i| created_issue_ids_by_sub_index.get(i))
-                    .and_then(|x| *x)
-                {
-                    Some(iid) => format!("#{iid}"),
-                    None => token.to_string(),
-                }
-            })
-            .collect();
-        if deps.is_empty() {
-            continue;
-        }
-        out.push(format!("Issue Dependencies: {}", deps.join(", ")));
-    }
-    out.join("\n")
 }
 
 fn save_pending_split(path: &str, pending: &PendingSplit) -> Result<()> {
@@ -2061,12 +1392,6 @@ fn resume_split(
     let mut created_issue_ids = pending.created_issue_ids.clone();
     let total_sub_issues = pending.sub_issues.len();
     let already_created = created_issue_ids.len();
-    let mut created_issue_ids_by_sub_index = vec![None; total_sub_issues];
-    for (i, iid) in created_issue_ids.iter().copied().enumerate() {
-        if i < created_issue_ids_by_sub_index.len() {
-            created_issue_ids_by_sub_index[i] = Some(iid);
-        }
-    }
 
     // Create remaining sub-issues
     for (index, sub_issue) in pending.sub_issues.iter().enumerate() {
@@ -2086,10 +1411,7 @@ fn resume_split(
             &sub_issue.title
         };
 
-        let resolved_description = resolve_dependency_placeholders_in_description(
-            &sub_issue.description,
-            &created_issue_ids_by_sub_index,
-        );
+        let resolved_description = sub_issue.description.clone();
 
         match gitlab.create_issue(sub_issue_title, &resolved_description) {
             Ok(sub_issue_iid) => {
@@ -2116,7 +1438,6 @@ fn resume_split(
                 }
 
                 created_issue_ids.push(sub_issue_iid);
-                created_issue_ids_by_sub_index[index] = Some(sub_issue_iid);
 
                 let updated_pending = PendingSplit {
                     parent_issue_iid: pending.parent_issue_iid,
@@ -2176,7 +1497,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_split_prompt_documents_plan_tool_as_primary() {
+    fn build_split_prompt_documents_plan_tool_only() {
         let state = AgentState {
             sessions_dir: "/tmp".into(),
             working_dir: "/tmp".into(),
@@ -2193,21 +1514,20 @@ mod tests {
             updated_at: None,
         };
         let prompt = build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2).unwrap();
-        // The plan tool is the primary output channel.
-        assert!(prompt.contains("`plan` tool"));
-        assert!(prompt.contains("\"decision\""));
+        // The plan tool is the ONLY output channel.
+        assert!(prompt.contains("call the `plan` tool"));
+        assert!(prompt.contains("`decision`"));
         assert!(prompt.contains("guide_worker"));
         assert!(prompt.contains("split"));
         assert!(prompt.contains("already_done"));
         assert!(prompt.contains("needs_clarification"));
-        // The text-marker fallback is still present (for Cursor-backed PMO).
-        assert!(prompt.contains("SUB_ISSUE_N:"));
-        assert!(prompt.contains("ALREADY_DONE"));
-        assert!(prompt.contains("NEEDS_CLARIFICATION"));
-        assert!(prompt.contains("GUIDE_WORKER"));
-        // The old verbose format spec is gone.
-        assert!(!prompt.contains("CURSOR PLAN FILE — CANONICAL BLOCKS"));
-        assert!(!prompt.contains("STRICT OUTPUT CONTRACT (SPLIT)"));
+        // No text-marker fallback.
+        assert!(!prompt.contains("SUB_ISSUE_N:"));
+        assert!(!prompt.contains("GUIDE_WORKER\n"));
+        assert!(!prompt.contains("ALREADY_DONE\n"));
+        assert!(!prompt.contains("NEEDS_CLARIFICATION\n"));
+        assert!(!prompt.contains("PUBLIC_COMMENT_BEGIN"));
+        assert!(!prompt.contains("text-marker"));
         // Reasoning guidance is intact.
         assert!(prompt.contains("TASK CONTAINER TEST"));
         assert!(prompt.contains("DUPLICATE / OVERLAP RULES"));
@@ -2232,7 +1552,6 @@ mod tests {
         assert_eq!(applied.sub_issues[0].priority, Some(1));
         assert_eq!(applied.sub_issues[1].title, "Second");
         assert_eq!(applied.sub_issues[1].priority, Some(2));
-        // plan_output is consumed (cleared).
         assert!(applied.plan_output.is_none());
     }
 
@@ -2287,31 +1606,47 @@ mod tests {
     #[test]
     fn apply_pmo_plan_output_none_leaves_handoff_unchanged() {
         let handoff = AgentHandoff {
-            response: "GUIDE_WORKER\nINSTRUCTIONS:\ndo something".into(),
+            response: "some text".into(),
             ..Default::default()
         };
         let applied = apply_pmo_plan_output(handoff);
         assert_eq!(applied.decision, None);
         assert_eq!(applied.instructions, None);
-        assert!(applied.response.contains("GUIDE_WORKER"));
+        assert_eq!(applied.response, "some text");
     }
 
     #[test]
-    fn apply_pmo_plan_output_public_comment_prepended_to_response() {
+    fn apply_pmo_plan_output_skips_empty_sub_issue_titles() {
         let handoff = AgentHandoff {
             plan_output: Some(serde_json::json!({
-                "decision": "guide_worker",
-                "instructions": "do X",
-                "public_comment": "Posted for the worker team."
+                "decision": "split",
+                "sub_issues": [
+                    {"title": "", "description": "no title"},
+                    {"title": "Valid", "description": "has title"}
+                ]
             })),
-            response: "original response".into(),
             ..Default::default()
         };
         let applied = apply_pmo_plan_output(handoff);
-        assert!(applied.response.contains("PUBLIC_COMMENT_BEGIN"));
-        assert!(applied.response.contains("Posted for the worker team."));
-        assert!(applied.response.contains("PUBLIC_COMMENT_END"));
-        assert!(applied.response.contains("original response"));
+        assert_eq!(applied.sub_issues.len(), 1);
+        assert_eq!(applied.sub_issues[0].title, "Valid");
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_skips_empty_sub_issue_descriptions() {
+        let handoff = AgentHandoff {
+            plan_output: Some(serde_json::json!({
+                "decision": "split",
+                "sub_issues": [
+                    {"title": "No desc", "description": ""},
+                    {"title": "Valid", "description": "has desc"}
+                ]
+            })),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert_eq!(applied.sub_issues.len(), 1);
+        assert_eq!(applied.sub_issues[0].title, "Valid");
     }
 
     #[test]
@@ -2353,407 +1688,141 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_sub_issues() {
+    fn extract_guidance_returns_structured_instructions() {
         let output = AgentHandoff {
-            response: r#"
-SUB_ISSUE_1:
-TITLE: Add authentication module
-PRIORITY: 1
-DESCRIPTION:
-Implement basic authentication with JWT tokens.
-Include login and logout endpoints.
-
-SUB_ISSUE_2:
-TITLE: Add user management
-PRIORITY: 2
-DESCRIPTION:
-Create user CRUD operations.
-Add role-based access control.
-        "#
-            .to_string(),
+            instructions: Some("Use the existing config loader.".into()),
             ..Default::default()
         };
-
-        let sub_issues = extract_sub_issues(&output);
-        assert_eq!(sub_issues.len(), 2);
-        assert_eq!(sub_issues[0].title, "Add authentication module");
-        assert!(sub_issues[0].description.contains("JWT tokens"));
-        assert_eq!(sub_issues[0].priority, Some(1));
-        assert_eq!(sub_issues[1].title, "Add user management");
-        assert!(sub_issues[1].description.contains("CRUD"));
-        assert_eq!(sub_issues[1].priority, Some(2));
+        assert_eq!(extract_guidance(&output), "Use the existing config loader.");
     }
 
     #[test]
-    fn extract_sub_issues_works_without_plan_file_paths() {
-        // Regression: the split path used to bail with "no saved plan file
-        // content" when `cursor_plan_paths` was empty, even if the model
-        // streamed SUB_ISSUE_N blocks inline. The harness now extracts
-        // sub-issues directly from the streamed response first, so a missing
-        // plan file is no longer fatal.
+    fn extract_guidance_returns_empty_when_no_instructions() {
         let output = AgentHandoff {
-            response: r#"
-SUB_ISSUE_1:
-TITLE: Fix tests
-PRIORITY: 2
-DESCRIPTION:
-Repair the failing tests in tests/foo.py.
-            "#
-            .to_string(),
-            cursor_plan_paths: Vec::new(),
+            response: "some response text".into(),
             ..Default::default()
         };
-        let sub_issues = extract_sub_issues(&output);
-        assert_eq!(sub_issues.len(), 1);
-        assert_eq!(sub_issues[0].title, "Fix tests");
-    }
-
-    #[test]
-    fn test_extract_sub_issues_without_priority() {
-        let output = AgentHandoff {
-            response: r#"
-SUB_ISSUE_1:
-TITLE: Simple task
-DESCRIPTION:
-Do something simple.
-        "#
-            .to_string(),
-            ..Default::default()
-        };
-
-        let sub_issues = extract_sub_issues(&output);
-        assert_eq!(sub_issues.len(), 1);
-        assert_eq!(sub_issues[0].priority, None);
-    }
-
-    #[test]
-    fn test_extract_sub_issues_markdown_headers_and_lists() {
-        let output = AgentHandoff {
-            response: r#"
-## SUB_ISSUE_1
-- title: Auth API
-- priority: 2
-- description:
-First line of desc.
-Second line.
-
-* SUB_ISSUE_2:
-* TITLE: Cleanup
-* DESCRIPTION: One-line description only.
-"#
-            .to_string(),
-            ..Default::default()
-        };
-        let sub_issues = extract_sub_issues(&output);
-        assert_eq!(sub_issues.len(), 2);
-        assert_eq!(sub_issues[0].title, "Auth API");
-        assert_eq!(sub_issues[0].priority, Some(2));
-        assert!(sub_issues[0].description.contains("Second line"));
-        assert_eq!(sub_issues[1].title, "Cleanup");
-        assert_eq!(sub_issues[1].description, "One-line description only.");
-    }
-
-    #[test]
-    fn test_extract_sub_issues_description_on_same_line() {
-        let output = AgentHandoff {
-            response: r#"
-SUB_ISSUE_1:
-TITLE: Task A
-DESCRIPTION: All on one line.
-"#
-            .to_string(),
-            ..Default::default()
-        };
-        let sub_issues = extract_sub_issues(&output);
-        assert_eq!(sub_issues.len(), 1);
-        assert_eq!(sub_issues[0].description, "All on one line.");
-    }
-
-    #[test]
-    fn test_extract_sub_issues_from_json_fence() {
-        let output = AgentHandoff {
-            response: r#"
-Here is the plan:
-
-```json
-[
-  {"title": "API", "description": "Build REST API.", "priority": 1},
-  {"title": "UI", "description": "Add dashboard."}
-]
-```
-"#
-            .to_string(),
-            ..Default::default()
-        };
-        let sub_issues = extract_sub_issues(&output);
-        assert_eq!(sub_issues.len(), 2);
-        assert_eq!(sub_issues[0].priority, Some(1));
-        assert_eq!(sub_issues[1].priority, None);
-    }
-
-    #[test]
-    fn test_extract_sub_issues_from_instructions_when_response_empty() {
-        let output = AgentHandoff {
-            response: String::new(),
-            instructions: Some(
-                r#"
-SUB_ISSUE_1:
-TITLE: From instructions
-DESCRIPTION:
-Body here.
-"#
-                .to_string(),
-            ),
-            ..Default::default()
-        };
-        let sub_issues = extract_sub_issues(&output);
-        assert_eq!(sub_issues.len(), 1);
-        assert_eq!(sub_issues[0].title, "From instructions");
-    }
-
-    #[test]
-    fn test_resolve_dependency_placeholders_in_description() {
-        let desc = "Build feature.\nIssue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2\nDone.";
-        let ids = vec![Some(101), Some(102)];
-        let out = resolve_dependency_placeholders_in_description(desc, &ids);
-        assert!(out.contains("Issue Dependencies: #101, #102"), "{out}");
-    }
-
-    #[test]
-    fn test_resolve_dependency_placeholders_keeps_unknown_tokens() {
-        let desc = "Issue Dependencies: SUB_ISSUE_3, external-task";
-        let ids = vec![Some(101), None];
-        let out = resolve_dependency_placeholders_in_description(desc, &ids);
-        assert_eq!(out, "Issue Dependencies: SUB_ISSUE_3, external-task");
-    }
-
-    #[test]
-    fn test_pmo_already_done_pattern() {
-        assert!(is_pmo_already_done_response(&AgentHandoff {
-            response: "Analysis complete.\nALREADY_DONE\nREASON: Feature exists in src/foo.rs."
-                .to_string(),
-            ..Default::default()
-        }));
-        assert!(is_pmo_already_done_response(&AgentHandoff {
-            response: "ALREADY_DONE  REASON: All tests already pass.".to_string(),
-            ..Default::default()
-        }));
-        assert!(!is_pmo_already_done_response(&AgentHandoff {
-            response: "ALREADY_DONE\n\nSee above.\nREASON: wrong — non-whitespace between tokens"
-                .to_string(),
-            ..Default::default()
-        }));
-        assert!(!is_pmo_already_done_response(&AgentHandoff {
-            response: "REASON: something\nALREADY_DONE".to_string(),
-            ..Default::default()
-        }));
-        assert!(!is_pmo_already_done_response(&AgentHandoff {
-            response: "ALREADY_DONE without reason header".to_string(),
-            ..Default::default()
-        }));
-
-        let reason = extract_already_done_reason(&AgentHandoff {
-            response: "noise\nALREADY_DONE\nREASON:\n\nImplemented in module X.".to_string(),
-            ..Default::default()
-        });
-        assert!(reason.contains("module X"));
-    }
-
-    #[test]
-    fn decision_markers_do_not_trigger_on_negated_mentions() {
-        let output = AgentHandoff {
-            response: "Decision: SPLIT\nNot NEEDS_CLARIFICATION (scope is clear).".to_string(),
-            ..Default::default()
-        };
-        assert!(!pmo_needs_clarification(&output));
-        assert!(!pmo_guides_worker(&output));
-        assert!(!pmo_no_split_needed(&output));
-    }
-
-    #[test]
-    fn extract_guidance_returns_empty_for_marker_without_body() {
-        let output = AgentHandoff {
-            response: "GUIDE_WORKER\n".to_string(),
-            ..Default::default()
-        };
-        assert!(pmo_guides_worker(&output));
         assert!(extract_guidance(&output).is_empty());
-    }
-
-    #[test]
-    fn extract_guidance_reads_instructions_marker() {
-        let output = AgentHandoff {
-            response: "GUIDE_WORKER\nINSTRUCTIONS:\nUse the existing config loader.".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_guidance(&output), "Use the existing config loader.");
-    }
-
-    #[test]
-    fn extract_guidance_prefers_structured_instructions_over_public_comment() {
-        // Regression: when the model called the `plan` tool, apply_pmo_plan_output
-        // populates `instructions` (worker-facing) and prepends `public_comment`
-        // (human-facing) to `response` as a PUBLIC_COMMENT block. extract_guidance
-        // used to check the PUBLIC_COMMENT block first, so it returned the
-        // human-facing text instead of the worker-facing `instructions`. The
-        // structured field must win.
-        let output = AgentHandoff {
-            instructions: Some("Use --foo instead of --bar.".into()),
-            response: "PUBLIC_COMMENT_BEGIN\nHeads up for reviewers: scope is unchanged.\nPUBLIC_COMMENT_END\nGUIDE_WORKER"
-                .into(),
-            ..Default::default()
-        };
-        assert_eq!(extract_guidance(&output), "Use --foo instead of --bar.");
-    }
-
-    #[test]
-    fn extract_guidance_falls_back_to_pmo_guidance_block() {
-        // When the model emitted a PMO_GUIDANCE_BEGIN/END block inline (instead
-        // of via the `plan` tool's `instructions` field), extract it.
-        let output = AgentHandoff {
-            response:
-                "GUIDE_WORKER\nPMO_GUIDANCE_BEGIN\nUse the existing config loader.\nPMO_GUIDANCE_END"
-                    .into(),
-            ..Default::default()
-        };
-        assert_eq!(extract_guidance(&output), "Use the existing config loader.");
-    }
-
-    #[test]
-    fn extract_guidance_uses_public_comment_as_last_resort() {
-        // PUBLIC_COMMENT is human-facing and is only used when no worker-facing
-        // instructions are available (text-marker path that emitted only a
-        // public comment).
-        let output = AgentHandoff {
-            response: "PUBLIC_COMMENT_BEGIN\nDo the thing.\nPUBLIC_COMMENT_END".into(),
-            ..Default::default()
-        };
-        assert_eq!(extract_guidance(&output), "Do the thing.");
     }
 
     #[test]
     fn extract_guidance_truncates_long_instructions() {
         let long = "Do this. ".repeat(80);
         let output = AgentHandoff {
-            instructions: Some(long.clone()),
+            instructions: Some(long),
             ..Default::default()
         };
         let extracted = extract_guidance(&output);
-        assert!(extracted.len() <= 502); // 500 chars + possible "..."
+        assert!(extracted.len() <= 502);
         assert!(extracted.starts_with("Do this."));
     }
 
     #[test]
-    fn format_pmo_guidance_comment_wraps_body_in_markers() {
+    fn format_pmo_guidance_comment_includes_header_and_body() {
         let comment = format_pmo_guidance_comment("Use --foo instead of --bar.");
         assert!(comment.contains("**PMO guidance for the worker agent:**"));
-        assert!(comment.contains("PMO_GUIDANCE_BEGIN"));
-        assert!(comment.contains("PMO_GUIDANCE_END"));
-        // Round-trip: extract_pmo_guidance_block recovers the body.
-        assert_eq!(
-            super::extract_pmo_guidance_block(&comment).as_deref(),
-            Some("Use --foo instead of --bar.")
-        );
+        assert!(comment.contains("Use --foo instead of --bar."));
+        // No internal markers — the comment is plain human-facing text.
+        assert!(!comment.contains("PMO_GUIDANCE_BEGIN"));
+        assert!(!comment.contains("PMO_GUIDANCE_END"));
     }
 
     #[test]
     fn format_pmo_guidance_comment_preserves_multiline_body() {
         let body = "Step one: do X.\nStep two: do Y.";
         let comment = format_pmo_guidance_comment(body);
-        assert_eq!(
-            super::extract_pmo_guidance_block(&comment).as_deref(),
-            Some(body)
-        );
+        assert!(comment.contains(body));
     }
 
     #[test]
-    fn format_pmo_guidance_comment_falls_back_to_plain_when_empty() {
-        // When guidance is empty (shouldn't happen in production — callers
-        // bail earlier — but the helper must not panic or emit an empty block).
+    fn format_pmo_guidance_comment_includes_header_even_when_body_is_whitespace() {
         let comment = format_pmo_guidance_comment("   ");
         assert!(comment.contains("**PMO guidance for the worker agent:**"));
         assert!(!comment.contains("PMO_GUIDANCE_BEGIN"));
     }
 
     #[test]
-    fn pmo_apply_cursor_plan_files_merges_markdown_into_response() {
-        let tmp =
-            std::env::temp_dir().join(format!("potlatch-pmo-plan-merge-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("plans")).unwrap();
-        let f = tmp.join("plans/triage.md");
-        std::fs::write(&f, "SUB_ISSUE_1 TITLE: x\n").unwrap();
-        let root = std::fs::canonicalize(&tmp).unwrap();
-        let abs = std::fs::canonicalize(&f)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let mut h = AgentHandoff::default();
-        h.cursor_plan_paths.push(abs);
-        let out = super::pmo_apply_cursor_plan_files(&root.to_string_lossy(), h);
-        assert!(out.response.contains("PMO Cursor plan file"));
-        assert!(out.response.contains("SUB_ISSUE_1"));
-        assert!(out.cursor_plan_paths.is_empty());
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn decision_predicates_use_structured_fields_only() {
+        // needs_clarification
+        let nc = AgentHandoff {
+            decision: Some("needs_clarification".into()),
+            ..Default::default()
+        };
+        assert!(pmo_needs_clarification(&nc));
+        assert!(!pmo_guides_worker(&nc));
+        assert!(!is_pmo_already_done_response(&nc));
+
+        // guide_worker
+        let gw = AgentHandoff {
+            decision: Some("guide_worker".into()),
+            ..Default::default()
+        };
+        assert!(pmo_guides_worker(&gw));
+        assert!(!pmo_needs_clarification(&gw));
+
+        // already_done
+        let ad = AgentHandoff {
+            decision: Some("already_done".into()),
+            ..Default::default()
+        };
+        assert!(is_pmo_already_done_response(&ad));
+        assert!(!pmo_guides_worker(&ad));
+
+        // No decision
+        let none = AgentHandoff::default();
+        assert!(!pmo_needs_clarification(&none));
+        assert!(!pmo_guides_worker(&none));
+        assert!(!is_pmo_already_done_response(&none));
     }
 
     #[test]
-    fn pmo_read_plan_file_text_allows_external_cursor_plans_under_home() {
-        let tmp =
-            std::env::temp_dir().join(format!("potlatch-pmo-external-plan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let workspace = tmp.join("repo");
-        let home = tmp.join("home");
-        let plans = home.join(".cursor/plans");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&plans).unwrap();
-        let plan_file = plans.join("x.plan.md");
-        std::fs::write(
-            &plan_file,
-            "SUB_ISSUE_1:\nTITLE: External\nDESCRIPTION:\nok",
-        )
-        .unwrap();
+    fn decision_predicates_ignore_text_markers() {
+        // Text markers in the response must NOT trigger decisions — only
+        // structured fields count.
+        let output = AgentHandoff {
+            response: "GUIDE_WORKER\nINSTRUCTIONS:\ndo something".into(),
+            ..Default::default()
+        };
+        assert!(!pmo_guides_worker(&output));
+        assert!(!pmo_needs_clarification(&output));
 
-        let body =
-            pmo_read_plan_file_text_with_home(&workspace, &plan_file.to_string_lossy(), Some(home))
-                .expect("should read external plan under ~/.cursor/plans");
-        assert!(body.contains("SUB_ISSUE_1"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
+        let output = AgentHandoff {
+            response: "ALREADY_DONE\nREASON: done".into(),
+            ..Default::default()
+        };
+        assert!(!is_pmo_already_done_response(&output));
     }
 
     #[test]
-    fn pmo_read_plan_file_text_rejects_external_paths_outside_allowlist() {
-        let tmp =
-            std::env::temp_dir().join(format!("potlatch-pmo-external-reject-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let workspace = tmp.join("repo");
-        let home = tmp.join("home");
-        let outside = tmp.join("outside");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let f = outside.join("bad.plan.md");
-        std::fs::write(&f, "x").unwrap();
-
-        let err = pmo_read_plan_file_text_with_home(&workspace, &f.to_string_lossy(), Some(home))
-            .expect_err("external non-allowlisted file should be rejected");
-        assert!(err.contains("escapes workspace"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn extract_already_done_reason_uses_structured_field() {
+        let output = AgentHandoff {
+            reason: Some("Implemented in module X.".into()),
+            ..Default::default()
+        };
+        assert!(extract_already_done_reason(&output).contains("module X"));
     }
 
     #[test]
-    fn pmo_extract_plan_file_text_returns_only_plan_sections() {
-        let response = "progress line\n=== PMO Cursor plan file ===\nSUB_ISSUE_1:\nTITLE: A\n\n=== PMO Cursor plan file ===\nSUB_ISSUE_2:\nTITLE: B\n";
-        let out = pmo_extract_plan_file_text(response).expect("plan text");
-        assert!(!out.contains("progress line"));
-        assert!(out.contains("SUB_ISSUE_1:"));
-        assert!(out.contains("SUB_ISSUE_2:"));
+    fn extract_already_done_reason_defaults_when_no_field() {
+        let output = AgentHandoff::default();
+        let reason = extract_already_done_reason(&output);
+        assert!(!reason.is_empty());
     }
 
     #[test]
-    fn pmo_extract_plan_file_text_none_when_marker_missing() {
-        assert!(pmo_extract_plan_file_text("no marker here").is_none());
+    fn extract_clarification_question_uses_structured_field() {
+        let output = AgentHandoff {
+            question: Some("Which modules?".into()),
+            ..Default::default()
+        };
+        assert_eq!(extract_clarification_question(&output), "Which modules?");
+    }
+
+    #[test]
+    fn extract_clarification_question_defaults_when_no_field() {
+        let output = AgentHandoff::default();
+        let q = extract_clarification_question(&output);
+        assert!(!q.is_empty());
     }
 
     #[test]

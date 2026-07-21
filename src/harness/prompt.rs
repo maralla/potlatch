@@ -49,7 +49,7 @@ Your workspace is the current working directory. It is the root of the repositor
 - **web_fetch**: Fetch web pages for documentation or references.
 - **todo**: Manage a task checklist that persists across context compaction. Send the full list of `{description, status}` items on every call — it replaces the entire list (replace-all API), so indices stay stable across updates. `status` is `pending`, `in_progress`, (mark exactly one item `in_progress` — the one you're working on) or `completed`. The checklist is always visible to you in the system prompt — check it before deciding what to do next. Optional; use it only when the task is complex enough to benefit from tracking.
 - **memory**: Save fundamental project facts that survive across sessions. Use this when you discover something permanently true about the project (language, build commands, architecture rules) that would help any future task. Be extremely selective — only save facts that belong in a README's first paragraph, not implementation details.
-- **plan**: Emit a structured JSON plan as your canonical handoff. Only available in plan mode. Call this with the JSON your role expects (e.g. for PMO: `{decision, instructions?, sub_issues?, reason?, question?}`). Potlatch reads the tool's JSON directly — streamed text is secondary.
+{plan_tool_line}
 
 ## Important Notes
 
@@ -65,18 +65,18 @@ When you have completed the task, provide a clear, concise summary of what you d
 
 /// Build the system prompt for the harness agent.
 ///
-/// Returns only the base operating-principles prompt. Project-specific
-/// instructions (e.g. `AGENTS.md`) are not concatenated here; the agent's task
-/// prompt is responsible for directing the agent to read them from disk. This
-/// keeps behavior identical whether the harness is the built-in potlatch harness
-/// or a third-party ACP server.
-pub fn system_prompt() -> &'static str {
-    BASE_PROMPT
+/// When `plan_mode` is true, includes the `plan` tool in the tool list so the
+/// model knows it can call it. When false (worker/review sessions), the `plan`
+/// tool is omitted — the model should never reference a tool that isn't
+/// registered.
+pub fn system_prompt(plan_mode: bool) -> String {
+    let plan_tool_line = if plan_mode {
+        "- **plan**: Emit a structured JSON plan as your canonical handoff. Only available in plan mode. Call this with the JSON your role expects (e.g. for PMO: `{decision, instructions?, sub_issues?, reason?, question?}`). Potlatch reads the tool's JSON directly — streamed text is secondary."
+    } else {
+        ""
+    };
+    BASE_PROMPT.replace("{plan_tool_line}", plan_tool_line)
 }
-
-/// The base system prompt.
-#[cfg(test)]
-pub const SYSTEM_PROMPT: &str = BASE_PROMPT;
 
 #[cfg(test)]
 mod tests {
@@ -84,28 +84,44 @@ mod tests {
 
     #[test]
     fn system_prompt_covers_key_principles() {
-        assert!(SYSTEM_PROMPT.contains("Explore before editing"));
-        assert!(SYSTEM_PROMPT.contains("minimal, targeted edits"));
-        assert!(SYSTEM_PROMPT.contains("Verify your changes"));
-        assert!(SYSTEM_PROMPT.contains("Stop when the task is done"));
-        assert!(SYSTEM_PROMPT.contains("compacted"));
+        let p = system_prompt(false);
+        assert!(p.contains("Explore before editing"));
+        assert!(p.contains("minimal, targeted edits"));
+        assert!(p.contains("Verify your changes"));
+        assert!(p.contains("Stop when the task is done"));
+        assert!(p.contains("compacted"));
     }
 
     #[test]
     fn system_prompt_encourages_batched_reads() {
-        // The model tends to issue single-file file_read calls across many
-        // turns, costing 1-3s of model time per round trip. The prompt must
-        // direct it to batch reads and prefer whole-file reads.
-        assert!(SYSTEM_PROMPT.contains("files"));
-        assert!(SYSTEM_PROMPT.contains("Batch independent operations"));
-        assert!(SYSTEM_PROMPT.contains("Read whole files"));
+        let p = system_prompt(false);
+        assert!(p.contains("files"));
+        assert!(p.contains("Batch independent operations"));
+        assert!(p.contains("Read whole files"));
+    }
+
+    #[test]
+    fn system_prompt_includes_plan_tool_in_plan_mode() {
+        let p = system_prompt(true);
+        assert!(p.contains("**plan**"));
+        assert!(p.contains("canonical handoff"));
+    }
+
+    #[test]
+    fn system_prompt_excludes_plan_tool_in_non_plan_mode() {
+        let p = system_prompt(false);
+        assert!(!p.contains("**plan**"));
+        assert!(!p.contains("canonical handoff"));
+        // The placeholder must be fully replaced — no literal {plan_tool_line}.
+        assert!(!p.contains("{plan_tool_line}"));
     }
 
     #[test]
     fn system_prompt_does_not_concatenate_agents_md() {
         // The prompt must not reference AGENTS.md or project instructions —
         // those are read from disk by the agent per its task prompt.
-        assert!(!SYSTEM_PROMPT.contains("AGENTS.md"));
-        assert!(!SYSTEM_PROMPT.contains("Project Instructions"));
+        let p = system_prompt(false);
+        assert!(!p.contains("AGENTS.md"));
+        assert!(!p.contains("Project Instructions"));
     }
 }

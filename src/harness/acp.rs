@@ -136,12 +136,23 @@ impl AcpServer {
 
         let result = json!({
             "sessionId": session_id,
-            "configOptions": [{
-                "id": "model",
-                "category": "model",
-                "type": "select",
-                "options": model_options
-            }]
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "type": "select",
+                    "options": model_options
+                },
+                {
+                    "id": "mode",
+                    "category": "mode",
+                    "type": "select",
+                    "options": [
+                        {"value": "ask", "name": "Ask"},
+                        {"value": "plan", "name": "Plan"}
+                    ]
+                }
+            ]
         });
 
         self.sessions.insert(session_id, session);
@@ -169,11 +180,17 @@ impl AcpServer {
         if let Some(session) = self.sessions.get_mut(session_id) {
             if config_id == "model" {
                 session.model = value.to_string();
-                debug!("harness ACP: set model to {value} via config option");
+                info!("harness ACP: session {session_id} set model={value}");
             } else if config_id == "mode" {
                 session.mode = value.to_string();
-                debug!("harness ACP: set mode to {value} for session {session_id}");
+                info!("harness ACP: session {session_id} set mode={value}");
+            } else {
+                debug!(
+                    "harness ACP: session {session_id} unknown configId={config_id} value={value}"
+                );
             }
+        } else {
+            warn!("harness ACP: set_config_option for unknown session {session_id}");
         }
 
         Ok(json!({ "configOptions": [] }))
@@ -223,6 +240,11 @@ impl AcpServer {
                 cancel,
             )
         };
+        info!(
+            "harness ACP: session {session_id} mode={}, registered tools: {:?}",
+            if mode.is_empty() { "default" } else { &mode },
+            agent.tool_names()
+        );
 
         // Collect progress text; the agent loop calls this callback after each LLM response.
         // We emit notifications by writing to the writer after collection.
@@ -389,6 +411,44 @@ mod tests {
             Some(Outbound::Response { result, .. }) => {
                 assert!(!result["sessionId"].as_str().unwrap().is_empty());
                 assert!(result["configOptions"].is_array());
+            }
+            _ => panic!("expected response"),
+        }
+    }
+
+    #[test]
+    fn session_new_advertises_mode_config_option() {
+        // The harness must advertise a "mode" config option with "plan" as an
+        // available value. Without this, the ACP runtime skips setting the
+        // session mode, the plan tool is never registered, and the PMO can't
+        // call it.
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let mut server = AcpServer::new(llm);
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": { "cwd": "/tmp", "mcpServers": [] }
+        });
+
+        let (response, _) = collect_output(&mut server, &msg);
+        match response {
+            Some(Outbound::Response { result, .. }) => {
+                let options = result["configOptions"].as_array().unwrap();
+                let mode_opt = options
+                    .iter()
+                    .find(|o| o["id"] == "mode")
+                    .expect("mode config option must be advertised");
+                assert_eq!(mode_opt["type"], "select");
+                let values: Vec<&str> = mode_opt["options"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|o| o["value"].as_str().unwrap())
+                    .collect();
+                assert!(values.contains(&"plan"));
+                assert!(values.contains(&"ask"));
             }
             _ => panic!("expected response"),
         }

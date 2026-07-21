@@ -177,6 +177,11 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
+    /// Registered tool names in insertion order.
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.order.iter().map(|n| n.as_str()).collect()
+    }
+
     /// OpenAI `tools` array for the chat completion request.
     pub fn tools_schema(&self) -> Vec<Value> {
         self.order

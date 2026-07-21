@@ -23,35 +23,6 @@ pub fn scope_label_filter(scope_label: &str) -> Option<&str> {
     if t.is_empty() { None } else { Some(t) }
 }
 
-/// Stable machine-readable block markers the PMO emits around worker-facing
-/// guidance in GitLab comments. The worker scans issue comments for this block
-/// so it can pick up PMO guidance reliably, regardless of any surrounding
-/// prose the PMO (or a human) added to the same comment.
-pub(crate) const PMO_GUIDANCE_BEGIN: &str = "PMO_GUIDANCE_BEGIN";
-pub(crate) const PMO_GUIDANCE_END: &str = "PMO_GUIDANCE_END";
-
-/// Wrap `body` in `PMO_GUIDANCE_BEGIN` / `PMO_GUIDANCE_END` markers. Returns
-/// `None` when `body` is empty after trimming so callers can fall back to a
-/// plain prose comment.
-pub(crate) fn wrap_pmo_guidance_block(body: &str) -> Option<String> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{begin}\n{body}\n{end}",
-        begin = PMO_GUIDANCE_BEGIN,
-        body = trimmed,
-        end = PMO_GUIDANCE_END,
-    ))
-}
-
-/// Extract the first `PMO_GUIDANCE_BEGIN` … `PMO_GUIDANCE_END` block from
-/// `text`. Returns `None` when no closed block is present or the body is empty.
-pub(crate) fn extract_pmo_guidance_block(text: &str) -> Option<String> {
-    extract_marker_block(text, PMO_GUIDANCE_BEGIN, PMO_GUIDANCE_END)
-}
-
 /// Stable machine-readable block for public GitLab comments embedded in agent text output.
 pub(crate) fn extract_public_comment_block(text: &str) -> Option<String> {
     extract_marker_block(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END")
@@ -75,6 +46,24 @@ fn extract_marker_block(text: &str, begin: &str, end: &str) -> Option<String> {
 
 pub(crate) fn strip_public_comment_blocks(text: &str) -> String {
     strip_marker_blocks(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END")
+}
+
+/// Strip internal potlatch markers from `text` before posting it to GitLab.
+/// Removes `PUBLIC_COMMENT_BEGIN/END` blocks and any stray marker lines so
+/// internal harness markers don't leak into human-facing GitLab comments when
+/// the model includes them in fields like `question` or `reason`.
+pub(crate) fn strip_internal_markers(text: &str) -> String {
+    let out = strip_marker_blocks(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END");
+    // Also strip bare marker lines the model might emit without a matching end.
+    out.lines()
+        .filter(|line| {
+            let t = line.trim();
+            t != "PUBLIC_COMMENT_BEGIN" && t != "PUBLIC_COMMENT_END"
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// Remove every `<begin>…<end>` block from `text`. If a `begin` marker has no
@@ -152,8 +141,8 @@ pub fn register(workflow: &mut Workflow) {
 #[cfg(test)]
 mod scope_tests {
     use super::{
-        extract_pmo_guidance_block, extract_public_comment_block, issue_in_scope, mr_in_scope,
-        register, strip_public_comment_blocks, wrap_pmo_guidance_block,
+        extract_public_comment_block, issue_in_scope, mr_in_scope, register,
+        strip_internal_markers, strip_public_comment_blocks,
     };
     use crate::agents::gitlab::{Issue, MergeRequest};
     use crate::core::config::Config;
@@ -227,48 +216,34 @@ mod scope_tests {
     }
 
     #[test]
-    fn extract_pmo_guidance_block_reads_stable_markers() {
-        let text = "noise\nPMO_GUIDANCE_BEGIN\nUse --foo not --bar.\nPMO_GUIDANCE_END\nmore";
-        assert_eq!(
-            extract_pmo_guidance_block(text).as_deref(),
-            Some("Use --foo not --bar.")
-        );
+    fn strip_internal_markers_removes_public_comment_blocks() {
+        let text = "PUBLIC_COMMENT_BEGIN\nhidden\nPUBLIC_COMMENT_END\nVisible.";
+        let clean = strip_internal_markers(text);
+        assert!(!clean.contains("PUBLIC_COMMENT_BEGIN"));
+        assert!(!clean.contains("hidden"));
+        assert!(clean.contains("Visible."));
     }
 
     #[test]
-    fn extract_pmo_guidance_block_returns_none_for_empty_body() {
-        let text = "PMO_GUIDANCE_BEGIN\n\nPMO_GUIDANCE_END";
-        assert!(extract_pmo_guidance_block(text).is_none());
+    fn strip_internal_markers_removes_bare_marker_lines() {
+        let text = "PUBLIC_COMMENT_BEGIN\nPUBLIC_COMMENT_END\nClean text.";
+        let clean = strip_internal_markers(text);
+        assert!(!clean.contains("PUBLIC_COMMENT_BEGIN"));
+        assert!(!clean.contains("PUBLIC_COMMENT_END"));
+        assert!(clean.contains("Clean text."));
     }
 
     #[test]
-    fn extract_pmo_guidance_block_returns_none_when_missing() {
-        assert!(extract_pmo_guidance_block("no markers here").is_none());
-        assert!(extract_pmo_guidance_block("PMO_GUIDANCE_BEGIN no end").is_none());
+    fn strip_internal_markers_preserves_clean_text() {
+        let text = "This is a normal comment for humans.";
+        assert_eq!(strip_internal_markers(text), text);
     }
 
     #[test]
-    fn wrap_pmo_guidance_block_round_trips() {
-        let wrapped = wrap_pmo_guidance_block("Do X.\nThen Y.").unwrap();
-        assert!(wrapped.starts_with("PMO_GUIDANCE_BEGIN\n"));
-        assert!(wrapped.ends_with("\nPMO_GUIDANCE_END"));
-        assert_eq!(
-            extract_pmo_guidance_block(&wrapped).as_deref(),
-            Some("Do X.\nThen Y.")
-        );
-    }
-
-    #[test]
-    fn wrap_pmo_guidance_block_none_for_empty() {
-        assert!(wrap_pmo_guidance_block("").is_none());
-        assert!(wrap_pmo_guidance_block("   \n  ").is_none());
-    }
-
-    #[test]
-    fn extract_marker_block_takes_first_pair() {
-        // When two blocks are present, the first complete pair wins.
-        let text = "PMO_GUIDANCE_BEGIN\nfirst\nPMO_GUIDANCE_END\nPMO_GUIDANCE_BEGIN\nsecond\nPMO_GUIDANCE_END";
-        assert_eq!(extract_pmo_guidance_block(text).as_deref(), Some("first"));
+    fn strip_internal_markers_handles_empty_result() {
+        let text = "PUBLIC_COMMENT_BEGIN\nPUBLIC_COMMENT_END";
+        let clean = strip_internal_markers(text);
+        assert!(clean.is_empty());
     }
 
     #[test]
