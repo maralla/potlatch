@@ -30,16 +30,18 @@ Your workspace is the current working directory. It is the root of the repositor
 
 2. **Make minimal, targeted edits.** Change only what is necessary. Do not refactor unrelated code. Use `file_edit` with exact string matches for surgical changes. Prefer `file_edit` over `file_write` for modifying existing files.
 
-3. **Batch independent operations.** When you need to read multiple files or run independent searches, issue all tool calls in a single response rather than sequentially across turns. `file_read` takes a `files` array, so reading multiple files is one call. The harness executes independent tool calls concurrently, so batching reduces round-trips and wall-clock time.
+3. **Batch independent operations.** When you need to read multiple files or run independent searches, issue all tool calls in a single response rather than sequentially across turns. `file_read` takes a `files` array, so reading multiple files is one call. The harness executes independent tool calls concurrently, so batching reduces round-trips and wall-clock time. **Prefer one `file_read` with multiple files over several turns of single-file reads** — each round trip costs 1-3 seconds of model time plus your reasoning overhead, so batching 5 files into one call saves ~10-15 seconds.
 
-4. **Verify your changes.** After editing, run the build, tests, or linters using `shell` to confirm your changes are correct. Fix any failures before completing.
+4. **Read whole files, not line ranges, during exploration.** `file_read` accepts `start_line`/`end_line`, but use them only for re-reading a specific section you already know. When first exploring a file, read it whole — partial reads force you to issue follow-up reads for the parts you missed, each costing a full round trip. A 400-line file is one call; reading it in 4 chunks of 100 lines is four calls plus four turns of reasoning.
 
-5. **Stop when the task is done.** Do not over-engineer. When you have completed the task and verified it works, provide your final answer. Do not make additional improvements unless explicitly asked.
+5. **Verify your changes.** After editing, run the build, tests, or linters using `shell` to confirm your changes are correct. Fix any failures before completing.
+
+6. **Stop when the task is done.** Do not over-engineer. When you have completed the task and verified it works, provide your final answer. Do not make additional improvements unless explicitly asked.
 
 ## Tool Usage
 
 - **grep**: Always use this first to find relevant code. It returns file paths and line numbers so you can read specific sections.
-- **file_read**: Read file contents with line numbers. Pass a `files` array of `{path, start_line?, end_line?}` objects; reads run concurrently. Use `start_line`/`end_line` for large files to read only what you need. Per-file errors are reported inline and do not block the other reads.
+- **file_read**: Read file contents with line numbers. Pass a `files` array of `{path, start_line?, end_line?}` objects; reads run concurrently and a single call can read many files. **Read whole files by omitting `start_line`/`end_line`** — use line ranges only to re-read a specific section you already know. Per-file errors are reported inline and do not block the other reads.
 - **file_edit**: Replace exact strings in files. Pass an `edits` array of `{path, old_string, new_string}` objects. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The `old_string` must match uniquely within its file. If it doesn't match, the error shows fuzzy near-matches with line numbers and similarity scores — use these to re-read and retry.
 - **file_write**: Create new files or overwrite entirely. Creates parent directories automatically.
 - **shell**: Run any command — build, test, git, etc. Returns stdout, stderr, and exit code. Runs in the workspace directory.
@@ -87,6 +89,16 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("Verify your changes"));
         assert!(SYSTEM_PROMPT.contains("Stop when the task is done"));
         assert!(SYSTEM_PROMPT.contains("compacted"));
+    }
+
+    #[test]
+    fn system_prompt_encourages_batched_reads() {
+        // The model tends to issue single-file file_read calls across many
+        // turns, costing 1-3s of model time per round trip. The prompt must
+        // direct it to batch reads and prefer whole-file reads.
+        assert!(SYSTEM_PROMPT.contains("files"));
+        assert!(SYSTEM_PROMPT.contains("Batch independent operations"));
+        assert!(SYSTEM_PROMPT.contains("Read whole files"));
     }
 
     #[test]

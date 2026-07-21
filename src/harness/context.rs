@@ -20,8 +20,6 @@ pub enum ContextKind {
     UserPrompt,
     /// Assistant text response — last N are never evicted.
     AssistantText,
-    /// Reasoning content — evictable (intermediate thinking).
-    Reasoning,
     /// A tool call the assistant issued — never evicted (the agent must remember its actions).
     ToolCall,
     /// Result of a file edit — never evicted (the agent must remember every change).
@@ -43,8 +41,7 @@ impl ContextKind {
     fn is_evictable(&self) -> bool {
         matches!(
             self,
-            ContextKind::Reasoning
-                | ContextKind::FileRead
+            ContextKind::FileRead
                 | ContextKind::ShellOutput
                 | ContextKind::Exploration
                 | ContextKind::WebFetch
@@ -60,7 +57,6 @@ impl ContextKind {
             ContextKind::FileRead => "file read output",
             ContextKind::WebFetch => "web fetch output",
             ContextKind::Exploration => "search results",
-            ContextKind::Reasoning => "reasoning",
             ContextKind::ToolResult => "tool result",
             _ => "tool result",
         }
@@ -202,28 +198,32 @@ impl Context {
     }
 
     /// Append an assistant message with tool_calls (the OpenAI format).
-    pub fn push_assistant_with_tools(
-        &mut self,
-        text: Option<&str>,
-        tool_calls: &[Value],
-        reasoning: Option<&str>,
-    ) {
-        if let Some(r) = reasoning
-            && !r.trim().is_empty()
-        {
-            self.push(Role::System, ContextKind::Reasoning, r);
-        }
+    ///
+    /// Reasoning content is intentionally NOT stored: it's intermediate
+    /// thinking already reflected in the subsequent tool calls and actions,
+    /// and re-injecting it on the next turn both wastes context tokens and
+    /// encourages the model to keep emitting long reasoning chains (which
+    /// dominate decode time at ~18ms/token). The streaming callback still
+    /// surfaces reasoning to the UI in real time if the model emits it.
+    ///
+    /// Tool call arguments are sanitized: if the streamed `arguments` string
+    /// is empty or not valid JSON, it is replaced with `"{}"`. This prevents
+    /// the next API call from rejecting the conversation with a 400
+    /// "function.arguments must be valid JSON" error when the model emits
+    /// a malformed or truncated tool call.
+    pub fn push_assistant_with_tools(&mut self, text: Option<&str>, tool_calls: &[Value]) {
+        let sanitized = sanitize_tool_calls(tool_calls);
         let content_json = if let Some(t) = text {
             json!({
                 "role": "assistant",
                 "content": t,
-                "tool_calls": tool_calls,
+                "tool_calls": sanitized,
             })
         } else {
             json!({
                 "role": "assistant",
                 "content": null,
-                "tool_calls": tool_calls,
+                "tool_calls": sanitized,
             })
         };
         let content_str = content_json.to_string();
@@ -241,6 +241,42 @@ impl Context {
     /// Append a plain assistant text response.
     pub fn push_assistant_text(&mut self, text: &str) {
         self.push(Role::Assistant, ContextKind::AssistantText, text);
+    }
+
+    /// Sanitize tool-call arguments in the last assistant entry. Called as a
+    /// recovery path when the API rejects the conversation with a 400
+    /// "function.arguments must be valid JSON" error: rewrites the stored
+    /// JSON in place so every tool call's `arguments` is valid JSON. Returns
+    /// true if any entry was modified.
+    pub fn sanitize_last_assistant_tool_calls(&mut self) -> bool {
+        let Some(entry) = self.entries.last_mut() else {
+            return false;
+        };
+        if entry.role != Role::Assistant || entry.kind != ContextKind::ToolCall {
+            return false;
+        }
+        let Ok(mut parsed) = serde_json::from_str::<Value>(&entry.content) else {
+            return false;
+        };
+        let Some(tool_calls) = parsed["tool_calls"].as_array_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        for tc in tool_calls.iter_mut() {
+            let args = tc["function"]["arguments"].as_str().unwrap_or("");
+            if args.is_empty() || serde_json::from_str::<Value>(args).is_err() {
+                tc["function"]["arguments"] = json!("{}");
+                changed = true;
+            }
+        }
+        if changed {
+            let new_content = parsed.to_string();
+            let new_tokens = Self::estimate_tokens(&new_content) + 4;
+            self.total_tokens = self.total_tokens - entry.tokens + new_tokens;
+            entry.content = new_content;
+            entry.tokens = new_tokens;
+        }
+        changed
     }
 
     /// Enforce the token budget using tiered retention.
@@ -435,18 +471,10 @@ impl Context {
         for entry in &self.entries {
             match entry.role {
                 Role::System => {
-                    if matches!(entry.kind, ContextKind::Reasoning) {
-                        // Reasoning is stored as system but sent as a system note
-                        messages.push(json!({
-                            "role": "system",
-                            "content": format!("[internal reasoning]\n{}", entry.content),
-                        }));
-                    } else {
-                        messages.push(json!({
-                            "role": "system",
-                            "content": entry.content,
-                        }));
-                    }
+                    messages.push(json!({
+                        "role": "system",
+                        "content": entry.content,
+                    }));
                 }
                 Role::User => {
                     messages.push(json!({
@@ -479,8 +507,32 @@ impl Context {
 }
 
 /// Summarize a large tool output into a compact form: a header showing the
-/// original size, the first few lines (most relevant), a marker, and the last
-/// few lines (often contains errors or final results).
+/// Return a copy of `tool_calls` where every call's `function.arguments` is
+/// valid JSON. The model sometimes streams empty or truncated arguments (e.g.
+/// `""` or a partial `{"path":`), which the API rejects with a 400 on the next
+/// turn. Replacing invalid arguments with `"{}"` lets the conversation
+/// continue — the tool returns an error, and the model retries with proper
+/// arguments.
+fn sanitize_tool_calls(tool_calls: &[Value]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .map(|tc| {
+            let args = tc["function"]["arguments"].as_str().unwrap_or("");
+            if !args.is_empty() && serde_json::from_str::<Value>(args).is_ok() {
+                return tc.clone();
+            }
+            // Arguments are empty or invalid — replace with "{}".
+            let mut fixed = tc.clone();
+            fixed["function"]["arguments"] = json!("{}");
+            fixed
+        })
+        .collect()
+}
+
+/// Naive compaction: preserve the first few and last few lines of a tool
+/// output, with a marker showing the original size, the first few lines (most
+/// relevant), a marker, and the last few lines (often contains errors or final
+/// results).
 fn compact_summary(content: &str, label: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let char_count = content.len();
@@ -711,7 +763,6 @@ mod tests {
                     "type": "function",
                     "function": {"name": "file_edit", "arguments": "{}"}
                 })],
-                None,
             );
             ctx.push_tool_result(
                 ContextKind::EditResult,
@@ -769,7 +820,6 @@ mod tests {
             ctx.push_assistant_with_tools(
                 Some(&format!("step {i}")),
                 &[json!({"id": format!("c{i}"), "type": "function", "function": {"name": "shell", "arguments": "{}"}})],
-                None,
             );
             ctx.push_tool_result(
                 ContextKind::EditResult,
@@ -799,7 +849,6 @@ mod tests {
                 "type": "function",
                 "function": {"name": "file_write", "arguments": "{\"path\":\"hi.py\",\"content\":\"print('hi')\"}"}
             })],
-            None,
         );
         ctx.push_tool_result(ContextKind::EditResult, "wrote hi.py", "call_1");
 
@@ -811,5 +860,138 @@ mod tests {
         assert!(messages[2]["tool_calls"].is_array());
         assert_eq!(messages[3]["role"], "tool");
         assert_eq!(messages[3]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn sanitize_tool_calls_replaces_empty_arguments() {
+        let tool_calls = vec![
+            json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": ""}
+            }),
+            json!({
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "grep", "arguments": "{\"pattern\":\"foo\"}"}
+            }),
+        ];
+        let sanitized = sanitize_tool_calls(&tool_calls);
+        // Empty arguments replaced with "{}".
+        assert_eq!(sanitized[0]["function"]["arguments"], "{}");
+        // Valid arguments left unchanged.
+        assert_eq!(
+            sanitized[1]["function"]["arguments"],
+            "{\"pattern\":\"foo\"}"
+        );
+    }
+
+    #[test]
+    fn sanitize_tool_calls_replaces_invalid_json_arguments() {
+        // The model streamed a partial JSON object — not valid JSON.
+        let tool_calls = vec![json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "file_read", "arguments": "{\"path\":"}
+        })];
+        let sanitized = sanitize_tool_calls(&tool_calls);
+        assert_eq!(sanitized[0]["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn sanitize_tool_calls_preserves_valid_arguments() {
+        let tool_calls = vec![json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "file_read", "arguments": "{\"files\":[{\"path\":\"a.rs\"}]}"}
+        })];
+        let sanitized = sanitize_tool_calls(&tool_calls);
+        assert_eq!(
+            sanitized[0]["function"]["arguments"],
+            "{\"files\":[{\"path\":\"a.rs\"}]}"
+        );
+    }
+
+    #[test]
+    fn push_assistant_with_tools_sanitizes_empty_arguments() {
+        // When the model streams empty arguments, the stored context entry
+        // must have "{}" so the next API call doesn't reject with a 400.
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        ctx.push_assistant_with_tools(
+            None,
+            &[json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": ""}
+            })],
+        );
+        let messages = ctx.to_messages();
+        let assistant_msg = &messages[2];
+        assert_eq!(assistant_msg["role"], "assistant");
+        assert_eq!(
+            assistant_msg["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn sanitize_last_assistant_tool_calls_fixes_invalid_arguments() {
+        // Simulate a stored assistant entry with invalid arguments (as if
+        // the model streamed a truncated tool call that bypassed sanitization
+        // — e.g. from an older session or a bug). The method should fix it.
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        // Manually push an assistant entry with invalid arguments by
+        // constructing the raw JSON.
+        let raw = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": ""}
+            }]
+        })
+        .to_string();
+        ctx.push(Role::Assistant, ContextKind::ToolCall, raw);
+
+        let changed = ctx.sanitize_last_assistant_tool_calls();
+        assert!(changed);
+
+        let messages = ctx.to_messages();
+        let assistant_msg = &messages[2];
+        assert_eq!(
+            assistant_msg["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn sanitize_last_assistant_tool_calls_returns_false_when_nothing_to_fix() {
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        ctx.push_assistant_with_tools(
+            None,
+            &[json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": "{\"files\":[]}"}
+            })],
+        );
+        // Arguments are already valid — no change.
+        assert!(!ctx.sanitize_last_assistant_tool_calls());
+    }
+
+    #[test]
+    fn sanitize_last_assistant_tool_calls_returns_false_for_text_entry() {
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        ctx.push_assistant_text("just text, no tool calls");
+        assert!(!ctx.sanitize_last_assistant_tool_calls());
     }
 }

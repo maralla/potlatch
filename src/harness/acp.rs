@@ -21,6 +21,10 @@ use super::client::ChatClient;
 use super::tools::ToolRegistry;
 use crate::core::model::acp::jsonrpc::Outbound;
 
+/// Context token budget for the harness ACP agent loop. Compaction triggers at
+/// 60% and targets 30% of this value (see `Context::enforce_budget`).
+const CONTEXT_TOKEN_BUDGET: usize = 100_000;
+
 /// A session in the ACP server.
 struct Session {
     id: String,
@@ -206,12 +210,18 @@ impl AcpServer {
                 Arc::clone(&self.llm),
                 tools,
                 model,
-                80_000,
+                CONTEXT_TOKEN_BUDGET,
                 cancel,
                 Some(plan_cell),
             )
         } else {
-            AgentLoop::new(Arc::clone(&self.llm), tools, model, 80_000, cancel)
+            AgentLoop::new(
+                Arc::clone(&self.llm),
+                tools,
+                model,
+                CONTEXT_TOKEN_BUDGET,
+                cancel,
+            )
         };
 
         // Collect progress text; the agent loop calls this callback after each LLM response.
@@ -319,10 +329,10 @@ mod tests {
             _tools: &[Value],
             _on_chunk: Option<&super::super::client::StreamCallback>,
             _on_tool_calls: Option<&super::super::client::ToolExecCallback<'_>>,
+            _on_early_tool_call: Option<&super::super::client::EarlyToolExecCallback<'_>>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
                 content: "Task completed successfully.".into(),
-                reasoning: None,
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
                 usage: super::super::client::Usage::default(),

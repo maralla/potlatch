@@ -9,6 +9,20 @@ use serde_json::{Value, json};
 /// Callback for streaming chunks.
 pub type StreamCallback = dyn Fn(&str) + Send + Sync;
 
+/// Callback invoked when a single tool call's arguments appear complete during
+/// streaming (before `finish_reason`). Fires once per tool call, as soon as
+/// the accumulated `arguments` string parses as valid JSON and the next SSE
+/// chunk does not extend that tool call's arguments. Lets the caller start
+/// read-only tools speculatively, overlapping their I/O with the model's
+/// remaining generation (reasoning tail, finish_reason, usage chunk).
+///
+/// Receives `(index, tool_call)` and returns `Some(result)` if the caller
+/// executed the tool (caching the result for later collection), or `None` if
+/// the caller chose not to execute speculatively (e.g. mutating tool). The
+/// caller is responsible for caching results by `index` and returning them
+/// from the final [`ToolExecCallback`] invocation.
+pub type EarlyToolExecCallback<'a> = dyn Fn(usize, &Value) -> Option<String> + Send + Sync + 'a;
+
 /// Callback invoked when the LLM response is fully received but before
 /// `chat()` returns. Allows the caller to start executing tool calls while
 /// the client finishes parsing trailing SSE data (usage, [DONE]).
@@ -21,7 +35,9 @@ pub trait ChatClient: Send + Sync {
     /// Send a chat completion request with tools. Calls `on_chunk` for each streamed delta.
     /// If `on_tool_calls` is provided, it is invoked as soon as the complete tool-call list
     /// is known (when `finish_reason` arrives), overlapping tool execution with the tail of
-    /// the SSE stream.
+    /// the SSE stream. If `on_early_tool_call` is provided, it is invoked per tool call as
+    /// soon as that call's arguments parse as valid JSON during streaming — enabling
+    /// speculative execution of read-only tools before `finish_reason` arrives.
     fn chat(
         &self,
         model: &str,
@@ -29,6 +45,7 @@ pub trait ChatClient: Send + Sync {
         tools: &[Value],
         on_chunk: Option<&StreamCallback>,
         on_tool_calls: Option<&ToolExecCallback<'_>>,
+        on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
     ) -> Result<ChatResponse>;
 
     /// List available models from the backend. Returns empty if unsupported.
@@ -65,8 +82,6 @@ impl Usage {
 pub struct ChatResponse {
     /// Assistant text content.
     pub content: String,
-    /// Reasoning content (if the model produces it, e.g. Model/o1-style reasoning).
-    pub reasoning: Option<String>,
     /// Tool calls (OpenAI format): `[{"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}]`
     pub tool_calls: Vec<Value>,
     /// `"stop"`, `"tool_calls"`, or other finish reasons.
@@ -143,6 +158,7 @@ impl ChatClient for OpenAiClient {
         tools: &[Value],
         on_chunk: Option<&StreamCallback>,
         on_tool_calls: Option<&ToolExecCallback<'_>>,
+        on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
     ) -> Result<ChatResponse> {
         let url = self.url("/chat/completions");
 
@@ -175,12 +191,56 @@ impl ChatClient for OpenAiClient {
 
         // Parse SSE stream line-by-line (true streaming, not buffering the whole response)
         let mut content = String::new();
-        let mut reasoning = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut finish_reason = String::new();
         let mut usage = Usage::default();
         // Tool results computed via overlap execution (populated when finish_reason arrives).
         let mut tool_results: Vec<String> = Vec::new();
+        // Indices that have been speculatively executed via on_early_tool_call.
+        // Tracked so we don't fire twice for the same tool call.
+        let mut speculatively_executed: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
+        // Helper: try to fire on_early_tool_call for a given index if its
+        // arguments parse as valid JSON and it hasn't been executed yet.
+        // Returns true if the callback was invoked.
+        let try_early_exec = |idx: usize,
+                              tool_calls: &Vec<Value>,
+                              executed: &mut std::collections::HashSet<usize>,
+                              cb: Option<&EarlyToolExecCallback<'_>>|
+         -> bool {
+            if executed.contains(&idx) {
+                return false;
+            }
+            let Some(cb) = cb else {
+                return false;
+            };
+            let Some(tc) = tool_calls.get(idx) else {
+                return false;
+            };
+            // Only fire when the tool call has a name and parseable arguments.
+            let name = tc["function"]["name"].as_str().unwrap_or("");
+            if name.is_empty() {
+                return false;
+            }
+            let args_str = tc["function"]["arguments"].as_str().unwrap_or("");
+            if args_str.is_empty() {
+                return false;
+            }
+            // Arguments must parse as valid JSON — partial streaming chunks
+            // won't parse, so this gates speculative execution until the
+            // arguments are likely complete.
+            if serde_json::from_str::<Value>(args_str).is_err() {
+                return false;
+            }
+            // Mark as executed BEFORE calling the callback so the caller's
+            // closure can safely mutate shared state without re-entry.
+            executed.insert(idx);
+            // Fire and discard the result — the caller caches it internally
+            // and returns it from the final on_tool_calls callback.
+            let _ = cb(idx, tc);
+            true
+        };
 
         let reader = BufReader::new(resp);
         for line in reader.lines() {
@@ -216,10 +276,11 @@ impl ChatClient for OpenAiClient {
                 }
             }
 
-            // Reasoning content (model-specific, e.g. Model/o1-style)
-            if let Some(r) = delta["reasoning"].as_str() {
-                reasoning.push_str(r);
-            }
+            // Track the highest tool-call index seen in this chunk so we can
+            // fire speculative execution for earlier indices whose arguments
+            // are now complete (a new index appearing means the previous one
+            // is done streaming arguments).
+            let mut new_max_index: Option<usize> = None;
 
             // Tool calls (streaming accumulation)
             if let Some(tc_array) = delta["tool_calls"].as_array() {
@@ -249,6 +310,22 @@ impl ChatClient for OpenAiClient {
                         tool_calls[idx]["function"]["arguments"] =
                             json!(format!("{current}{args}"));
                     }
+                    new_max_index = Some(idx.max(new_max_index.unwrap_or(0)));
+                }
+            }
+
+            // Speculative execution: when a new tool-call index appears, all
+            // earlier indices whose arguments parse as valid JSON are complete.
+            // Fire on_early_tool_call for them so read-only tools start
+            // executing while the model continues generating the later calls.
+            if let Some(max_idx) = new_max_index {
+                for earlier in 0..max_idx {
+                    try_early_exec(
+                        earlier,
+                        &tool_calls,
+                        &mut speculatively_executed,
+                        on_early_tool_call,
+                    );
                 }
             }
 
@@ -278,11 +355,6 @@ impl ChatClient for OpenAiClient {
 
         Ok(ChatResponse {
             content,
-            reasoning: if reasoning.is_empty() {
-                None
-            } else {
-                Some(reasoning)
-            },
             tool_calls,
             finish_reason,
             usage,
@@ -316,12 +388,12 @@ impl ChatClient for FakeChatClient {
         _tools: &[Value],
         _on_chunk: Option<&StreamCallback>,
         _on_tool_calls: Option<&ToolExecCallback<'_>>,
+        _on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
     ) -> Result<ChatResponse> {
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
             return Ok(ChatResponse {
                 content: "No more scripted responses".into(),
-                reasoning: None,
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
                 usage: Usage::default(),
@@ -342,7 +414,6 @@ mod tests {
         let client = FakeChatClient::new(vec![
             ChatResponse {
                 content: String::new(),
-                reasoning: None,
                 tool_calls: vec![json!({
                     "id": "call_1",
                     "type": "function",
@@ -355,7 +426,6 @@ mod tests {
             },
             ChatResponse {
                 content: "Done!".into(),
-                reasoning: None,
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
                 usage: Usage::default(),
@@ -364,11 +434,11 @@ mod tests {
             },
         ]);
 
-        let resp1 = client.chat("m", &[], &[], None, None).unwrap();
+        let resp1 = client.chat("m", &[], &[], None, None, None).unwrap();
         assert_eq!(resp1.finish_reason, "tool_calls");
         assert_eq!(resp1.tool_calls.len(), 1);
 
-        let resp2 = client.chat("m", &[], &[], None, None).unwrap();
+        let resp2 = client.chat("m", &[], &[], None, None, None).unwrap();
         assert_eq!(resp2.finish_reason, "stop");
         assert_eq!(resp2.content, "Done!");
     }
