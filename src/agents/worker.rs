@@ -3074,7 +3074,7 @@ fn get_common_requirements() -> &'static str {
 - Leave staging, committing, pushing, and merge request creation to the system
 - If information is missing, document what's needed in your response (do not ask interactively)
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
-- Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed
+- Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed. PMO guidance is wrapped in `PMO_GUIDANCE_BEGIN` / `PMO_GUIDANCE_END` markers inside a comment; treat the text inside that block as authoritative worker instructions and follow it exactly.
 - Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules (see MANDATORY OUTPUT): not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments"#
 }
 

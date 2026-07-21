@@ -23,14 +23,48 @@ pub fn scope_label_filter(scope_label: &str) -> Option<&str> {
     if t.is_empty() { None } else { Some(t) }
 }
 
+/// Stable machine-readable block markers the PMO emits around worker-facing
+/// guidance in GitLab comments. The worker scans issue comments for this block
+/// so it can pick up PMO guidance reliably, regardless of any surrounding
+/// prose the PMO (or a human) added to the same comment.
+pub(crate) const PMO_GUIDANCE_BEGIN: &str = "PMO_GUIDANCE_BEGIN";
+pub(crate) const PMO_GUIDANCE_END: &str = "PMO_GUIDANCE_END";
+
+/// Wrap `body` in `PMO_GUIDANCE_BEGIN` / `PMO_GUIDANCE_END` markers. Returns
+/// `None` when `body` is empty after trimming so callers can fall back to a
+/// plain prose comment.
+pub(crate) fn wrap_pmo_guidance_block(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{begin}\n{body}\n{end}",
+        begin = PMO_GUIDANCE_BEGIN,
+        body = trimmed,
+        end = PMO_GUIDANCE_END,
+    ))
+}
+
+/// Extract the first `PMO_GUIDANCE_BEGIN` … `PMO_GUIDANCE_END` block from
+/// `text`. Returns `None` when no closed block is present or the body is empty.
+pub(crate) fn extract_pmo_guidance_block(text: &str) -> Option<String> {
+    extract_marker_block(text, PMO_GUIDANCE_BEGIN, PMO_GUIDANCE_END)
+}
+
 /// Stable machine-readable block for public GitLab comments embedded in agent text output.
 pub(crate) fn extract_public_comment_block(text: &str) -> Option<String> {
-    const BEGIN: &str = "PUBLIC_COMMENT_BEGIN";
-    const END: &str = "PUBLIC_COMMENT_END";
-    let start = text.find(BEGIN)?;
-    let body_start = start + BEGIN.len();
+    extract_marker_block(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END")
+}
+
+/// Generic single-block extractor: returns the trimmed body between the first
+/// `begin` marker and the next `end` marker. `None` when either marker is
+/// missing or the body is empty.
+fn extract_marker_block(text: &str, begin: &str, end: &str) -> Option<String> {
+    let start = text.find(begin)?;
+    let body_start = start + begin.len();
     let rest = &text[body_start..];
-    let end_rel = rest.find(END)?;
+    let end_rel = rest.find(end)?;
     let body = rest[..end_rel].trim();
     if body.is_empty() {
         None
@@ -40,15 +74,20 @@ pub(crate) fn extract_public_comment_block(text: &str) -> Option<String> {
 }
 
 pub(crate) fn strip_public_comment_blocks(text: &str) -> String {
-    const BEGIN: &str = "PUBLIC_COMMENT_BEGIN";
-    const END: &str = "PUBLIC_COMMENT_END";
+    strip_marker_blocks(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END")
+}
+
+/// Remove every `<begin>…<end>` block from `text`. If a `begin` marker has no
+/// matching `end`, the remainder is dropped (an unclosed block would
+/// otherwise leak machine text into a human-facing surface).
+fn strip_marker_blocks(text: &str, begin: &str, end: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
-    while let Some(start) = rest.find(BEGIN) {
+    while let Some(start) = rest.find(begin) {
         out.push_str(&rest[..start]);
-        let after_begin = &rest[start + BEGIN.len()..];
-        if let Some(end_rel) = after_begin.find(END) {
-            rest = &after_begin[end_rel + END.len()..];
+        let after_begin = &rest[start + begin.len()..];
+        if let Some(end_rel) = after_begin.find(end) {
+            rest = &after_begin[end_rel + end.len()..];
         } else {
             rest = "";
             break;
@@ -113,8 +152,8 @@ pub fn register(workflow: &mut Workflow) {
 #[cfg(test)]
 mod scope_tests {
     use super::{
-        extract_public_comment_block, issue_in_scope, mr_in_scope, register,
-        strip_public_comment_blocks,
+        extract_pmo_guidance_block, extract_public_comment_block, issue_in_scope, mr_in_scope,
+        register, strip_public_comment_blocks, wrap_pmo_guidance_block,
     };
     use crate::agents::gitlab::{Issue, MergeRequest};
     use crate::core::config::Config;
@@ -185,6 +224,51 @@ mod scope_tests {
             extract_public_comment_block(text).as_deref(),
             Some("Final public comment.")
         );
+    }
+
+    #[test]
+    fn extract_pmo_guidance_block_reads_stable_markers() {
+        let text = "noise\nPMO_GUIDANCE_BEGIN\nUse --foo not --bar.\nPMO_GUIDANCE_END\nmore";
+        assert_eq!(
+            extract_pmo_guidance_block(text).as_deref(),
+            Some("Use --foo not --bar.")
+        );
+    }
+
+    #[test]
+    fn extract_pmo_guidance_block_returns_none_for_empty_body() {
+        let text = "PMO_GUIDANCE_BEGIN\n\nPMO_GUIDANCE_END";
+        assert!(extract_pmo_guidance_block(text).is_none());
+    }
+
+    #[test]
+    fn extract_pmo_guidance_block_returns_none_when_missing() {
+        assert!(extract_pmo_guidance_block("no markers here").is_none());
+        assert!(extract_pmo_guidance_block("PMO_GUIDANCE_BEGIN no end").is_none());
+    }
+
+    #[test]
+    fn wrap_pmo_guidance_block_round_trips() {
+        let wrapped = wrap_pmo_guidance_block("Do X.\nThen Y.").unwrap();
+        assert!(wrapped.starts_with("PMO_GUIDANCE_BEGIN\n"));
+        assert!(wrapped.ends_with("\nPMO_GUIDANCE_END"));
+        assert_eq!(
+            extract_pmo_guidance_block(&wrapped).as_deref(),
+            Some("Do X.\nThen Y.")
+        );
+    }
+
+    #[test]
+    fn wrap_pmo_guidance_block_none_for_empty() {
+        assert!(wrap_pmo_guidance_block("").is_none());
+        assert!(wrap_pmo_guidance_block("   \n  ").is_none());
+    }
+
+    #[test]
+    fn extract_marker_block_takes_first_pair() {
+        // When two blocks are present, the first complete pair wins.
+        let text = "PMO_GUIDANCE_BEGIN\nfirst\nPMO_GUIDANCE_END\nPMO_GUIDANCE_BEGIN\nsecond\nPMO_GUIDANCE_END";
+        assert_eq!(extract_pmo_guidance_block(text).as_deref(), Some("first"));
     }
 
     #[test]

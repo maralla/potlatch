@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-use super::{claim, extract_public_comment_block, issue_in_scope, labels, pmo_cursor_ask};
+use super::{
+    claim, extract_pmo_guidance_block, extract_public_comment_block, issue_in_scope, labels,
+    pmo_cursor_ask, wrap_pmo_guidance_block,
+};
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient, Issue};
 use crate::agents::settings;
@@ -733,9 +736,17 @@ fn process_action_required_issue(
     );
     let had_plan_file_paths = !agent_output.cursor_plan_paths.is_empty();
     agent_output = pmo_apply_cursor_plan_files(&state.working_dir, agent_output);
-    if !agent_output.has_final_result_text && !had_plan_file_paths {
+    // Apply the structured plan JSON the model emitted via the `plan` tool
+    // (potlatch harness ACP backend, plan mode). Populates the handoff's
+    // structured fields (decision, sub_issues, instructions, etc.) so the
+    // decision functions below take the structured path first. Falls back to
+    // text-marker parsing when plan_output is None (Cursor backend or tool
+    // not called).
+    let had_plan_output = agent_output.plan_output.is_some();
+    agent_output = apply_pmo_plan_output(agent_output);
+    if !agent_output.has_final_result_text && !had_plan_file_paths && !had_plan_output {
         warn!(
-            "PMO: No canonical final output for issue #{} (no final response text and no plan file), releasing claim for retry",
+            "PMO: No canonical final output for issue #{} (no final response text, no plan file, no plan tool output), releasing claim for retry",
             issue.iid
         );
         anyhow::bail!(
@@ -743,9 +754,12 @@ fn process_action_required_issue(
             issue.iid
         );
     }
-    if agent_output.response.trim().is_empty() {
+    if agent_output.response.trim().is_empty()
+        && agent_output.sub_issues.is_empty()
+        && agent_output.decision.is_none()
+    {
         warn!(
-            "PMO: Empty canonical output for issue #{}, releasing claim for retry",
+            "PMO: Empty canonical output for issue #{} (no response text, no decision, no sub-issues), releasing claim for retry",
             issue.iid
         );
         anyhow::bail!(
@@ -807,10 +821,7 @@ fn process_action_required_issue(
             );
         }
         info!("PMO: Issue #{} needs guidance, not splitting", issue.iid);
-        gitlab.add_issue_comment(
-            issue.iid,
-            &format!("**PMO guidance for the worker agent:**\n\n{}", guidance),
-        )?;
+        gitlab.add_issue_comment(issue.iid, &format_pmo_guidance_comment(&guidance))?;
         gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
         let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
         return Ok(false);
@@ -828,38 +839,39 @@ fn process_action_required_issue(
                 issue.iid
             );
         }
-        let comment = format!("**PMO guidance for the worker agent:**\n\n{}", guidance);
         info!("PMO: Issue #{} does not need splitting", issue.iid);
-        gitlab.add_issue_comment(issue.iid, &comment)?;
+        gitlab.add_issue_comment(issue.iid, &format_pmo_guidance_comment(&guidance))?;
         gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
         let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
         return Ok(false);
     }
 
     // --- SPLIT: create sub-issues, close the parent as a task container ---
-    if !had_plan_file_paths {
-        warn!(
-            "PMO: Split path for issue #{} has no saved plan file output, releasing claim for retry",
-            issue.iid
-        );
-        anyhow::bail!(
-            "PMO split output for issue #{} had no saved plan file content; retrying later",
-            issue.iid
-        );
-    }
-    let Some(plan_text) = pmo_extract_plan_file_text(&agent_output.response) else {
-        warn!(
-            "PMO: Split path for issue #{} had plan path indicator but unreadable plan content, releasing claim for retry",
-            issue.iid
-        );
-        anyhow::bail!(
-            "PMO split output for issue #{} had unreadable plan file content; retrying later",
-            issue.iid
-        );
-    };
-    // For split parsing, consume only saved plan file content.
-    agent_output.response = plan_text;
+    // Try extracting sub-issues directly from the streamed response first —
+    // the model may have emitted SUB_ISSUE_N blocks or a JSON array inline.
+    // Only fall back to the saved Cursor plan file when inline extraction
+    // comes up empty and a plan file was actually saved.
     let sub_issues = extract_sub_issues(&agent_output);
+    let sub_issues = if !sub_issues.is_empty() {
+        sub_issues
+    } else if had_plan_file_paths {
+        let Some(plan_text) = pmo_extract_plan_file_text(&agent_output.response) else {
+            warn!(
+                "PMO: Split path for issue #{} had plan path indicator but unreadable plan content, releasing claim for retry",
+                issue.iid
+            );
+            anyhow::bail!(
+                "PMO split output for issue #{} had unreadable plan file content; retrying later",
+                issue.iid
+            );
+        };
+        // Re-run extraction scoped to the plan file text.
+        let mut scoped = agent_output.clone();
+        scoped.response = plan_text;
+        extract_sub_issues(&scoped)
+    } else {
+        Vec::new()
+    };
 
     if sub_issues.is_empty() {
         let preview = pmo_truncate_utf8_by_bytes(agent_output.response.trim(), 800);
@@ -1046,49 +1058,35 @@ CRITICAL REQUIREMENTS:
 - The worker agent has FULL ACCESS to shell commands (rm, mv, git, etc.) and all build/test tools
 - If the worker claimed it "cannot run commands" or "cannot delete files", that is WRONG — it CAN. Instruct it clearly.
 - Before deciding GUIDE_WORKER or SPLIT, you MUST verify whether the issue is already implemented in the current project state when that is plausible from the issue, comments, or worker output. If the behavior/tests/code already exist, choose ALREADY_DONE so Potlatch will close the issue and add a comment.
-- In your final reply for this turn, make the outcome obvious in plain text (markers below). Potlatch parses your message; there is no separate tool call for handoff.
-- For any human-facing comment text that should be posted to GitLab, include a stable block:
-  PUBLIC_COMMENT_BEGIN
-  <only final public comment text; no progress/status/tool logs>
-  PUBLIC_COMMENT_END
-- **Plan mode (STRICT):** Cursor may save your work as a `.md` file under the repo. Potlatch **reads that file after the turn** and appends its text to your output for parsing. A Cursor plan UI (outline, checkboxes, widgets) **does not count** unless the **saved file body** contains the plain-text markers below. You **must** put the machine-readable blocks **inside the `.md` file** (or duplicate them in your final streamed message). Do not finish the turn with only UI structure — **edit the plan file** to include the exact formats in `CURSOR PLAN FILE — CANONICAL BLOCKS` below. This run is fully automated; do not wait for user confirmation.
-- Also mirror intent in prose where helpful (`decision:`, `question:`, `instructions:`, `reason:`) but **parsers require the literal marker lines** (`GUIDE_WORKER`, `SUB_ISSUE_1:`, `ALREADY_DONE`, etc.) — prose alone is not enough.
-- For SPLIT, each sub-issue **must** use the `SUB_ISSUE_N:` + `TITLE:` + `PRIORITY:` + `DESCRIPTION:` layout (see canonical examples). Include acceptance criteria inside `DESCRIPTION:`.
-- **STRICT OUTPUT CONTRACT (SPLIT):** if you choose `decision: split`, your final output must be machine-readable only: either `SUB_ISSUE_N` blocks or one fenced JSON array. Do not include extra prose before or after those structured blocks.
-- Any split output that is not machine-readable in those exact formats is treated as a PMO failure; Potlatch will retry later without posting a GitLab intervention request.
 
-CURSOR PLAN FILE — CANONICAL BLOCKS (copy these shapes into the saved plan file; spelling and keywords must match):
-- **GUIDE_WORKER** — exact lines:
-  GUIDE_WORKER
-  INSTRUCTIONS:
-  <3–5 sentences; one clear action for the worker>
-- **SPLIT** — repeat per sub-issue; **preferred** format (dependencies line optional, inside DESCRIPTION):
-  SUB_ISSUE_1:
-  TITLE: <concise title>
-  PRIORITY: <1, 2, or 3>
-  DESCRIPTION:
-  <scope and acceptance criteria>
-  <optional single line: Issue Dependencies: SUB_ISSUE_2, SUB_ISSUE_3>
+## Output — call the `plan` tool with your decision
 
-  SUB_ISSUE_2:
-  TITLE: <next title>
-  PRIORITY: <1, 2, or 3>
-  DESCRIPTION:
-  <...>
-- **ALREADY_DONE** — strict (only whitespace between the two lines, or same line):
-  ALREADY_DONE
-  REASON: <why the codebase already satisfies the issue>
-- **NEEDS_CLARIFICATION:**
-  NEEDS_CLARIFICATION
-  QUESTION:
-  <precise questions for a human>
-- **JSON fallback (SPLIT only):** a fenced `json` code block whose body is a JSON **array** of objects, each with string `title`, string `description`, optional numeric `priority` (1–3). Use this only if you cannot use `SUB_ISSUE_N` blocks; plain `SUB_ISSUE_N` text is preferred for dependency lines (`Issue Dependencies: …`).
+If the `plan` tool is available (potlatch harness ACP backend), call it with a JSON object as your canonical handoff. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Shape:
 
-- Dependency formatting rule for each `DESCRIPTION`:
-  - If a sub-issue has NO dependencies, do NOT mention dependencies at all.
-  - If it DOES depend on other sub-issues, include EXACTLY one single line in the description:
-    `Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2, ...`
-  - Do not use alternative labels like `Dependencies:` or prose variants.
+  {{
+    "decision": "<guide_worker | split | already_done | needs_clarification>",
+    "instructions": "<for guide_worker: 3-5 sentences, one clear action for the worker — this text is posted to GitLab wrapped in PMO_GUIDANCE_BEGIN/PMO_GUIDANCE_END markers and the worker reads it verbatim, so keep it worker-facing and actionable; do NOT address it to humans>",
+    "sub_issues": [                                  // for split only
+      {{"title": "<concise title>", "description": "<scope and acceptance criteria; optionally one line: Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2>", "priority": <1-3>}}
+    ],
+    "reason": "<for already_done: why the codebase already satisfies the issue>",
+    "question": "<for needs_clarification: specific questions for a human>",
+    "public_comment": "<optional: human-facing comment text to post to GitLab — separate from `instructions`; use this when you also need to address a human reviewer>"
+  }}
+
+Only fill the field(s) relevant to your decision; omit the others. For GUIDE_WORKER, prefer `instructions` alone; add `public_comment` only when a human-facing note is also needed.
+
+If the `plan` tool is NOT available (e.g. Cursor ACP backend), emit text markers as a fallback:
+- **GUIDE_WORKER** — lines: `GUIDE_WORKER` / `INSTRUCTIONS:` / `<3-5 sentences — posted to GitLab wrapped in PMO_GUIDANCE_BEGIN/PMO_GUIDANCE_END, worker-facing and actionable>`
+- **SPLIT** — repeat per sub-issue: `SUB_ISSUE_N:` / `TITLE:` / `PRIORITY:` / `DESCRIPTION:` / `<scope and criteria; optionally one line: Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2>`
+- **ALREADY_DONE** — lines: `ALREADY_DONE` / `REASON: <why already complete>`
+- **NEEDS_CLARIFICATION** — lines: `NEEDS_CLARIFICATION` / `QUESTION:` / `<precise questions>`
+- For any human-facing comment, wrap it in `PUBLIC_COMMENT_BEGIN` / `PUBLIC_COMMENT_END` lines (separate from the worker-facing `INSTRUCTIONS:` block).
+
+Dependency formatting (applies to both the `plan` tool's `sub_issues[].description` and the text-marker fallback):
+- If a sub-issue has NO dependencies, do NOT mention dependencies at all.
+- If it DOES depend on other sub-issues, include EXACTLY one single line: `Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2, ...`
+- Do not use alternative labels like `Dependencies:` or prose variants.
 
 DECISION — choose EXACTLY ONE of the following:
 
@@ -1097,11 +1095,6 @@ DECISION — choose EXACTLY ONE of the following:
    b) The worker failed due to a specific misunderstanding, wrong command, or simple technical obstacle
    c) The fix is ONE clear action (e.g. "use flag X instead of Y", "the config file is at path Z")
    If your guidance would enumerate 2+ independent modules, files, or components, you MUST choose SPLIT instead.
-   Respond with:
-   GUIDE_WORKER
-   INSTRUCTIONS:
-   <Brief, actionable guidance — MAX 3-5 sentences. State the single core action the worker must take.>
-   Include `decision: guide_worker` and the same guidance under `INSTRUCTIONS:` in your reply text.
 
 2. SPLIT — Use when ANY of these are true:
    - The issue is a "task container" describing a broad goal (e.g. "add tests for module X", "refactor all Y", "check full code for Z") — these ALWAYS need splitting into concrete sub-tasks
@@ -1110,26 +1103,7 @@ DECISION — choose EXACTLY ONE of the following:
    - The issue description or worker rejection lists multiple distinct things to do
    - Your guidance would need to enumerate 2+ independent items
    When splitting, the PARENT ISSUE will be CLOSED automatically as a task container. The sub-issues become the real tracked work.
-   Respond with sub-issues in this format:
-
-   SUB_ISSUE_1:
-   TITLE: <concise title>
-   PRIORITY: <1, 2, or 3>
-   DESCRIPTION:
-   <Detailed description of what needs to be implemented>
-   <Include acceptance criteria>
-   <If needed, include EXACTLY one line: Issue Dependencies: SUB_ISSUE_1, SUB_ISSUE_2, ...>
-
-   SUB_ISSUE_2:
-   TITLE: <concise title>
-   PRIORITY: <1, 2, or 3>
-   DESCRIPTION:
-   <Detailed description>
-
-   (continue for all sub-issues — each should target ~500 lines of non-test code, ~1500 total including tests; auto-generated code does not count)
-   Include `decision: split` in your reply and the same sub-issues as `SUB_ISSUE_N` blocks.
-   Example structured item:
-   - `{{"title":"Fix failing TestPythonChunker tests","description":"Repair the failing tests in tests/parser/test_python_chunker.py. Acceptance criteria: all tests in that file pass. Dependencies: SUB_ISSUE_1.","priority":2}}`
+   Each sub-issue should target ~500 lines of non-test code, ~1500 total including tests; auto-generated code does not count.
 
    PRIORITY LEVELS:
    - 1 = Critical: blocking other work, security fix, core dependency that other sub-issues depend on
@@ -1141,22 +1115,12 @@ DECISION — choose EXACTLY ONE of the following:
    - The worker's output or your analysis shows the feature/tests/code already exists
    - There is nothing left to implement — the issue is simply outdated or redundant
    - Prefer ALREADY_DONE over GUIDE_WORKER or SPLIT when the required behavior is already present in the repository as it exists now
-   You MUST use this exact pattern so the PMO can parse it (only whitespace may appear between the two lines; no other text in between):
-   ALREADY_DONE
-   REASON: <Brief explanation of why this issue is already complete, referencing the existing code/files>
-   (Same line is also valid: ALREADY_DONE  REASON: <explanation>)
-   Include `decision: already_done` and `reason:` with the same explanation in your reply.
 
 4. NEEDS_CLARIFICATION — Use when you CANNOT make a decision because:
    - After reading the **task context file** and (if needed) the repo, the issue is still too vague to determine scope or intent
    - The worker's rejection and the issue (as given in that file) still don't give enough to guide or split
    - You need specific information from a human (e.g. which modules to cover, what the acceptance criteria are)
    Do **not** use this option because you skipped reading the task context file.
-   Respond with:
-   NEEDS_CLARIFICATION
-   QUESTION:
-   <Specific question(s) you need answered before you can guide or split this issue. Be precise about what information is missing.>
-   Include `decision: needs_clarification` and your `question:` in the reply text.
 
 DUPLICATE / OVERLAP RULES (STRICT):
 - Review the EXISTING OPEN ISSUES list above before creating any sub-issue.
@@ -1176,6 +1140,7 @@ INSTRUCTIONS:
 8. COMPLETION TEST: Does the worker's output, the comments in the file, or your direct inspection of the current project state indicate the work is already fully implemented in the codebase? If YES → ALREADY_DONE.
 9. Choose EXACTLY ONE of GUIDE_WORKER, SPLIT, ALREADY_DONE, or NEEDS_CLARIFICATION — never combine them.
 10. When in doubt between GUIDE_WORKER and SPLIT, prefer SPLIT — it's better to create focused sub-issues than to give the worker a laundry list.
+11. Emit your decision: call the `plan` tool with the JSON shape above if it's available; otherwise emit the text-marker fallback. This is the last step.
 
 Proceed with analyzing the issue autonomously.
 "#,
@@ -1246,7 +1211,65 @@ fn pmo_no_split_needed(output: &AgentHandoff) -> bool {
 }
 
 fn response_has_decision_marker(response: &str, marker: &str) -> bool {
-    response.lines().map(str::trim).any(|line| line == marker)
+    response
+        .lines()
+        .map(str::trim)
+        .any(|line| line_matches_decision_marker(line, marker))
+}
+
+/// Check whether a trimmed line is a decision marker like `GUIDE_WORKER`,
+/// tolerating common markdown formatting the model may add:
+/// - Bold/italic: `**GUIDE_WORKER**`, `__GUIDE_WORKER__`, `*GUIDE_WORKER*`
+/// - Headers: `## GUIDE_WORKER`, `### GUIDE_WORKER`
+/// - Blockquote: `> GUIDE_WORKER`
+/// - Inline code: `` `GUIDE_WORKER` ``
+/// - Same-line suffix: `**GUIDE_WORKER** INSTRUCTIONS: ...` (marker followed
+///   by whitespace or `:`)
+///
+/// The marker must appear as a whole word/line — `GUIDE_WORKER` as a
+/// substring of a longer line like `I chose GUIDE_WORKER because...` does NOT
+/// match (avoids false positives from prose mentions).
+fn line_matches_decision_marker(line: &str, marker: &str) -> bool {
+    let stripped = strip_markdown_wrapper(line);
+    if stripped == marker {
+        return true;
+    }
+    // Marker followed by whitespace or `:` (e.g. "GUIDE_WORKER INSTRUCTIONS:"
+    // or "GUIDE_WORKER: ..."). Only match when the marker is at the start.
+    if let Some(rest) = stripped.strip_prefix(marker) {
+        let next = rest.chars().next();
+        matches!(next, Some(' ') | Some('\t') | Some(':') | None)
+    } else {
+        false
+    }
+}
+
+/// Strip leading markdown decoration (header `#`, blockquote `>`, list `-`/`*`)
+/// and surrounding emphasis marks (`**`, `__`, `*`, `_`, `` ` ``) from a line.
+/// Leaves the inner text intact.
+fn strip_markdown_wrapper(line: &str) -> String {
+    let mut s = line.trim().to_string();
+
+    // Strip leading header hashes, blockquote markers, and list bullets.
+    while let Some(stripped) = s
+        .strip_prefix('#')
+        .or_else(|| s.strip_prefix('>'))
+        .or_else(|| s.strip_prefix('-'))
+        .or_else(|| s.strip_prefix('*'))
+    {
+        s = stripped.trim_start().to_string();
+    }
+
+    // Strip surrounding emphasis marks: **, __, *, _, `
+    loop {
+        let trimmed = s.trim_matches(|c: char| matches!(c, '*' | '_' | '`'));
+        if trimmed.len() == s.len() {
+            break;
+        }
+        s = trimmed.to_string();
+    }
+
+    s
 }
 
 fn is_pmo_already_done_response(output: &AgentHandoff) -> bool {
@@ -1309,44 +1332,77 @@ fn extract_clarification_question(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_guidance(agent_output: &AgentHandoff) -> String {
-    if let Some(block) = extract_public_comment_block(&agent_output.response) {
-        return block;
-    }
-    let raw = if let Some(instructions) = &agent_output.instructions {
+    // Preference order:
+    //   1. structured `instructions` field (plan tool, GUIDE_WORKER / NO_SPLIT)
+    //   2. `INSTRUCTIONS:` text marker (text-marker fallback, GUIDE_WORKER)
+    //   3. `PMO_GUIDANCE_BEGIN`/`_END` block (the block we post to GitLab —
+    //      useful when the model emitted it inline instead of via `plan`)
+    //   4. `REASON:` text marker (text-marker fallback, NO_SPLIT_NEEDED)
+    //   5. `reason` structured field (plan tool, NO_SPLIT_NEEDED)
+    //   6. `PUBLIC_COMMENT` block — LAST resort only, since that block is
+    //      human-facing and may have been written for a reviewer rather than
+    //      the worker. We keep it as a fallback so the text-marker path that
+    //      emits only a public comment still produces *some* guidance.
+    if let Some(instructions) = &agent_output.instructions {
         let trimmed = instructions.trim();
         if !trimmed.is_empty() {
-            trimmed.to_string()
-        } else {
-            String::new()
+            return cap_guidance_length(trimmed);
         }
-    } else if let Some(pos) = agent_output.response.find("INSTRUCTIONS:") {
+    }
+    if let Some(pos) = agent_output.response.find("INSTRUCTIONS:") {
         let rest = &agent_output.response[pos + 13..];
         let trimmed = rest.trim();
         if !trimmed.is_empty() {
-            trimmed.to_string()
-        } else {
-            String::new()
+            return cap_guidance_length(trimmed);
         }
-    } else if let Some(reason) = &agent_output.reason {
-        reason.trim().to_string()
-    } else if let Some(pos) = agent_output.response.find("REASON:") {
-        let rest = &agent_output.response[pos + 7..];
-        rest.trim().to_string()
-    } else {
-        return String::new();
-    };
-
-    // Cap guidance length — keep it brief and actionable
-    if raw.len() > 500 {
-        let truncated: String = raw.chars().take(500).collect();
-        if let Some(last_period) = truncated.rfind('.') {
-            truncated[..=last_period].to_string()
-        } else {
-            format!("{}...", truncated)
-        }
-    } else {
-        raw
     }
+    if let Some(block) = extract_pmo_guidance_block(&agent_output.response) {
+        return cap_guidance_length(&block);
+    }
+    if let Some(pos) = agent_output.response.find("REASON:") {
+        let rest = &agent_output.response[pos + 7..];
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return cap_guidance_length(trimmed);
+        }
+    }
+    if let Some(reason) = &agent_output.reason {
+        let trimmed = reason.trim();
+        if !trimmed.is_empty() {
+            return cap_guidance_length(trimmed);
+        }
+    }
+    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        return cap_guidance_length(&block);
+    }
+    String::new()
+}
+
+/// Cap guidance length — keep it brief and actionable. Truncates at the last
+/// sentence boundary within the limit, falling back to an ellipsis suffix.
+fn cap_guidance_length(raw: &str) -> String {
+    const MAX: usize = 500;
+    if raw.len() <= MAX {
+        return raw.to_string();
+    }
+    let truncated: String = raw.chars().take(MAX).collect();
+    if let Some(last_period) = truncated.rfind('.') {
+        truncated[..=last_period].to_string()
+    } else {
+        format!("{}...", truncated)
+    }
+}
+
+/// Format the worker-facing PMO guidance as a GitLab issue comment. The
+/// guidance body is wrapped in `PMO_GUIDANCE_BEGIN` / `PMO_GUIDANCE_END`
+/// markers so the worker agent can extract it reliably from the comment
+/// stream, regardless of any prose the PMO (or a human) added around it.
+/// The human-facing header outside the block gives reviewers context without
+/// polluting the machine-readable body.
+fn format_pmo_guidance_comment(guidance: &str) -> String {
+    let trimmed = guidance.trim();
+    let block = wrap_pmo_guidance_block(trimmed).unwrap_or_else(|| trimmed.to_string());
+    format!("**PMO guidance for the worker agent:**\n\n{block}")
 }
 
 /// Append contents of [`AgentHandoff::cursor_plan_paths`] (Cursor plan-mode `tool_call_update`) into
@@ -1457,6 +1513,98 @@ fn pmo_extract_plan_file_text(response: &str) -> Option<String> {
     } else {
         Some(joined)
     }
+}
+
+/// Apply the structured plan JSON the model emitted via the `plan` tool.
+/// Populates the handoff's structured fields (`decision`, `instructions`,
+/// `sub_issues`, `reason`, `question`, `needs_clarification`) from the JSON,
+/// so the decision functions take the structured path first. Returns the
+/// handoff unchanged when `plan_output` is `None` (Cursor backend or tool not
+/// called) so text-marker fallback parsers run.
+fn apply_pmo_plan_output(mut handoff: AgentHandoff) -> AgentHandoff {
+    let Some(plan) = handoff.plan_output.take() else {
+        return handoff;
+    };
+
+    // decision (lowercase snake_case for the matcher functions).
+    if let Some(d) = plan.get("decision").and_then(Value::as_str) {
+        let d = d.trim();
+        if !d.is_empty() {
+            handoff.decision = Some(d.to_lowercase());
+        }
+    }
+
+    if let Some(instructions) = plan.get("instructions").and_then(Value::as_str) {
+        let t = instructions.trim();
+        if !t.is_empty() {
+            handoff.instructions = Some(t.to_string());
+        }
+    }
+
+    if let Some(reason) = plan.get("reason").and_then(Value::as_str) {
+        let t = reason.trim();
+        if !t.is_empty() {
+            handoff.reason = Some(t.to_string());
+        }
+    }
+
+    if let Some(question) = plan.get("question").and_then(Value::as_str) {
+        let t = question.trim();
+        if !t.is_empty() {
+            handoff.question = Some(t.to_string());
+            handoff.needs_clarification = Some(t.to_string());
+        }
+    }
+
+    if let Some(sub_issues) = plan.get("sub_issues").and_then(Value::as_array) {
+        let parsed: Vec<HandoffSubIssue> = sub_issues
+            .iter()
+            .filter_map(|s| {
+                let title = s.get("title").and_then(Value::as_str)?.to_string();
+                let description = s
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let priority = s
+                    .get("priority")
+                    .and_then(Value::as_u64)
+                    .filter(|p| (1..=3).contains(p))
+                    .map(|p| p as u8);
+                Some(HandoffSubIssue {
+                    title,
+                    description,
+                    priority,
+                })
+            })
+            .collect();
+        if !parsed.is_empty() {
+            handoff.sub_issues = parsed;
+        }
+    }
+
+    if let Some(comment) = plan.get("public_comment").and_then(Value::as_str) {
+        let comment = comment.trim();
+        if !comment.is_empty() {
+            // Prepend as a PUBLIC_COMMENT block so extract_public_comment_block
+            // and other text-based extractors see it.
+            let mut new_response =
+                String::with_capacity(comment.len() + 32 + handoff.response.len());
+            new_response.push_str("PUBLIC_COMMENT_BEGIN\n");
+            new_response.push_str(comment);
+            new_response.push_str("\nPUBLIC_COMMENT_END\n");
+            new_response.push_str(&handoff.response);
+            handoff.response = new_response;
+        }
+    }
+
+    info!(
+        "PMO: applied structured plan_output (decision={:?}, sub_issues={})",
+        handoff.decision.as_deref().unwrap_or(""),
+        handoff.sub_issues.len()
+    );
+
+    handoff
 }
 
 fn combined_pmo_handoff_text(h: &AgentHandoff) -> String {
@@ -2028,7 +2176,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_split_prompt_includes_cursor_plan_canonical_blocks() {
+    fn build_split_prompt_documents_plan_tool_as_primary() {
         let state = AgentState {
             sessions_dir: "/tmp".into(),
             working_dir: "/tmp".into(),
@@ -2045,12 +2193,125 @@ mod tests {
             updated_at: None,
         };
         let prompt = build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2).unwrap();
-        assert!(prompt.contains("CURSOR PLAN FILE — CANONICAL BLOCKS"));
-        assert!(prompt.contains("SUB_ISSUE_1:"));
+        // The plan tool is the primary output channel.
+        assert!(prompt.contains("`plan` tool"));
+        assert!(prompt.contains("\"decision\""));
+        assert!(prompt.contains("guide_worker"));
+        assert!(prompt.contains("split"));
+        assert!(prompt.contains("already_done"));
+        assert!(prompt.contains("needs_clarification"));
+        // The text-marker fallback is still present (for Cursor-backed PMO).
+        assert!(prompt.contains("SUB_ISSUE_N:"));
         assert!(prompt.contains("ALREADY_DONE"));
         assert!(prompt.contains("NEEDS_CLARIFICATION"));
         assert!(prompt.contains("GUIDE_WORKER"));
-        assert!(prompt.contains("STRICT OUTPUT CONTRACT (SPLIT)"));
+        // The old verbose format spec is gone.
+        assert!(!prompt.contains("CURSOR PLAN FILE — CANONICAL BLOCKS"));
+        assert!(!prompt.contains("STRICT OUTPUT CONTRACT (SPLIT)"));
+        // Reasoning guidance is intact.
+        assert!(prompt.contains("TASK CONTAINER TEST"));
+        assert!(prompt.contains("DUPLICATE / OVERLAP RULES"));
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_populates_structured_fields_for_split() {
+        let handoff = AgentHandoff {
+            plan_output: Some(serde_json::json!({
+                "decision": "split",
+                "sub_issues": [
+                    {"title": "First", "description": "Do the first thing", "priority": 1},
+                    {"title": "Second", "description": "Do the second thing", "priority": 2}
+                ]
+            })),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert_eq!(applied.decision.as_deref(), Some("split"));
+        assert_eq!(applied.sub_issues.len(), 2);
+        assert_eq!(applied.sub_issues[0].title, "First");
+        assert_eq!(applied.sub_issues[0].priority, Some(1));
+        assert_eq!(applied.sub_issues[1].title, "Second");
+        assert_eq!(applied.sub_issues[1].priority, Some(2));
+        // plan_output is consumed (cleared).
+        assert!(applied.plan_output.is_none());
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_populates_instructions_for_guide_worker() {
+        let handoff = AgentHandoff {
+            plan_output: Some(serde_json::json!({
+                "decision": "guide_worker",
+                "instructions": "Use flag --foo instead of --bar."
+            })),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert_eq!(applied.decision.as_deref(), Some("guide_worker"));
+        assert_eq!(
+            applied.instructions.as_deref(),
+            Some("Use flag --foo instead of --bar.")
+        );
+        assert!(pmo_guides_worker(&applied));
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_populates_reason_for_already_done() {
+        let handoff = AgentHandoff {
+            plan_output: Some(serde_json::json!({
+                "decision": "already_done",
+                "reason": "The feature exists in src/lib.rs."
+            })),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert_eq!(applied.decision.as_deref(), Some("already_done"));
+        assert!(applied.reason.as_deref().unwrap().contains("src/lib.rs"));
+        assert!(is_pmo_already_done_response(&applied));
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_populates_question_for_needs_clarification() {
+        let handoff = AgentHandoff {
+            plan_output: Some(serde_json::json!({
+                "decision": "needs_clarification",
+                "question": "Which modules should be covered?"
+            })),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert_eq!(applied.decision.as_deref(), Some("needs_clarification"));
+        assert!(applied.question.as_deref().unwrap().contains("modules"));
+        assert!(pmo_needs_clarification(&applied));
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_none_leaves_handoff_unchanged() {
+        let handoff = AgentHandoff {
+            response: "GUIDE_WORKER\nINSTRUCTIONS:\ndo something".into(),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert_eq!(applied.decision, None);
+        assert_eq!(applied.instructions, None);
+        assert!(applied.response.contains("GUIDE_WORKER"));
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_public_comment_prepended_to_response() {
+        let handoff = AgentHandoff {
+            plan_output: Some(serde_json::json!({
+                "decision": "guide_worker",
+                "instructions": "do X",
+                "public_comment": "Posted for the worker team."
+            })),
+            response: "original response".into(),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert!(applied.response.contains("PUBLIC_COMMENT_BEGIN"));
+        assert!(applied.response.contains("Posted for the worker team."));
+        assert!(applied.response.contains("PUBLIC_COMMENT_END"));
+        assert!(applied.response.contains("original response"));
     }
 
     #[test]
@@ -2121,6 +2382,30 @@ Add role-based access control.
         assert_eq!(sub_issues[1].title, "Add user management");
         assert!(sub_issues[1].description.contains("CRUD"));
         assert_eq!(sub_issues[1].priority, Some(2));
+    }
+
+    #[test]
+    fn extract_sub_issues_works_without_plan_file_paths() {
+        // Regression: the split path used to bail with "no saved plan file
+        // content" when `cursor_plan_paths` was empty, even if the model
+        // streamed SUB_ISSUE_N blocks inline. The harness now extracts
+        // sub-issues directly from the streamed response first, so a missing
+        // plan file is no longer fatal.
+        let output = AgentHandoff {
+            response: r#"
+SUB_ISSUE_1:
+TITLE: Fix tests
+PRIORITY: 2
+DESCRIPTION:
+Repair the failing tests in tests/foo.py.
+            "#
+            .to_string(),
+            cursor_plan_paths: Vec::new(),
+            ..Default::default()
+        };
+        let sub_issues = extract_sub_issues(&output);
+        assert_eq!(sub_issues.len(), 1);
+        assert_eq!(sub_issues[0].title, "Fix tests");
     }
 
     #[test]
@@ -2302,6 +2587,92 @@ Body here.
             ..Default::default()
         };
         assert_eq!(extract_guidance(&output), "Use the existing config loader.");
+    }
+
+    #[test]
+    fn extract_guidance_prefers_structured_instructions_over_public_comment() {
+        // Regression: when the model called the `plan` tool, apply_pmo_plan_output
+        // populates `instructions` (worker-facing) and prepends `public_comment`
+        // (human-facing) to `response` as a PUBLIC_COMMENT block. extract_guidance
+        // used to check the PUBLIC_COMMENT block first, so it returned the
+        // human-facing text instead of the worker-facing `instructions`. The
+        // structured field must win.
+        let output = AgentHandoff {
+            instructions: Some("Use --foo instead of --bar.".into()),
+            response: "PUBLIC_COMMENT_BEGIN\nHeads up for reviewers: scope is unchanged.\nPUBLIC_COMMENT_END\nGUIDE_WORKER"
+                .into(),
+            ..Default::default()
+        };
+        assert_eq!(extract_guidance(&output), "Use --foo instead of --bar.");
+    }
+
+    #[test]
+    fn extract_guidance_falls_back_to_pmo_guidance_block() {
+        // When the model emitted a PMO_GUIDANCE_BEGIN/END block inline (instead
+        // of via the `plan` tool's `instructions` field), extract it.
+        let output = AgentHandoff {
+            response:
+                "GUIDE_WORKER\nPMO_GUIDANCE_BEGIN\nUse the existing config loader.\nPMO_GUIDANCE_END"
+                    .into(),
+            ..Default::default()
+        };
+        assert_eq!(extract_guidance(&output), "Use the existing config loader.");
+    }
+
+    #[test]
+    fn extract_guidance_uses_public_comment_as_last_resort() {
+        // PUBLIC_COMMENT is human-facing and is only used when no worker-facing
+        // instructions are available (text-marker path that emitted only a
+        // public comment).
+        let output = AgentHandoff {
+            response: "PUBLIC_COMMENT_BEGIN\nDo the thing.\nPUBLIC_COMMENT_END".into(),
+            ..Default::default()
+        };
+        assert_eq!(extract_guidance(&output), "Do the thing.");
+    }
+
+    #[test]
+    fn extract_guidance_truncates_long_instructions() {
+        let long = "Do this. ".repeat(80);
+        let output = AgentHandoff {
+            instructions: Some(long.clone()),
+            ..Default::default()
+        };
+        let extracted = extract_guidance(&output);
+        assert!(extracted.len() <= 502); // 500 chars + possible "..."
+        assert!(extracted.starts_with("Do this."));
+    }
+
+    #[test]
+    fn format_pmo_guidance_comment_wraps_body_in_markers() {
+        let comment = format_pmo_guidance_comment("Use --foo instead of --bar.");
+        assert!(comment.contains("**PMO guidance for the worker agent:**"));
+        assert!(comment.contains("PMO_GUIDANCE_BEGIN"));
+        assert!(comment.contains("PMO_GUIDANCE_END"));
+        // Round-trip: extract_pmo_guidance_block recovers the body.
+        assert_eq!(
+            super::extract_pmo_guidance_block(&comment).as_deref(),
+            Some("Use --foo instead of --bar.")
+        );
+    }
+
+    #[test]
+    fn format_pmo_guidance_comment_preserves_multiline_body() {
+        let body = "Step one: do X.\nStep two: do Y.";
+        let comment = format_pmo_guidance_comment(body);
+        assert_eq!(
+            super::extract_pmo_guidance_block(&comment).as_deref(),
+            Some(body)
+        );
+    }
+
+    #[test]
+    fn format_pmo_guidance_comment_falls_back_to_plain_when_empty() {
+        // When guidance is empty (shouldn't happen in production — callers
+        // bail earlier — but the helper must not panic or emit an empty block).
+        let comment = format_pmo_guidance_comment("   ");
+        assert!(comment.contains("**PMO guidance for the worker agent:**"));
+        assert!(!comment.contains("PMO_GUIDANCE_BEGIN"));
     }
 
     #[test]

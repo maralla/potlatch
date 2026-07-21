@@ -47,6 +47,7 @@ Your workspace is the current working directory. It is the root of the repositor
 - **web_fetch**: Fetch web pages for documentation or references.
 - **todo**: Manage a task checklist that persists across context compaction. Send the full list of `{description, status}` items on every call — it replaces the entire list (replace-all API), so indices stay stable across updates. `status` is `pending`, `in_progress`, (mark exactly one item `in_progress` — the one you're working on) or `completed`. The checklist is always visible to you in the system prompt — check it before deciding what to do next. Optional; use it only when the task is complex enough to benefit from tracking.
 - **memory**: Save fundamental project facts that survive across sessions. Use this when you discover something permanently true about the project (language, build commands, architecture rules) that would help any future task. Be extremely selective — only save facts that belong in a README's first paragraph, not implementation details.
+- **plan**: Emit a structured JSON plan as your canonical handoff. Only available in plan mode. Call this with the JSON your role expects (e.g. for PMO: `{decision, instructions?, sub_issues?, reason?, question?}`). Potlatch reads the tool's JSON directly — streamed text is secondary.
 
 ## Important Notes
 

@@ -747,10 +747,22 @@ fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> Agent
 
     let cursor_plan_paths = hooks.take_cursor_plan_paths();
 
+    // Extract the structured plan JSON the model emitted via the `plan` tool,
+    // if the harness ACP backend included it in the session/prompt result.
+    // Present only when the session was in plan mode and the model called the
+    // tool; `None` otherwise (Cursor backend, non-plan sessions, or tool not
+    // called).
+    let plan_output = pr
+        .extra
+        .get("plan_output")
+        .filter(|v| !v.is_null())
+        .cloned();
+
     AgentHandoff {
         response,
         has_final_result_text,
         cursor_plan_paths,
+        plan_output,
         ..Default::default()
     }
 }
@@ -905,5 +917,43 @@ mod tests {
         assert!(out.has_final_result_text);
         assert!(out.response.contains("SUB_ISSUE_1:"));
         assert!(out.response.contains("TITLE: Refactor queue"));
+    }
+
+    #[test]
+    fn handoff_extracts_plan_output_from_prompt_extra() {
+        let hooks = StreamTextHooks::new();
+        let pr: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "message": "done",
+            "plan_output": {"decision": "split", "sub_issues": [{"title": "A"}]}
+        }))
+        .unwrap();
+        let h = handoff_from_prompt_hooks(&hooks, pr);
+        assert_eq!(
+            h.plan_output,
+            Some(json!({"decision": "split", "sub_issues": [{"title": "A"}]}))
+        );
+    }
+
+    #[test]
+    fn handoff_plan_output_none_when_absent() {
+        let hooks = StreamTextHooks::new();
+        let pr: PromptResult =
+            serde_json::from_value(json!({"stopReason": "end_turn", "message": "done"})).unwrap();
+        let h = handoff_from_prompt_hooks(&hooks, pr);
+        assert!(h.plan_output.is_none());
+    }
+
+    #[test]
+    fn handoff_plan_output_none_when_null() {
+        let hooks = StreamTextHooks::new();
+        let pr: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "message": "done",
+            "plan_output": null
+        }))
+        .unwrap();
+        let h = handoff_from_prompt_hooks(&hooks, pr);
+        assert!(h.plan_output.is_none());
     }
 }

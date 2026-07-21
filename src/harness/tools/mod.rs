@@ -4,6 +4,7 @@ pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
 pub mod memory;
+pub mod plan_tool;
 pub mod search;
 pub mod shell;
 pub mod todo;
@@ -11,7 +12,7 @@ pub mod web_fetch;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -155,6 +156,17 @@ impl ToolRegistry {
         reg.register(Arc::new(search::GlobTool));
         reg.register(Arc::new(web_fetch::WebFetchTool::new()));
         reg
+    }
+
+    /// Register the `plan` tool, backed by a shared side-channel cell.
+    /// The caller reads the captured plan via [`plan_tool::PlanTool::take`]
+    /// after the agent loop completes. Only call this when the session is in
+    /// plan mode — the tool's schema advertises itself as the primary output
+    /// channel, so registering it unconditionally would mislead the model.
+    pub fn register_plan_tool(&mut self) -> plan_tool::PlanCell {
+        let cell: plan_tool::PlanCell = Arc::new(Mutex::new(None));
+        self.register(Arc::new(plan_tool::PlanTool::new(Arc::clone(&cell))));
+        cell
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
