@@ -12,7 +12,7 @@ pub mod web_fetch;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -158,23 +158,21 @@ impl ToolRegistry {
         reg
     }
 
-    /// Register the `plan` tool, backed by a shared side-channel cell.
-    /// The caller reads the captured plan via [`plan_tool::PlanTool::take`]
-    /// after the agent loop completes. Only call this when the session is in
-    /// plan mode — the tool's schema advertises itself as the primary output
-    /// channel, so registering it unconditionally would mislead the model.
-    pub fn register_plan_tool(&mut self) -> plan_tool::PlanCell {
-        let cell: plan_tool::PlanCell = Arc::new(Mutex::new(None));
-        self.register(Arc::new(plan_tool::PlanTool::new(Arc::clone(&cell))));
-        cell
-    }
-
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
         if !self.tools.contains_key(&name) {
             self.order.push(name.clone());
         }
         self.tools.insert(name, tool);
+    }
+
+    /// Unregister a tool by name. No-op when the tool isn't registered.
+    /// Used by mode-specific gating (e.g. plan mode drops `file_edit` so the
+    /// model can't mutate files while triaging).
+    pub fn unregister(&mut self, name: &str) {
+        if self.tools.remove(name).is_some() {
+            self.order.retain(|n| n != name);
+        }
     }
 
     /// Registered tool names in insertion order.
@@ -328,5 +326,47 @@ mod tests {
         let result = resolve_read_path("inside.txt", dir.as_str());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), dir.path().join("inside.txt"));
+    }
+
+    #[test]
+    fn unregister_removes_tool_from_registry() {
+        let mut reg = ToolRegistry::with_builtin_tools();
+        assert!(reg.tool_names().contains(&"file_edit"));
+        reg.unregister("file_edit");
+        assert!(!reg.tool_names().contains(&"file_edit"));
+        // Schemas reflect the removal too.
+        let schemas = reg.tools_schema();
+        let names: Vec<String> = schemas
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(!names.contains(&"file_edit".to_string()));
+        // Execution now fails with "unknown tool".
+        let res = reg.execute("file_edit", &json!({}), "/tmp");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn unregister_is_noop_for_unknown_tool() {
+        let mut reg = ToolRegistry::with_builtin_tools();
+        let before: Vec<String> = reg.tool_names().iter().map(|s| s.to_string()).collect();
+        reg.unregister("nonexistent");
+        let after: Vec<String> = reg.tool_names().iter().map(|s| s.to_string()).collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn unregister_preserves_order_of_remaining_tools() {
+        let mut reg = ToolRegistry::with_builtin_tools();
+        reg.unregister("file_edit");
+        let names = reg.tool_names();
+        // file_edit was in the middle; the rest keep their relative order.
+        let pos_shell = names.iter().position(|n| *n == "shell").unwrap();
+        let pos_read = names.iter().position(|n| *n == "file_read").unwrap();
+        let pos_write = names.iter().position(|n| *n == "file_write").unwrap();
+        let pos_grep = names.iter().position(|n| *n == "grep").unwrap();
+        assert!(pos_shell < pos_read);
+        assert!(pos_read < pos_write);
+        assert!(pos_write < pos_grep);
     }
 }

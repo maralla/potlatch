@@ -55,21 +55,21 @@ impl AgentLoop {
         token_budget: usize,
         cancel: Arc<AtomicBool>,
     ) -> Self {
-        Self::new_with_plan_cell(llm, tools, model, token_budget, cancel, None)
+        Self::new_with_plan_mode(llm, tools, model, token_budget, cancel, false)
     }
 
-    /// Construct with an optional `plan` tool side-channel cell. The caller
-    /// registers the `plan` tool (via [`ToolRegistry::register_plan_tool`])
-    /// and passes the returned cell here so [`Self::take_plan_output`] can
-    /// read it after the run. Pass `None` when the `plan` tool isn't
-    /// registered (non-plan sessions).
-    pub fn new_with_plan_cell(
+    /// Construct with an explicit `plan_mode` flag. When true, registers the
+    /// `plan` tool and wires a side-channel cell so [`Self::take_plan_output`]
+    /// can read the model's structured plan after `run()`. When false, the
+    /// `plan` tool is not registered and `take_plan_output` always returns
+    /// `None`.
+    pub fn new_with_plan_mode(
         llm: Arc<dyn ChatClient>,
         mut tools: ToolRegistry,
         model: String,
         token_budget: usize,
         cancel: Arc<AtomicBool>,
-        plan_output: Option<super::tools::plan_tool::PlanCell>,
+        plan_mode: bool,
     ) -> Self {
         let todo = Arc::new(super::todo::TodoList::new());
         // Register the todo tool so the model can manage its task checklist.
@@ -78,6 +78,19 @@ impl AgentLoop {
         ))));
         // Register the memory tool so the model can save fundamental project facts.
         tools.register(Arc::new(super::tools::memory::MemoryTool));
+        // In plan mode, register the `plan` tool backed by a side-channel
+        // cell the harness reads after the run. The cell is created here so
+        // the `ToolRegistry` stays symmetric (generic `register`/`unregister`
+        // only) and callers don't have to wire the cell themselves.
+        let plan_output = if plan_mode {
+            let cell: super::tools::plan_tool::PlanCell = Arc::new(std::sync::Mutex::new(None));
+            tools.register(Arc::new(super::tools::plan_tool::PlanTool::new(
+                Arc::clone(&cell),
+            )));
+            Some(cell)
+        } else {
+            None
+        };
         // Build tool schemas once — the tool set is fixed for the harness lifetime.
         let tool_schemas = tools.tools_schema();
         Self {
@@ -989,17 +1002,10 @@ mod tests {
             },
         ]));
 
-        let mut tools = ToolRegistry::with_builtin_tools();
-        let plan_cell = tools.register_plan_tool();
+        let tools = ToolRegistry::with_builtin_tools();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent = AgentLoop::new_with_plan_cell(
-            llm,
-            tools,
-            "test-model".into(),
-            100_000,
-            cancel,
-            Some(plan_cell),
-        );
+        let mut agent =
+            AgentLoop::new_with_plan_mode(llm, tools, "test-model".into(), 100_000, cancel, true);
 
         let result = agent.run("triage this", "/tmp", None).unwrap();
         assert!(result.contains("Done"));
@@ -1050,17 +1056,10 @@ mod tests {
 
         let llm = Arc::new(FakeChatClient::new(responses));
 
-        let mut tools = ToolRegistry::with_builtin_tools();
-        let plan_cell = tools.register_plan_tool();
+        let tools = ToolRegistry::with_builtin_tools();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent = AgentLoop::new_with_plan_cell(
-            llm,
-            tools,
-            "test-model".into(),
-            100_000,
-            cancel,
-            Some(plan_cell),
-        );
+        let mut agent =
+            AgentLoop::new_with_plan_mode(llm, tools, "test-model".into(), 100_000, cancel, true);
 
         agent.run("do something", "/tmp", None).unwrap();
         assert_eq!(agent.take_plan_output(), None);
@@ -1108,17 +1107,10 @@ mod tests {
             },
         ]));
 
-        let mut tools = ToolRegistry::with_builtin_tools();
-        let plan_cell = tools.register_plan_tool();
+        let tools = ToolRegistry::with_builtin_tools();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent = AgentLoop::new_with_plan_cell(
-            llm,
-            tools,
-            "test-model".into(),
-            100_000,
-            cancel,
-            Some(plan_cell),
-        );
+        let mut agent =
+            AgentLoop::new_with_plan_mode(llm, tools, "test-model".into(), 100_000, cancel, true);
 
         agent.run("triage this issue", "/tmp", None).unwrap();
         // The plan tool was called on the second turn.

@@ -218,18 +218,19 @@ impl AcpServer {
         cancel.store(false, Ordering::SeqCst);
 
         let mut tools = ToolRegistry::with_builtin_tools();
-        // Register the `plan` tool only when the session is in plan mode.
-        // The ACP runtime sets the mode via session/set_config_option with
-        // configId=mode when PMO requests plan mode.
+        // In plan mode: drop `file_edit` (the PMO triages and decides, it
+        // must not mutate code) and let the agent loop register the `plan`
+        // tool. The ACP runtime sets the mode via session/set_config_option
+        // with configId=mode when PMO requests plan mode.
         let mut agent = if mode == "plan" {
-            let plan_cell = tools.register_plan_tool();
-            AgentLoop::new_with_plan_cell(
+            tools.unregister("file_edit");
+            AgentLoop::new_with_plan_mode(
                 Arc::clone(&self.llm),
                 tools,
                 model,
                 CONTEXT_TOKEN_BUDGET,
                 cancel,
-                Some(plan_cell),
+                true,
             )
         } else {
             AgentLoop::new(
@@ -633,5 +634,109 @@ mod tests {
             }
             _ => panic!("expected response"),
         }
+    }
+
+    /// A chat client that records the `tools` schema array it was called with,
+    /// so tests can assert which tools a session registered.
+    struct ToolsCapturingClient {
+        captured: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    impl ToolsCapturingClient {
+        fn new(captured: std::sync::Arc<std::sync::Mutex<Vec<Value>>>) -> Self {
+            Self { captured }
+        }
+    }
+
+    impl ChatClient for ToolsCapturingClient {
+        fn chat(
+            &self,
+            _model: &str,
+            _messages: &[Value],
+            tools: &[Value],
+            _on_chunk: Option<&super::super::client::StreamCallback>,
+            _on_tool_calls: Option<&super::super::client::ToolExecCallback<'_>>,
+            _on_early_tool_call: Option<&super::super::client::EarlyToolExecCallback<'_>>,
+        ) -> Result<ChatResponse> {
+            *self.captured.lock().unwrap() = tools.to_vec();
+            Ok(ChatResponse {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: "stop".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
+                elapsed_ms: 0,
+            })
+        }
+    }
+
+    fn run_session_prompt_in_mode(mode: &str) -> Vec<String> {
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm: Arc<dyn ChatClient> =
+            Arc::new(ToolsCapturingClient::new(std::sync::Arc::clone(&captured)));
+
+        let mut server = AcpServer::new(llm);
+        let new_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": { "cwd": "/tmp" }
+        });
+        let (resp, _) = collect_output(&mut server, &new_msg);
+        let session_id = match resp {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected session/new response"),
+        };
+
+        if !mode.is_empty() {
+            let mode_msg = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": session_id,
+                    "configId": "mode",
+                    "value": mode
+                }
+            });
+            let _ = collect_output(&mut server, &mode_msg);
+        }
+
+        let prompt_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "hi" }]
+            }
+        });
+        let _ = collect_output(&mut server, &prompt_msg);
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn plan_mode_drops_file_edit_from_registered_tools() {
+        let tools = run_session_prompt_in_mode("plan");
+        assert!(tools.contains(&"plan".to_string()), "plan tool registered");
+        assert!(
+            !tools.contains(&"file_edit".to_string()),
+            "file_edit must NOT be registered in plan mode"
+        );
+    }
+
+    #[test]
+    fn non_plan_mode_keeps_file_edit_registered() {
+        let tools = run_session_prompt_in_mode("");
+        assert!(tools.contains(&"file_edit".to_string()));
+        assert!(!tools.contains(&"plan".to_string()));
     }
 }
