@@ -749,8 +749,10 @@ fn execute_and_log(tools: &ToolRegistry, name: &str, args: &Value, cwd: &str) ->
 
     match tools.execute(name, args, cwd) {
         Ok(result) => {
-            let preview: String = result.chars().take(200).collect();
-            info!("harness: tool {name} result: {preview}");
+            info!(
+                "harness: tool {name} result: {}",
+                preview_lines(&result, 10)
+            );
             result
         }
         Err(e) => {
@@ -759,6 +761,20 @@ fn execute_and_log(tools: &ToolRegistry, name: &str, args: &Value, cwd: &str) ->
             err_msg
         }
     }
+}
+
+/// Render a tool result as a log preview: at most `max_lines` lines, with an
+/// ellipsis marker when more remain. Used by `execute_and_log` so multi-line
+/// tool output (file reads, shell, todo) shows a bounded preview rather than
+/// either overflowing the log or being truncated mid-line by a char limit.
+fn preview_lines(result: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = result.lines().collect();
+    if lines.len() <= max_lines {
+        return result.to_string();
+    }
+    let mut out = lines[..max_lines].join("\n");
+    out.push_str("\n[...]");
+    out
 }
 
 /// Truncate a tool result to `MAX_TOOL_RESULT_CHARS`, preserving the beginning
@@ -920,6 +936,35 @@ mod tests {
         // Network error — no status code.
         let err = anyhow::anyhow!("POST /v1/chat/completions: connection refused");
         assert!(!is_malformed_tool_call_error(&err));
+    }
+
+    #[test]
+    fn preview_lines_returns_full_when_at_or_under_limit() {
+        assert_eq!(preview_lines("one line", 10), "one line");
+        assert_eq!(preview_lines("a\nb\nc", 3), "a\nb\nc");
+        assert_eq!(preview_lines("", 10), "");
+    }
+
+    #[test]
+    fn preview_lines_truncates_with_ellipsis_when_over_limit() {
+        let input = "l1\nl2\nl3\nl4\nl5";
+        let out = preview_lines(input, 3);
+        assert_eq!(out, "l1\nl2\nl3\n[...]");
+    }
+
+    #[test]
+    fn preview_lines_keeps_exactly_max_lines() {
+        // 5 lines, max 5 → no truncation, no ellipsis.
+        let input = "a\nb\nc\nd\ne";
+        let out = preview_lines(input, 5);
+        assert_eq!(out, input);
+        assert!(!out.contains("[...]"));
+    }
+
+    #[test]
+    fn preview_lines_truncates_single_long_input_with_no_newlines() {
+        // Edge case: 0 newlines means 1 line, so it's never truncated.
+        assert_eq!(preview_lines("only line", 10), "only line");
     }
 
     #[test]

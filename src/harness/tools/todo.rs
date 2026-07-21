@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tracing::info;
 
 use super::Tool;
 use crate::harness::todo::{TodoItem, TodoList, TodoStatus};
@@ -92,7 +91,6 @@ impl Tool for TodoTool {
 
         self.todo.replace_all(parsed);
         let rendered = self.todo.render().unwrap_or_default();
-        info!("harness: todo updated\n{rendered}");
         let count = rendered
             .lines()
             .filter(|l| l.starts_with(|c: char| c.is_numeric()))
