@@ -38,6 +38,11 @@ pub trait ChatClient: Send + Sync {
     /// the SSE stream. If `on_early_tool_call` is provided, it is invoked per tool call as
     /// soon as that call's arguments parse as valid JSON during streaming — enabling
     /// speculative execution of read-only tools before `finish_reason` arrives.
+    ///
+    /// The `model` string may be a plain model name (e.g. `"model1-fp8"`) or an
+    /// `acp://` URL (e.g. `"acp://zhipu/model1-fp8?thinking=false"`). Implementations
+    /// that support the URL form parse it via [`ModelSpec::parse`] to extract the
+    /// real model name and options like `thinking`.
     fn chat(
         &self,
         model: &str,
@@ -52,6 +57,66 @@ pub trait ChatClient: Send + Sync {
     fn list_models(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+}
+
+/// Parsed model specification from an `acp://` URL.
+///
+/// Format: `acp://<vendor>/<model>?thinking=false&param=value`
+///
+/// When the model string is a plain name (no `acp://` prefix), it's treated as
+/// the model name with default options. The `thinking` query param controls
+/// whether the backend sends `chat_template_kwargs.enable_thinking`.
+///
+/// Examples:
+/// - `"model1-fp8"` → `ModelSpec { model: "model1-fp8", thinking: true }`
+/// - `"acp://zhipu/model1-fp8?thinking=false"` → `ModelSpec { model: "model1-fp8", thinking: false }`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSpec {
+    /// The actual model name to send to the API (e.g. `"model1-fp8"`).
+    pub model: String,
+    /// Whether to enable thinking/reasoning tokens. Defaults to `false`.
+    /// When `false`, the client sends `chat_template_kwargs.enable_thinking = false`
+    /// to suppress reasoning tokens (they dominate decode time without improving
+    /// output quality for coding tasks). Set `thinking=true` via the URL query
+    /// param to enable reasoning for tasks that benefit from it.
+    pub thinking: bool,
+}
+
+impl ModelSpec {
+    /// Parse a model string that may be a plain name or an `acp://` URL.
+    pub fn parse(s: &str) -> Self {
+        let trimmed = s.trim();
+        if let Some(rest) = trimmed.strip_prefix("acp://") {
+            // Split path and query: `vendor/model?thinking=false`
+            let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+            // Extract model name: take the last path segment after `/`.
+            let model = path.rsplit('/').next().unwrap_or(path).to_string();
+            let thinking = parse_query_bool(query, "thinking").unwrap_or(false);
+            ModelSpec { model, thinking }
+        } else {
+            ModelSpec {
+                model: trimmed.to_string(),
+                thinking: false,
+            }
+        }
+    }
+}
+
+/// Parse a boolean query parameter from a query string like `thinking=false`.
+/// Returns `None` when the parameter is absent.
+fn parse_query_bool(query: &str, key: &str) -> Option<bool> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+        {
+            return match v.to_lowercase().as_str() {
+                "false" | "0" | "no" | "off" => Some(false),
+                "true" | "1" | "yes" | "on" => Some(true),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// Token usage reported by the model API for a single chat completion.
@@ -161,21 +226,24 @@ impl ChatClient for OpenAiClient {
         on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
     ) -> Result<ChatResponse> {
         let url = self.url("/chat/completions");
+        let spec = ModelSpec::parse(model);
 
         let mut body = json!({
-            "model": model,
+            "model": spec.model,
             "messages": messages,
             "stream": true,
             // Ask the backend to include token usage in the final SSE chunk.
             "stream_options": {"include_usage": true},
+        });
+        if !spec.thinking {
             // Disable thinking/reasoning tokens. Model1 (and other reasoning
             // models served via sglang/vLLM) honor this chat-template kwarg to
             // skip the `<think>...</think>` phase entirely. This eliminates
             // reasoning_tokens (typically 100-500 per turn) that dominate
             // decode time without improving output quality for coding tasks.
             // Harmless on backends that don't recognize it.
-            "chat_template_kwargs": {"enable_thinking": false},
-        });
+            body["chat_template_kwargs"] = json!({"enable_thinking": false});
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
@@ -482,5 +550,80 @@ mod tests {
         assert_eq!(u.input_tokens, 0);
         assert_eq!(u.output_tokens, 0);
         assert_eq!(u.cached_tokens, 0);
+    }
+
+    #[test]
+    fn model_spec_parses_plain_model_name() {
+        let spec = ModelSpec::parse("model1-fp8");
+        assert_eq!(spec.model, "model1-fp8");
+        assert!(
+            !spec.thinking,
+            "plain model name defaults to thinking=false"
+        );
+    }
+
+    #[test]
+    fn model_spec_parses_acp_url_with_thinking_false() {
+        let spec = ModelSpec::parse("acp://zhipu/model1-fp8?thinking=false");
+        assert_eq!(spec.model, "model1-fp8");
+        assert!(!spec.thinking);
+    }
+
+    #[test]
+    fn model_spec_parses_acp_url_with_thinking_true() {
+        let spec = ModelSpec::parse("acp://zhipu/model1-fp8?thinking=true");
+        assert_eq!(spec.model, "model1-fp8");
+        assert!(spec.thinking);
+    }
+
+    #[test]
+    fn model_spec_parses_acp_url_without_query() {
+        let spec = ModelSpec::parse("acp://openai/gpt-4o");
+        assert_eq!(spec.model, "gpt-4o");
+        assert!(
+            !spec.thinking,
+            "missing thinking param defaults to false"
+        );
+    }
+
+    #[test]
+    fn model_spec_parses_acp_url_with_vendor_prefix() {
+        // The vendor segment is stripped; only the model name matters.
+        let spec = ModelSpec::parse("acp://zhipu/model1-fp8?thinking=false");
+        assert_eq!(spec.model, "model1-fp8");
+    }
+
+    #[test]
+    fn model_spec_parses_nested_model_path() {
+        // Some vendors use org/model format.
+        let spec = ModelSpec::parse("acp://hf/Qwen/QwQ-32B?thinking=true");
+        assert_eq!(spec.model, "QwQ-32B");
+        assert!(spec.thinking);
+    }
+
+    #[test]
+    fn model_spec_parses_thinking_param_variants() {
+        assert!(!ModelSpec::parse("acp://v/m?thinking=false").thinking);
+        assert!(!ModelSpec::parse("acp://v/m?thinking=0").thinking);
+        assert!(!ModelSpec::parse("acp://v/m?thinking=no").thinking);
+        assert!(!ModelSpec::parse("acp://v/m?thinking=off").thinking);
+        assert!(ModelSpec::parse("acp://v/m?thinking=true").thinking);
+        assert!(ModelSpec::parse("acp://v/m?thinking=1").thinking);
+        assert!(ModelSpec::parse("acp://v/m?thinking=yes").thinking);
+        assert!(ModelSpec::parse("acp://v/m?thinking=on").thinking);
+    }
+
+    #[test]
+    fn model_spec_ignores_unknown_query_params() {
+        let spec = ModelSpec::parse("acp://v/m?foo=bar&thinking=false&baz=1");
+        assert_eq!(spec.model, "m");
+        assert!(!spec.thinking);
+    }
+
+    #[test]
+    fn model_spec_handles_empty_string() {
+        let spec = ModelSpec::parse("");
+        assert_eq!(spec.model, "");
+        assert!(!spec.thinking);
     }
 }
