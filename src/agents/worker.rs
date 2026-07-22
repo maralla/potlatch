@@ -1455,13 +1455,8 @@ fn handle_mr_comments(
     let plain_comments_text = format_comments_for_prompt(&plain_comments);
     let all_comments_text = format_comments_for_prompt(&all_comments);
 
-    let combined_context_path = write_task_context_file(
-        &state.sessions_dir,
-        &format!(
-            "{}-mr-feedback-and-diff-{}.md",
-            &state.agent_id, latest_mr.iid
-        ),
-        &build_combined_mr_feedback_context(CombinedMrFeedbackContextInput {
+    let combined_context_content =
+        build_combined_mr_feedback_context(CombinedMrFeedbackContextInput {
             project_name: &state.project_name,
             mr: &latest_mr,
             issue_context: &issue_context,
@@ -1471,7 +1466,16 @@ fn handle_mr_comments(
             plain_comments_text: &plain_comments_text,
             all_comments_text: &all_comments_text,
             diff_context: &diff_context_content,
-        }),
+        });
+    // Write the context to disk for archival/debugging, but inject the content
+    // directly into the prompt so the model doesn't waste turns reading it back.
+    let _combined_context_path = write_task_context_file(
+        &state.sessions_dir,
+        &format!(
+            "{}-mr-feedback-and-diff-{}.md",
+            &state.agent_id, latest_mr.iid
+        ),
+        &combined_context_content,
     )?;
 
     let feedback_scope_rules = get_feedback_scope_rules();
@@ -1484,20 +1488,19 @@ PROJECT: {}
 
 MERGE REQUEST !{}: {}
 
-TASK CONTEXT FILE:
+TASK CONTEXT (already included below — do NOT read it from disk):
 {}
 
 CRITICAL REQUIREMENTS:
 - This is a NON-INTERACTIVE automated system
 - You MUST delete, rename, or move files as needed — do not ask permission or suggest it
 - Leave staging, committing, pushing, and merge request creation to the system
-- Review ALL comments to understand the full conversation
-- Identify which feedback items still need to be addressed
+- The task context above includes all comments and the diff — review it, then act directly
 - Address all unresolved thread feedback and actionable plain MR comments autonomously
 - Make all necessary code changes to resolve the comments
 - Keep the original issue requirements in mind while addressing feedback
 - If the workspace has merge conflict markers (<<<<<<< / ======= / >>>>>>>), resolve ALL of them before doing anything else. Edit each conflicted file to keep the correct version.
-- Read the **Merge conflict status** section in the task context file. It is verified by Potlatch. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
+- The **Merge conflict status** section in the task context above is verified by Potlatch. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
 - Potlatch will refuse to mark review threads resolved while GitLab still reports merge conflicts or conflict markers remain in the branch.
 - Potlatch already fetched `origin/{}` and merged it into your workspace when conflicts were reported. Edit the listed conflicted files, remove all conflict markers, and leave committing/pushing to Potlatch. Do not claim the conflict is fixed until the **Merge conflict status** section shows a clean merge with the fetched target tip.
 
@@ -1505,8 +1508,8 @@ CRITICAL REQUIREMENTS:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly.
-2. Read the task context file above before making any changes, including "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context".
-3. In that combined file, use inline comment locations (`path:line` or `path:start-end`) to find corresponding hunks in the diff section and make targeted fixes.
+2. The task context is already included above. Review the "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context" sections. Do NOT use file_read on the task context — it's already in your prompt.
+3. Use inline comment locations (`path:line` or `path:start-end`) from the comments to find the corresponding code and make targeted fixes. Grep for the relevant symbol, read only the surrounding lines, then edit.
 4. First, check for merge conflicts using the **Merge conflict status** section and your workspace. If any exist, resolve ALL conflicts in every file, commit the resolution, and verify the target branch merges cleanly before claiming completion.
 5. Review the original issue and what was implemented
 6. Review ALL comments to understand the full conversation and context, including simple comments that do not require resolution.
@@ -1552,7 +1555,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         &state.project_name,
         latest_mr.iid,
         latest_mr.title,
-        combined_context_path,
+        combined_context_content,
         latest_mr.target_branch,
         feedback_scope_rules,
         latest_mr.target_branch
@@ -2915,10 +2918,12 @@ fn build_implementation_prompt(
     issue: &Issue,
     gitlab_comments_text: &str,
 ) -> Result<String> {
-    let context_path = write_task_context_file(
+    let context_content = worker_issue_context_markdown(issue, gitlab_comments_text);
+    // Write to disk for archival, but inject content into the prompt.
+    let _context_path = write_task_context_file(
         &state.sessions_dir,
         &format!("{}-issue-{}.md", state.agent_id, issue.iid),
-        &worker_issue_context_markdown(issue, gitlab_comments_text),
+        &context_content,
     )?;
 
     let common_requirements = get_common_requirements();
@@ -2934,11 +2939,11 @@ PROJECT: {}
 
 ISSUE #{}: {}
 
-TASK CONTEXT FILE (read this file on disk — full issue + all GitLab comments):
+TASK CONTEXT (already included below — do NOT read it from disk):
 {}
 
 CONTEXT:
-- The path above is written by Potlatch: it contains this issue's **description** and **every GitLab issue comment** at the time the task started. That is your primary written spec; read it end-to-end before saying context is missing.
+- The task context above is included in your prompt: it contains this issue's **description** and **every GitLab issue comment** at the time the task started. That is your primary written spec.
 - Labels on the issue (e.g. priority) are visible in GitLab; infer scope from description + comments + `AGENTS.md`.
 
 {}
@@ -2947,7 +2952,7 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly for implementation, tests, linting, and documentation rules.
-2. Read the **entire** TASK CONTEXT FILE at the absolute path above. Do not skip the "GitLab issue comments" section.
+2. The task context is already included above. Do NOT use file_read on it — review it from your prompt, then start implementing.
 3. Analyze the issue and comments carefully
 4. Estimate the number of changed lines:
    - Non-test, non-generated code: should stay around ~500 lines
@@ -2984,7 +2989,7 @@ Proceed with the implementation autonomously. Do not ask for any user input.
         &state.project_name,
         issue.iid,
         issue.title,
-        context_path,
+        context_content,
         common_requirements,
         scope_rules,
         output_format
@@ -2998,10 +3003,12 @@ fn build_continuation_prompt(
     issue: &Issue,
     gitlab_comments_text: &str,
 ) -> Result<String> {
-    let context_path = write_task_context_file(
+    let context_content = worker_issue_context_markdown(issue, gitlab_comments_text);
+    // Write to disk for archival, but inject content into the prompt.
+    let _context_path = write_task_context_file(
         &state.sessions_dir,
         &format!("{}-issue-{}.md", &state.agent_id, issue.iid),
-        &worker_issue_context_markdown(issue, gitlab_comments_text),
+        &context_content,
     )?;
 
     let common_requirements = get_common_requirements();
@@ -3017,11 +3024,11 @@ PROJECT: {}
 
 ISSUE #{}: {}
 
-TASK CONTEXT FILE (read this file on disk — full issue + all GitLab comments):
+TASK CONTEXT (already included below — do NOT read it from disk):
 {}
 
 CONTEXT:
-- The path above contains this issue's **description** and **every GitLab issue comment** at task start — read it end-to-end before claiming missing context.
+- The task context above contains this issue's **description** and **every GitLab issue comment** at task start.
 - A branch for this issue already exists with previous work
 - You are continuing the implementation from where it was left off
 - Review the existing code changes in this branch
@@ -3033,7 +3040,7 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly for implementation, tests, linting, and documentation rules.
-2. Read the **entire** TASK CONTEXT FILE at the absolute path above (including "GitLab issue comments").
+2. The task context is already included above. Do NOT use file_read on it — review it from your prompt.
 3. Review the existing changes in the current branch
 4. Analyze what has been done and what remains
 5. Estimate total changed lines (including existing + remaining work):
@@ -3072,7 +3079,7 @@ Proceed with continuing the implementation autonomously. Do not ask for any user
         &state.project_name,
         issue.iid,
         issue.title,
-        context_path,
+        context_content,
         common_requirements,
         scope_rules,
         output_format
@@ -3091,7 +3098,8 @@ fn get_common_requirements() -> &'static str {
 - If information is missing, document what's needed in your response (do not ask interactively)
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
 - Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed. PMO guidance appears as a comment starting with **PMO guidance for the worker agent:** — treat the body of that comment as authoritative worker instructions and follow it exactly.
-- Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules (see MANDATORY OUTPUT): not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments"#
+- Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules (see MANDATORY OUTPUT): not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments
+- ACT QUICKLY. The task context is already in your prompt — do not read it from disk. After reading AGENTS.md, grep for the first symbol you need to change, read the surrounding lines, and make the edit. Do not write long analysis prose — each turn should produce a tool call that makes progress (a grep, a read, or an edit). If you catch yourself writing more than 2 sentences of "Let me analyze..." or "I notice that...", stop and make the edit instead. The first file_edit should happen within your first 5 tool calls."#
 }
 
 fn get_evidence_bound_scope_bullets() -> &'static str {

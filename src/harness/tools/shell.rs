@@ -32,7 +32,7 @@ impl Tool for ShellTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s).",
+            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `file_write` or `file_edit` instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -55,6 +55,16 @@ impl Tool for ShellTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'command' argument"))?;
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(self.timeout_secs);
+
+        // Detect file-writing patterns and log a warning. We don't block the
+        // command (some legitimate uses exist, e.g. `git commit` writes files),
+        // but we surface it so the model gets feedback in the next turn's logs.
+        if looks_like_file_write(command) {
+            tracing::warn!(
+                "harness: shell command appears to write files directly — use file_write/file_edit instead: {}",
+                command.chars().take(200).collect::<String>()
+            );
+        }
 
         let mut cmd = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
@@ -181,6 +191,33 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Detect shell patterns that create or modify files directly, bypassing the
+/// sandboxed `file_write`/`file_edit` tools. Returns true for patterns like
+/// `cat > file`, `echo > file`, `sed -i`, `tee file`, `cp`, `mv` into the
+/// workspace. Does NOT match `git`, `go build`, `mkdir`, or read-only commands.
+fn looks_like_file_write(command: &str) -> bool {
+    // Redirection to a file: `> file` or `>> file` (but not `2>` stderr-only)
+    if command.contains(">>") || command.contains("> ") {
+        // Exclude stderr redirection `2>` and process substitution
+        if !command.contains("2>") || command.contains(">>") {
+            return true;
+        }
+    }
+    // Heredocs writing to files: `cat > file << 'EOF'`
+    if command.contains("<<") && command.contains("cat") {
+        return true;
+    }
+    // In-place file editing
+    if command.contains("sed -i") || command.contains("sed --in-place") {
+        return true;
+    }
+    // tee writing to files
+    if command.contains("tee ") && !command.contains("tee /dev/null") {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +259,42 @@ mod tests {
             "should kill within ~2s, took {elapsed:?}"
         );
         assert!(result.contains("timed out"));
+    }
+
+    #[test]
+    fn looks_like_file_write_detects_cat_redirect() {
+        assert!(looks_like_file_write(
+            "cat > inventory/excel/checksum.go << 'GOEOF'\npackage main\nGOEOF"
+        ));
+        assert!(looks_like_file_write("echo hello > file.txt"));
+        assert!(looks_like_file_write("echo >> log.txt"));
+    }
+
+    #[test]
+    fn looks_like_file_write_detects_sed_inplace() {
+        assert!(looks_like_file_write("sed -i 's/old/new/g' file.go"));
+        assert!(looks_like_file_write("sed --in-place 's/a/b/' file.go"));
+    }
+
+    #[test]
+    fn looks_like_file_write_detects_tee() {
+        assert!(looks_like_file_write("echo hello | tee file.txt"));
+        assert!(!looks_like_file_write("echo hello | tee /dev/null"));
+    }
+
+    #[test]
+    fn looks_like_file_write_ignores_readonly_commands() {
+        assert!(!looks_like_file_write("go build ./..."));
+        assert!(!looks_like_file_write("git status"));
+        assert!(!looks_like_file_write("ls -la"));
+        assert!(!looks_like_file_write("grep -rn 'pattern' ."));
+        assert!(!looks_like_file_write("go test ./..."));
+        assert!(!looks_like_file_write("echo hello"));
+    }
+
+    #[test]
+    fn looks_like_file_write_ignores_stderr_redirect() {
+        // `2>` is stderr redirect, not file creation
+        assert!(!looks_like_file_write("go build ./... 2> /dev/null"));
     }
 }
