@@ -42,7 +42,7 @@ impl Tool for FileEditTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Edit files by replacing exact strings. Pass an 'edits' array of {path, old_string, new_string} objects. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The old_string must match uniquely within its file. On failure, the error includes line numbers and similarity scores of fuzzy near-matches so you can retry with a more specific match. After editing, the edited region is read back and included in the result so you can verify the change.",
+            "description": "Edit files by replacing exact strings. Pass an 'edits' array of objects, each with {path, old_string, new_string}. The 'path' goes INSIDE each edit object, not at the top level. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The old_string must match uniquely within its file. On failure, the error includes line numbers and similarity scores of fuzzy near-matches so you can retry with a more specific match. After editing, the edited region is read back and included in the result so you can verify the change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -87,11 +87,31 @@ impl Tool for FileEditTool {
         // Parse + validate each entry up front (cheap, no I/O). Group by resolved
         // path so we can apply multiple edits to the same file in order, while
         // independent files run concurrently.
+        //
+        // Graceful fallback: if none of the edit objects have a `path` but the
+        // top-level args has a `path` string, treat it as a default path for all
+        // edits. Models sometimes place `path` at the top level instead of
+        // inside each edit object; rather than failing, we apply it to every
+        // edit so the work proceeds.
+        let top_level_path = args["path"].as_str();
+        let saw_any_edit_path = edits
+            .iter()
+            .any(|e| e["path"].as_str().is_some_and(|s| !s.is_empty()));
+
         let mut groups: Vec<EditGroup> = Vec::new();
         for (idx, entry) in edits.iter().enumerate() {
-            let path = entry["path"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("each edit requires a 'path' string"))?;
+            let path = entry["path"].as_str();
+            let path = if path.is_some_and(|s| !s.is_empty()) {
+                path.unwrap()
+            } else if !saw_any_edit_path && top_level_path.is_some() {
+                top_level_path.unwrap()
+            } else {
+                anyhow::bail!(
+                    "each edit requires a 'path' string inside the edit object \
+                     (e.g. {{\"path\": \"src/main.rs\", \"old_string\": \"...\", \"new_string\": \"...\"}}). \
+                     Do not put 'path' at the top level of the arguments — it goes inside each edit."
+                );
+            };
             let old_string = entry["old_string"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("each edit requires an 'old_string' string"))?;
@@ -825,5 +845,70 @@ mod tests {
         let b_pos = result.find("[edit 2]").unwrap();
         assert!(c_pos < a_pos);
         assert!(a_pos < b_pos);
+    }
+
+    #[test]
+    fn falls_back_to_top_level_path_when_edits_lack_path() {
+        // Models sometimes place `path` at the top level instead of inside each
+        // edit object. The tool should apply it as a default to every edit
+        // rather than failing, so the work proceeds without a retry round-trip.
+        let dir = test_util::unique_test_dir();
+        let name = make_test_file(&dir, "test.txt", "alpha\nbeta\n");
+        let tool = FileEditTool;
+        let args = json!({
+            "path": name,
+            "edits": [
+                {"old_string": "alpha", "new_string": "ALPHA"},
+                {"old_string": "beta", "new_string": "BETA"}
+            ]
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Applied 2 edit(s)"));
+        assert!(result.contains("ALPHA"));
+        assert!(result.contains("BETA"));
+
+        let content = std::fs::read_to_string(dir.path().join(&name)).unwrap();
+        assert_eq!(content, "ALPHA\nBETA\n");
+    }
+
+    #[test]
+    fn top_level_path_ignored_when_edits_have_their_own_paths() {
+        // When edits have their own `path` fields, a top-level `path` is
+        // ignored — it should not override the per-edit paths.
+        let dir = test_util::unique_test_dir();
+        let a = make_test_file(&dir, "a.txt", "one\n");
+        let b = make_test_file(&dir, "b.txt", "two\n");
+        let tool = FileEditTool;
+        let args = json!({
+            "path": "a.txt",
+            "edits": [
+                {"path": a, "old_string": "one", "new_string": "ONE"},
+                {"path": b, "old_string": "two", "new_string": "TWO"}
+            ]
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Applied 2 edit(s)"));
+        let ca = std::fs::read_to_string(dir.path().join(&a)).unwrap();
+        let cb = std::fs::read_to_string(dir.path().join(&b)).unwrap();
+        assert_eq!(ca, "ONE\n");
+        assert_eq!(cb, "TWO\n");
+    }
+
+    #[test]
+    fn errors_with_clear_message_when_path_missing_everywhere() {
+        // When no edit has a `path` AND there's no top-level `path`, the error
+        // must clearly explain that `path` goes inside each edit object.
+        let dir = test_util::unique_test_dir();
+        let tool = FileEditTool;
+        let args = json!({
+            "edits": [
+                {"old_string": "alpha", "new_string": "ALPHA"}
+            ]
+        });
+        let result = tool.execute(&args, dir.as_str());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("inside the edit object"));
+        assert!(err.contains("Do not put 'path' at the top level"));
     }
 }
