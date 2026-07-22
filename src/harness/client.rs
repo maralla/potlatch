@@ -168,6 +168,13 @@ impl ChatClient for OpenAiClient {
             "stream": true,
             // Ask the backend to include token usage in the final SSE chunk.
             "stream_options": {"include_usage": true},
+            // Disable thinking/reasoning tokens. Model1 (and other reasoning
+            // models served via sglang/vLLM) honor this chat-template kwarg to
+            // skip the `<think>...</think>` phase entirely. This eliminates
+            // reasoning_tokens (typically 100-500 per turn) that dominate
+            // decode time without improving output quality for coding tasks.
+            // Harmless on backends that don't recognize it.
+            "chat_template_kwargs": {"enable_thinking": false},
         });
         if !tools.is_empty() {
             body["tools"] = json!(tools);
@@ -268,7 +275,11 @@ impl ChatClient for OpenAiClient {
 
             let delta = &chunk["choices"][0]["delta"];
 
-            // Text content
+            // Text content. Note: reasoning models (Model1, DeepSeek R1, etc.)
+            // stream reasoning in `delta.reasoning_content` — we intentionally
+            // ignore that field. The `enable_thinking: false` kwarg in the
+            // request body suppresses it at the source, but this guard also
+            // handles backends that don't honor the kwarg.
             if let Some(text) = delta["content"].as_str() {
                 content.push_str(text);
                 if let Some(cb) = on_chunk {

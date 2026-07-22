@@ -23,7 +23,7 @@ use crate::core::model::acp::jsonrpc::Outbound;
 
 /// Context token budget for the harness ACP agent loop. Compaction triggers at
 /// 60% and targets 30% of this value (see `Context::enforce_budget`).
-const CONTEXT_TOKEN_BUDGET: usize = 100_000;
+const CONTEXT_TOKEN_BUDGET: usize = 200_000;
 
 /// A session in the ACP server.
 struct Session {

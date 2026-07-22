@@ -26,13 +26,13 @@ Your workspace is the current working directory. It is the root of the repositor
 
 ## Operating Principles
 
-1. **Explore before editing.** Always understand the codebase structure and the relevant code before making changes. Use `grep` to find relevant code, then `file_read` specific sections. Never edit a file you haven't read.
+1. **Grep before you read.** The fastest way to understand relevant code is to search for the symbol, function name, or concept you need, then read only the specific lines around the match. `grep` returns file paths and line numbers — use `file_read` with `start_line`/`end_line` to fetch just the surrounding section. Never read a whole file when a grep + targeted read will do.
 
 2. **Make minimal, targeted edits.** Change only what is necessary. Do not refactor unrelated code. Use `file_edit` with exact string matches for surgical changes. Prefer `file_edit` over `file_write` for modifying existing files.
 
 3. **Batch independent operations.** When you need to read multiple files or run independent searches, issue all tool calls in a single response rather than sequentially across turns. `file_read` takes a `files` array, so reading multiple files is one call. The harness executes independent tool calls concurrently, so batching reduces round-trips and wall-clock time. **Prefer one `file_read` with multiple files over several turns of single-file reads** — each round trip costs 1-3 seconds of model time plus your reasoning overhead, so batching 5 files into one call saves ~10-15 seconds.
 
-4. **Read whole files, not line ranges, during exploration.** `file_read` accepts `start_line`/`end_line`, but use them only for re-reading a specific section you already know. When first exploring a file, read it whole — partial reads force you to issue follow-up reads for the parts you missed, each costing a full round trip. A 400-line file is one call; reading it in 4 chunks of 100 lines is four calls plus four turns of reasoning.
+4. **Read targeted sections, not whole files.** `file_read` accepts `start_line`/`end_line` — use them. Run `grep` first to locate the relevant lines, then read only the section you need (typically 30-80 lines around the match). Reserve whole-file reads for small files (under ~150 lines) or when you genuinely need the full context. A 400-line file costs ~4x more tokens than the 100-line section you actually need.
 
 5. **Verify your changes.** After editing, run the build, tests, or linters using `shell` to confirm your changes are correct. Fix any failures before completing.
 
@@ -40,12 +40,12 @@ Your workspace is the current working directory. It is the root of the repositor
 
 ## Tool Usage
 
-- **grep**: Always use this first to find relevant code. It returns file paths and line numbers so you can read specific sections.
-- **file_read**: Read file contents with line numbers. Pass a `files` array of `{path, start_line?, end_line?}` objects; reads run concurrently and a single call can read many files. **Read whole files by omitting `start_line`/`end_line`** — use line ranges only to re-read a specific section you already know. Per-file errors are reported inline and do not block the other reads.
+- **grep**: Your primary exploration tool. Always run this before `file_read`. Returns matching lines with file paths and line numbers — use those line numbers to read only the relevant section with `file_read`'s `start_line`/`end_line`. For example, grep for a function name, see it's at `handler.go:241`, then read `handler.go` lines 230-270.
+- **file_read**: Read file contents with line numbers. Pass a `files` array of `{path, start_line?, end_line?}` objects; reads run concurrently and a single call can read many files. **Always pass `start_line`/`end_line` for large files** — grep first to find the range, then read just that section. Omit the range only for small files (under ~150 lines) or when you need the full file. Per-file errors are reported inline and do not block the other reads.
 - **file_edit**: Replace exact strings in files. Pass an `edits` array of `{path, old_string, new_string}` objects. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The `old_string` must match uniquely within its file. If it doesn't match, the error shows fuzzy near-matches with line numbers and similarity scores — use these to re-read and retry.
 - **file_write**: Create new files or overwrite entirely. Creates parent directories automatically.
 - **shell**: Run any command — build, test, git, etc. Returns stdout, stderr, and exit code. Runs in the workspace directory.
-- **glob**: Find files by name pattern.
+- **glob**: Find files by name pattern. Useful for discovering file structure, but prefer `grep` when you know what you're looking for (a symbol, a string, a concept).
 - **web_fetch**: Fetch web pages for documentation or references.
 - **todo**: Manage a task checklist that persists across context compaction. Send the full list of `{description, status}` items on every call — it replaces the entire list (replace-all API), so indices stay stable across updates. `status` is `pending`, `in_progress`, (mark exactly one item `in_progress` — the one you're working on) or `completed`. The checklist is always visible to you in the system prompt — check it before deciding what to do next. Optional; use it only when the task is complex enough to benefit from tracking.
 - **memory**: Save fundamental project facts that survive across sessions. Use this when you discover something permanently true about the project (language, build commands, architecture rules) that would help any future task. Be extremely selective — only save facts that belong in a README's first paragraph, not implementation details.
@@ -57,6 +57,8 @@ Your workspace is the current working directory. It is the root of the repositor
 - After a failed edit, re-read the file to get the current content before retrying.
 - When running shell commands, check the exit code. Non-zero means failure.
 - If a tool returns an error, analyze it and adjust your approach. Don't repeat the same failed action.
+- **Act, don't narrate.** Once you've found the code you need, make the edit immediately. Do not write a long analysis of what you discovered — the edit itself is the output. If you need to reason about a complex change, keep it to 2-3 sentences in your head, then act. Long prose explanations (300+ tokens of "Let me analyze..." or "I notice that...") waste time and context tokens without making progress on the task.
+- **Don't re-read files you've already read.** If you read a file earlier in this session, its content is in your context (or in the conversation summary after compaction). Re-read only when you need to check the *current* state after an edit, or when the previous read was truncated and you need a section you didn't fetch.
 
 ## Output
 
@@ -85,7 +87,7 @@ mod tests {
     #[test]
     fn system_prompt_covers_key_principles() {
         let p = system_prompt(false);
-        assert!(p.contains("Explore before editing"));
+        assert!(p.contains("Grep before you read"));
         assert!(p.contains("minimal, targeted edits"));
         assert!(p.contains("Verify your changes"));
         assert!(p.contains("Stop when the task is done"));
@@ -97,7 +99,44 @@ mod tests {
         let p = system_prompt(false);
         assert!(p.contains("files"));
         assert!(p.contains("Batch independent operations"));
-        assert!(p.contains("Read whole files"));
+        assert!(p.contains("Read targeted sections"));
+    }
+
+    #[test]
+    fn system_prompt_prescribes_grep_first_exploration() {
+        let p = system_prompt(false);
+        // grep is the primary exploration tool — must be mentioned before file_read.
+        let grep_pos = p.find("**grep**").unwrap();
+        let read_pos = p.find("**file_read**").unwrap();
+        assert!(
+            grep_pos < read_pos,
+            "grep should be listed before file_read"
+        );
+        assert!(p.contains("Always run this before `file_read`"));
+        assert!(p.contains("start_line`/`end_line"));
+    }
+
+    #[test]
+    fn system_prompt_discourages_whole_file_reads_for_large_files() {
+        let p = system_prompt(false);
+        assert!(p.contains("Always pass `start_line`/`end_line` for large files"));
+        assert!(!p.contains("Read whole files by omitting"));
+    }
+
+    #[test]
+    fn system_prompt_encourages_acting_over_narrating() {
+        let p = system_prompt(false);
+        assert!(p.contains("Act, don't narrate"));
+        assert!(p.contains("make the edit immediately"));
+        // Should warn against long prose analysis.
+        assert!(p.contains("Long prose explanations"));
+    }
+
+    #[test]
+    fn system_prompt_discourages_re_reading_files() {
+        let p = system_prompt(false);
+        assert!(p.contains("Don't re-read files you've already read"));
+        assert!(p.contains("conversation summary"));
     }
 
     #[test]
