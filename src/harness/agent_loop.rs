@@ -235,14 +235,28 @@ impl AgentLoop {
                 }
 
                 let prompt = format!(
-                    "Summarize the following agent conversation. Focus on:\n\
-                     - What task the agent is working on and its current progress\n\
-                     - What files were read, created, or edited (with paths)\n\
-                     - What commands were run and their results (builds, tests, errors)\n\
-                     - What decisions were made and what remains to be done\n\
-                     - Any errors or blockers encountered\n\n\
-                     Be concise but complete — the agent will use this summary to continue \
-                     working without access to the original tool outputs.\n\n{transcript}"
+                    "Summarize the following agent conversation so the agent can continue working \
+                     without re-reading files or re-running commands. Your summary MUST include \
+                     these sections:\n\n\
+                     ## Task\n\
+                     What the agent is working on and its current progress.\n\n\
+                     ## Files explored\n\
+                     For each file the agent read or searched, list:\n\
+                     - The file path\n\
+                     - Key symbols, functions, structs, or types found there (with line numbers if known)\n\
+                     - A one-line note on what that code does\n\
+                     This section is critical — it prevents the agent from re-reading the same files \
+                     after compaction. Be specific: `ukb/ukbtask/drain.go: Drainer struct (line 30), \
+                     Drain method (line 84) — processes document deletion queue` is useful; \
+                     `read drain.go` is not.\n\n\
+                     ## Changes made\n\
+                     Files created or edited, with a one-line description of each change.\n\n\
+                     ## Commands run\n\
+                     Build, test, or shell commands and their key results (errors, pass/fail).\n\n\
+                     ## Next steps\n\
+                     What remains to be done, in order.\n\n\
+                     Be concise but complete. Do not include full file contents — just the symbol \
+                     index and key findings.\n\n{transcript}"
                 );
 
                 let messages = vec![json!({
