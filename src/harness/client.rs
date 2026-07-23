@@ -580,10 +580,7 @@ mod tests {
     fn model_spec_parses_acp_url_without_query() {
         let spec = ModelSpec::parse("acp://openai/gpt-4o");
         assert_eq!(spec.model, "gpt-4o");
-        assert!(
-            !spec.thinking,
-            "missing thinking param defaults to false"
-        );
+        assert!(!spec.thinking, "missing thinking param defaults to false");
     }
 
     #[test]
