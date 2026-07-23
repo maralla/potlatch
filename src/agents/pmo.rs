@@ -956,18 +956,20 @@ fn refresh_pmo_issue_context_file(
 ) -> Result<String> {
     let (comments_text, gitlab_note_count) = pmo_gitlab_comments_section(gitlab, issue.iid);
     let existing_issues_text = build_existing_issues_summary(issue.iid, all_issues);
+    let closed_mr_text = pmo_closed_mr_section(gitlab, issue.iid);
 
     let generated_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let body = format!(
-        "# PMO Triage Context\n\nProject: {project_name}\nIssue: #{iid} {title}\n\n## Issue description\n{description}\n\n## Comments and worker feedback\n{comments}\n\n## Existing open issues\n{existing}\n\n---\n_Potlatch: PMO refreshed this file; {gitlab_note_count} GitLab note(s) in the section above; UNIX ts {generated_ts}._\n",
+        "# PMO Triage Context\n\nProject: {project_name}\nIssue: #{iid} {title}\n\n## Issue description\n{description}\n\n## Comments and worker feedback\n{comments}\n\n## Closed merge request context\n{closed_mr}\n\n## Existing open issues\n{existing}\n\n---\n_Potlatch: PMO refreshed this file; {gitlab_note_count} GitLab note(s) in the comments section; UNIX ts {generated_ts}._\n",
         project_name = &state.project_name,
         iid = issue.iid,
         title = issue.title,
         description = issue.description,
         comments = comments_text,
+        closed_mr = closed_mr_text,
         existing = existing_issues_text,
         gitlab_note_count = gitlab_note_count,
         generated_ts = generated_ts,
@@ -983,6 +985,132 @@ fn refresh_pmo_issue_context_file(
         .into_owned();
 
     Ok(context_path)
+}
+
+/// Build the "Closed merge request context" section for the PMO context file.
+///
+/// When a worker hands off an issue to PMO after failing to resolve reviewer
+/// feedback, it closes the MR and posts a reason as an issue comment. But the
+/// MR's own comment threads (reviewer feedback, worker replies) and the diff
+/// carry context the issue comment alone doesn't capture. This section fetches
+/// the most recent closed MR for the issue (keyed by the `issue-<iid>` branch
+/// convention) and includes its comments and a truncated diff.
+///
+/// Returns "No closed MRs found for this issue." when there are none (the
+/// common case for issues that were never assigned to a worker).
+fn pmo_closed_mr_section(gitlab: &GitLabClient, issue_iid: u64) -> String {
+    let branch_name = format!("issue-{issue_iid}");
+    let mr_iids = match gitlab.find_mrs_by_source_branch(&branch_name) {
+        Ok(iids) => iids,
+        Err(e) => {
+            warn!("PMO: failed to search MRs for issue #{issue_iid} branch {branch_name}: {e}");
+            return format!(
+                "**ERROR: Potlatch could not search merge requests for this issue.**\n\n```\n{e}\n```"
+            );
+        }
+    };
+
+    // Find the most recent non-open MR (closed or merged). Open MRs are
+    // excluded — they're handled by the worker/reviewer flow, not PMO.
+    let mr_iid = mr_iids
+        .iter()
+        .find(|&&iid| match gitlab.get_merge_request(iid) {
+            Ok(mr) => mr.state != "opened",
+            Err(_) => false,
+        })
+        .copied();
+
+    let Some(mr_iid) = mr_iid else {
+        return "No closed MRs found for this issue.".to_string();
+    };
+
+    let mr = match gitlab.get_merge_request(mr_iid) {
+        Ok(mr) => mr,
+        Err(e) => {
+            warn!("PMO: failed to fetch MR !{mr_iid}: {e}");
+            return format!(
+                "**ERROR: Potlatch could not load merge request !{mr_iid}.**\n\n```\n{e}\n```"
+            );
+        }
+    };
+
+    let comments_text = match gitlab.get_mr_comments(mr_iid) {
+        Ok(comments) if comments.is_empty() => "No MR comments.".to_string(),
+        Ok(comments) => comments
+            .iter()
+            .map(|c| c.format_for_prompt())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => {
+            warn!("PMO: failed to fetch MR !{mr_iid} comments: {e}");
+            format!("**ERROR: could not load MR comments: {e}**")
+        }
+    };
+
+    let diff_text = match gitlab.get_merge_request_changes(mr_iid) {
+        Ok(snapshot) if snapshot.patch.is_empty() => "No diff available.".to_string(),
+        Ok(snapshot) => {
+            let files_list = if snapshot.files.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nChanged files ({}):\n{}\n",
+                    snapshot.files.len(),
+                    snapshot
+                        .files
+                        .iter()
+                        .take(50)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            let patch = truncate_diff_for_pmo(&snapshot.patch);
+            if snapshot.overflow {
+                format!(
+                    "Diff (truncated — too large for full inclusion):\n```\n{patch}\n```{files_list}\n\n_Note: the full diff exceeds the context limit. See the MR in GitLab for the complete changes._"
+                )
+            } else {
+                format!("Diff:\n```\n{patch}\n```{files_list}")
+            }
+        }
+        Err(e) => {
+            warn!("PMO: failed to fetch MR !{mr_iid} diff: {e}");
+            format!("**ERROR: could not load MR diff: {e}**")
+        }
+    };
+
+    format!(
+        "MR: !{mr_iid} {mr_title}\nState: {mr_state}\nSource branch: {source_branch} → Target: {target_branch}\n\n### MR comments\n{comments}\n\n### MR diff\n{diff}",
+        mr_iid = mr.iid,
+        mr_title = mr.title,
+        mr_state = mr.state,
+        source_branch = mr.source_branch,
+        target_branch = mr.target_branch,
+        comments = comments_text,
+        diff = diff_text,
+    )
+}
+
+/// Truncate a diff patch for inclusion in the PMO context file. Keeps the
+/// first 8000 characters (enough to see the shape of changes without bloating
+/// the context) with a marker when truncated.
+fn truncate_diff_for_pmo(patch: &str) -> String {
+    const MAX_DIFF_CHARS: usize = 8_000;
+    if patch.len() <= MAX_DIFF_CHARS {
+        return patch.to_string();
+    }
+    let mut end = MAX_DIFF_CHARS;
+    while !patch.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[...diff truncated at {} chars, {}/{} bytes shown...]",
+        &patch[..end],
+        MAX_DIFF_CHARS,
+        end,
+        patch.len()
+    )
 }
 
 fn build_split_prompt(
@@ -1003,9 +1131,10 @@ TASK CONTEXT FILE (you MUST open and read this path on disk — it has the full 
 
 CONTEXT:
 An automated worker agent attempted to implement this issue but was unable to complete it.
-Potlatch wrote the path above as a markdown file: **full issue description**, **every GitLab issue comment** (including worker rejection / PMO notes), and **the list of other open issues**. That file is the authoritative written context for this triage.
+Potlatch wrote the path above as a markdown file: **full issue description**, **every GitLab issue comment** (including worker rejection / PMO notes), **closed merge request context** (MR comments, reviewer feedback, and diff from the worker's closed MR, when one exists), and **the list of other open issues**. That file is the authoritative written context for this triage.
 - Use your **file-reading** capability on the absolute path and read it **end-to-end** before you decide the situation is unclear.
 - The single line `ISSUE #…: title` in this prompt is **not** a substitute for the file; do not claim "no context" or choose NEEDS_CLARIFICATION only because you did not read the task context file.
+- The **Closed merge request context** section is especially important when the worker closed an MR after failing to resolve reviewer feedback — the MR comments and diff show what the reviewer asked for and what the worker tried.
 Your job is to analyze the failure reason (from the file + repo when needed) and take the appropriate action.
 
 CRITICAL REQUIREMENTS:
@@ -1069,8 +1198,8 @@ DUPLICATE / OVERLAP RULES (STRICT):
 - If ALL sub-issues would duplicate existing issues, choose GUIDE_WORKER instead and tell the worker which existing issues already cover the work.
 
 INSTRUCTIONS:
-1. Open and read the **entire** TASK CONTEXT FILE at the absolute path above (description, GitLab comments, existing issues). Do this first.
-2. From that file, read the issue description and **all** comments — especially the worker's rejection reason.
+1. Open and read the **entire** TASK CONTEXT FILE at the absolute path above (description, GitLab comments, closed MR context, existing issues). Do this first.
+2. From that file, read the issue description and **all** comments — especially the worker's rejection reason. If there is a **Closed merge request context** section, read the MR comments and diff to understand what the reviewer asked for and what the worker tried.
 3. Review the EXISTING OPEN ISSUES section in that same file to see what is already tracked.
 4. TASK CONTAINER TEST: Does the issue describe a broad goal that involves multiple independent pieces of work (e.g. "add tests for all modules", "refactor X across the codebase", "check code for Y")? If YES → SPLIT. The parent issue is just a container; the real work is in the sub-issues.
 5. GUIDANCE TEST: Is there ONE specific thing the worker misunderstood or did wrong? If YES → GUIDE_WORKER.
@@ -1839,5 +1968,30 @@ mod tests {
             gitlab::priority_from_labels(&["in-progress".to_string()]),
             3
         );
+    }
+
+    #[test]
+    fn truncate_diff_for_pmo_keeps_short_diffs_unchanged() {
+        let diff = "diff --git a/file.go b/file.go\n+hello\n";
+        assert_eq!(truncate_diff_for_pmo(diff), diff);
+    }
+
+    #[test]
+    fn truncate_diff_for_pmo_truncates_long_diffs_with_marker() {
+        let diff = "x".repeat(10_000);
+        let result = truncate_diff_for_pmo(&diff);
+        assert!(result.contains("[...diff truncated at"));
+        assert!(result.len() < diff.len());
+        // Should still start with the original content.
+        assert!(result.starts_with('x'));
+    }
+
+    #[test]
+    fn truncate_diff_for_pmo_respects_char_boundary() {
+        // Multi-byte UTF-8 characters must not be split.
+        let diff = format!("{}\n", "α".repeat(4_000)); // each α is 2 bytes
+        let result = truncate_diff_for_pmo(&diff);
+        // Result is valid UTF-8 (no panic), and either truncated or full.
+        assert!(result.contains('α'));
     }
 }

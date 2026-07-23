@@ -367,6 +367,27 @@ impl GitLabClient {
         Ok(hits.into_iter().next().map(|mr| mr.iid))
     }
 
+    /// Find merge requests by source branch in any state (open, closed, merged).
+    /// Returns MR iids sorted by iid descending (most recent first). Used by the
+    /// PMO to inspect closed MRs when a worker hands off an issue after failing
+    /// to resolve reviewer feedback — the MR's comments and diff carry context
+    /// the issue comments alone don't capture.
+    pub fn find_mrs_by_source_branch(&self, source_branch: &str) -> Result<Vec<u64>> {
+        let endpoint = self.api_path(&format!(
+            "merge_requests?source_branch={source_branch}&per_page=20&order_by=updated_at&sort=desc"
+        ));
+        let output = self.run_api(&endpoint, &[])?;
+        #[derive(Deserialize)]
+        struct MrHit {
+            iid: u64,
+        }
+        let hits: Vec<MrHit> =
+            serde_json::from_slice(&output.stdout).context("Failed to parse MR search JSON")?;
+        let mut iids: Vec<u64> = hits.into_iter().map(|h| h.iid).collect();
+        iids.sort_by(|a, b| b.cmp(a));
+        Ok(iids)
+    }
+
     pub fn list_issues(&self) -> Result<Vec<Issue>> {
         with_transient_retries("listing open issues", || self.list_issues_pages())
     }
