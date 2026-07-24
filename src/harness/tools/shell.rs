@@ -1,7 +1,9 @@
 //! Shell command execution tool with timeout and process group control.
 
+use std::collections::HashMap;
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,14 +15,243 @@ use super::Tool;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_OUTPUT: usize = 50_000;
 
+/// A running background shell job. The child process is kept alive across
+/// tool calls; stdout/stderr are drained into shared buffers by reader threads
+/// so the pipe buffer never fills and blocks the process.
+struct Job {
+    child: Child,
+    pid: u32,
+    command: String,
+    started_at: Instant,
+    stdout_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    /// Set once the process exits (observed via `try_wait`).
+    exit_code: Option<i32>,
+    /// Set when the job was killed via `kill`/`kill_all` rather than exiting.
+    killed: bool,
+}
+
+/// Shared table of background jobs, keyed by job id. Held as `Arc<JobTable>`
+/// by both `ShellTool` (for spawn/poll/kill) and `Session` (for cleanup on
+/// close). All methods take `&self` and lock internally, so the `Tool::execute`
+/// `&self` borrow is sufficient.
+pub struct JobTable {
+    jobs: Mutex<HashMap<String, Job>>,
+}
+
+impl JobTable {
+    pub fn new() -> Self {
+        Self {
+            jobs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Spawn a command in the background. Returns the assigned job id.
+    pub fn spawn(&self, command: &str, cwd: &str) -> Result<String> {
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            c.args(["/C", command]);
+            c
+        } else {
+            let mut c = Command::new("bash");
+            c.args(["-c", command]);
+            c
+        };
+
+        cmd.current_dir(cwd);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.stdin(Stdio::null());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
+        let mut child = cmd.spawn()?;
+        let pid = child.id();
+
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let stdout_buf_clone = Arc::clone(&stdout_buf);
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            *stdout_buf_clone.lock().unwrap() = buf;
+        });
+        let stderr_buf_clone = Arc::clone(&stderr_buf);
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            *stderr_buf_clone.lock().unwrap() = buf;
+        });
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let job = Job {
+            child,
+            pid,
+            command: command.to_string(),
+            started_at: Instant::now(),
+            stdout_buf,
+            stderr_buf,
+            exit_code: None,
+            killed: false,
+        };
+        self.jobs.lock().unwrap().insert(id.clone(), job);
+        Ok(id)
+    }
+
+    /// Poll a background job: update its exit status and return accumulated
+    /// stdout/stderr. The buffers grow until the process exits; we return the
+    /// full contents each poll (truncated to `MAX_OUTPUT`).
+    pub fn poll(&self, job_id: &str) -> Result<String> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let job = jobs
+            .get_mut(job_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown job id: {job_id}"))?;
+
+        // If we haven't observed exit yet, try to reap without blocking.
+        if job.exit_code.is_none()
+            && let Ok(Some(status)) = job.child.try_wait()
+        {
+            job.exit_code = status.code();
+        }
+
+        let running = job.exit_code.is_none() && !job.killed;
+        let status = if job.killed {
+            "killed"
+        } else if running {
+            "running"
+        } else {
+            "exited"
+        };
+
+        let stdout_str = {
+            let buf = job.stdout_buf.lock().unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let stderr_str = {
+            let buf = job.stderr_buf.lock().unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let elapsed = job.started_at.elapsed();
+        let exit_line = match job.exit_code {
+            Some(code) => format!("exit code: {code}"),
+            None if job.killed => "exit code: -1 (killed)".to_string(),
+            None => "exit code: (still running)".to_string(),
+        };
+
+        let mut result = format!(
+            "job: {job_id}\ncommand: {}\nstatus: {status}\nelapsed: {:.1}s\n{exit_line}",
+            job.command,
+            elapsed.as_secs_f64()
+        );
+        if !stdout_str.is_empty() {
+            result.push_str("\nstdout:\n");
+            result.push_str(&stdout_str);
+        }
+        if !stderr_str.is_empty() {
+            result.push_str("\nstderr:\n");
+            result.push_str(&stderr_str);
+        }
+
+        if result.len() > MAX_OUTPUT {
+            let truncated = truncate_at_char_boundary(&result, MAX_OUTPUT);
+            result = format!(
+                "{truncated}\n\n[...output truncated, {} total chars...]",
+                result.len()
+            );
+        }
+        Ok(result)
+    }
+
+    /// Kill a background job. Sends SIGKILL to the process group (Unix) or
+    /// `child.kill()` (Windows), marks it killed, and reaps the child.
+    pub fn kill(&self, job_id: &str) -> Result<String> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let job = jobs
+            .get_mut(job_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown job id: {job_id}"))?;
+
+        if job.exit_code.is_some() {
+            // Already exited — report final status without killing.
+            return self.poll(job_id);
+        }
+
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::killpg(job.pid as i32, libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = job.child.kill();
+        }
+        job.killed = true;
+        if let Ok(Some(status)) = job.child.try_wait() {
+            job.exit_code = status.code();
+        }
+        drop(jobs);
+        self.poll(job_id)
+    }
+
+    /// Kill all still-running jobs. Called on session close to avoid leaking
+    /// background processes.
+    pub fn kill_all(&self) {
+        let mut jobs = self.jobs.lock().unwrap();
+        for job in jobs.values_mut() {
+            if job.exit_code.is_some() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                unsafe {
+                    libc::killpg(job.pid as i32, libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = job.child.kill();
+            }
+            job.killed = true;
+            if let Ok(Some(status)) = job.child.try_wait() {
+                job.exit_code = status.code();
+            }
+        }
+    }
+}
+
+impl Default for JobTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct ShellTool {
     timeout_secs: u64,
+    jobs: Arc<JobTable>,
 }
 
 impl ShellTool {
     pub fn new() -> Self {
         Self {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            jobs: Arc::new(JobTable::new()),
+        }
+    }
+
+    /// Construct with an externally-owned job table, so background jobs are
+    /// shared across tool instances (e.g. across multiple prompts in a
+    /// session).
+    pub fn with_job_table(jobs: Arc<JobTable>) -> Self {
+        Self {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            jobs,
         }
     }
 }
@@ -32,29 +263,54 @@ impl Tool for ShellTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `file_write` or `file_edit` instead.",
+            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `file_write` or `file_edit` instead. To run a long-running command in the background, set `background: true`; you get a job id back and can poll its output later with `job_id`, or terminate it with `job_id` + `kill: true`.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute"
+                        "description": "The shell command to execute. Required unless polling or killing a background job (`job_id`)."
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds. Default: 120."
+                        "description": "Timeout in seconds for foreground commands. Default: 120. Ignored for background jobs (they run until exit or kill)."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "If true, spawn the command in the background and return a job id immediately instead of waiting. Poll with `job_id`."
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "Poll or kill a background job. Returns accumulated stdout/stderr and current status. Ignored unless polling or killing."
+                    },
+                    "kill": {
+                        "type": "boolean",
+                        "description": "When true with `job_id`, terminate the background job."
                     }
                 },
-                "required": ["command"]
+                "required": []
             }
         })
     }
 
     fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
+        let job_id = args["job_id"].as_str();
+        let kill = args["kill"].as_bool().unwrap_or(false);
+
+        // Polling or killing a background job takes precedence — `command`
+        // is ignored in these modes.
+        if let Some(id) = job_id {
+            if kill {
+                return self.jobs.kill(id);
+            }
+            return self.jobs.poll(id);
+        }
+
         let command = args["command"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'command' argument"))?;
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(self.timeout_secs);
+        let background = args["background"].as_bool().unwrap_or(false);
 
         // Detect wrong-directory `cd` prefixes and warn. We don't strip or
         // modify the command — if the model cd's to the wrong path, the
@@ -71,6 +327,16 @@ impl Tool for ShellTool {
                 "harness: shell command appears to write files directly — use file_write/file_edit instead: {}",
                 command.chars().take(200).collect::<String>()
             );
+        }
+
+        if background {
+            let id = self.jobs.spawn(command, cwd)?;
+            let mut result = format!("Background job started: {id}\ncommand: {command}");
+            if let Some(ref warning) = cd_warning {
+                result.push_str("\n\n");
+                result.push_str(warning);
+            }
+            return Ok(result);
         }
 
         let mut cmd = if cfg!(target_os = "windows") {
@@ -411,5 +677,125 @@ mod tests {
     fn detect_wrong_cd_treats_trailing_slash_as_same() {
         // /tmp and /tmp/ are the same directory.
         assert!(detect_wrong_cd("cd /tmp/ && echo hi", "/tmp").is_none());
+    }
+
+    #[test]
+    fn spawn_background_returns_job_id() {
+        let tool = ShellTool::new();
+        let args = json!({"command": "echo hi", "background": true});
+        let result = tool.execute(&args, "/tmp").unwrap();
+        assert!(result.starts_with("Background job started:"));
+        // The job id follows the label.
+        let id = result
+            .strip_prefix("Background job started: ")
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
+        assert!(!id.is_empty());
+
+        // The job should exit quickly; poll until we see the output.
+        let poll_args = json!({"job_id": id});
+        let mut found = false;
+        for _ in 0..20 {
+            let poll = tool.execute(&poll_args, "/tmp").unwrap();
+            if poll.contains("hi") && poll.contains("exited") {
+                found = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(found, "expected to poll output 'hi' and exited status");
+    }
+
+    #[test]
+    fn poll_running_job_returns_running_status() {
+        let tool = ShellTool::new();
+        let args = json!({"command": "sleep 2", "background": true});
+        let result = tool.execute(&args, "/tmp").unwrap();
+        let id = result
+            .strip_prefix("Background job started: ")
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
+
+        let poll_args = json!({"job_id": id});
+        let poll = tool.execute(&poll_args, "/tmp").unwrap();
+        assert!(poll.contains("status: running"));
+        assert!(poll.contains("sleep 2"));
+
+        // Clean up.
+        let kill_args = json!({"job_id": id, "kill": true});
+        tool.execute(&kill_args, "/tmp").unwrap();
+    }
+
+    #[test]
+    fn kill_terminates_background_job() {
+        let tool = ShellTool::new();
+        let args = json!({"command": "sleep 60", "background": true});
+        let result = tool.execute(&args, "/tmp").unwrap();
+        let id = result
+            .strip_prefix("Background job started: ")
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
+
+        let kill_args = json!({"job_id": id, "kill": true});
+        let kill_result = tool.execute(&kill_args, "/tmp").unwrap();
+        assert!(
+            kill_result.contains("status: killed"),
+            "expected killed status, got: {kill_result}"
+        );
+
+        // Polling again should still report killed.
+        let poll_args = json!({"job_id": id});
+        let poll = tool.execute(&poll_args, "/tmp").unwrap();
+        assert!(poll.contains("status: killed"));
+    }
+
+    #[test]
+    fn kill_all_kills_all_running_jobs() {
+        let jobs = Arc::new(JobTable::new());
+        let tool = ShellTool::with_job_table(Arc::clone(&jobs));
+
+        let a = jobs.spawn("sleep 60", "/tmp").unwrap();
+        let b = jobs.spawn("sleep 60", "/tmp").unwrap();
+
+        jobs.kill_all();
+
+        let poll_a = tool.execute(&json!({"job_id": a}), "/tmp").unwrap();
+        let poll_b = tool.execute(&json!({"job_id": b}), "/tmp").unwrap();
+        assert!(
+            poll_a.contains("status: killed"),
+            "job a not killed: {poll_a}"
+        );
+        assert!(
+            poll_b.contains("status: killed"),
+            "job b not killed: {poll_b}"
+        );
+    }
+
+    #[test]
+    fn poll_unknown_job_id_returns_error() {
+        let tool = ShellTool::new();
+        let args = json!({"job_id": "nonexistent-id"});
+        let result = tool.execute(&args, "/tmp");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown job id"));
+    }
+
+    #[test]
+    fn foreground_execution_unchanged() {
+        // `background` defaults to false — the command runs synchronously and
+        // returns the full output, not a job id.
+        let tool = ShellTool::new();
+        let args = json!({"command": "echo foreground"});
+        let result = tool.execute(&args, "/tmp").unwrap();
+        assert!(result.contains("foreground"));
+        assert!(result.contains("exit code: 0"));
+        assert!(!result.contains("Background job started"));
     }
 }
