@@ -33,6 +33,9 @@ const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
 const WORKER_PENDING_LABEL: &str = "pending";
 /// Reviewer-only workflow: worker skips and stops tracking while reviewer may still process the MR.
 const WORKER_REVIEW_ONLY_LABEL: &str = "review-only";
+/// Prefix for labels that park an issue until a dependency MR merges.
+/// The full label is `waiting-on-mr:!N` where N is the dependency MR IID.
+const WAITING_ON_MR_LABEL_PREFIX: &str = "waiting-on-mr:!";
 /// ACP runtime message when `cancel_check` returns true.
 const WORKER_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
 
@@ -736,6 +739,29 @@ fn worker_cycle(
             continue;
         }
 
+        // Check if this issue is parked waiting on a dependency MR.
+        if let Some(dep_mr_iid) = extract_waiting_on_mr_iid(&issue.labels) {
+            let dep_merged = state
+                .glab
+                .get_merge_request(dep_mr_iid)
+                .map(|mr| mr.state == "merged")
+                .unwrap_or(false);
+            if !dep_merged {
+                debug!(
+                    "{}: Issue #{} waiting on MR !{} (not yet merged), skipping",
+                    &state.agent_id, issue.iid, dep_mr_iid
+                );
+                continue;
+            }
+            // Dependency merged — strip the waiting label and proceed to claim.
+            info!(
+                "{}: Issue #{} dependency MR !{} merged, resuming",
+                &state.agent_id, issue.iid, dep_mr_iid
+            );
+            let label = waiting_on_mr_label(dep_mr_iid);
+            let _ = state.glab.remove_issue_label(issue.iid, &label);
+        }
+
         if claim::is_claimed(&issue.labels) {
             debug!(
                 "{}: Issue #{} already claimed, skipping",
@@ -1331,6 +1357,43 @@ fn process_issue(
 
     let impl_summary = extract_mr_description(&agent_output);
     state.save_session_with_summary(issue.iid, mr_iid, &impl_summary)?;
+
+    // If the agent declared a dependency on an unmerged MR, park the issue:
+    // label it `waiting-on-mr:!N`, remove `in-progress`, release the claim,
+    // and clear `current` so the caller doesn't track it as active. The MR
+    // stays open — it just can't merge until the dependency does.
+    if let Some(dep_mr_iid) = extract_depends_on_mr(&agent_output) {
+        let dep_merged = state
+            .glab
+            .get_merge_request(dep_mr_iid)
+            .map(|mr| mr.state == "merged")
+            .unwrap_or(false);
+        if !dep_merged {
+            let label = waiting_on_mr_label(dep_mr_iid);
+            let _ = state.glab.add_issue_label(issue.iid, &label);
+            let _ = state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
+            let _ = state.glab.add_issue_comment(
+                issue.iid,
+                &format!(
+                    "Implementation complete in MR !{}, but it depends on MR !{} which is not yet merged. \
+                     Parking this issue until the dependency merges.",
+                    mr_iid, dep_mr_iid
+                ),
+            );
+            let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
+            state.cleanup_session(issue.iid);
+            info!(
+                "{}: Issue #{} parked waiting on MR !{} (dependency unmerged), released claim",
+                &state.agent_id, issue.iid, dep_mr_iid
+            );
+            // Signal to the caller that the MR was created but the issue is
+            // parked — `mr_created = false` makes the caller's else-branch run
+            // (idempotent release_claim, no git cleanup, no active tracking).
+            current.mr_created = false;
+            current.branch_name = None;
+            return Ok(Some(mr_iid));
+        }
+    }
 
     Ok(Some(mr_iid))
 }
@@ -3182,6 +3245,10 @@ MR_DESCRIPTION_END
 
 IMPORTANT: The MR_TITLE and MR_DESCRIPTION markers are REQUIRED. Without them, the system cannot create the merge request properly.
 
+If your implementation depends on another merge request that is not yet merged, include this line:
+DEPENDS_ON_MR: !<N>
+where <N> is the IID of the dependency MR. Only use this when the dependency is real — your MR cannot merge until the other one does. The system will park this issue until the dependency merges, then resume it automatically. Omit this line if there is no dependency.
+
 Do NOT put PUBLIC_COMMENT_BEGIN / PUBLIC_COMMENT_END inside MR_DESCRIPTION or MR_DESCRIPTION_BEGIN…END — those blocks are only for GitLab thread replies. The MR description must be plain documentation (goal, implementation, testing); reply text belongs in a separate PUBLIC_COMMENT block after the MR description.
 
 For any human-facing GitLab comment text (separate from the MR description), also include:
@@ -3245,6 +3312,34 @@ fn extract_clarification(agent_output: &AgentHandoff) -> String {
         return clarification.trim().to_string();
     }
     "This issue needs clarification. Please provide more details.".to_string()
+}
+
+/// Extract a dependency MR IID from the agent's output. The model emits
+/// `DEPENDS_ON_MR: !42` when its implementation relies on an unmerged MR.
+/// Returns the first IID found, or `None` if the marker is absent/malformed.
+fn extract_depends_on_mr(agent_output: &AgentHandoff) -> Option<u64> {
+    let response = &agent_output.response;
+    let pos = response.find("DEPENDS_ON_MR:")?;
+    let rest = &response[pos + "DEPENDS_ON_MR:".len()..];
+    let line = rest.lines().next()?;
+    let line = line.trim();
+    // Accept "!42", "42", "!42, !43" — take the first IID.
+    let first = line.split(',').next()?.trim();
+    let num = first.trim_start_matches('!').trim();
+    num.parse::<u64>().ok()
+}
+
+/// Build the `waiting-on-mr:!N` label for a dependency MR IID.
+fn waiting_on_mr_label(mr_iid: u64) -> String {
+    format!("{WAITING_ON_MR_LABEL_PREFIX}{mr_iid}")
+}
+
+/// Extract the dependency MR IID from a `waiting-on-mr:!N` issue label.
+fn extract_waiting_on_mr_iid(labels: &[String]) -> Option<u64> {
+    labels.iter().find_map(|l| {
+        l.strip_prefix(WAITING_ON_MR_LABEL_PREFIX)
+            .and_then(|s| s.parse::<u64>().ok())
+    })
 }
 
 fn extract_mr_title(agent_output: &AgentHandoff) -> String {
@@ -3943,5 +4038,73 @@ mod tests {
         };
         assert_eq!(extract_mr_description(&output), "## Goal\nA");
         assert_eq!(extract_explicit_mr_description(&output), "## Goal\nA");
+    }
+
+    #[test]
+    fn extract_depends_on_mr_parses_single_iid() {
+        let out = AgentHandoff {
+            response: "DEPENDS_ON_MR: !42".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_mr(&out), Some(42));
+    }
+
+    #[test]
+    fn extract_depends_on_mr_parses_bangless_iid() {
+        let out = AgentHandoff {
+            response: "DEPENDS_ON_MR: 42".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_mr(&out), Some(42));
+    }
+
+    #[test]
+    fn extract_depends_on_mr_takes_first_of_multiple() {
+        let out = AgentHandoff {
+            response: "DEPENDS_ON_MR: !42, !43".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_mr(&out), Some(42));
+    }
+
+    #[test]
+    fn extract_depends_on_mr_returns_none_when_absent() {
+        let out = AgentHandoff {
+            response: "MR_TITLE: something\nMR_DESCRIPTION: done".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_mr(&out), None);
+    }
+
+    #[test]
+    fn extract_depends_on_mr_returns_none_for_garbage() {
+        let out = AgentHandoff {
+            response: "DEPENDS_ON_MR: !abc".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_mr(&out), None);
+    }
+
+    #[test]
+    fn waiting_on_mr_label_format() {
+        assert_eq!(waiting_on_mr_label(42), "waiting-on-mr:!42");
+    }
+
+    #[test]
+    fn extract_waiting_on_mr_iid_finds_label() {
+        let labels = vec!["in-progress".to_string(), "waiting-on-mr:!42".to_string()];
+        assert_eq!(extract_waiting_on_mr_iid(&labels), Some(42));
+    }
+
+    #[test]
+    fn extract_waiting_on_mr_iid_returns_none_without_label() {
+        let labels = vec!["in-progress".to_string(), "priority::3".to_string()];
+        assert_eq!(extract_waiting_on_mr_iid(&labels), None);
+    }
+
+    #[test]
+    fn extract_waiting_on_mr_iid_ignores_malformed() {
+        let labels = vec!["waiting-on-mr:!abc".to_string()];
+        assert_eq!(extract_waiting_on_mr_iid(&labels), None);
     }
 }

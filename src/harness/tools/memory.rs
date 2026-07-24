@@ -16,7 +16,7 @@ impl Tool for MemoryTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Save fundamental project facts to persistent memory that survives across sessions and context compaction. Use ONLY for facts that are permanently true for the entire project and broadly useful for any future task: language, build/test/lint commands, critical architecture rules, key conventions. Do NOT use for task-specific details, implementation notes, or anything you discovered by reading specific files. Think: 'would this be in a README's first paragraph?'",
+            "description": "Save fundamental project facts to persistent memory that survives across sessions and context compaction. Use ONLY for facts that are permanently true for the entire project and broadly useful for any future task: critical architecture rules, key conventions, and structural knowledge discovered through exploration. Do NOT save build/test/lint commands — those are easy to discover. Do NOT save anything already written in AGENTS.md, README, or other on-disk project config files — those are re-read each session, so storing them here is redundant duplication. Do NOT use for task-specific details or implementation notes. Think: 'is this fact written down anywhere in the repo, and if not, would it help a fresh session?'",
             "parameters": {
                 "type": "object",
                 "properties": {
