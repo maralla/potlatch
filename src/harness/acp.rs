@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use super::agent_loop::AgentLoop;
 use super::client::ChatClient;
 use super::tools::ToolRegistry;
+use super::tools::shell::JobTable;
 use crate::core::model::acp::jsonrpc::Outbound;
 
 /// Context token budget for the harness ACP agent loop. Compaction triggers at
@@ -35,6 +36,9 @@ struct Session {
     /// `configId=mode` when PMO requests plan mode.
     mode: String,
     cancel: Arc<AtomicBool>,
+    /// Background shell jobs spawned during this session. Shared with the
+    /// `ShellTool` so jobs survive across prompts; killed on session close.
+    jobs: Arc<JobTable>,
 }
 
 impl Session {
@@ -45,6 +49,7 @@ impl Session {
             model: std::env::var("BREEZE_MODEL").unwrap_or_default(),
             mode: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+            jobs: Arc::new(JobTable::new()),
         }
     }
 }
@@ -215,9 +220,15 @@ impl AcpServer {
         let model = session.model.clone();
         let mode = session.mode.clone();
         let cancel = session.cancel.clone();
+        let jobs = Arc::clone(&session.jobs);
         cancel.store(false, Ordering::SeqCst);
 
         let mut tools = ToolRegistry::with_builtin_tools();
+        // Re-register the shell tool with the session's job table so background
+        // jobs survive across prompts and are killed on session close.
+        tools.register(Arc::new(super::tools::shell::ShellTool::with_job_table(
+            jobs,
+        )));
         // In plan mode: drop `file_edit` (the PMO triages and decides, it
         // must not mutate code) and let the agent loop register the `plan`
         // tool. The ACP runtime sets the mode via session/set_config_option
@@ -299,8 +310,10 @@ impl AcpServer {
 
     fn handle_session_close(&mut self, params: &Value) -> Result<Value> {
         let session_id = params["sessionId"].as_str().unwrap_or("");
-        self.sessions.remove(session_id);
-        debug!("harness ACP: closed session {session_id}");
+        if let Some(session) = self.sessions.remove(session_id) {
+            session.jobs.kill_all();
+            debug!("harness ACP: closed session {session_id}");
+        }
         Ok(json!(null))
     }
 
