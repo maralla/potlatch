@@ -49,7 +49,7 @@ Your workspace is the current working directory. It is the root of the repositor
 - **glob**: Find files by name pattern. Useful for discovering file structure, but prefer `grep` when you know what you're looking for (a symbol, a string, a concept).
 - **web_fetch**: Fetch web pages for documentation or references.
 - **todo**: Manage a task checklist that persists across context compaction. Send the full list of `{description, status}` items on every call — it replaces the entire list (replace-all API), so indices stay stable across updates. `status` is `pending`, `in_progress`, (mark exactly one item `in_progress` — the one you're working on) or `completed`. The checklist is always visible to you in the system prompt — check it before deciding what to do next. Optional; use it only when the task is complex enough to benefit from tracking.
-- **memory**: Save fundamental project facts that survive across sessions. Use this when you discover something permanently true about the project (language, build commands, architecture rules) that would help any future task. Be extremely selective — only save facts that belong in a README's first paragraph, not implementation details.
+- **memory**: Save fundamental project facts that survive across sessions. Use this only for critical architecture rules, key conventions, or structural knowledge you discovered through exploration that is NOT already written in AGENTS.md, README, or other on-disk project files (those are re-read each session). Do not save build/test/lint commands — those are easy to discover. Be extremely selective.
 {plan_tool_line}
 
 ## Important Notes
@@ -158,10 +158,14 @@ mod tests {
 
     #[test]
     fn system_prompt_does_not_concatenate_agents_md() {
-        // The prompt must not reference AGENTS.md or project instructions —
-        // those are read from disk by the agent per its task prompt.
+        // The prompt must not embed AGENTS.md content or project instructions —
+        // those are read from disk by the agent per its task prompt. Mentioning
+        // the filename in tool guidance (e.g. "don't duplicate AGENTS.md") is
+        // fine; embedding its actual content is not.
         let p = system_prompt(false);
-        assert!(!p.contains("AGENTS.md"));
+        assert!(!p.contains("Agent Instructions"));
+        assert!(!p.contains("Code Quality"));
+        assert!(!p.contains("For Worker Agent"));
         assert!(!p.contains("Project Instructions"));
     }
 }
