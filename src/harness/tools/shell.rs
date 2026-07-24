@@ -56,6 +56,13 @@ impl Tool for ShellTool {
             .ok_or_else(|| anyhow::anyhow!("missing 'command' argument"))?;
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(self.timeout_secs);
 
+        // Detect wrong-directory `cd` prefixes and warn. We don't strip or
+        // modify the command — if the model cd's to the wrong path, the
+        // command fails naturally, which is clearer feedback than silently
+        // fixing it. The warning is prepended to the tool result so the model
+        // sees it.
+        let cd_warning = detect_wrong_cd(command, cwd);
+
         // Detect file-writing patterns and log a warning. We don't block the
         // command (some legitimate uses exist, e.g. `git commit` writes files),
         // but we surface it so the model gets feedback in the next turn's logs.
@@ -155,6 +162,10 @@ impl Tool for ShellTool {
                 "Command timed out after {timeout_secs}s and was killed.\n"
             ));
         }
+        if let Some(ref warning) = cd_warning {
+            result.push_str(warning);
+            result.push_str("\n\n");
+        }
         if !stdout_str.is_empty() {
             result.push_str("stdout:\n");
             result.push_str(&stdout_str);
@@ -189,6 +200,67 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Detect a leading `cd <path> &&` (or `cd <path>;`) prefix that targets a
+/// directory other than the working directory. The shell tool already runs in
+/// the working directory, so such a `cd` sends the command to the wrong place.
+///
+/// We do NOT strip or modify the command — if the model cd's to the wrong
+/// path, the command fails naturally, which is clearer feedback than silently
+/// fixing it. Instead we return a warning string that is prepended to the tool
+/// result so the model sees it. Returns `None` when there is no `cd` prefix,
+/// the `cd` targets the working directory, or the `cd` is a standalone
+/// command with no separator.
+fn detect_wrong_cd(command: &str, cwd: &str) -> Option<String> {
+    let trimmed = command.trim_start();
+
+    // Match `cd <path> && <rest>` or `cd <path>;<rest>`.
+    let after_cd = trimmed.strip_prefix("cd ")?;
+
+    // Find the separator: `&&` or `;`
+    let sep_pos = after_cd.find("&&").or_else(|| after_cd.find(';'))?;
+    let rest = after_cd[sep_pos..]
+        .trim_start_matches("&&")
+        .trim_start_matches(';')
+        .trim_start();
+
+    if rest.is_empty() {
+        return None;
+    }
+
+    let cd_path = after_cd[..sep_pos]
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"');
+
+    // Canonicalize both paths to compare. If we can't canonicalize (path
+    // doesn't exist), treat the cd as wrong.
+    let cwd_canonical = std::path::Path::new(cwd)
+        .canonicalize()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cwd.to_string());
+
+    let cd_canonical = std::path::Path::new(cd_path)
+        .canonicalize()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cd_path.to_string());
+
+    if cd_canonical == cwd_canonical {
+        // Redundant cd to the same directory — harmless, no warning.
+        None
+    } else {
+        // Wrong directory — warn. The warning is visible in the tool result
+        // so the model learns to stop guessing paths. The command runs as
+        // given so the failure (if any) is honest feedback.
+        let warning = format!(
+            "WARNING: the command begins with `cd {cd_path}`, which is not the working directory. \
+             Commands already run in the working directory. Do not use `cd` with absolute paths; \
+             use relative paths instead. The command ran as given."
+        );
+        tracing::warn!("harness: wrong-directory cd '{cd_path}' (cwd is '{cwd_canonical}')");
+        Some(warning)
+    }
 }
 
 /// Detect shell patterns that create or modify files directly, bypassing the
@@ -296,5 +368,48 @@ mod tests {
     fn looks_like_file_write_ignores_stderr_redirect() {
         // `2>` is stderr redirect, not file creation
         assert!(!looks_like_file_write("go build ./... 2> /dev/null"));
+    }
+
+    #[test]
+    fn detect_wrong_cd_silent_for_same_directory() {
+        assert!(
+            detect_wrong_cd("cd /tmp && echo hi", "/tmp").is_none(),
+            "no warning for redundant cd to cwd"
+        );
+    }
+
+    #[test]
+    fn detect_wrong_cd_warns_for_wrong_directory() {
+        let warning = detect_wrong_cd("cd /home/user/wrong-project && go test ./...", "/tmp")
+            .expect("should warn for wrong-directory cd");
+        assert!(warning.contains("not the working directory"));
+        assert!(!warning.contains("stripped"));
+    }
+
+    #[test]
+    fn detect_wrong_cd_handles_semicolon_separator() {
+        assert!(detect_wrong_cd("cd /tmp; echo hi", "/tmp").is_none());
+    }
+
+    #[test]
+    fn detect_wrong_cd_ignores_commands_without_cd() {
+        assert!(detect_wrong_cd("go test ./...", "/tmp").is_none());
+    }
+
+    #[test]
+    fn detect_wrong_cd_ignores_cd_without_separator() {
+        // `cd /tmp` alone (no && or ;) is a valid standalone command — don't warn.
+        assert!(detect_wrong_cd("cd /tmp", "/tmp").is_none());
+    }
+
+    #[test]
+    fn detect_wrong_cd_handles_quoted_path() {
+        assert!(detect_wrong_cd("cd '/tmp' && echo hi", "/tmp").is_none());
+    }
+
+    #[test]
+    fn detect_wrong_cd_treats_trailing_slash_as_same() {
+        // /tmp and /tmp/ are the same directory.
+        assert!(detect_wrong_cd("cd /tmp/ && echo hi", "/tmp").is_none());
     }
 }
