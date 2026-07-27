@@ -55,3 +55,10 @@ logs = [
   { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app/app.log" },
   # { ssh_user = "deploy", ssh_host = "worker.example.com", log_path = "/var/log/app/worker.log" },
 ]
+
+[agent.qa]
+# QA agent: runs regression tests and security analysis on branch commits.
+# Only runs when qa.md exists in the repo root. Omit [agent.qa] to disable.
+poll_interval_secs = 300
+instances = 1
+branches = ["main"]

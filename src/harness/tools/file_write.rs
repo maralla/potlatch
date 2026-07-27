@@ -16,7 +16,7 @@ impl Tool for FileWriteTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Create a new file or overwrite an existing file with the given content. Creates parent directories if needed. Use this for new files; prefer file_edit for modifying existing files.",
+            "description": "Create a new file or overwrite an existing file with the given content. Creates parent directories if needed. Use this for new files; prefer file_edit for modifying existing files. By default paths must be relative to the working directory; set outside_cwd: true to write to an absolute path outside the workspace (only for agent-managed scratch files explicitly permitted by the task instructions).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -27,6 +27,11 @@ impl Tool for FileWriteTool {
                     "content": {
                         "type": "string",
                         "description": "The full content to write to the file"
+                    },
+                    "outside_cwd": {
+                        "type": "boolean",
+                        "description": "When true, allow absolute paths outside the working directory. Default false. Only set this when the task instructions explicitly direct you to write to a specific absolute path (e.g. an agent session directory).",
+                        "default": false
                     }
                 },
                 "required": ["path", "content"]
@@ -41,8 +46,9 @@ impl Tool for FileWriteTool {
         let content = args["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'content' argument"))?;
+        let outside_cwd = args["outside_cwd"].as_bool().unwrap_or(false);
 
-        let full_path = match super::resolve_workspace_path(path, cwd) {
+        let full_path = match super::resolve_write_path(path, cwd, outside_cwd) {
             Ok(p) => p,
             Err(msg) => return Ok(format!("Error: {msg}")),
         };
@@ -126,6 +132,85 @@ mod tests {
     fn rejects_absolute_path() {
         let dir = test_util::unique_test_dir();
         let tool = FileWriteTool;
+        let args = json!({
+            "path": "/tmp/evil.txt",
+            "content": "bad"
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("absolute paths are not allowed"));
+    }
+
+    #[test]
+    fn rejects_parent_traversal() {
+        let dir = test_util::unique_test_dir();
+        let tool = FileWriteTool;
+        let args = json!({
+            "path": "../escape.txt",
+            "content": "bad"
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("escapes the workspace"));
+    }
+
+    #[test]
+    fn outside_cwd_allows_absolute_path() {
+        let dir = test_util::unique_test_dir();
+        let outside = test_util::unique_test_dir();
+        let target = outside.path().join("outside.txt");
+
+        let tool = FileWriteTool;
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "from outside",
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Created"), "{result}");
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "from outside");
+    }
+
+    #[test]
+    fn outside_cwd_creates_parent_dirs() {
+        let dir = test_util::unique_test_dir();
+        let outside = test_util::unique_test_dir();
+        let target = outside.path().join("nested/deep/script.py");
+
+        let tool = FileWriteTool;
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "print('hi')",
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Created"), "{result}");
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn outside_cwd_overwrites_existing_file() {
+        let dir = test_util::unique_test_dir();
+        let outside = test_util::unique_test_dir();
+        let target = outside.path().join("existing.txt");
+        std::fs::write(&target, "old").unwrap();
+
+        let tool = FileWriteTool;
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "new",
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Overwrote"), "{result}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[test]
+    fn outside_cwd_defaults_to_false_when_absent() {
+        let dir = test_util::unique_test_dir();
+        let tool = FileWriteTool;
+        // No outside_cwd field — must still reject absolute paths.
         let args = json!({
             "path": "/tmp/evil.txt",
             "content": "bad"

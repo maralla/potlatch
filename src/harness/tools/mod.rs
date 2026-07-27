@@ -91,6 +91,30 @@ pub fn resolve_read_path(path: &str, cwd: &str) -> Result<PathBuf, String> {
     Ok(resolved.canonicalize().unwrap_or(resolved))
 }
 
+/// Resolve a write path, optionally allowing locations outside the workspace.
+///
+/// When `outside_cwd` is false (the default for all callers), this is exactly
+/// [`resolve_workspace_path`]: absolute paths and `..` escapes are rejected, so
+/// writes stay inside the working directory. When `outside_cwd` is true, the
+/// workspace check is bypassed and absolute paths are accepted — used by agents
+/// (e.g. QA) that manage their own scratch files in a dedicated session
+/// directory outside the checked-out repo. This is no weaker than the `shell`
+/// tool, which can already write anywhere via `bash -c`; the in-workspace guard
+/// in `file_write` is a footgun guardrail, not a security boundary.
+pub fn resolve_write_path(path: &str, cwd: &str, outside_cwd: bool) -> Result<PathBuf, String> {
+    if outside_cwd {
+        let p = Path::new(path);
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            Path::new(cwd).join(path)
+        };
+        Ok(resolved.canonicalize().unwrap_or(resolved))
+    } else {
+        resolve_workspace_path(path, cwd)
+    }
+}
+
 /// Format `path` for display in tool output. When `path` is inside `cwd`,
 /// returns the path relative to `cwd` (e.g. `taskapp/tasks/handler.go` instead of
 /// `/home/user/project/taskapp/tasks/handler.go`). When `path` is outside `cwd`

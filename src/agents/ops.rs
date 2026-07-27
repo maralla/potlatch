@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::agents::gitlab::{self, GitLabClient};
 use crate::agents::settings;
+use crate::agents::ssh_util::{shell_single_quote, validate_remote_path, validate_ssh_identity};
 use crate::agents::workspace::{
     ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
 };
@@ -654,30 +655,6 @@ fn save_history(path: &Path, history: &OpsIssueHistory) -> Result<()> {
     let json =
         serde_json::to_string_pretty(history).context("Failed to serialize issue history")?;
     fs::write(path, json).with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn validate_remote_path(path: &str) -> Result<()> {
-    ensure!(!path.is_empty(), "log_path must not be empty");
-    for ch in path.chars() {
-        ensure!(
-            !matches!(ch, '\0' | '\n' | '\r' | ';' | '|' | '&' | '$' | '`'),
-            "log_path contains unsupported character: {ch:?}"
-        );
-    }
-    Ok(())
-}
-
-fn validate_ssh_identity(value: &str, field: &str) -> Result<()> {
-    ensure!(!value.is_empty(), "{field} must not be empty");
-    ensure!(
-        !value.chars().any(|c| c.is_whitespace()),
-        "{field} must not contain whitespace"
-    );
     Ok(())
 }
 
