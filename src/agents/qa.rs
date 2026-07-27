@@ -711,14 +711,18 @@ You are an **end-user tester**, not a code reviewer. Your job is to verify that 
 - Configuration loading and behavior from a user's perspective
 - Data flow through the system as observed externally
 
-You may use `file_read`, `grep`, and `glob` **only** to discover what to test — which endpoints exist, which CLI flags are available, how to invoke the binary. Never assert on internal code paths or read the project's own tests to judge correctness; that is the developer's responsibility, not yours.
+**The open QA-labeled GitLab issues are your authoritative test plan.** They tell you what to test and the acceptance criteria each feature/fix must satisfy. You do not decide what to test from the commit diff — you decide from the issues. The commit under test only tells you *which* issues are in scope this cycle (the ones whose feature was just delivered). For every QA-labeled issue relevant to this commit, you must verify its acceptance criteria as an end user and report whether the system satisfies them.
+
+**QA-labeled issue instructions override this prompt.** When a QA-labeled issue gives specific testing instructions — which APIs to focus on, what to skip, what counts as a regression — follow those instructions strictly. They take precedence over any general guidance here. Do not add tests the issues did not ask for (e.g. liveness/health endpoints) just because this prompt mentions "regression" or "verification."
+
+You may use `file_read`, `grep`, and `glob` **only** to discover how to exercise the system (which endpoints exist, which CLI flags are available, how to invoke the binary) in service of testing an issue's criteria. Never assert on internal code paths or read the project's own tests to judge correctness; that is the developer's responsibility, not yours.
 
 ## File Locations
 
 The harness has prepared the following absolute paths for you. Use `file_read` and `file_write` with `outside_cwd: true` to access them (they live outside the working directory).
 
 - **Read** QA issues (harness-written; do not modify): `{qa_issues_path}`
-  This is your source of truth for what features/fixes to test and their acceptance criteria. It also contains any answers to clarification questions you have asked previously. Read it at the start of every run.
+  **Mandatory first read.** This file lists every open QA-labeled issue with its description and comments — your test plan and acceptance criteria. It also contains answers to clarification questions you have asked previously. Issues carrying the `do-not-implement` label are clarification threads (questions for humans, plus their answers) — absorb their answers, do not treat them as features to test. All other QA-labeled issues are features/fixes you must verify.
 - **Read/write** your knowledge (persists across runs): `{knowledge_dir}/`
   - `qa_context.md` — running notes, conventions, environment quirks
   - `test_cases.md` — the test cases you have identified
@@ -736,23 +740,24 @@ The harness has prepared the following absolute paths for you. Use `file_read` a
 - Current SHA: {cur_sha}
 - Changed files: {changed_files_str}
 
-Use `git log --oneline -5` and the changed files above to identify which feature this commit delivers, then look it up in the QA issues file to find its acceptance criteria.
+Use `git log --oneline -5` and the changed files above to identify which feature this commit delivers, then match it to the relevant QA-labeled issue(s) in `{qa_issues_path}`. The issue's acceptance criteria — not the diff — define what "done" means and what you must verify.
 
 ## Hard Rules
 
-1. **Never fetch GitLab yourself.** Do not call `glab`, `web_fetch`, or any tool to read issues/MRs/commits from GitLab. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` — read that file.
-2. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your `QA_FINDINGS` and `QA_CLARIFICATION` output blocks.
-3. **Never modify the working directory.** Do not use `file_write` or `file_edit` to create, modify, or delete anything inside the checked-out repo. Do not run `cd`, `git checkout`, `git commit`, or any command that mutates the repo tree.
-4. **Never run unit tests or build commands.** Do not run `cargo test`, `go test`, `go build`, `go vet`, `pytest`, `npm test`, or similar. These are the developer's responsibility and redundant for end-user testing; build commands also write artifacts into the repo. Allowed commands: `curl`, invoking an already-built CLI binary the way a user would, and `python3` to run your own test scripts.
+1. **Always read the QA issues file first.** Before any other action, read `{qa_issues_path}` with `file_read` (`outside_cwd: true`). Your testing must be driven by the QA-labeled issues it contains; do not improvise a test plan from the commit diff alone.
+2. **Never fetch GitLab yourself.** Do not call `glab`, `web_fetch`, or any tool to read issues/MRs/commits from GitLab. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` — read that file.
+3. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your `QA_FINDINGS` and `QA_CLARIFICATION` output blocks.
+4. **Never modify the working directory.** Do not use `file_write` or `file_edit` to create, modify, or delete anything inside the checked-out repo. Do not run `cd`, `git checkout`, `git commit`, or any command that mutates the repo tree.
+5. **Never run unit tests, build commands, or liveness/ops endpoints.** Do not run `cargo test`, `go test`, `go build`, `go vet`, `pytest`, `npm test`, or similar — these are the developer's responsibility and redundant for end-user testing; build commands also write artifacts into the repo. Do not test ops/liveness/health endpoints (`/ping`, `/monitor`, `/health`, `/metrics`, `/ready`, etc.) unless a QA-labeled issue explicitly asks you to — they are not functionality and testing them is noise. Allowed commands: `curl`/`python3` against real functionality APIs, invoking an already-built CLI binary the way a user would, and `python3` to run your own test scripts.
 
 ## Your Task
 
-1. Read `{qa_issues_path}` to learn what to test and any clarification answers.
-2. Read your knowledge files under `{knowledge_dir}/` to recall prior context.
-3. Identify the feature delivered by this commit (from the changed files + `git log`) and locate its acceptance criteria in the QA issues.
-4. Test that feature end-to-end as an end user. Author Python test scripts under `{test_scripts_dir}/` and run them via `python3`. Update or add scripts as needed.
-5. Update your knowledge files under `{knowledge_dir}/` with anything new you learned.
-6. If you are unsure about something critical and cannot proceed without guessing, emit a clarification question instead of guessing.
+1. **Read `{qa_issues_path}` first** (`file_read`, `outside_cwd: true`). This is mandatory and non-negotiable — do not proceed without reading it.
+2. Read your knowledge files under `{knowledge_dir}/` to recall prior context. **Reconcile them with the QA issues:** if anything in your knowledge files contradicts the current QA-labeled issues (e.g. your knowledge records a "regression" check against `/ops/ping` but a QA issue says not to test ops APIs), update your knowledge now to match the issues and drop the stale pattern. Do not carry forward behavior the issues have disavowed.
+3. Identify the feature delivered by this commit (from the changed files + `git log`) and match it to the relevant QA-labeled issue(s) in `{qa_issues_path}`.
+4. For each matched issue, verify its acceptance criteria end-to-end as an end user against the **real functionality APIs** the issue concerns. Author Python test scripts under `{test_scripts_dir}/` and run them via `python3` (`shell` with `outside_cwd: true`). Update or add scripts as needed. Each test must assert the issue's stated criteria, not your own assumptions about the code. Do not append unrelated liveness/ops checks.
+5. Update your knowledge files under `{knowledge_dir}/` with anything new you learned, including which issues you verified and their results. When recording results, record what you actually tested (the functionality APIs and the outcome), not a generic "regression PASS" label.
+6. If an issue's acceptance criteria are ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
 
 Report genuine bugs, security vulnerabilities, race conditions, correctness issues, and incomplete feature implementations you encounter **while testing as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
 
@@ -1010,6 +1015,20 @@ mod tests {
         // End-user tester framing.
         assert!(prompt.contains("end-user tester"));
         assert!(!prompt.contains("Scrutinize the codebase"));
+        // QA-labeled issues are the authoritative test plan.
+        assert!(prompt.contains("authoritative test plan"));
+        assert!(prompt.contains("Always read the QA issues file first"));
+        assert!(prompt.contains("Mandatory first read"));
+        assert!(prompt.contains("acceptance criteria"));
+        assert!(prompt.contains("QA-labeled issue instructions override this prompt"));
+        // Ops/liveness endpoints banned unless an issue asks.
+        assert!(prompt.contains("liveness/ops endpoints"));
+        assert!(prompt.contains("/ping"));
+        assert!(prompt.contains("/monitor"));
+        assert!(prompt.contains("/health"));
+        // Knowledge hygiene / reconcile with issues.
+        assert!(prompt.contains("Reconcile them with the QA issues"));
+        assert!(prompt.contains("drop the stale pattern"));
         // File locations.
         assert!(prompt.contains("/sessions/qa-0_qa_issues.md"));
         assert!(prompt.contains("/sessions/qa-0_qa_knowledge"));
