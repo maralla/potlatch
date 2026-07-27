@@ -263,7 +263,7 @@ impl Tool for ShellTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `file_write` or `file_edit` instead. To run a long-running command in the background, set `background: true`; you get a job id back and can poll its output later with `job_id`, or terminate it with `job_id` + `kill: true`.",
+            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `file_write` or `file_edit` instead. To run a long-running command in the background, set `background: true`; you get a job id back and can poll its output later with `job_id`, or terminate it with `job_id` + `kill: true`. Set `outside_cwd: true` when you legitimately need to `cd` into or operate on a path outside the working directory (e.g. an agent session directory explicitly permitted by the task instructions).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -286,6 +286,11 @@ impl Tool for ShellTool {
                     "kill": {
                         "type": "boolean",
                         "description": "When true with `job_id`, terminate the background job."
+                    },
+                    "outside_cwd": {
+                        "type": "boolean",
+                        "description": "When true, suppress the warning about `cd`-ing to a path outside the working directory. Use this when the task instructions explicitly direct you to operate on a path outside the workspace (e.g. running a script from an agent session directory). Default false.",
+                        "default": false
                     }
                 },
                 "required": []
@@ -311,13 +316,20 @@ impl Tool for ShellTool {
             .ok_or_else(|| anyhow::anyhow!("missing 'command' argument"))?;
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(self.timeout_secs);
         let background = args["background"].as_bool().unwrap_or(false);
+        let outside_cwd = args["outside_cwd"].as_bool().unwrap_or(false);
 
         // Detect wrong-directory `cd` prefixes and warn. We don't strip or
         // modify the command — if the model cd's to the wrong path, the
         // command fails naturally, which is clearer feedback than silently
         // fixing it. The warning is prepended to the tool result so the model
-        // sees it.
-        let cd_warning = detect_wrong_cd(command, cwd);
+        // sees it. Suppressed when the caller explicitly opted into operating
+        // outside the working directory (e.g. running a script from an agent
+        // session directory).
+        let cd_warning = if outside_cwd {
+            None
+        } else {
+            detect_wrong_cd(command, cwd)
+        };
 
         // Detect file-writing patterns and log a warning. We don't block the
         // command (some legitimate uses exist, e.g. `git commit` writes files),
@@ -559,6 +571,7 @@ fn looks_like_file_write(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::tools::test_util;
 
     #[test]
     fn runs_echo_command() {
@@ -677,6 +690,43 @@ mod tests {
     fn detect_wrong_cd_treats_trailing_slash_as_same() {
         // /tmp and /tmp/ are the same directory.
         assert!(detect_wrong_cd("cd /tmp/ && echo hi", "/tmp").is_none());
+    }
+
+    #[test]
+    fn execute_suppresses_cd_warning_when_outside_cwd_true() {
+        // The QA agent legitimately `cd`s into its session test-scripts dir to
+        // run scripts. With outside_cwd: true, the wrong-directory cd warning
+        // must not appear in the tool result.
+        let tool = ShellTool::new();
+        let temp = test_util::unique_test_dir();
+        let outside = temp.path().to_path_buf();
+        let args = json!({
+            "command": format!("cd {} && echo ran", outside.to_string_lossy()),
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, "/tmp").unwrap();
+        assert!(
+            !result.contains("not the working directory"),
+            "no cd warning expected with outside_cwd, got: {result}"
+        );
+        assert!(result.contains("ran"));
+    }
+
+    #[test]
+    fn execute_warns_on_cd_outside_when_outside_cwd_absent() {
+        // Default (outside_cwd false/absent): a cd to a path that isn't cwd
+        // still produces the warning.
+        let tool = ShellTool::new();
+        let temp = test_util::unique_test_dir();
+        let outside = temp.path().to_path_buf();
+        let args = json!({
+            "command": format!("cd {} && echo ran", outside.to_string_lossy())
+        });
+        let result = tool.execute(&args, "/tmp").unwrap();
+        assert!(
+            result.contains("not the working directory"),
+            "expected cd warning without outside_cwd, got: {result}"
+        );
     }
 
     #[test]

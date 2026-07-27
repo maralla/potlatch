@@ -909,7 +909,10 @@ fn should_skip_issue(issue: &Issue) -> bool {
         return true;
     }
 
-    if issue.labels.contains(&"do-not-implement".to_string()) {
+    if issue
+        .labels
+        .contains(&super::labels::DO_NOT_IMPLEMENT.to_string())
+    {
         return true;
     }
 
@@ -3583,7 +3586,7 @@ mod tests {
         assert!(should_skip_issue(&issue));
 
         issue.title = "Normal issue".to_string();
-        issue.labels = vec!["do-not-implement".to_string()];
+        issue.labels = vec![super::super::labels::DO_NOT_IMPLEMENT.to_string()];
         assert!(should_skip_issue(&issue));
 
         issue.labels = vec![WORKING_ON_LABEL.to_string()];
