@@ -1,6 +1,7 @@
 //! LLM client: trait + OpenAI-compatible implementation with streaming.
 
 use std::io::{BufRead, BufReader};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -164,22 +165,46 @@ pub struct ChatResponse {
 ///
 /// Works with any backend that implements the OpenAI `/v1/chat/completions`
 /// and `/v1/models` API (vLLM, llama.cpp, Ollama, OpenRouter, etc.).
+///
+/// The underlying `reqwest::blocking::Client` (and thus its HTTP connection
+/// pool) is held behind a `Mutex` so it can be swapped for a fresh client on a
+/// transient failure. A pooled connection that produced an error may be in a
+/// bad state; reusing it for a retry would just fail again. On each transient
+/// failure we drop the old client and build a new one, so the retry opens a
+/// brand-new connection from a fresh pool.
 pub struct OpenAiClient {
     base_url: String,
     api_key: String,
-    client: reqwest::blocking::Client,
+    client: Mutex<reqwest::blocking::Client>,
 }
 
 impl OpenAiClient {
     pub fn new(base_url: String, api_key: String) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        let client = Self::build_client();
         Self {
             base_url,
             api_key,
-            client,
+            client: Mutex::new(client),
+        }
+    }
+
+    /// Build a fresh `reqwest::blocking::Client` with the harness's standard
+    /// timeout. Each call produces an independent connection pool, used to
+    /// discard a poisoned pool after a transient failure.
+    fn build_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    }
+
+    /// Replace the pooled client with a fresh one, dropping the old connection
+    /// pool. Called after a transient failure so the retry doesn't reuse a
+    /// connection that may be in a bad state.
+    fn reset_client(&self) {
+        let new_client = Self::build_client();
+        if let Ok(mut guard) = self.client.lock() {
+            *guard = new_client;
         }
     }
 
@@ -198,12 +223,17 @@ impl OpenAiClient {
 impl ChatClient for OpenAiClient {
     fn list_models(&self) -> Result<Vec<String>> {
         let url = self.url("/models");
-        let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .context("GET /v1/models")?;
+        let resp = {
+            let client = self
+                .client
+                .lock()
+                .map_err(|_| anyhow::anyhow!("client lock poisoned"))?;
+            client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .send()
+                .context("GET /v1/models")?
+        };
         let body: Value = resp.json().context("parse /v1/models response")?;
         let models = body["data"]
             .as_array()
@@ -226,43 +256,18 @@ impl ChatClient for OpenAiClient {
         on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
     ) -> Result<ChatResponse> {
         let url = self.url("/chat/completions");
-        let spec = ModelSpec::parse(model);
-
-        let mut body = json!({
-            "model": spec.model,
-            "messages": messages,
-            "stream": true,
-            // Ask the backend to include token usage in the final SSE chunk.
-            "stream_options": {"include_usage": true},
-        });
-        if !spec.thinking {
-            // Disable thinking/reasoning tokens. Model1 (and other reasoning
-            // models served via sglang/vLLM) honor this chat-template kwarg to
-            // skip the `<think>...</think>` phase entirely. This eliminates
-            // reasoning_tokens (typically 100-500 per turn) that dominate
-            // decode time without improving output quality for coding tasks.
-            // Harmless on backends that don't recognize it.
-            body["chat_template_kwargs"] = json!({"enable_thinking": false});
-        }
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-        }
+        let body = build_chat_body(model, messages, tools);
 
         let started = Instant::now();
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .context("POST /v1/chat/completions")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().unwrap_or_default();
-            anyhow::bail!("LLM request failed ({}): {}", status, text);
-        }
+        // Send the request with transient-failure retry. The retry wraps only
+        // the request-send + status-check phase — once a 200 response arrives
+        // and we start reading the SSE stream, the streaming callbacks have
+        // fired and we can't transparently retry. On each transient failure we
+        // drop the pooled client and build a fresh one so the retry opens a
+        // brand-new connection (a pooled connection that produced the error
+        // may be in a bad state and reusing it would just fail again).
+        let resp = self.send_with_retry(&url, &body)?;
 
         // Parse SSE stream line-by-line (true streaming, not buffering the whole response)
         let mut content = String::new();
@@ -441,6 +446,163 @@ impl ChatClient for OpenAiClient {
             elapsed_ms: elapsed.as_millis(),
         })
     }
+}
+
+impl OpenAiClient {
+    /// Send a single chat-completion request. Locks the pooled client, sends
+    /// the request, and checks the HTTP status. Returns the streaming
+    /// `Response` on success. The lock is released as soon as `send()` returns
+    /// — reading the SSE body later does not hold the lock.
+    fn send_request(&self, url: &str, body: &Value) -> Result<reqwest::blocking::Response> {
+        let client = self
+            .client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client lock poisoned"))?;
+        let resp = client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .context("POST /v1/chat/completions")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().unwrap_or_default();
+            anyhow::bail!("LLM request failed ({}): {}", status, text);
+        }
+
+        Ok(resp)
+    }
+
+    /// Send a chat-completion request with transient-failure retry. On each
+    /// transient failure (network error, 429, 5xx), the pooled client is
+    /// replaced with a fresh one so the retry opens a new connection — the
+    /// failed connection may be in a bad state and reusing it would just fail
+    /// again. Permanent errors (400, 401, 403, 404) propagate immediately.
+    fn send_with_retry(&self, url: &str, body: &Value) -> Result<reqwest::blocking::Response> {
+        const MAX_ATTEMPTS: u32 = 5;
+        const INITIAL_DELAY: Duration = Duration::from_secs(1);
+        const MAX_DELAY: Duration = Duration::from_secs(30);
+
+        let mut attempt = 0u32;
+        let mut delay = INITIAL_DELAY;
+        loop {
+            attempt += 1;
+            match self.send_request(url, body) {
+                Ok(resp) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            "harness: LLM request succeeded after {} attempt(s)",
+                            attempt
+                        );
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    if attempt >= MAX_ATTEMPTS || !is_transient_llm_error(&e) {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        "harness: LLM request failed (attempt {attempt}/{MAX_ATTEMPTS}), \
+                         resetting connection and retrying in {delay:?}: {e:#}"
+                    );
+                    self.reset_client();
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(MAX_DELAY);
+                }
+            }
+        }
+    }
+}
+
+/// Build the JSON request body for a chat-completion request.
+fn build_chat_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
+    let spec = ModelSpec::parse(model);
+
+    let mut body = json!({
+        "model": spec.model,
+        "messages": messages,
+        "stream": true,
+        // Ask the backend to include token usage in the final SSE chunk.
+        "stream_options": {"include_usage": true},
+    });
+    if !spec.thinking {
+        // Disable thinking/reasoning tokens. Model1 (and other reasoning
+        // models served via sglang/vLLM) honor this chat-template kwarg to
+        // skip the reasoning phase entirely. This eliminates reasoning_tokens
+        // (typically 100-500 per turn) that dominate decode time without
+        // improving output quality for coding tasks. Harmless on backends
+        // that don't recognize it.
+        body["chat_template_kwargs"] = json!({"enable_thinking": false});
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+    }
+    body
+}
+
+/// Whether an LLM API error is worth retrying. Transient errors include
+/// network-level failures (timeouts, connection resets, TLS blips) and
+/// transient HTTP status codes (429 rate-limit, 500/502/503/504 server errors).
+/// Permanent client/validation errors (400, 401, 403, 404) propagate
+/// immediately without retry.
+fn is_transient_llm_error(err: &anyhow::Error) -> bool {
+    // Search the full error chain — reqwest wraps the underlying network error
+    // as a source, and our own `.context()` adds another layer.
+    let full = err
+        .chain()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let m = full.to_lowercase();
+
+    // Permanent client/validation errors — repeating the request won't help.
+    // Note: 400 is handled specially by the agent loop (malformed tool-call
+    // sanitization), so it must propagate immediately rather than being
+    // retried at the client level.
+    if m.contains("400 bad request")
+        || m.contains("401 unauthorized")
+        || m.contains("403 forbidden")
+        || m.contains("404 not found")
+        || m.contains("405 method not allowed")
+        || m.contains("422 unprocessable entity")
+    {
+        return false;
+    }
+
+    // Transient HTTP status codes: rate-limit and server-side errors.
+    if m.contains("429")
+        || m.contains("500 internal server error")
+        || m.contains("502 bad gateway")
+        || m.contains("503 service unavailable")
+        || m.contains("504 gateway timeout")
+    {
+        return true;
+    }
+
+    // Network-level failures (the request never completed — no HTTP status).
+    // These are always potentially transient.
+    if m.contains("timed out")
+        || m.contains("timeout")
+        || m.contains("connection refused")
+        || m.contains("connection reset")
+        || m.contains("connection closed")
+        || m.contains("broken pipe")
+        || m.contains("tls")
+        || m.contains("dns")
+        || m.contains("lookup")
+        || m.contains("connect error")
+        || m.contains("network")
+        || m.contains("eof")
+    {
+        return true;
+    }
+
+    // Default: treat unknown errors as transient. A spurious retry is cheaper
+    // than failing a long-running agent task on a one-off blip, and the retry
+    // count is bounded.
+    true
 }
 
 /// Fake LLM client for testing — returns scripted responses in sequence.
@@ -622,5 +784,102 @@ mod tests {
         let spec = ModelSpec::parse("");
         assert_eq!(spec.model, "");
         assert!(!spec.thinking);
+    }
+
+    // --- is_transient_llm_error classifier tests ---
+
+    #[test]
+    fn transient_error_retries_429_rate_limit() {
+        let err = anyhow::anyhow!("LLM request failed (429 Too Many Requests): rate limited");
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_retries_500_server_error() {
+        let err = anyhow::anyhow!("LLM request failed (500 Internal Server Error): upstream boom");
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_retries_502_bad_gateway() {
+        let err = anyhow::anyhow!("LLM request failed (502 Bad Gateway): bad gateway");
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_retries_503_service_unavailable() {
+        let err =
+            anyhow::anyhow!("LLM request failed (503 Service Unavailable): temporarily overloaded");
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_retries_504_gateway_timeout() {
+        let err = anyhow::anyhow!("LLM request failed (504 Gateway Timeout): upstream timed out");
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_retries_network_timeout() {
+        let err = anyhow::anyhow!("POST /v1/chat/completions: operation timed out");
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_retries_connection_reset() {
+        let err = anyhow::anyhow!("POST /v1/chat/completions: connection reset by peer");
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_retries_tls_handshake_failure() {
+        let err = anyhow::anyhow!(
+            "POST /v1/chat/completions: error sending request: error trying to connect: \
+             error:0A000418:SSL routines:tls_construct_server_key_exchange:tlsv1 alert unknown ca"
+        );
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_retries_dns_lookup_failure() {
+        let err = anyhow::anyhow!(
+            "POST /v1/chat/completions: error sending request: dns error: failed to lookup address"
+        );
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_retries_connection_refused() {
+        let err =
+            anyhow::anyhow!("POST /v1/chat/completions: error sending request: connection refused");
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_does_not_retry_400_bad_request() {
+        // 400 is permanent — handled by the agent loop's malformed-tool-call
+        // sanitization, not retried at the client level.
+        let err = anyhow::anyhow!(
+            "LLM request failed (400 Bad Request): function.arguments must be valid JSON"
+        );
+        assert!(!is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_does_not_retry_401_unauthorized() {
+        let err = anyhow::anyhow!("LLM request failed (401 Unauthorized): invalid api key");
+        assert!(!is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_does_not_retry_403_forbidden() {
+        let err = anyhow::anyhow!("LLM request failed (403 Forbidden): no access");
+        assert!(!is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn transient_error_does_not_retry_404_not_found() {
+        let err = anyhow::anyhow!("LLM request failed (404 Not Found): model not found");
+        assert!(!is_transient_llm_error(&err));
     }
 }
