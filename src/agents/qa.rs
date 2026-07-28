@@ -524,9 +524,27 @@ fn qa_cycle(
     }
 
     // --- Update SHA history ---
-
-    sha_history.0.insert(branch.to_string(), cur_sha.clone());
-    save_sha_history(state, &sha_history);
+    //
+    // Record the current commit as tested ONLY when the run actually performed
+    // testing — i.e. it emitted findings (including an empty findings array,
+    // which means "tested, no bugs found"). When the run produced only
+    // clarification questions, the commit was NOT tested: the model couldn't
+    // proceed without an answer. Recording the SHA here would make the next
+    // cycle skip this commit entirely, so the feature would never get tested
+    // once the clarification is answered. Skip the SHA update in that case so
+    // the next cycle re-tests the same commit.
+    let had_findings_block = agent_output.response.contains(QA_FINDINGS_BEGIN);
+    let is_clarification_only =
+        !clarification_questions.is_empty() && !had_findings_block && findings.is_empty();
+    if is_clarification_only {
+        info!(
+            "{}: Skipping SHA history update for {} — run produced only clarification questions, commit not yet tested",
+            state.agent_id, cur_sha
+        );
+    } else {
+        sha_history.0.insert(branch.to_string(), cur_sha.clone());
+        save_sha_history(state, &sha_history);
+    }
 
     Ok(())
 }
@@ -831,9 +849,10 @@ Use `git log --oneline -5` and the changed files above to identify which feature
 3. Read your knowledge files under `{knowledge_dir}/` to recall prior context. **Reconcile them with the QA issues:** if anything in your knowledge files contradicts the current QA-labeled issues (e.g. your knowledge records a "regression" check against `/ops/ping` but a QA issue says not to test ops APIs), update your knowledge now to match the issues and drop the stale pattern. Do not carry forward behavior the issues have disavowed.
 4. Identify the feature delivered by this commit (from the changed files + `git log`) and match it to the relevant QA-labeled issue(s) in `{qa_issues_path}`.
 5. For each matched issue, verify its acceptance criteria end-to-end as an end user against the **real functionality APIs** the issue concerns. Author Python test scripts under `{test_scripts_dir}/` and run them via `python3` (`shell` with `outside_cwd: true`). Update or add scripts as needed. Each test must assert the issue's stated criteria, not your own assumptions about the code. Do not append unrelated liveness/ops checks.
-6. Before reporting any finding, check it against `{open_issues_path}`. Skip a finding if an open issue already covers the same root cause — do not file a duplicate.
-7. Update your knowledge files under `{knowledge_dir}/` with anything new you learned, including which issues you verified and their results. When recording results, record what you actually tested (the functionality APIs and the outcome), not a generic "regression PASS" label.
-8. If an issue's acceptance criteria are ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
+6. **Run regression tests for all tracked test cases.** After testing the new commit's features, read `{knowledge_dir}/test_cases.md` — your curated list of every test case you have identified across all previous cycles. Re-run each test case against the current system state. A commit that delivers one feature can break an unrelated feature — regressions are the whole point of maintaining a tracked test case library. If a previously-passing test case now fails, report it as a finding (severity: high or critical). If a test case is no longer relevant because its feature was removed or its issue was closed, note that in `test_cases.md` (mark it retired) but do not report it as a finding. If `test_cases.md` is empty or does not yet exist (first run), skip this step. When you add a new test case in step 5, also add it to `test_cases.md` so future cycles regression-test it.
+7. Before reporting any finding, check it against `{open_issues_path}`. Skip a finding if an open issue already covers the same root cause — do not file a duplicate.
+8. Update your knowledge files under `{knowledge_dir}/` with anything new you learned, including which issues you verified and their results. When recording results, record what you actually tested (the functionality APIs and the outcome), not a generic "regression PASS" label.
+9. If an issue's acceptance criteria are ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
 
 Report genuine bugs, security vulnerabilities, race conditions, correctness issues, and incomplete feature implementations you encounter **while testing as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
 
@@ -1126,6 +1145,10 @@ mod tests {
         assert!(prompt.contains("Never report a duplicate finding"));
         assert!(prompt.contains("already tracked"));
         assert!(prompt.contains("root cause"));
+        // Regression testing of all tracked test cases.
+        assert!(prompt.contains("Run regression tests for all tracked test cases"));
+        assert!(prompt.contains("test_cases.md"));
+        assert!(prompt.contains("regressions are the whole point"));
         // Git context.
         assert!(prompt.contains("main"));
         assert!(prompt.contains("abc123"));
