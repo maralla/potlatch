@@ -187,17 +187,30 @@ fn resolve_project_id(host: &str, project_path: &str) -> Result<u64> {
         "projects?search={}&membership=true&simple=true&per_page=50",
         search_term
     );
-    let output = Command::new("glab")
-        .args(["api", "--hostname", host, &endpoint])
-        .output()
-        .with_context(|| format!("Failed to resolve GitLab project id for {project_path}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "Failed to resolve GitLab project id for {}: {}",
-            project_path,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    // This runs once per agent at startup, concurrently across all GitLab agents
+    // (worker/reviewer/pmo/ops/qa). It is the only glab call that wasn't retried,
+    // so a single transient blip (TLS timeout, 502, rate-limit) while N agents race
+    // to resolve the same project id would kill agent startup nondeterministically.
+    // Wrap it in the same transient-retry policy every other glab call uses.
+    let output = with_transient_retries(
+        &format!("resolve GitLab project id for {project_path} on {host}"),
+        || {
+            let output = Command::new("glab")
+                .args(["api", "--hostname", host, &endpoint])
+                .output()
+                .with_context(|| {
+                    format!("Failed to resolve GitLab project id for {project_path}")
+                })?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "Failed to resolve GitLab project id for {}: {}",
+                    project_path,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(output)
+        },
+    )?;
     #[derive(Deserialize)]
     struct ProjectHit {
         id: u64,

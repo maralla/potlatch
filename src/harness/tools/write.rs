@@ -1,4 +1,4 @@
-//! File write tool: create or overwrite files.
+//! Write tool: create or overwrite files.
 
 use std::fs;
 
@@ -7,16 +7,16 @@ use serde_json::{Value, json};
 
 use super::Tool;
 
-pub struct FileWriteTool;
+pub struct WriteTool;
 
-impl Tool for FileWriteTool {
+impl Tool for WriteTool {
     fn name(&self) -> &str {
-        "file_write"
+        "write"
     }
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Create a new file or overwrite an existing file with the given content. Creates parent directories if needed. Use this for new files; prefer file_edit for modifying existing files. By default paths must be relative to the working directory; set outside_cwd: true to write to an absolute path outside the workspace (only for agent-managed scratch files explicitly permitted by the task instructions).",
+            "description": "Create a new file or overwrite an existing file with the given content. Creates parent directories if needed. Use this for new files; prefer edit for modifying existing files. By default paths must be relative to the working directory; set outside_cwd: true to write to an absolute path outside the workspace (only for agent-managed scratch files explicitly permitted by the task instructions).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -83,7 +83,7 @@ mod tests {
     fn creates_new_file() {
         let dir = test_util::unique_test_dir();
 
-        let tool = FileWriteTool;
+        let tool = WriteTool;
         let args = json!({
             "path": "new.txt",
             "content": "line one\nline two\n"
@@ -101,7 +101,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         std::fs::write(dir.path().join("over.txt"), "old content").unwrap();
 
-        let tool = FileWriteTool;
+        let tool = WriteTool;
         let args = json!({
             "path": "over.txt",
             "content": "new content"
@@ -117,7 +117,7 @@ mod tests {
     fn creates_parent_directories() {
         let dir = test_util::unique_test_dir();
 
-        let tool = FileWriteTool;
+        let tool = WriteTool;
         let args = json!({
             "path": "nested/deep/file.txt",
             "content": "nested"
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn rejects_absolute_path() {
         let dir = test_util::unique_test_dir();
-        let tool = FileWriteTool;
+        let tool = WriteTool;
         let args = json!({
             "path": "/tmp/evil.txt",
             "content": "bad"
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn rejects_parent_traversal() {
         let dir = test_util::unique_test_dir();
-        let tool = FileWriteTool;
+        let tool = WriteTool;
         let args = json!({
             "path": "../escape.txt",
             "content": "bad"
@@ -158,7 +158,7 @@ mod tests {
         let outside = test_util::unique_test_dir();
         let target = outside.path().join("outside.txt");
 
-        let tool = FileWriteTool;
+        let tool = WriteTool;
         let args = json!({
             "path": target.to_string_lossy(),
             "content": "from outside",
@@ -177,7 +177,7 @@ mod tests {
         let outside = test_util::unique_test_dir();
         let target = outside.path().join("nested/deep/script.py");
 
-        let tool = FileWriteTool;
+        let tool = WriteTool;
         let args = json!({
             "path": target.to_string_lossy(),
             "content": "print('hi')",
@@ -195,7 +195,7 @@ mod tests {
         let target = outside.path().join("existing.txt");
         std::fs::write(&target, "old").unwrap();
 
-        let tool = FileWriteTool;
+        let tool = WriteTool;
         let args = json!({
             "path": target.to_string_lossy(),
             "content": "new",
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn outside_cwd_defaults_to_false_when_absent() {
         let dir = test_util::unique_test_dir();
-        let tool = FileWriteTool;
+        let tool = WriteTool;
         // No outside_cwd field — must still reject absolute paths.
         let args = json!({
             "path": "/tmp/evil.txt",

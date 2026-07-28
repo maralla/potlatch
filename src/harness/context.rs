@@ -761,7 +761,7 @@ mod tests {
                 &[json!({
                     "id": format!("call_{i}"),
                     "type": "function",
-                    "function": {"name": "file_edit", "arguments": "{}"}
+                    "function": {"name": "edit", "arguments": "{}"}
                 })],
             );
             ctx.push_tool_result(
@@ -847,7 +847,7 @@ mod tests {
             &[json!({
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "file_write", "arguments": "{\"path\":\"hi.py\",\"content\":\"print('hi')\"}"}
+                "function": {"name": "write", "arguments": "{\"path\":\"hi.py\",\"content\":\"print('hi')\"}"}
             })],
         );
         ctx.push_tool_result(ContextKind::EditResult, "wrote hi.py", "call_1");
@@ -868,7 +868,7 @@ mod tests {
             json!({
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "file_read", "arguments": ""}
+                "function": {"name": "read", "arguments": ""}
             }),
             json!({
                 "id": "call_2",
@@ -892,7 +892,7 @@ mod tests {
         let tool_calls = vec![json!({
             "id": "call_1",
             "type": "function",
-            "function": {"name": "file_read", "arguments": "{\"path\":"}
+            "function": {"name": "read", "arguments": "{\"path\":"}
         })];
         let sanitized = sanitize_tool_calls(&tool_calls);
         assert_eq!(sanitized[0]["function"]["arguments"], "{}");
@@ -903,7 +903,7 @@ mod tests {
         let tool_calls = vec![json!({
             "id": "call_1",
             "type": "function",
-            "function": {"name": "file_read", "arguments": "{\"files\":[{\"path\":\"a.rs\"}]}"}
+            "function": {"name": "read", "arguments": "{\"files\":[{\"path\":\"a.rs\"}]}"}
         })];
         let sanitized = sanitize_tool_calls(&tool_calls);
         assert_eq!(
@@ -924,7 +924,7 @@ mod tests {
             &[json!({
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "file_read", "arguments": ""}
+                "function": {"name": "read", "arguments": ""}
             })],
         );
         let messages = ctx.to_messages();
@@ -952,7 +952,7 @@ mod tests {
             "tool_calls": [{
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "file_read", "arguments": ""}
+                "function": {"name": "read", "arguments": ""}
             }]
         })
         .to_string();
@@ -979,7 +979,7 @@ mod tests {
             &[json!({
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "file_read", "arguments": "{\"files\":[]}"}
+                "function": {"name": "read", "arguments": "{\"files\":[]}"}
             })],
         );
         // Arguments are already valid — no change.

@@ -1574,7 +1574,7 @@ CRITICAL REQUIREMENTS:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly.
-2. The task context is already included above. Review the "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context" sections. Do NOT use file_read on the task context — it's already in your prompt.
+2. The task context is already included above. Review the "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context" sections. Do NOT use read on the task context — it's already in your prompt.
 3. Use inline comment locations (`path:line` or `path:start-end`) from the comments to find the corresponding code and make targeted fixes. Grep for the relevant symbol, read only the surrounding lines, then edit.
 4. First, check for merge conflicts using the **Merge conflict status** section and your workspace. If any exist, resolve ALL conflicts in every file, commit the resolution, and verify the target branch merges cleanly before claiming completion.
 5. Review the original issue and what was implemented
@@ -3018,7 +3018,7 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly for implementation, tests, linting, and documentation rules.
-2. The task context is already included above. Do NOT use file_read on it — review it from your prompt, then start implementing.
+2. The task context is already included above. Do NOT use read on it — review it from your prompt, then start implementing.
 3. Analyze the issue and comments carefully
 4. Estimate the number of changed lines:
    - Non-test, non-generated code: should stay around ~500 lines
@@ -3106,7 +3106,7 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly for implementation, tests, linting, and documentation rules.
-2. The task context is already included above. Do NOT use file_read on it — review it from your prompt.
+2. The task context is already included above. Do NOT use read on it — review it from your prompt.
 3. Review the existing changes in the current branch
 4. Analyze what has been done and what remains
 5. Estimate total changed lines (including existing + remaining work):
@@ -3165,7 +3165,7 @@ fn get_common_requirements() -> &'static str {
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
 - Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed. PMO guidance appears as a comment starting with **PMO guidance for the worker agent:** — treat the body of that comment as authoritative worker instructions and follow it exactly.
 - Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules (see MANDATORY OUTPUT): not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments
-- ACT QUICKLY. The task context is already in your prompt — do not read it from disk. After reading AGENTS.md, grep for the first symbol you need to change, read the surrounding lines, and make the edit. Do not write long analysis prose — each turn should produce a tool call that makes progress (a grep, a read, or an edit). If you catch yourself writing more than 2 sentences of "Let me analyze..." or "I notice that...", stop and make the edit instead. The first file_edit should happen within your first 5 tool calls."#
+- ACT QUICKLY. The task context is already in your prompt — do not read it from disk. After reading AGENTS.md, grep for the first symbol you need to change, read the surrounding lines, and make the edit. Do not write long analysis prose — each turn should produce a tool call that makes progress (a grep, a read, or an edit). If you catch yourself writing more than 2 sentences of "Let me analyze..." or "I notice that...", stop and make the edit instead. The first edit should happen within your first 5 tool calls."#
 }
 
 fn get_evidence_bound_scope_bullets() -> &'static str {

@@ -1,4 +1,4 @@
-//! Web fetch tool: HTTP GET to retrieve web page content, with proper HTML-to-text conversion.
+//! Fetch tool: HTTP GET to retrieve web page content, with proper HTML-to-text conversion.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -7,11 +7,11 @@ use super::Tool;
 
 const MAX_OUTPUT: usize = 50_000;
 
-pub struct WebFetchTool {
+pub struct FetchTool {
     client: reqwest::blocking::Client,
 }
 
-impl WebFetchTool {
+impl FetchTool {
     pub fn new() -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -22,15 +22,15 @@ impl WebFetchTool {
     }
 }
 
-impl Default for WebFetchTool {
+impl Default for FetchTool {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Tool for WebFetchTool {
+impl Tool for FetchTool {
     fn name(&self) -> &str {
-        "web_fetch"
+        "fetch"
     }
 
     fn schema(&self) -> Value {

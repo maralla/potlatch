@@ -1,6 +1,6 @@
-//! File read tool: read one or more files with line numbers.
+//! Read tool: read one or more files with line numbers.
 //!
-//! [`FileReadTool`] takes a `files` array of `{path, start_line?, end_line?}`
+//! [`ReadTool`] takes a `files` array of `{path, start_line?, end_line?}`
 //! objects. Reads run concurrently; per-file errors are reported inline and do
 //! not block the other reads. Very large files are truncated with a marker.
 //!
@@ -16,11 +16,11 @@ use serde_json::{Value, json};
 
 use super::Tool;
 
-pub struct FileReadTool;
+pub struct ReadTool;
 
-impl Tool for FileReadTool {
+impl Tool for ReadTool {
     fn name(&self) -> &str {
-        "file_read"
+        "read"
     }
 
     fn schema(&self) -> Value {
@@ -206,7 +206,7 @@ mod tests {
         writeln!(f, "line two").unwrap();
         writeln!(f, "line three").unwrap();
 
-        let tool = FileReadTool;
+        let tool = ReadTool;
         let args = json!({"files": [{"path": "test.txt"}]});
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("line one"));
@@ -224,7 +224,7 @@ mod tests {
             writeln!(f, "line {i}").unwrap();
         }
 
-        let tool = FileReadTool;
+        let tool = ReadTool;
         let args = json!({
             "files": [{"path": "range.txt", "start_line": 3, "end_line": 5}]
         });
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn errors_on_missing_file() {
         let dir = test_util::unique_test_dir();
-        let tool = FileReadTool;
+        let tool = ReadTool;
         let args = json!({"files": [{"path": "nonexistent.txt"}]});
         // The tool itself returns Ok with an inline "Error:" — a missing file
         // is a per-file failure, not a whole-call failure.
@@ -256,14 +256,14 @@ mod tests {
         let cwd = test_util::unique_test_dir();
         let abs = external.path().join("external.txt");
         let args = json!({"files": [{"path": abs.to_str().unwrap()}]});
-        let result = FileReadTool.execute(&args, cwd.as_str()).unwrap();
+        let result = ReadTool.execute(&args, cwd.as_str()).unwrap();
         assert!(result.contains("external content"));
     }
 
     #[test]
     fn errors_on_missing_absolute_path() {
         let dir = test_util::unique_test_dir();
-        let tool = FileReadTool;
+        let tool = ReadTool;
         let args = json!({"files": [{"path": "/nonexistent/path/file.txt"}]});
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("Error"));
@@ -276,7 +276,7 @@ mod tests {
         std::fs::write(dir.path().join("b.txt"), "beta\nbeta2\n").unwrap();
         std::fs::write(dir.path().join("c.rs"), "fn main() {}\n").unwrap();
 
-        let tool = FileReadTool;
+        let tool = ReadTool;
         let args = json!({
             "files": [
                 {"path": "a.txt"},
@@ -297,7 +297,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         std::fs::write(dir.path().join("ok.txt"), "good\n").unwrap();
 
-        let tool = FileReadTool;
+        let tool = ReadTool;
         let args = json!({
             "files": [
                 {"path": "ok.txt"},
@@ -319,7 +319,7 @@ mod tests {
             writeln!(f, "line {i}").unwrap();
         }
 
-        let tool = FileReadTool;
+        let tool = ReadTool;
         let args = json!({
             "files": [
                 {"path": "nums.txt", "start_line": 1, "end_line": 2},
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn rejects_empty_files_array() {
         let dir = test_util::unique_test_dir();
-        let tool = FileReadTool;
+        let tool = ReadTool;
         let args = json!({"files": []});
         let result = tool.execute(&args, dir.as_str());
         assert!(result.is_err());
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn rejects_missing_files_array() {
         let dir = test_util::unique_test_dir();
-        let tool = FileReadTool;
+        let tool = ReadTool;
         let args = json!({});
         let result = tool.execute(&args, dir.as_str());
         assert!(result.is_err());

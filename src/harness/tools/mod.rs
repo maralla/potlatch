@@ -1,14 +1,14 @@
 //! Tool trait and registry.
 
-pub mod file_edit;
-pub mod file_read;
-pub mod file_write;
+pub mod edit;
+pub mod fetch;
 pub mod memory;
 pub mod plan_tool;
+pub mod read;
 pub mod search;
 pub mod shell;
 pub mod todo;
-pub mod web_fetch;
+pub mod write;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ pub fn resolve_workspace_path(path: &str, cwd: &str) -> Result<PathBuf, String> 
     let resolved = cwd_path.join(path);
 
     // Canonicalize both the cwd and the resolved path to detect `..` escapes.
-    // If canonicalization fails (file doesn't exist yet for file_write), use lexical normalization.
+    // If canonicalization fails (file doesn't exist yet for write), use lexical normalization.
     let canonical_cwd = cwd_path
         .canonicalize()
         .unwrap_or_else(|_| cwd_path.to_path_buf());
@@ -100,7 +100,7 @@ pub fn resolve_read_path(path: &str, cwd: &str) -> Result<PathBuf, String> {
 /// (e.g. QA) that manage their own scratch files in a dedicated session
 /// directory outside the checked-out repo. This is no weaker than the `shell`
 /// tool, which can already write anywhere via `bash -c`; the in-workspace guard
-/// in `file_write` is a footgun guardrail, not a security boundary.
+/// in `write` is a footgun guardrail, not a security boundary.
 pub fn resolve_write_path(path: &str, cwd: &str, outside_cwd: bool) -> Result<PathBuf, String> {
     if outside_cwd {
         let p = Path::new(path);
@@ -193,12 +193,12 @@ impl ToolRegistry {
     pub fn with_builtin_tools() -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(shell::ShellTool::new()));
-        reg.register(Arc::new(file_read::FileReadTool));
-        reg.register(Arc::new(file_edit::FileEditTool));
-        reg.register(Arc::new(file_write::FileWriteTool));
+        reg.register(Arc::new(read::ReadTool));
+        reg.register(Arc::new(edit::EditTool));
+        reg.register(Arc::new(write::WriteTool));
         reg.register(Arc::new(search::GrepTool));
         reg.register(Arc::new(search::GlobTool));
-        reg.register(Arc::new(web_fetch::WebFetchTool::new()));
+        reg.register(Arc::new(fetch::FetchTool::new()));
         reg
     }
 
@@ -211,7 +211,7 @@ impl ToolRegistry {
     }
 
     /// Unregister a tool by name. No-op when the tool isn't registered.
-    /// Used by mode-specific gating (e.g. plan mode drops `file_edit` so the
+    /// Used by mode-specific gating (e.g. plan mode drops `edit` so the
     /// model can't mutate files while triaging).
     pub fn unregister(&mut self, name: &str) {
         if self.tools.remove(name).is_some() {
@@ -400,18 +400,18 @@ mod tests {
     #[test]
     fn unregister_removes_tool_from_registry() {
         let mut reg = ToolRegistry::with_builtin_tools();
-        assert!(reg.tool_names().contains(&"file_edit"));
-        reg.unregister("file_edit");
-        assert!(!reg.tool_names().contains(&"file_edit"));
+        assert!(reg.tool_names().contains(&"edit"));
+        reg.unregister("edit");
+        assert!(!reg.tool_names().contains(&"edit"));
         // Schemas reflect the removal too.
         let schemas = reg.tools_schema();
         let names: Vec<String> = schemas
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap_or("").to_string())
             .collect();
-        assert!(!names.contains(&"file_edit".to_string()));
+        assert!(!names.contains(&"edit".to_string()));
         // Execution now fails with "unknown tool".
-        let res = reg.execute("file_edit", &json!({}), "/tmp");
+        let res = reg.execute("edit", &json!({}), "/tmp");
         assert!(res.is_err());
     }
 
@@ -427,12 +427,12 @@ mod tests {
     #[test]
     fn unregister_preserves_order_of_remaining_tools() {
         let mut reg = ToolRegistry::with_builtin_tools();
-        reg.unregister("file_edit");
+        reg.unregister("edit");
         let names = reg.tool_names();
-        // file_edit was in the middle; the rest keep their relative order.
+        // edit was in the middle; the rest keep their relative order.
         let pos_shell = names.iter().position(|n| *n == "shell").unwrap();
-        let pos_read = names.iter().position(|n| *n == "file_read").unwrap();
-        let pos_write = names.iter().position(|n| *n == "file_write").unwrap();
+        let pos_read = names.iter().position(|n| *n == "read").unwrap();
+        let pos_write = names.iter().position(|n| *n == "write").unwrap();
         let pos_grep = names.iter().position(|n| *n == "grep").unwrap();
         assert!(pos_shell < pos_read);
         assert!(pos_read < pos_write);
