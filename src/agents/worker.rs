@@ -1316,7 +1316,7 @@ fn process_issue(
     // the branch diverges from the base at all.
     state.git_repo.add_all()?;
 
-    let mr_title = extract_mr_title(&agent_output);
+    let mr_title = extract_mr_title(&agent_output, &issue.title);
 
     if state.git_repo.has_staged_changes()? {
         let commit_message = build_commit_message(&mr_title, issue.iid);
@@ -1703,12 +1703,8 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     // reviewer asked for a better title), update the MR metadata.
     let new_title = extract_explicit_mr_title(&agent_output);
     let new_desc = extract_explicit_mr_description(&agent_output);
-    if new_title != "Implementation changes" || new_desc != "Implementation completed." {
-        let title = if new_title != "Implementation changes" {
-            &new_title
-        } else {
-            &latest_mr.title
-        };
+    if new_title.is_some() || new_desc != "Implementation completed." {
+        let title = new_title.as_deref().unwrap_or(&latest_mr.title);
 
         let desc = if new_desc != "Implementation completed." {
             &new_desc
@@ -3345,7 +3341,12 @@ fn extract_waiting_on_mr_iid(labels: &[String]) -> Option<u64> {
     })
 }
 
-fn extract_mr_title(agent_output: &AgentHandoff) -> String {
+/// Extract the MR title the agent emitted, falling back to the issue title
+/// (not a generic placeholder like "Implementation changes") when the agent
+/// didn't provide one. The issue title is always meaningful and specific to
+/// the work, so it's a far better default than a placeholder that produces
+/// a stream of indistinguishable MRs.
+fn extract_mr_title(agent_output: &AgentHandoff, issue_title: &str) -> String {
     if let Some(block) =
         extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
     {
@@ -3404,22 +3405,30 @@ fn extract_mr_title(agent_output: &AgentHandoff) -> String {
         }
     }
 
-    "Implementation changes".to_string()
+    // No title extracted from the agent output — fall back to the issue title,
+    // which is always specific to the work. Never use a generic placeholder.
+    issue_title.to_string()
 }
 
-fn extract_explicit_mr_title(agent_output: &AgentHandoff) -> String {
+/// Extract an explicit MR title the agent emitted (for metadata updates on
+/// follow-up turns). Returns `None` when the agent didn't provide one, so the
+/// caller can distinguish "no title provided" from "title provided". Unlike
+/// [`extract_mr_title`], this does NOT fall back to CHANGES_SUMMARY or the
+/// issue title — a metadata update should only overwrite the title when the
+/// agent explicitly said to.
+fn extract_explicit_mr_title(agent_output: &AgentHandoff) -> Option<String> {
     if let Some(block) =
         extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
     {
         let cleaned = strip_markdown_formatting(block.trim());
         if !cleaned.is_empty() {
-            return cleaned;
+            return Some(cleaned);
         }
     }
     if let Some(title) = &agent_output.mr_title {
         let cleaned = strip_markdown_formatting(title.trim());
         if !cleaned.is_empty() {
-            return cleaned;
+            return Some(cleaned);
         }
     }
     if let Some(pos) = agent_output.response.find("MR_TITLE:") {
@@ -3431,10 +3440,10 @@ fn extract_explicit_mr_title(agent_output: &AgentHandoff) -> String {
         };
         let cleaned = strip_markdown_formatting(raw);
         if !cleaned.is_empty() {
-            return cleaned;
+            return Some(cleaned);
         }
     }
-    "Implementation changes".to_string()
+    None
 }
 
 fn strip_markdown_formatting(s: &str) -> String {
@@ -3726,10 +3735,28 @@ mod tests {
             response: "CHANGES_SUMMARY: Fix reviewer follow-up lint issue.".to_string(),
             ..Default::default()
         };
-        assert_eq!(extract_explicit_mr_title(&output), "Implementation changes");
+        // extract_explicit_mr_title returns None when no MR_TITLE marker is
+        // present (it must not pick up CHANGES_SUMMARY).
+        assert_eq!(extract_explicit_mr_title(&output), None);
+        // extract_mr_title falls back to CHANGES_SUMMARY, then to the issue
+        // title when no marker and no CHANGES_SUMMARY are present.
         assert_eq!(
-            extract_mr_title(&output),
+            extract_mr_title(&output, "Issue title"),
             "Fix reviewer follow-up lint issue."
+        );
+    }
+
+    #[test]
+    fn extract_mr_title_falls_back_to_issue_title_when_no_marker() {
+        // When the agent emits neither MR_TITLE nor CHANGES_SUMMARY, the MR
+        // title falls back to the issue title — never a generic placeholder.
+        let output = AgentHandoff {
+            response: "I made some changes.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_mr_title(&output, "Add login rate limiting"),
+            "Add login rate limiting"
         );
     }
 
@@ -4027,8 +4054,11 @@ mod tests {
             response: "MR_TITLE_BEGIN\nStable title\nMR_TITLE_END\nMR_TITLE: fallback".to_string(),
             ..Default::default()
         };
-        assert_eq!(extract_mr_title(&output), "Stable title");
-        assert_eq!(extract_explicit_mr_title(&output), "Stable title");
+        assert_eq!(extract_mr_title(&output, "Issue title"), "Stable title");
+        assert_eq!(
+            extract_explicit_mr_title(&output),
+            Some("Stable title".into())
+        );
     }
 
     #[test]
