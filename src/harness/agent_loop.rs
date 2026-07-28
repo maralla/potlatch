@@ -346,9 +346,9 @@ impl AgentLoop {
                         .collect();
 
                     // Only run concurrently when every call is read-only.
-                    // If any call is to a mutating tool (file_write, file_edit,
+                    // If any call is to a mutating tool (write, edit,
                     // shell), run all calls sequentially in order to preserve
-                    // dependencies (e.g. `mkdir` before `file_write`).
+                    // dependencies (e.g. `mkdir` before `write`).
                     let all_read_only = parsed.iter().all(|(name, _, _)| is_read_only_tool(name));
 
                     let cache = early_cache_for_exec.lock().unwrap();
@@ -608,8 +608,8 @@ impl AgentLoop {
     /// `(tool_name, tool_call_id, result_string)`.
     ///
     /// Concurrency is only used when **every** call is to a read-only tool
-    /// (`file_read`, `grep`, `glob`, `web_fetch`). If any call is to a mutating
-    /// tool (`file_write`, `file_edit`, `shell`), all calls run sequentially in
+    /// (`read`, `grep`, `glob`, `fetch`). If any call is to a mutating
+    /// tool (`write`, `edit`, `shell`), all calls run sequentially in
     /// order to preserve dependencies.
     fn execute_tool_calls_concurrent(
         &self,
@@ -702,11 +702,11 @@ impl AgentLoop {
 fn classify_tool_result(tool_name: &str, _result: &str) -> ContextKind {
     match tool_name {
         "shell" => ContextKind::ShellOutput,
-        "file_read" => ContextKind::FileRead,
-        "file_edit" => ContextKind::EditResult,
-        "file_write" => ContextKind::EditResult,
+        "read" => ContextKind::FileRead,
+        "edit" => ContextKind::EditResult,
+        "write" => ContextKind::EditResult,
         "grep" | "glob" => ContextKind::Exploration,
-        "web_fetch" => ContextKind::WebFetch,
+        "fetch" => ContextKind::WebFetch,
         "plan" | "todo" | "memory" => ContextKind::ToolResult,
         _ => ContextKind::ToolResult,
     }
@@ -719,9 +719,9 @@ const MAX_TOOL_RESULT_CHARS: usize = 4_000;
 
 /// Whether a tool is read-only (no side effects). Read-only tools can be
 /// executed concurrently safely; mutating tools must run in order to preserve
-/// dependencies (e.g. `mkdir` before `file_write`).
+/// dependencies (e.g. `mkdir` before `write`).
 fn is_read_only_tool(name: &str) -> bool {
-    matches!(name, "file_read" | "grep" | "glob" | "web_fetch")
+    matches!(name, "read" | "grep" | "glob" | "fetch")
 }
 
 /// Check whether an LLM API error is caused by malformed tool call arguments
@@ -917,13 +917,13 @@ mod tests {
 
     #[test]
     fn is_read_only_tool_classifies_correctly() {
-        assert!(is_read_only_tool("file_read"));
+        assert!(is_read_only_tool("read"));
         assert!(is_read_only_tool("grep"));
         assert!(is_read_only_tool("glob"));
-        assert!(is_read_only_tool("web_fetch"));
+        assert!(is_read_only_tool("fetch"));
 
-        assert!(!is_read_only_tool("file_write"));
-        assert!(!is_read_only_tool("file_edit"));
+        assert!(!is_read_only_tool("write"));
+        assert!(!is_read_only_tool("edit"));
         assert!(!is_read_only_tool("shell"));
         assert!(!is_read_only_tool("unknown_tool"));
     }
@@ -985,7 +985,7 @@ mod tests {
     fn loop_executes_mixed_tool_calls_in_order() {
         // When the model issues both read-only and mutating tool calls in one
         // turn, all calls must run sequentially (not concurrently) to preserve
-        // dependencies. We verify by issuing file_write then file_read on the
+        // dependencies. We verify by issuing write then read on the
         // same path — if they ran concurrently the read might see the old state.
         let dir = super::super::tools::test_util::unique_test_dir();
 
@@ -996,12 +996,12 @@ mod tests {
                     json!({
                         "id": "call_1",
                         "type": "function",
-                        "function": {"name": "file_write", "arguments": format!("{{\"path\":\"out.txt\",\"content\":\"written\"}}")}
+                        "function": {"name": "write", "arguments": format!("{{\"path\":\"out.txt\",\"content\":\"written\"}}")}
                     }),
                     json!({
                         "id": "call_2",
                         "type": "function",
-                        "function": {"name": "file_read", "arguments": "{\"files\":[{\"path\":\"out.txt\"}]}"}
+                        "function": {"name": "read", "arguments": "{\"files\":[{\"path\":\"out.txt\"}]}"}
                     }),
                 ],
                 finish_reason: "tool_calls".into(),
@@ -1025,7 +1025,7 @@ mod tests {
 
         let result = agent.run("write then read", dir.as_str(), None).unwrap();
         assert!(result.contains("Done"));
-        // The file_read result should contain the content written by file_write,
+        // The read result should contain the content written by write,
         // proving sequential execution preserved the order.
         let written = std::fs::read_to_string(dir.path().join("out.txt")).unwrap_or_default();
         assert_eq!(written, "written");
@@ -1250,7 +1250,7 @@ mod tests {
             "id": "call_1",
             "type": "function",
             "function": {
-                "name": "file_read",
+                "name": "read",
                 "arguments": "{\"files\":[{\"path\":\"target.txt\"}]}"
             }
         });
@@ -1361,7 +1361,7 @@ mod tests {
                 tool_calls: vec![json!({
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "file_read", "arguments": "{\"files\":[]}"}
+                    "function": {"name": "read", "arguments": "{\"files\":[]}"}
                 })],
                 finish_reason: "tool_calls".into(),
                 usage: super::super::client::Usage::default(),

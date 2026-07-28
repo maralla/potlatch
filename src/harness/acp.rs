@@ -229,12 +229,12 @@ impl AcpServer {
         tools.register(Arc::new(super::tools::shell::ShellTool::with_job_table(
             jobs,
         )));
-        // In plan mode: drop `file_edit` (the PMO triages and decides, it
+        // In plan mode: drop `edit` (the PMO triages and decides, it
         // must not mutate code) and let the agent loop register the `plan`
         // tool. The ACP runtime sets the mode via session/set_config_option
         // with configId=mode when PMO requests plan mode.
         let mut agent = if mode == "plan" {
-            tools.unregister("file_edit");
+            tools.unregister("edit");
             AgentLoop::new_with_plan_mode(
                 Arc::clone(&self.llm),
                 tools,
@@ -741,15 +741,15 @@ mod tests {
         let tools = run_session_prompt_in_mode("plan");
         assert!(tools.contains(&"plan".to_string()), "plan tool registered");
         assert!(
-            !tools.contains(&"file_edit".to_string()),
-            "file_edit must NOT be registered in plan mode"
+            !tools.contains(&"edit".to_string()),
+            "edit must NOT be registered in plan mode"
         );
     }
 
     #[test]
     fn non_plan_mode_keeps_file_edit_registered() {
         let tools = run_session_prompt_in_mode("");
-        assert!(tools.contains(&"file_edit".to_string()));
+        assert!(tools.contains(&"edit".to_string()));
         assert!(!tools.contains(&"plan".to_string()));
     }
 }

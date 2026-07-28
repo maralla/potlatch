@@ -263,7 +263,7 @@ impl Tool for ShellTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `file_write` or `file_edit` instead. To run a long-running command in the background, set `background: true`; you get a job id back and can poll its output later with `job_id`, or terminate it with `job_id` + `kill: true`. Set `outside_cwd: true` when you legitimately need to `cd` into or operate on a path outside the working directory (e.g. an agent session directory explicitly permitted by the task instructions).",
+            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `write` or `edit` instead. To run a long-running command in the background, set `background: true`; you get a job id back and can poll its output later with `job_id`, or terminate it with `job_id` + `kill: true`. Set `outside_cwd: true` when you legitimately need to `cd` into or operate on a path outside the working directory (e.g. an agent session directory explicitly permitted by the task instructions).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -336,7 +336,7 @@ impl Tool for ShellTool {
         // but we surface it so the model gets feedback in the next turn's logs.
         if looks_like_file_write(command) {
             tracing::warn!(
-                "harness: shell command appears to write files directly — use file_write/file_edit instead: {}",
+                "harness: shell command appears to write files directly — use write/edit instead: {}",
                 command.chars().take(200).collect::<String>()
             );
         }
@@ -542,7 +542,7 @@ fn detect_wrong_cd(command: &str, cwd: &str) -> Option<String> {
 }
 
 /// Detect shell patterns that create or modify files directly, bypassing the
-/// sandboxed `file_write`/`file_edit` tools. Returns true for patterns like
+/// sandboxed `write`/`edit` tools. Returns true for patterns like
 /// `cat > file`, `echo > file`, `sed -i`, `tee file`, `cp`, `mv` into the
 /// workspace. Does NOT match `git`, `go build`, `mkdir`, or read-only commands.
 fn looks_like_file_write(command: &str) -> bool {

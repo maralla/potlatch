@@ -1,7 +1,7 @@
-//! File edit tool: str_replace one or more edits, with line-number anchored
+//! Edit tool: str_replace one or more edits, with line-number anchored
 //! errors, fuzzy near-match suggestions, and read-after-edit verification.
 //!
-//! [`FileEditTool`] takes an `edits` array of `{path, old_string, new_string}`
+//! [`EditTool`] takes an `edits` array of `{path, old_string, new_string}`
 //! objects. Edits to the same file apply in order (an earlier edit may shift
 //! text a later edit references); edits to different files run concurrently.
 //! Per-edit errors are reported inline and do not block the other edits.
@@ -33,11 +33,11 @@ const MAX_MULTI_MATCHES: usize = 3;
 /// heuristics only.
 const MIN_FUZZY_NEEDLE_LEN: usize = 8;
 
-pub struct FileEditTool;
+pub struct EditTool;
 
-impl Tool for FileEditTool {
+impl Tool for EditTool {
     fn name(&self) -> &str {
-        "file_edit"
+        "edit"
     }
 
     fn schema(&self) -> Value {
@@ -614,7 +614,7 @@ mod tests {
     fn edits_file_successfully() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "hello world\nfoo bar\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "hello world", "new_string": "hello universe"}
@@ -632,7 +632,7 @@ mod tests {
     fn errors_on_no_match() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "hello world\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "nonexistent text", "new_string": "replacement"}
@@ -649,7 +649,7 @@ mod tests {
     fn errors_on_multiple_matches() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "dup\ndup\ndup\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "dup", "new_string": "unique"}
@@ -663,7 +663,7 @@ mod tests {
     fn read_after_edit_verification_included() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "fn old_name() {}\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "fn old_name() {}", "new_string": "fn new_name() {\n    // renamed\n}"}
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn rejects_absolute_path() {
         let dir = test_util::unique_test_dir();
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": "/etc/passwd", "old_string": "x", "new_string": "y"}
@@ -695,7 +695,7 @@ mod tests {
             "test.txt",
             "fn calculate_total() -> i32 {\n    42\n}\n",
         );
-        let tool = FileEditTool;
+        let tool = EditTool;
         // Small typo: calculat_total vs calculate_total
         let args = json!({
             "edits": [
@@ -712,7 +712,7 @@ mod tests {
     fn edits_single_file_multiple_edits_in_order() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "alpha\nbeta\ngamma\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "alpha", "new_string": "ALPHA"},
@@ -733,7 +733,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let a = make_test_file(&dir, "a.txt", "one\ntwo\n");
         let b = make_test_file(&dir, "b.txt", "three\nfour\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": a, "old_string": "one", "new_string": "ONE"},
@@ -754,7 +754,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let ok = make_test_file(&dir, "ok.txt", "good content\n");
         let bad = make_test_file(&dir, "bad.txt", "other content\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": ok, "old_string": "good content", "new_string": "GREAT"},
@@ -779,7 +779,7 @@ mod tests {
         // same in-memory buffer in order.
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "fn old() {}\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "fn old() {}", "new_string": "fn renamed() {\n    body\n}"},
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn rejects_empty_edits_array() {
         let dir = test_util::unique_test_dir();
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({"edits": []});
         let result = tool.execute(&args, dir.as_str());
         assert!(result.is_err());
@@ -807,7 +807,7 @@ mod tests {
     fn rejects_absolute_path_inline() {
         let dir = test_util::unique_test_dir();
         let ok = make_test_file(&dir, "ok.txt", "good\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": ok, "old_string": "good", "new_string": "GREAT"},
@@ -830,7 +830,7 @@ mod tests {
         let a = make_test_file(&dir, "a.txt", "1\n");
         let b = make_test_file(&dir, "b.txt", "2\n");
         let c = make_test_file(&dir, "c.txt", "3\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": c, "old_string": "3", "new_string": "C"},
@@ -854,7 +854,7 @@ mod tests {
         // rather than failing, so the work proceeds without a retry round-trip.
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "alpha\nbeta\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "path": name,
             "edits": [
@@ -878,7 +878,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let a = make_test_file(&dir, "a.txt", "one\n");
         let b = make_test_file(&dir, "b.txt", "two\n");
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "path": "a.txt",
             "edits": [
@@ -899,7 +899,7 @@ mod tests {
         // When no edit has a `path` AND there's no top-level `path`, the error
         // must clearly explain that `path` goes inside each edit object.
         let dir = test_util::unique_test_dir();
-        let tool = FileEditTool;
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"old_string": "alpha", "new_string": "ALPHA"}
