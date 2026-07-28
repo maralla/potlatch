@@ -100,6 +100,15 @@ impl AgentState {
         Path::new(&self.sessions_dir).join(format!("{}_qa_issues.md", self.agent_id))
     }
 
+    /// Path to a compact listing of *all* open project issues (not just
+    /// QA-labeled), refreshed each cycle. The model reads this to check
+    /// whether a finding is already tracked before reporting it, so the QA
+    /// agent doesn't file duplicates of issues other agents or humans have
+    /// already opened.
+    fn open_issues_path(&self) -> PathBuf {
+        Path::new(&self.sessions_dir).join(format!("{}_open_issues.md", self.agent_id))
+    }
+
     fn knowledge_dir(&self) -> PathBuf {
         Path::new(&self.sessions_dir).join(format!("{}_qa_knowledge", self.agent_id))
     }
@@ -310,11 +319,23 @@ fn qa_cycle(
         return Ok(());
     }
 
-    // --- Gather GitLab context: open QA-labeled issues ---
+    // --- Gather GitLab context: all open issues + QA-labeled subset ---
 
-    let qa_issues = fetch_qa_labeled_issues(state)?;
+    let all_issues = state.glab.list_issues()?;
+    let qa_issues: Vec<gitlab::Issue> = all_issues
+        .iter()
+        .filter(|i| i.labels.iter().any(|l| l == QA_LABEL))
+        .cloned()
+        .collect();
     let qa_issue_titles: Vec<String> = qa_issues.iter().map(|i| i.title.clone()).collect();
     write_qa_issues_context(state, &qa_issues)?;
+    write_open_issues_context(state, &all_issues)?;
+    debug!(
+        "{}: {} open issue(s) total, {} QA-labeled",
+        state.agent_id,
+        all_issues.len(),
+        qa_issues.len()
+    );
 
     if shutdown.load(Ordering::SeqCst) {
         return Ok(());
@@ -344,6 +365,7 @@ fn qa_cycle(
         },
         &AnalysisInput {
             qa_issues_path: &state.qa_issues_path().to_string_lossy(),
+            open_issues_path: &state.open_issues_path().to_string_lossy(),
             knowledge_dir: &state.knowledge_dir().to_string_lossy(),
             test_scripts_dir: &state.test_scripts_dir().to_string_lossy(),
         },
@@ -509,23 +531,6 @@ fn qa_cycle(
     Ok(())
 }
 
-/// Fetch all open issues carrying the QA label, sorted as GitLab returns them
-/// (by priority). These are the features/fixes the QA agent should test and
-/// any clarification threads it has opened.
-fn fetch_qa_labeled_issues(state: &AgentState) -> Result<Vec<gitlab::Issue>> {
-    let issues = state.glab.list_issues()?;
-    let qa_issues: Vec<_> = issues
-        .into_iter()
-        .filter(|i| i.labels.iter().any(|l| l == QA_LABEL))
-        .collect();
-    debug!(
-        "{}: Fetched {} open QA-labeled issue(s)",
-        state.agent_id,
-        qa_issues.len()
-    );
-    Ok(qa_issues)
-}
-
 /// Render the QA-labeled issues (with comments) to the agent's context file.
 /// The model reads this file directly; it never calls any tool to fetch GitLab.
 fn write_qa_issues_context(state: &AgentState, issues: &[gitlab::Issue]) -> Result<()> {
@@ -586,6 +591,70 @@ fn write_qa_issues_context(state: &AgentState, issues: &[gitlab::Issue]) -> Resu
     fs::write(&path, &out).with_context(|| format!("Failed to write {}", path.display()))?;
     debug!(
         "{}: Wrote QA issues context to {} ({} issue(s))",
+        state.agent_id,
+        path.display(),
+        issues.len()
+    );
+    Ok(())
+}
+
+/// Render a compact, dedup-oriented listing of *all* open project issues (not
+/// just QA-labeled ones) to a separate file. The model reads this to check
+/// whether a finding duplicates an issue that's already tracked — by the QA
+/// agent itself, another agent, or a human — before reporting it.
+///
+/// Only the title and a one-line description preview are included per issue;
+/// acceptance-criteria detail lives in the QA-issues file. Keeping this view
+/// compact lets the model scan the full open-issue set cheaply for duplicates
+/// without a second copy of every issue body.
+fn write_open_issues_context(state: &AgentState, issues: &[gitlab::Issue]) -> Result<()> {
+    let mut out = String::new();
+    out.push_str("# All open project issues (for duplicate checking)\n\n");
+    out.push_str(&format!(
+        "_Fetched by the QA harness on {}. Read this file before reporting a finding to check whether an issue with the same problem is already open. Do not report a finding that duplicates an issue listed here — reference the existing issue instead._\n\n",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
+    ));
+
+    if issues.is_empty() {
+        out.push_str("_No open issues. Every finding you report will be a new issue._\n");
+    } else {
+        out.push_str(&format!("_{} open issue(s) total._\n\n", issues.len()));
+        for issue in issues {
+            let labels = if issue.labels.is_empty() {
+                String::new()
+            } else {
+                format!(" `[{}]`", issue.labels.join(", "))
+            };
+            let preview: String = issue
+                .description
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(160)
+                .collect();
+            let preview = if preview.is_empty() {
+                String::new()
+            } else {
+                format!(" — {preview}")
+            };
+            out.push_str(&format!(
+                "- #{iid} — {title}{labels}{preview}\n",
+                iid = issue.iid,
+                title = issue.title
+            ));
+        }
+    }
+
+    let path = state.open_issues_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create sessions dir {}", parent.display()))?;
+    }
+    fs::write(&path, &out).with_context(|| format!("Failed to write {}", path.display()))?;
+    debug!(
+        "{}: Wrote open issues context to {} ({} issue(s))",
         state.agent_id,
         path.display(),
         issues.len()
@@ -682,6 +751,7 @@ struct GitContext<'a> {
 
 struct AnalysisInput<'a> {
     qa_issues_path: &'a str,
+    open_issues_path: &'a str,
     knowledge_dir: &'a str,
     test_scripts_dir: &'a str,
 }
@@ -697,6 +767,7 @@ fn build_qa_prompt(agent_id: &str, git: &GitContext, input: &AnalysisInput) -> S
     let prev_sha = git.prev_sha;
     let cur_sha = git.cur_sha;
     let qa_issues_path = input.qa_issues_path;
+    let open_issues_path = input.open_issues_path;
     let knowledge_dir = input.knowledge_dir;
     let test_scripts_dir = input.test_scripts_dir;
 
@@ -723,6 +794,8 @@ The harness has prepared the following absolute paths for you. Use `read` and `w
 
 - **Read** QA issues (harness-written; do not modify): `{qa_issues_path}`
   **Mandatory first read.** This file lists every open QA-labeled issue with its description and comments — your test plan and acceptance criteria. It also contains answers to clarification questions you have asked previously. Issues carrying the `do-not-implement` label are clarification threads (questions for humans, plus their answers) — absorb their answers, do not treat them as features to test. All other QA-labeled issues are features/fixes you must verify.
+- **Read** all open issues (harness-written; do not modify): `{open_issues_path}`
+  A compact listing of every open project issue — not just QA-labeled ones — with its iid, title, labels, and a one-line description preview. Read it before reporting a finding to check whether an issue is already tracked (by the QA agent, another agent, or a human). Do not report a finding that duplicates an issue listed here. This file is refreshed from GitLab at the start of every QA run, so it reflects the current open-issue set.
 - **Read/write** your knowledge (persists across runs): `{knowledge_dir}/`
   - `qa_context.md` — running notes, conventions, environment quirks
   - `test_cases.md` — the test cases you have identified
@@ -745,19 +818,22 @@ Use `git log --oneline -5` and the changed files above to identify which feature
 ## Hard Rules
 
 1. **Always read the QA issues file first.** Before any other action, read `{qa_issues_path}` with `read` (`outside_cwd: true`). Your testing must be driven by the QA-labeled issues it contains; do not improvise a test plan from the commit diff alone.
-2. **Never fetch GitLab yourself.** Do not call `glab`, `fetch`, or any tool to read issues/MRs/commits from GitLab. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` — read that file.
-3. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your `QA_FINDINGS` and `QA_CLARIFICATION` output blocks.
-4. **Never modify the working directory.** Do not use `write` or `edit` to create, modify, or delete anything inside the checked-out repo. Do not run `cd`, `git checkout`, `git commit`, or any command that mutates the repo tree.
-5. **Never run unit tests, build commands, or liveness/ops endpoints.** Do not run `cargo test`, `go test`, `go build`, `go vet`, `pytest`, `npm test`, or similar — these are the developer's responsibility and redundant for end-user testing; build commands also write artifacts into the repo. Do not test ops/liveness/health endpoints (`/ping`, `/monitor`, `/health`, `/metrics`, `/ready`, etc.) unless a QA-labeled issue explicitly asks you to — they are not functionality and testing them is noise. Allowed commands: `curl`/`python3` against real functionality APIs, invoking an already-built CLI binary the way a user would, and `python3` to run your own test scripts.
+2. **Never fetch GitLab yourself.** Do not call `glab`, `fetch`, or any tool to read issues/MRs/commits from GitLab. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` and the full open-issue listing into `{open_issues_path}` — read those files.
+3. **Never report a duplicate finding.** Before emitting a finding in `QA_FINDINGS`, read `{open_issues_path}` and check whether an open issue already describes the same problem (by the QA agent, another agent, or a human). If it does, do not report that finding — the issue is already tracked. Compare by the underlying problem, not just exact-title match: a finding about "login returns 500 on empty password" duplicates an issue titled "Auth API crashes on malformed input" even though the wording differs. Only report a finding if no open issue covers the same root cause.
+4. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your `QA_FINDINGS` and `QA_CLARIFICATION` output blocks.
+5. **Never modify the working directory.** Do not use `write` or `edit` to create, modify, or delete anything inside the checked-out repo. Do not run `cd`, `git checkout`, `git commit`, or any command that mutates the repo tree.
+6. **Never run unit tests, build commands, or liveness/ops endpoints.** Do not run `cargo test`, `go test`, `go build`, `go vet`, `pytest`, `npm test`, or similar — these are the developer's responsibility and redundant for end-user testing; build commands also write artifacts into the repo. Do not test ops/liveness/health endpoints (`/ping`, `/monitor`, `/health`, `/metrics`, `/ready`, etc.) unless a QA-labeled issue explicitly asks you to — they are not functionality and testing them is noise. Allowed commands: `curl`/`python3` against real functionality APIs, invoking an already-built CLI binary the way a user would, and `python3` to run your own test scripts.
 
 ## Your Task
 
 1. **Read `{qa_issues_path}` first** (`read`, `outside_cwd: true`). This is mandatory and non-negotiable — do not proceed without reading it.
-2. Read your knowledge files under `{knowledge_dir}/` to recall prior context. **Reconcile them with the QA issues:** if anything in your knowledge files contradicts the current QA-labeled issues (e.g. your knowledge records a "regression" check against `/ops/ping` but a QA issue says not to test ops APIs), update your knowledge now to match the issues and drop the stale pattern. Do not carry forward behavior the issues have disavowed.
-3. Identify the feature delivered by this commit (from the changed files + `git log`) and match it to the relevant QA-labeled issue(s) in `{qa_issues_path}`.
-4. For each matched issue, verify its acceptance criteria end-to-end as an end user against the **real functionality APIs** the issue concerns. Author Python test scripts under `{test_scripts_dir}/` and run them via `python3` (`shell` with `outside_cwd: true`). Update or add scripts as needed. Each test must assert the issue's stated criteria, not your own assumptions about the code. Do not append unrelated liveness/ops checks.
-5. Update your knowledge files under `{knowledge_dir}/` with anything new you learned, including which issues you verified and their results. When recording results, record what you actually tested (the functionality APIs and the outcome), not a generic "regression PASS" label.
-6. If an issue's acceptance criteria are ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
+2. Read `{open_issues_path}` (`read`, `outside_cwd: true`) to load the full open-issue set you'll dedup against when reporting findings.
+3. Read your knowledge files under `{knowledge_dir}/` to recall prior context. **Reconcile them with the QA issues:** if anything in your knowledge files contradicts the current QA-labeled issues (e.g. your knowledge records a "regression" check against `/ops/ping` but a QA issue says not to test ops APIs), update your knowledge now to match the issues and drop the stale pattern. Do not carry forward behavior the issues have disavowed.
+4. Identify the feature delivered by this commit (from the changed files + `git log`) and match it to the relevant QA-labeled issue(s) in `{qa_issues_path}`.
+5. For each matched issue, verify its acceptance criteria end-to-end as an end user against the **real functionality APIs** the issue concerns. Author Python test scripts under `{test_scripts_dir}/` and run them via `python3` (`shell` with `outside_cwd: true`). Update or add scripts as needed. Each test must assert the issue's stated criteria, not your own assumptions about the code. Do not append unrelated liveness/ops checks.
+6. Before reporting any finding, check it against `{open_issues_path}`. Skip a finding if an open issue already covers the same root cause — do not file a duplicate.
+7. Update your knowledge files under `{knowledge_dir}/` with anything new you learned, including which issues you verified and their results. When recording results, record what you actually tested (the functionality APIs and the outcome), not a generic "regression PASS" label.
+8. If an issue's acceptance criteria are ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
 
 Report genuine bugs, security vulnerabilities, race conditions, correctness issues, and incomplete feature implementations you encounter **while testing as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
 
@@ -1008,6 +1084,7 @@ mod tests {
             },
             &AnalysisInput {
                 qa_issues_path: "/sessions/qa-0_qa_issues.md",
+                open_issues_path: "/sessions/qa-0_open_issues.md",
                 knowledge_dir: "/sessions/qa-0_qa_knowledge",
                 test_scripts_dir: "/sessions/qa-0_test_scripts",
             },
@@ -1031,6 +1108,7 @@ mod tests {
         assert!(prompt.contains("drop the stale pattern"));
         // File locations.
         assert!(prompt.contains("/sessions/qa-0_qa_issues.md"));
+        assert!(prompt.contains("/sessions/qa-0_open_issues.md"));
         assert!(prompt.contains("/sessions/qa-0_qa_knowledge"));
         assert!(prompt.contains("/sessions/qa-0_test_scripts"));
         // outside_cwd usage instruction.
@@ -1044,6 +1122,10 @@ mod tests {
         assert!(prompt.contains("pytest"));
         // Cwd mutation ban.
         assert!(prompt.contains("Never modify the working directory"));
+        // Dedup against the full open-issue listing.
+        assert!(prompt.contains("Never report a duplicate finding"));
+        assert!(prompt.contains("already tracked"));
+        assert!(prompt.contains("root cause"));
         // Git context.
         assert!(prompt.contains("main"));
         assert!(prompt.contains("abc123"));
@@ -1072,6 +1154,7 @@ mod tests {
             },
             &AnalysisInput {
                 qa_issues_path: "/x/issues.md",
+                open_issues_path: "/x/open_issues.md",
                 knowledge_dir: "/x/knowledge",
                 test_scripts_dir: "/x/scripts",
             },
