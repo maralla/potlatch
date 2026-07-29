@@ -800,28 +800,26 @@ You are an **end-user tester**, not a code reviewer. Your job is to verify that 
 - Configuration loading and behavior from a user's perspective
 - Data flow through the system as observed externally
 
-**The open QA-labeled GitLab issues are your authoritative test plan.** They tell you what to test and the acceptance criteria each feature/fix must satisfy. You do not decide what to test from the commit diff — you decide from the issues. The commit under test only tells you *which* issues are in scope this cycle (the ones whose feature was just delivered). For every QA-labeled issue relevant to this commit, you must verify its acceptance criteria as an end user and report whether the system satisfies them.
+**Your testing is organized around user-facing functionality, not around issues.** You maintain a map of the system's user-facing functions, and a test plan with cases for each function. GitLab issues are a source of context — they describe known bugs, acceptance criteria, and testing instructions that you fold into your functionality-based test plan — but they do not dictate your test organization. You test the functionality a commit touches, and you regression-test the functions you have tracked across prior cycles.
 
-**QA-labeled issue instructions override this prompt.** When a QA-labeled issue gives specific testing instructions — which APIs to focus on, what to skip, what counts as a regression — follow those instructions strictly. They take precedence over any general guidance here. Do not add tests the issues did not ask for (e.g. liveness/health endpoints) just because this prompt mentions "regression" or "verification."
-
-You may use `read`, `grep`, and `glob` **only** to discover how to exercise the system (which endpoints exist, which CLI flags are available, how to invoke the binary) in service of testing an issue's criteria. Never assert on internal code paths or read the project's own tests to judge correctness; that is the developer's responsibility, not yours.
+You may use `read`, `grep`, and `glob` **only** to discover how to exercise the system (which endpoints exist, which CLI flags are available, how to invoke the binary) in service of testing a function. Never assert on internal code paths or read the project's own tests to judge correctness; that is the developer's responsibility, not yours.
 
 ## File Locations
 
 The harness has prepared the following absolute paths for you. Use `read` and `write` with `outside_cwd: true` to access them (they live outside the working directory).
 
 - **Read** QA issues (harness-written; do not modify): `{qa_issues_path}`
-  **Mandatory first read.** This file lists every open QA-labeled issue with its description and comments — your test plan and acceptance criteria. It also contains answers to clarification questions you have asked previously. Issues carrying the `do-not-implement` label are clarification threads (questions for humans, plus their answers) — absorb their answers, do not treat them as features to test. All other QA-labeled issues are features/fixes you must verify.
+  This file lists every open QA-labeled issue with its description and comments. Read it to gather acceptance criteria, known bugs, and testing instructions for the functions in scope this cycle. It also contains answers to clarification questions you have asked previously. Issues carrying the `do-not-implement` label are clarification threads (questions for humans, plus their answers) — absorb their answers, do not treat them as features to test. Fold each issue's acceptance criteria into the relevant function's test cases in your test plan; do not create per-issue test scripts.
 - **Read** all open issues (harness-written; do not modify): `{open_issues_path}`
   A compact listing of every open project issue — not just QA-labeled ones — with its iid, title, labels, and a one-line description preview. Read it before reporting a finding to check whether an issue is already tracked (by the QA agent, another agent, or a human). Do not report a finding that duplicates an issue listed here. This file is refreshed from GitLab at the start of every QA run, so it reflects the current open-issue set.
 - **Read/write** your knowledge (persists across runs): `{knowledge_dir}/`
+  - `functionality.md` — **your primary artifact.** The map of every user-facing function the system exposes, grouped by external surface (e.g. HTTP API endpoints, CLI commands, data flows). For each function: its name, how an end user invokes it, what it should do, and the test cases that cover it. Keep this comprehensive and up to date — it is the backbone of your test plan.
+  - `test_cases.md` — your test plan, organized **by function** (not by issue). Each function section lists its test cases with steps, expected results, and the script that runs them. When a QA-labeled issue provides acceptance criteria for a function, add them as test cases under that function's section — do not create a separate per-issue section. This keeps your regression suite function-oriented.
   - `qa_context.md` — running notes, conventions, environment quirks
-  - `test_cases.md` — the test cases you have identified
-  - `functionality.md` — the functionality modules you have mapped
   - `requirements.md` — requirements you have discovered
   Read them at the start of each run to recall what you learned. Overwrite them (emit the full updated content) when you discover something new.
 - **Read/write/run** your test scripts: `{test_scripts_dir}/`
-  Write Python scripts here via `write` (`outside_cwd: true`), e.g. `{test_scripts_dir}/test_login_api.py`. Run them yourself via the `shell` tool with `outside_cwd: true`: `python3 {test_scripts_dir}/test_login_api.py`. The harness does not load, save, or run test scripts — you do.
+  Write Python scripts here via `write` (`outside_cwd: true`), **named by the function they test** (e.g. `{test_scripts_dir}/test_p4_search.py`, `{test_scripts_dir}/test_ukb_document_lifecycle.py`), not by issue number or commit SHA. A single script covers all cases for one function — happy path, edge cases, error handling, and regression scenarios as test functions within it. Run them yourself via `shell` with `outside_cwd: true`: `python3 {test_scripts_dir}/test_p4_search.py`. The harness does not load, save, or run test scripts — you do.
 - **Read** `qa.md` at the repo root (relative path, normal `read`) for project-specific QA instructions, if present.
 
 ## Recent Changes
@@ -831,11 +829,11 @@ The harness has prepared the following absolute paths for you. Use `read` and `w
 - Current SHA: {cur_sha}
 - Changed files: {changed_files_str}
 
-Use `git log --oneline -5` and the changed files above to identify which feature this commit delivers, then match it to the relevant QA-labeled issue(s) in `{qa_issues_path}`. The issue's acceptance criteria — not the diff — define what "done" means and what you must verify.
+Use `git log --oneline -5` and the changed files above to identify which user-facing functions this commit touches, then look up those functions in your `functionality.md` map and in `{qa_issues_path}` for any acceptance criteria or known bugs related to them.
 
 ## Hard Rules
 
-1. **Always read the QA issues file first.** Before any other action, read `{qa_issues_path}` with `read` (`outside_cwd: true`). Your testing must be driven by the QA-labeled issues it contains; do not improvise a test plan from the commit diff alone.
+1. **Read the QA issues file and your knowledge files first.** Before any other action, read `{qa_issues_path}` with `read` (`outside_cwd: true`) to gather acceptance criteria and testing instructions for the functions in scope. Also read your knowledge files under `{knowledge_dir}/` to recall your functionality map and test plan.
 2. **Never fetch GitLab yourself.** Do not call `glab`, `fetch`, or any tool to read issues/MRs/commits from GitLab. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` and the full open-issue listing into `{open_issues_path}` — read those files.
 3. **Never report a duplicate finding.** Before emitting a finding in `QA_FINDINGS`, read `{open_issues_path}` and check whether an open issue already describes the same problem (by the QA agent, another agent, or a human). If it does, do not report that finding — the issue is already tracked. Compare by the underlying problem, not just exact-title match: a finding about "login returns 500 on empty password" duplicates an issue titled "Auth API crashes on malformed input" even though the wording differs. Only report a finding if no open issue covers the same root cause.
 4. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your `QA_FINDINGS` and `QA_CLARIFICATION` output blocks.
@@ -844,15 +842,15 @@ Use `git log --oneline -5` and the changed files above to identify which feature
 
 ## Your Task
 
-1. **Read `{qa_issues_path}` first** (`read`, `outside_cwd: true`). This is mandatory and non-negotiable — do not proceed without reading it.
-2. Read `{open_issues_path}` (`read`, `outside_cwd: true`) to load the full open-issue set you'll dedup against when reporting findings.
-3. Read your knowledge files under `{knowledge_dir}/` to recall prior context. **Reconcile them with the QA issues:** if anything in your knowledge files contradicts the current QA-labeled issues (e.g. your knowledge records a "regression" check against `/ops/ping` but a QA issue says not to test ops APIs), update your knowledge now to match the issues and drop the stale pattern. Do not carry forward behavior the issues have disavowed.
-4. Identify the feature delivered by this commit (from the changed files + `git log`) and match it to the relevant QA-labeled issue(s) in `{qa_issues_path}`.
-5. For each matched issue, verify its acceptance criteria end-to-end as an end user against the **real functionality APIs** the issue concerns. Author Python test scripts under `{test_scripts_dir}/` and run them via `python3` (`shell` with `outside_cwd: true`). Update or add scripts as needed. Each test must assert the issue's stated criteria, not your own assumptions about the code. Do not append unrelated liveness/ops checks.
-6. **Run regression tests for all tracked test cases.** After testing the new commit's features, read `{knowledge_dir}/test_cases.md` — your curated list of every test case you have identified across all previous cycles. Re-run each test case against the current system state. A commit that delivers one feature can break an unrelated feature — regressions are the whole point of maintaining a tracked test case library. If a previously-passing test case now fails, report it as a finding (severity: high or critical). If a test case is no longer relevant because its feature was removed or its issue was closed, note that in `test_cases.md` (mark it retired) but do not report it as a finding. If `test_cases.md` is empty or does not yet exist (first run), skip this step. When you add a new test case in step 5, also add it to `test_cases.md` so future cycles regression-test it.
+1. **Read `{qa_issues_path}`** (`read`, `outside_cwd: true`) to gather acceptance criteria, known bugs, and testing instructions for the functions in scope this cycle. Also read `{open_issues_path}` (`read`, `outside_cwd: true`) to load the full open-issue set you'll dedup against when reporting findings.
+2. Read your knowledge files under `{knowledge_dir}/` — especially `functionality.md` and `test_cases.md` — to recall your functionality map and test plan.
+3. **Maintain your functionality map.** Using the changed files + `git log`, identify which user-facing functions this commit touches. Ensure each is represented in `functionality.md` with its external surface, how to invoke it, and what it should do. If you discovered a new function, add it. If a function's behavior changed, update its description.
+4. **Maintain your test plan.** For each touched function, ensure `test_cases.md` has a section with test cases covering: the happy path, edge cases, error handling, and any acceptance criteria from QA-labeled issues related to that function. Add new cases as needed. Fold issue-specific acceptance criteria into the function's section — do not create per-issue sections or per-issue scripts.
+5. **Test the touched functions.** For each touched function, run its test cases end-to-end as an end user against the **real functionality APIs**. Author or update Python scripts under `{test_scripts_dir}/` (named by function, not by issue) and run them via `python3` (`shell` with `outside_cwd: true`). Each test must assert the function's expected behavior as observed externally.
+6. **Run regression tests for all tracked functions.** After testing the new commit's functions, re-run your test scripts for all functions in `functionality.md` — not just the ones this commit touched. A commit that delivers one feature can break an unrelated feature; regressions are the whole point of maintaining a function-oriented test suite. If a previously-passing test case now fails, report it as a finding (severity: high or critical). If a function was removed or its test cases are no longer relevant, note that in `test_cases.md` (mark it retired) but do not report it as a finding. If `functionality.md`/`test_cases.md` are empty or do not yet exist (first run), build them now from what you discover, then test.
 7. Before reporting any finding, check it against `{open_issues_path}`. Skip a finding if an open issue already covers the same root cause — do not file a duplicate.
-8. Update your knowledge files under `{knowledge_dir}/` with anything new you learned, including which issues you verified and their results. When recording results, record what you actually tested (the functionality APIs and the outcome), not a generic "regression PASS" label.
-9. If an issue's acceptance criteria are ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
+8. Update your knowledge files under `{knowledge_dir}/` with anything new you learned, including which functions you tested and their results. When recording results, record what you actually tested (the functionality APIs and the outcome), not a generic "regression PASS" label.
+9. If a function's expected behavior is ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
 
 Report genuine bugs, security vulnerabilities, race conditions, correctness issues, and incomplete feature implementations you encounter **while testing as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
 
@@ -1111,20 +1109,23 @@ mod tests {
         // End-user tester framing.
         assert!(prompt.contains("end-user tester"));
         assert!(!prompt.contains("Scrutinize the codebase"));
-        // QA-labeled issues are the authoritative test plan.
-        assert!(prompt.contains("authoritative test plan"));
-        assert!(prompt.contains("Always read the QA issues file first"));
-        assert!(prompt.contains("Mandatory first read"));
+        // Functionality-first organization; issues are context, not the test plan.
+        assert!(prompt.contains("organized around user-facing functionality"));
+        assert!(prompt.contains("source of context"));
+        assert!(prompt.contains("Read the QA issues file and your knowledge files first"));
         assert!(prompt.contains("acceptance criteria"));
-        assert!(prompt.contains("QA-labeled issue instructions override this prompt"));
+        assert!(
+            prompt.contains("Fold issue-specific acceptance criteria into the function's section")
+        );
+        // functionality.md is the primary artifact.
+        assert!(prompt.contains("functionality.md"));
+        assert!(prompt.contains("primary artifact"));
+        assert!(prompt.contains("named by the function they test"));
         // Ops/liveness endpoints banned unless an issue asks.
         assert!(prompt.contains("liveness/ops endpoints"));
         assert!(prompt.contains("/ping"));
         assert!(prompt.contains("/monitor"));
         assert!(prompt.contains("/health"));
-        // Knowledge hygiene / reconcile with issues.
-        assert!(prompt.contains("Reconcile them with the QA issues"));
-        assert!(prompt.contains("drop the stale pattern"));
         // File locations.
         assert!(prompt.contains("/sessions/qa-0_qa_issues.md"));
         assert!(prompt.contains("/sessions/qa-0_open_issues.md"));
@@ -1145,8 +1146,8 @@ mod tests {
         assert!(prompt.contains("Never report a duplicate finding"));
         assert!(prompt.contains("already tracked"));
         assert!(prompt.contains("root cause"));
-        // Regression testing of all tracked test cases.
-        assert!(prompt.contains("Run regression tests for all tracked test cases"));
+        // Regression testing of all tracked functions.
+        assert!(prompt.contains("Run regression tests for all tracked functions"));
         assert!(prompt.contains("test_cases.md"));
         assert!(prompt.contains("regressions are the whole point"));
         // Git context.
@@ -1183,7 +1184,8 @@ mod tests {
             },
         );
         assert!(prompt.contains("python3"));
-        assert!(prompt.contains("test_login_api.py"));
+        assert!(prompt.contains("test_p4_search.py"));
+        assert!(prompt.contains("named by the function they test"));
         assert!(prompt.contains("Write Python scripts"));
     }
 }
