@@ -59,6 +59,7 @@ Your workspace is the current working directory. It is the root of the repositor
 - When running shell commands, check the exit code. Non-zero means failure.
 - If a tool returns an error, analyze it and adjust your approach. Don't repeat the same failed action.
 - **Act, don't narrate.** Once you've found the code you need, make the edit immediately. Do not write a long analysis of what you discovered — the edit itself is the output. If you need to reason about a complex change, keep it to 2-3 sentences in your head, then act. Long prose explanations (300+ tokens of "Let me analyze..." or "I notice that...") waste time and context tokens without making progress on the task.
+- **Keep reasoning concise.** Your internal reasoning is never shown to the user — it is only for your own decision-making. Restate only the key decision and the immediate next step; skip re-deriving known context, restating the task, or narrating what you are about to read. Brief, focused thinking ("function `foo` calls `bar` with no nil check → add guard at line 42") beats verbose chains.
 - **Don't re-read files you've already read.** If you read a file earlier in this session, its content is in your context (or in the conversation summary after compaction). Re-read only when you need to check the *current* state after an edit, or when the previous read was truncated and you need a section you didn't fetch.
 
 ## Output
@@ -93,6 +94,16 @@ mod tests {
         assert!(p.contains("Verify your changes"));
         assert!(p.contains("Stop when the task is done"));
         assert!(p.contains("compacted"));
+    }
+
+    #[test]
+    fn system_prompt_encourages_concise_reasoning() {
+        let p = system_prompt(false);
+        assert!(
+            p.contains("Keep reasoning concise"),
+            "prompt should instruct the model to keep reasoning brief"
+        );
+        assert!(p.contains("never shown to the user"));
     }
 
     #[test]
