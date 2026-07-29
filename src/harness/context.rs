@@ -94,6 +94,13 @@ pub struct Context {
 /// assistant text is evictable since the model's intermediate narration
 /// ("Let me check...", "I'll now edit...") is low-value once the action is done.
 const KEEP_LAST_ASSISTANT_TEXT: usize = 3;
+
+/// Number of recent tool-call entries whose `reasoning_content` is preserved.
+/// Older tool-call entries have their reasoning stripped during budget
+/// pressure (the `tool_calls` JSON itself is always kept — only the thinking
+/// trace is dropped, since the tool result already reflects the outcome).
+const KEEP_LAST_REASONING: usize = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetAction {
     /// Context was within budget — no action taken.
@@ -104,6 +111,10 @@ pub enum BudgetAction {
     Truncated,
     /// Oldest evictable entries were removed entirely.
     Evicted,
+    /// `reasoning_content` was stripped from old tool-call entries to reclaim
+    /// tokens without breaking the tool-call chain. The `tool_calls` JSON and
+    /// recent reasoning (last [`KEEP_LAST_REASONING`] turns) are preserved.
+    ReasoningStripped,
     /// The entire conversation was collapsed into a summary (non-evictable
     /// entries exceeded the threshold).
     Collapsed,
@@ -155,6 +166,48 @@ impl Context {
     #[cfg(test)]
     pub fn entries(&self) -> &[ContextEntry] {
         &self.entries
+    }
+
+    /// Strip `reasoning_content` from old tool-call entries, preserving the
+    /// `tool_calls` JSON and the reasoning on the most recent
+    /// [`KEEP_LAST_REASONING`] tool-call entries. Returns true if any entry
+    /// was modified. This reclaims tokens from stale reasoning without breaking
+    /// the tool-call chain (which the OpenAI API requires to stay intact).
+    fn strip_old_reasoning(&mut self) -> bool {
+        // Count tool-call entries from the end to find the cutoff: entries with
+        // fewer than KEEP_LAST_REASONING tool-call entries after them keep
+        // their reasoning.
+        let mut tool_call_after: Vec<usize> = vec![0; self.entries.len()];
+        let mut running = 0usize;
+        for i in (0..self.entries.len()).rev() {
+            tool_call_after[i] = running;
+            if self.entries[i].kind == ContextKind::ToolCall {
+                running += 1;
+            }
+        }
+
+        let mut changed = false;
+        for (i, entry) in self.entries.iter_mut().enumerate() {
+            if entry.kind != ContextKind::ToolCall || tool_call_after[i] < KEEP_LAST_REASONING {
+                continue;
+            }
+            let Ok(mut msg) = serde_json::from_str::<Value>(&entry.content) else {
+                continue;
+            };
+            if msg.get("reasoning_content").is_none() {
+                continue;
+            }
+            msg.as_object_mut()
+                .expect("assistant tool-call message is a JSON object")
+                .remove("reasoning_content");
+            let new_content = msg.to_string();
+            let new_tokens = Self::estimate_tokens(&new_content) + 4;
+            self.total_tokens = self.total_tokens - entry.tokens + new_tokens;
+            entry.content = new_content;
+            entry.tokens = new_tokens;
+            changed = true;
+        }
+        changed
     }
 
     fn estimate_tokens(text: &str) -> usize {
@@ -341,6 +394,20 @@ impl Context {
         if self.total_tokens <= trigger {
             return BudgetAction::None;
         }
+
+        // Phase 0: Strip reasoning_content from old tool-call entries.
+        // Reasoning models (Model1, DeepSeek R1) emit a thinking trace that is
+        // re-injected so the model can build on recent reasoning. But once a
+        // tool call is several turns old, its reasoning is dead weight — the
+        // tool result already reflects the outcome. Stripping `reasoning_content`
+        // reclaims 100-500 tokens per entry without breaking the tool-call
+        // chain (the `tool_calls` JSON stays intact). Recent reasoning (last
+        // KEEP_LAST_REASONING turns) is preserved for chain-of-thought continuity.
+        if self.strip_old_reasoning() && self.total_tokens <= target {
+            return BudgetAction::ReasoningStripped;
+        }
+        // If still over target after stripping, continue to compaction/eviction.
+        // The reclaimed headroom may avoid a collapse.
 
         // Check if protected entries alone exceed the target.
         // If so, per-entry compaction won't help — we must collapse the conversation.
@@ -1117,5 +1184,157 @@ mod tests {
             assistant_msg.get("reasoning_content").is_none(),
             "reasoning_content should be absent when reasoning is empty"
         );
+    }
+
+    #[test]
+    fn strip_old_reasoning_removes_stale_reasoning_keeps_recent() {
+        // With KEEP_LAST_REASONING=2, the last 2 tool-call entries keep their
+        // reasoning; older ones have it stripped. The tool_calls JSON itself
+        // must survive so the OpenAI conversation stays valid.
+        // Use a small budget so the total exceeds the 60% trigger and forces
+        // enforce_budget to actually run its reduction phases.
+        let mut ctx = Context::new(200);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        // Four tool-call turns, each with reasoning.
+        for i in 0..4 {
+            ctx.push_assistant_with_tools(
+                Some(&format!("step {i}")),
+                &[json!({
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"}
+                })],
+                &format!("reasoning for step {i} that is long enough to matter"),
+            );
+            ctx.push_tool_result(
+                ContextKind::ShellOutput,
+                format!("result {i}"),
+                format!("call_{i}"),
+            );
+        }
+        // Sanity: total must exceed the 60% trigger (120) for stripping to run.
+        assert!(
+            ctx.total_tokens() > 120,
+            "test setup should exceed trigger, got {}",
+            ctx.total_tokens()
+        );
+
+        let before_tokens = ctx.total_tokens();
+        let action = ctx.enforce_budget(None, None);
+        // Stripping should have run. It may bring us under target (60) or not;
+        // either way reasoning on old entries is gone.
+        assert!(
+            action == BudgetAction::ReasoningStripped
+                || action == BudgetAction::Truncated
+                || action == BudgetAction::Evicted,
+            "expected a reduction action, got {action:?}"
+        );
+
+        let messages = ctx.to_messages();
+        // Find the assistant tool-call messages (entries with tool_calls).
+        let tool_call_msgs: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m.get("tool_calls").is_some())
+            .collect();
+        assert_eq!(
+            tool_call_msgs.len(),
+            4,
+            "tool-call entries must not be evicted"
+        );
+
+        // The last 2 keep reasoning; the first 2 have it stripped.
+        assert!(
+            tool_call_msgs[0].get("reasoning_content").is_none(),
+            "oldest tool-call reasoning should be stripped"
+        );
+        assert!(
+            tool_call_msgs[1].get("reasoning_content").is_none(),
+            "second-oldest tool-call reasoning should be stripped"
+        );
+        assert_eq!(
+            tool_call_msgs[2]["reasoning_content"],
+            "reasoning for step 2 that is long enough to matter"
+        );
+        assert_eq!(
+            tool_call_msgs[3]["reasoning_content"],
+            "reasoning for step 3 that is long enough to matter"
+        );
+        // tool_calls JSON is intact on all entries.
+        for (i, msg) in tool_call_msgs.iter().enumerate() {
+            assert_eq!(msg["tool_calls"][0]["function"]["name"], "shell");
+            assert_eq!(msg["tool_calls"][0]["id"], format!("call_{i}"));
+        }
+        // Tokens should not have increased.
+        assert!(
+            ctx.total_tokens() <= before_tokens,
+            "stripping reasoning should not increase tokens"
+        );
+    }
+
+    #[test]
+    fn strip_old_reasoning_preserves_entries_without_reasoning() {
+        // Tool-call entries that never had reasoning_content should be
+        // untouched (no spurious modification, no token change).
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        for i in 0..3 {
+            ctx.push_assistant_with_tools(
+                Some(&format!("step {i}")),
+                &[json!({
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"}
+                })],
+                "", // no reasoning
+            );
+            ctx.push_tool_result(
+                ContextKind::ShellOutput,
+                format!("result {i}"),
+                format!("call_{i}"),
+            );
+        }
+        let before = ctx.total_tokens();
+        let action = ctx.enforce_budget(None, None);
+        assert_eq!(action, BudgetAction::None, "nothing to strip");
+        assert_eq!(ctx.total_tokens(), before, "tokens unchanged");
+    }
+
+    #[test]
+    fn strip_old_reasoning_keeps_recent_two_when_fewer_entries() {
+        // With only 2 tool-call entries (== KEEP_LAST_REASONING), nothing is
+        // stripped even if reasoning is present.
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        for i in 0..2 {
+            ctx.push_assistant_with_tools(
+                Some(&format!("step {i}")),
+                &[json!({
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"}
+                })],
+                &format!("reasoning {i}"),
+            );
+            ctx.push_tool_result(
+                ContextKind::ShellOutput,
+                format!("result {i}"),
+                format!("call_{i}"),
+            );
+        }
+        let before = ctx.total_tokens();
+        let action = ctx.enforce_budget(None, None);
+        assert_eq!(action, BudgetAction::None);
+        assert_eq!(ctx.total_tokens(), before);
+        // Both still have reasoning.
+        let messages = ctx.to_messages();
+        let tool_call_msgs: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m.get("tool_calls").is_some())
+            .collect();
+        assert_eq!(tool_call_msgs[0]["reasoning_content"], "reasoning 0");
+        assert_eq!(tool_call_msgs[1]["reasoning_content"], "reasoning 1");
     }
 }
