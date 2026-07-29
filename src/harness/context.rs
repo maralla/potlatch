@@ -199,21 +199,25 @@ impl Context {
 
     /// Append an assistant message with tool_calls (the OpenAI format).
     ///
-    /// Reasoning content is intentionally NOT stored: it's intermediate
-    /// thinking already reflected in the subsequent tool calls and actions,
-    /// and re-injecting it on the next turn both wastes context tokens and
-    /// encourages the model to keep emitting long reasoning chains (which
-    /// dominate decode time at ~18ms/token). The streaming callback still
-    /// surfaces reasoning to the UI in real time if the model emits it.
+    /// Reasoning content is re-injected into the stored message so the model
+    /// can see its prior reasoning on the next turn and build on it instead of
+    /// re-deriving the same conclusions. The `reasoning_content` field is the
+    /// convention used by Model1, DeepSeek R1, and other reasoning models for
+    /// their thinking trace; backends that don't recognize it simply ignore it.
     ///
     /// Tool call arguments are sanitized: if the streamed `arguments` string
     /// is empty or not valid JSON, it is replaced with `"{}"`. This prevents
     /// the next API call from rejecting the conversation with a 400
     /// "function.arguments must be valid JSON" error when the model emits
     /// a malformed or truncated tool call.
-    pub fn push_assistant_with_tools(&mut self, text: Option<&str>, tool_calls: &[Value]) {
+    pub fn push_assistant_with_tools(
+        &mut self,
+        text: Option<&str>,
+        tool_calls: &[Value],
+        reasoning: &str,
+    ) {
         let sanitized = sanitize_tool_calls(tool_calls);
-        let content_json = if let Some(t) = text {
+        let mut msg = if let Some(t) = text {
             json!({
                 "role": "assistant",
                 "content": t,
@@ -226,7 +230,10 @@ impl Context {
                 "tool_calls": sanitized,
             })
         };
-        let content_str = content_json.to_string();
+        if !reasoning.is_empty() {
+            msg["reasoning_content"] = json!(reasoning);
+        }
+        let content_str = msg.to_string();
         let tokens = Self::estimate_tokens(&content_str) + 4;
         self.total_tokens += tokens;
         self.entries.push(ContextEntry {
@@ -238,9 +245,34 @@ impl Context {
         });
     }
 
-    /// Append a plain assistant text response.
+    /// Append a plain assistant text response, optionally with reasoning.
     pub fn push_assistant_text(&mut self, text: &str) {
         self.push(Role::Assistant, ContextKind::AssistantText, text);
+    }
+
+    /// Append an assistant text response with reasoning content re-injected,
+    /// so the model can see its prior reasoning on the next turn. Used for
+    /// `stop` turns where the model produced a final text answer after thinking.
+    pub fn push_assistant_text_with_reasoning(&mut self, text: &str, reasoning: &str) {
+        if reasoning.is_empty() {
+            self.push_assistant_text(text);
+            return;
+        }
+        let msg = json!({
+            "role": "assistant",
+            "content": text,
+            "reasoning_content": reasoning,
+        });
+        let content_str = msg.to_string();
+        let tokens = Self::estimate_tokens(&content_str) + 4;
+        self.total_tokens += tokens;
+        self.entries.push(ContextEntry {
+            role: Role::Assistant,
+            kind: ContextKind::AssistantText,
+            content: content_str,
+            tokens,
+            tool_call_id: None,
+        });
     }
 
     /// Sanitize tool-call arguments in the last assistant entry. Called as a
@@ -763,6 +795,7 @@ mod tests {
                     "type": "function",
                     "function": {"name": "edit", "arguments": "{}"}
                 })],
+                "",
             );
             ctx.push_tool_result(
                 ContextKind::EditResult,
@@ -820,6 +853,7 @@ mod tests {
             ctx.push_assistant_with_tools(
                 Some(&format!("step {i}")),
                 &[json!({"id": format!("c{i}"), "type": "function", "function": {"name": "shell", "arguments": "{}"}})],
+                "",
             );
             ctx.push_tool_result(
                 ContextKind::EditResult,
@@ -849,6 +883,7 @@ mod tests {
                 "type": "function",
                 "function": {"name": "write", "arguments": "{\"path\":\"hi.py\",\"content\":\"print('hi')\"}"}
             })],
+            "",
         );
         ctx.push_tool_result(ContextKind::EditResult, "wrote hi.py", "call_1");
 
@@ -926,6 +961,7 @@ mod tests {
                 "type": "function",
                 "function": {"name": "read", "arguments": ""}
             })],
+            "",
         );
         let messages = ctx.to_messages();
         let assistant_msg = &messages[2];
@@ -981,6 +1017,7 @@ mod tests {
                 "type": "function",
                 "function": {"name": "read", "arguments": "{\"files\":[]}"}
             })],
+            "",
         );
         // Arguments are already valid — no change.
         assert!(!ctx.sanitize_last_assistant_tool_calls());
@@ -993,5 +1030,92 @@ mod tests {
         ctx.push(Role::User, ContextKind::UserPrompt, "do task");
         ctx.push_assistant_text("just text, no tool calls");
         assert!(!ctx.sanitize_last_assistant_tool_calls());
+    }
+
+    #[test]
+    fn push_assistant_with_tools_stores_reasoning_when_present() {
+        // Reasoning captured from the stream must be re-injected into the
+        // stored assistant message so the model can build on its prior thinking.
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        ctx.push_assistant_with_tools(
+            Some("running edit"),
+            &[json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "edit", "arguments": "{}"}
+            })],
+            "I should edit the file then verify.",
+        );
+        let messages = ctx.to_messages();
+        let assistant_msg = &messages[2];
+        assert_eq!(assistant_msg["role"], "assistant");
+        assert_eq!(
+            assistant_msg["reasoning_content"],
+            "I should edit the file then verify."
+        );
+        assert_eq!(assistant_msg["tool_calls"][0]["function"]["name"], "edit");
+    }
+
+    #[test]
+    fn push_assistant_with_tools_omits_reasoning_when_empty() {
+        // Empty reasoning must not produce an empty reasoning_content field,
+        // which could confuse backends or waste tokens.
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        ctx.push_assistant_with_tools(
+            None,
+            &[json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"}
+            })],
+            "",
+        );
+        let messages = ctx.to_messages();
+        let assistant_msg = &messages[2];
+        assert!(
+            assistant_msg.get("reasoning_content").is_none(),
+            "reasoning_content should be absent when reasoning is empty"
+        );
+    }
+
+    #[test]
+    fn push_assistant_text_with_reasoning_stores_reasoning() {
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        ctx.push_assistant_text_with_reasoning(
+            "Done, the file is edited.",
+            "Considered two approaches; chose the simpler one.",
+        );
+        let messages = ctx.to_messages();
+        let assistant_msg = &messages[2];
+        assert_eq!(assistant_msg["role"], "assistant");
+        assert_eq!(assistant_msg["content"], "Done, the file is edited.");
+        assert_eq!(
+            assistant_msg["reasoning_content"],
+            "Considered two approaches; chose the simpler one."
+        );
+    }
+
+    #[test]
+    fn push_assistant_text_with_reasoning_falls_back_when_empty() {
+        // Empty reasoning should produce a plain assistant text entry with no
+        // reasoning_content field, matching push_assistant_text behavior.
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        ctx.push_assistant_text_with_reasoning("just an answer", "");
+        let messages = ctx.to_messages();
+        let assistant_msg = &messages[2];
+        assert_eq!(assistant_msg["role"], "assistant");
+        assert_eq!(assistant_msg["content"], "just an answer");
+        assert!(
+            assistant_msg.get("reasoning_content").is_none(),
+            "reasoning_content should be absent when reasoning is empty"
+        );
     }
 }

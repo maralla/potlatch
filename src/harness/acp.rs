@@ -374,6 +374,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             })
         }
     }
@@ -679,6 +680,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             })
         }
     }
