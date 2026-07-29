@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::client::{ChatClient, ChatResponse, StreamCallback};
 use super::context::{Context, ContextEntry, ContextKind, Role};
@@ -446,6 +446,19 @@ impl AgentLoop {
                 response.tool_calls.len()
             );
 
+            // Log a few lines of reasoning content for diagnostics. Reasoning
+            // can be long, so cap at the first few non-empty lines.
+            if !response.reasoning.is_empty() {
+                let preview: String = response
+                    .reasoning
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" ⏎ ");
+                debug!(target: "harness", "harness: reasoning preview: {preview}");
+            }
+
             // Also emit the full response text (for non-streaming fallback or completeness)
             if let Some(cb) = on_chunk
                 && !response.content.is_empty()
@@ -491,7 +504,10 @@ impl AgentLoop {
                 if !called_plan && self.plan_nudge_count < 2 {
                     self.plan_nudge_count += 1;
                     if !response.content.is_empty() {
-                        self.context.push_assistant_text(&response.content);
+                        self.context.push_assistant_text_with_reasoning(
+                            &response.content,
+                            &response.reasoning,
+                        );
                     }
                     self.context.push(
                         Role::System,
@@ -511,14 +527,15 @@ impl AgentLoop {
 
             // Model is done — store the final text
             if !response.content.is_empty() {
-                self.context.push_assistant_text(&response.content);
+                self.context
+                    .push_assistant_text_with_reasoning(&response.content, &response.reasoning);
             }
             info!("harness: model finished with stop reason");
             return Ok(LoopControl::Stop);
         }
 
         // Model requested tool calls — store the assistant message with tool_calls.
-        // Reasoning is intentionally NOT stored (see `push_assistant_with_tools`).
+        // Reasoning is re-injected so the model can build on its prior thinking.
         self.context.push_assistant_with_tools(
             if response.content.is_empty() {
                 None
@@ -526,6 +543,7 @@ impl AgentLoop {
                 Some(&response.content)
             },
             &response.tool_calls,
+            &response.reasoning,
         );
 
         // Check for stuck patterns
@@ -830,6 +848,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
             ChatResponse {
                 content: "Done, the command ran.".into(),
@@ -838,6 +857,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
         ]));
 
@@ -863,6 +883,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
             ChatResponse {
                 content: "Recovered from error.".into(),
@@ -871,6 +892,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
         ]));
 
@@ -896,6 +918,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
             ChatResponse {
                 content: "should not reach".into(),
@@ -904,6 +927,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
         ]));
 
@@ -1008,6 +1032,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
             ChatResponse {
                 content: "Done.".into(),
@@ -1016,6 +1041,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
         ]));
 
@@ -1050,6 +1076,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
             ChatResponse {
                 content: "Done.".into(),
@@ -1058,6 +1085,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
         ]));
 
@@ -1086,6 +1114,7 @@ mod tests {
             usage: super::super::client::Usage::default(),
             tool_results: vec![],
             elapsed_ms: 0,
+            reasoning: String::new(),
         }]));
 
         let tools = ToolRegistry::with_builtin_tools();
@@ -1110,6 +1139,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             })
             .collect();
 
@@ -1138,6 +1168,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
             // Second response: model calls plan after the nudge.
             ChatResponse {
@@ -1154,6 +1185,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
             // Third response: model stops after the tool call.
             ChatResponse {
@@ -1163,6 +1195,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
         ]));
 
@@ -1225,6 +1258,7 @@ mod tests {
                     usage: super::super::client::Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
+                    reasoning: String::new(),
                 });
             }
             Ok(responses.remove(0))
@@ -1264,6 +1298,7 @@ mod tests {
                     usage: super::super::client::Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
+                    reasoning: String::new(),
                 },
                 ChatResponse {
                     content: "Done.".into(),
@@ -1272,6 +1307,7 @@ mod tests {
                     usage: super::super::client::Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
+                    reasoning: String::new(),
                 },
             ],
             vec![tool_call],
@@ -1337,6 +1373,7 @@ mod tests {
                     usage: super::super::client::Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
+                    reasoning: String::new(),
                 });
             }
             Ok(responses.remove(0))
@@ -1367,6 +1404,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
             ChatResponse {
                 content: "Done.".into(),
@@ -1375,6 +1413,7 @@ mod tests {
                 usage: super::super::client::Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
         ]));
 

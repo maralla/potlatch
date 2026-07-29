@@ -84,22 +84,20 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
-    /// Parse a model string that may be a plain name or an `acp://` URL.
+    /// Parse a model string that may be a plain name, an `acp://` URL, or a
+    /// plain name carrying a `?thinking=` query. The latter arrives via the ACP
+    /// `session/set_model` command: the orchestrator forwards the config URI's
+    /// model segment verbatim (e.g. `model1-fp8?thinking=true`), so the harness
+    /// must honor the query even without the `acp://` prefix.
     pub fn parse(s: &str) -> Self {
         let trimmed = s.trim();
-        if let Some(rest) = trimmed.strip_prefix("acp://") {
-            // Split path and query: `vendor/model?thinking=false`
-            let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-            // Extract model name: take the last path segment after `/`.
-            let model = path.rsplit('/').next().unwrap_or(path).to_string();
-            let thinking = parse_query_bool(query, "thinking").unwrap_or(false);
-            ModelSpec { model, thinking }
-        } else {
-            ModelSpec {
-                model: trimmed.to_string(),
-                thinking: false,
-            }
-        }
+        let rest = trimmed.strip_prefix("acp://").unwrap_or(trimmed);
+        // Split path and query: `vendor/model?thinking=false`
+        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+        // Extract model name: take the last path segment after `/`.
+        let model = path.rsplit('/').next().unwrap_or(path).to_string();
+        let thinking = parse_query_bool(query, "thinking").unwrap_or(false);
+        ModelSpec { model, thinking }
     }
 }
 
@@ -159,6 +157,12 @@ pub struct ChatResponse {
     pub tool_results: Vec<String>,
     /// Wall-clock time for the API call, in milliseconds.
     pub elapsed_ms: u128,
+    /// Reasoning/thinking content streamed by reasoning models (Model1,
+    /// DeepSeek R1, etc.) via `delta.reasoning_content`. Re-injected into the
+    /// context on the next turn so the model can see its prior reasoning and
+    /// build on it instead of re-deriving the same conclusions. Empty when
+    /// thinking is disabled or the backend doesn't emit reasoning.
+    pub reasoning: String,
 }
 
 /// OpenAI-compatible LLM client using reqwest blocking.
@@ -271,6 +275,7 @@ impl ChatClient for OpenAiClient {
 
         // Parse SSE stream line-by-line (true streaming, not buffering the whole response)
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut finish_reason = String::new();
         let mut usage = Usage::default();
@@ -348,16 +353,18 @@ impl ChatClient for OpenAiClient {
 
             let delta = &chunk["choices"][0]["delta"];
 
-            // Text content. Note: reasoning models (Model1, DeepSeek R1, etc.)
-            // stream reasoning in `delta.reasoning_content` — we intentionally
-            // ignore that field. The `enable_thinking: false` kwarg in the
-            // request body suppresses it at the source, but this guard also
-            // handles backends that don't honor the kwarg.
+            // Text content. Reasoning models (Model1, DeepSeek R1, etc.)
+            // stream reasoning in `delta.reasoning_content` — we capture it
+            // for re-injection into the next turn's context so the model can
+            // build on its prior reasoning instead of re-deriving it.
             if let Some(text) = delta["content"].as_str() {
                 content.push_str(text);
                 if let Some(cb) = on_chunk {
                     cb(text);
                 }
+            }
+            if let Some(r) = delta["reasoning_content"].as_str() {
+                reasoning.push_str(r);
             }
 
             // Track the highest tool-call index seen in this chunk so we can
@@ -444,6 +451,7 @@ impl ChatClient for OpenAiClient {
             usage,
             tool_results,
             elapsed_ms: elapsed.as_millis(),
+            reasoning,
         })
     }
 }
@@ -640,6 +648,7 @@ impl ChatClient for FakeChatClient {
                 usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             });
         }
         Ok(responses.remove(0))
@@ -664,6 +673,7 @@ mod tests {
                 usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
             ChatResponse {
                 content: "Done!".into(),
@@ -672,6 +682,7 @@ mod tests {
                 usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
+                reasoning: String::new(),
             },
         ]);
 
@@ -722,6 +733,21 @@ mod tests {
             !spec.thinking,
             "plain model name defaults to thinking=false"
         );
+    }
+
+    #[test]
+    fn model_spec_parses_bare_name_with_thinking_query() {
+        // The orchestrator forwards the config URI's model segment verbatim via
+        // ACP session/set_model, so the harness receives a bare name carrying
+        // the ?thinking= query (e.g. `model1-fp8?thinking=true`). The query
+        // must be honored and stripped from the model name sent to the API.
+        let spec = ModelSpec::parse("model1-fp8?thinking=true");
+        assert_eq!(spec.model, "model1-fp8");
+        assert!(spec.thinking);
+
+        let spec = ModelSpec::parse("model1-fp8?thinking=false");
+        assert_eq!(spec.model, "model1-fp8");
+        assert!(!spec.thinking);
     }
 
     #[test]
