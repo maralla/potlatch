@@ -42,7 +42,7 @@ impl Tool for EditTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Edit files by replacing exact strings. Pass an 'edits' array of objects, each with {path, old_string, new_string}. The 'path' goes INSIDE each edit object, not at the top level. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The old_string must match uniquely within its file. On failure, the error includes line numbers and similarity scores of fuzzy near-matches so you can retry with a more specific match. After editing, the edited region is read back and included in the result so you can verify the change.",
+            "description": "Edit files by replacing exact strings. Pass an 'edits' array of objects, each with {path, old_string, new_string}. The 'path' goes INSIDE each edit object, not at the top level. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The old_string must match uniquely within its file. On failure, the error includes line numbers and similarity scores of fuzzy near-matches so you can retry with a more specific match. After editing, the edited region is read back and included in the result so you can verify the change. By default paths must be relative to the working directory; set outside_cwd: true to edit an absolute path outside the workspace (only for agent-managed scratch files explicitly permitted by the task instructions).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -54,7 +54,7 @@ impl Tool for EditTool {
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Path to the file to edit (relative to the working directory)."
+                                    "description": "Path to the file to edit (relative to the working directory, or an absolute path when outside_cwd is true)."
                                 },
                                 "old_string": {
                                     "type": "string",
@@ -68,6 +68,11 @@ impl Tool for EditTool {
                             "required": ["path", "old_string", "new_string"]
                         },
                         "minItems": 1
+                    },
+                    "outside_cwd": {
+                        "type": "boolean",
+                        "description": "When true, allow editing files at absolute paths outside the working directory (only for agent-managed scratch files explicitly permitted by the task instructions). Default: false.",
+                        "default": false
                     }
                 },
                 "required": ["edits"]
@@ -83,6 +88,8 @@ impl Tool for EditTool {
         if edits.is_empty() {
             anyhow::bail!("'edits' array must contain at least one entry");
         }
+
+        let outside_cwd = args["outside_cwd"].as_bool().unwrap_or(false);
 
         // Parse + validate each entry up front (cheap, no I/O). Group by resolved
         // path so we can apply multiple edits to the same file in order, while
@@ -119,7 +126,7 @@ impl Tool for EditTool {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("each edit requires a 'new_string' string"))?;
 
-            let full_path = match super::resolve_workspace_path(path, cwd) {
+            let full_path = match super::resolve_write_path(path, cwd, outside_cwd) {
                 Ok(p) => p,
                 Err(msg) => {
                     // Pre-validation failure: record a synthetic group with a
@@ -910,5 +917,72 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("inside the edit object"));
         assert!(err.contains("Do not put 'path' at the top level"));
+    }
+
+    #[test]
+    fn outside_cwd_allows_absolute_path() {
+        let dir = test_util::unique_test_dir();
+        let outside = test_util::unique_test_dir();
+        let target = outside.path().join("outside.txt");
+        std::fs::write(&target, "hello world\n").unwrap();
+
+        let tool = EditTool;
+        let args = json!({
+            "edits": [
+                {"path": target.to_string_lossy(), "old_string": "hello world", "new_string": "hello universe"}
+            ],
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Successfully edited"), "{result}");
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("hello universe"));
+        assert!(!content.contains("hello world"));
+    }
+
+    #[test]
+    fn outside_cwd_allows_multiple_edits_to_same_external_file() {
+        let dir = test_util::unique_test_dir();
+        let outside = test_util::unique_test_dir();
+        let target = outside.path().join("script.py");
+        std::fs::write(&target, "alpha\nbeta\n").unwrap();
+
+        let tool = EditTool;
+        let args = json!({
+            "edits": [
+                {"path": target.to_string_lossy(), "old_string": "alpha", "new_string": "ALPHA"},
+                {"path": target.to_string_lossy(), "old_string": "beta", "new_string": "BETA"}
+            ],
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Applied 2 edit(s)"), "{result}");
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "ALPHA\nBETA\n");
+    }
+
+    #[test]
+    fn outside_cwd_defaults_to_false_when_absent() {
+        // Without outside_cwd, an absolute path must still be rejected.
+        let dir = test_util::unique_test_dir();
+        let outside = test_util::unique_test_dir();
+        let target = outside.path().join("outside.txt");
+        std::fs::write(&target, "hello\n").unwrap();
+
+        let tool = EditTool;
+        let args = json!({
+            "edits": [
+                {"path": target.to_string_lossy(), "old_string": "hello", "new_string": "bye"}
+            ]
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(
+            result.contains("absolute paths are not allowed"),
+            "expected rejection, got: {result}"
+        );
+        // File untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello\n");
     }
 }
