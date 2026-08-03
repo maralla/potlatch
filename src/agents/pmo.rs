@@ -1150,7 +1150,7 @@ Call the `plan` tool with your decision as its arguments. Potlatch reads the too
 
 - `decision` (required): one of `guide_worker`, `split`, `already_done`, `needs_clarification`
 - `instructions` (for guide_worker): 3-5 sentences, one clear action for the worker — posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.
-- `sub_issues` (for split): array of `{{"title": "...", "description": "...", "priority": 1-3}}`
+- `sub_issues` (for split): array of `{{"title": "...", "description": "...", "priority": 1-3, "depends_on": N}}` where `depends_on` is the 1-based index of another sub-issue this one depends on (omit or 0 if none). Example: if sub-issue 2 builds on sub-issue 1's work, set `"depends_on": 1`. The system automatically labels dependent issues so the worker won't start them until their dependency is closed.
 - `reason` (for already_done): why the codebase already satisfies the issue
 - `question` (for needs_clarification): specific questions for a human
 
@@ -1178,6 +1178,9 @@ DECISION — choose EXACTLY ONE of the following:
    - 2 = High: important feature, depended on by lower-priority sub-issues
    - 3 = Normal: independent work, enhancements, nice-to-haves
    The parent issue has priority {parent_priority}. Sub-issues that are dependencies for others should get higher priority (lower number). Independent leaf tasks can inherit the parent priority or be lower.
+
+   DEPENDENCIES:
+   When a sub-issue cannot be started until another sub-issue is done, set `"depends_on"` to the 1-based index of the dependency. Example: if sub-issue 2 builds on the primitives from sub-issue 1, set `"depends_on": 1` on sub-issue 2. The system parks sub-issue 2 (labels it `waiting-on-issue:#N`) so the worker skips it until sub-issue 1 is closed. Use this for real build-order dependencies — do not set `depends_on` for issues that are merely related or could run in parallel.
 
 3. ALREADY_DONE — Use when the work described in the issue is ALREADY fully implemented in the codebase:
    - The worker's output or your analysis shows the feature/tests/code already exists
@@ -1396,10 +1399,19 @@ fn apply_pmo_plan_output(mut handoff: AgentHandoff) -> AgentHandoff {
                     .and_then(Value::as_u64)
                     .filter(|p| (1..=3).contains(p))
                     .map(|p| p as u8);
+                // depends_on is a 1-based index into the sub_issues array
+                // (matching how the model references "sub-issue 1"). 0/absent
+                // means no dependency.
+                let depends_on = s
+                    .get("depends_on")
+                    .and_then(Value::as_u64)
+                    .map(|d| d as usize)
+                    .unwrap_or(0);
                 Some(HandoffSubIssue {
                     title,
                     description,
                     priority,
+                    depends_on,
                 })
             })
             .collect();
@@ -1566,6 +1578,19 @@ fn resume_split(
                     );
                 }
 
+                // If this sub-issue declares a dependency, add a temporary
+                // `do-not-implement` label so the worker skips it immediately.
+                // The label is swapped for the real `waiting-on-issue:#N` label
+                // in the post-loop pass once all IIDs are known. This closes
+                // the race: the issue is blocked from the moment it's created.
+                if sub_issue.depends_on > 0
+                    && let Err(e) = gitlab.add_issue_label(sub_issue_iid, labels::DO_NOT_IMPLEMENT)
+                {
+                    warn!(
+                        "PMO: Failed to add temporary do-not-implement label to sub-issue #{sub_issue_iid}: {e}"
+                    );
+                }
+
                 created_issue_ids.push(sub_issue_iid);
 
                 let updated_pending = PendingSplit {
@@ -1586,6 +1611,36 @@ fn resume_split(
                 );
                 return Err(e);
             }
+        }
+    }
+
+    // Post-loop pass: replace the temporary `do-not-implement` label with the
+    // real `waiting-on-issue:#N` label now that all sub-issue IIDs are known.
+    // Both backward and forward references are handled — the temporary label
+    // blocked the worker throughout the creation loop, so there's no race.
+    for (index, sub_issue) in pending.sub_issues.iter().enumerate() {
+        if sub_issue.depends_on == 0 {
+            continue;
+        }
+        let dep_idx = sub_issue.depends_on - 1;
+        let Some(&dep_iid) = created_issue_ids.get(dep_idx) else {
+            warn!(
+                "PMO: sub-issue {} depends on sub-issue {} but the dependency was not created, leaving do-not-implement label",
+                index + 1,
+                sub_issue.depends_on
+            );
+            continue;
+        };
+        let Some(&dependent_iid) = created_issue_ids.get(index) else {
+            continue;
+        };
+        // Swap: remove the temporary hold, add the real dependency label.
+        let _ = gitlab.remove_issue_label(dependent_iid, labels::DO_NOT_IMPLEMENT);
+        let label = format!("waiting-on-issue:#{dep_iid}");
+        if let Err(e) = gitlab.add_issue_label(dependent_iid, &label) {
+            warn!("PMO: Failed to add dependency label {label} to sub-issue #{dependent_iid}: {e}");
+        } else {
+            info!("PMO: Sub-issue #{dependent_iid} depends on #{dep_iid}, labeled {label}");
         }
     }
 
@@ -1669,7 +1724,7 @@ mod tests {
                 "decision": "split",
                 "sub_issues": [
                     {"title": "First", "description": "Do the first thing", "priority": 1},
-                    {"title": "Second", "description": "Do the second thing", "priority": 2}
+                    {"title": "Second", "description": "Do the second thing", "priority": 2, "depends_on": 1}
                 ]
             })),
             ..Default::default()
@@ -1679,8 +1734,10 @@ mod tests {
         assert_eq!(applied.sub_issues.len(), 2);
         assert_eq!(applied.sub_issues[0].title, "First");
         assert_eq!(applied.sub_issues[0].priority, Some(1));
+        assert_eq!(applied.sub_issues[0].depends_on, 0);
         assert_eq!(applied.sub_issues[1].title, "Second");
         assert_eq!(applied.sub_issues[1].priority, Some(2));
+        assert_eq!(applied.sub_issues[1].depends_on, 1);
         assert!(applied.plan_output.is_none());
     }
 
