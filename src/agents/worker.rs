@@ -762,6 +762,29 @@ fn worker_cycle(
             let _ = state.glab.remove_issue_label(issue.iid, &label);
         }
 
+        // Check if this issue is parked waiting on a dependency issue.
+        if let Some(dep_issue_iid) = extract_waiting_on_issue_iid(&issue.labels) {
+            let dep_closed = state
+                .glab
+                .get_issue(dep_issue_iid)
+                .map(|dep| dep.state == "closed")
+                .unwrap_or(false);
+            if !dep_closed {
+                debug!(
+                    "{}: Issue #{} waiting on issue #{} (not yet closed), skipping",
+                    &state.agent_id, issue.iid, dep_issue_iid
+                );
+                continue;
+            }
+            // Dependency closed — strip the waiting label and proceed to claim.
+            info!(
+                "{}: Issue #{} dependency issue #{} closed, resuming",
+                &state.agent_id, issue.iid, dep_issue_iid
+            );
+            let label = format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{dep_issue_iid}");
+            let _ = state.glab.remove_issue_label(issue.iid, &label);
+        }
+
         if claim::is_claimed(&issue.labels) {
             debug!(
                 "{}: Issue #{} already claimed, skipping",
@@ -3341,6 +3364,18 @@ fn extract_waiting_on_mr_iid(labels: &[String]) -> Option<u64> {
     })
 }
 
+/// Prefix for labels that park an issue until a dependency issue is closed.
+/// The full label is `waiting-on-issue:#N` where N is the dependency issue IID.
+const WAITING_ON_ISSUE_LABEL_PREFIX: &str = "waiting-on-issue:#";
+
+/// Extract the dependency issue IID from a `waiting-on-issue:#N` label.
+fn extract_waiting_on_issue_iid(labels: &[String]) -> Option<u64> {
+    labels.iter().find_map(|l| {
+        l.strip_prefix(WAITING_ON_ISSUE_LABEL_PREFIX)
+            .and_then(|s| s.parse::<u64>().ok())
+    })
+}
+
 /// Extract the MR title the agent emitted, falling back to the issue title
 /// (not a generic placeholder like "Implementation changes") when the agent
 /// didn't provide one. The issue title is always meaningful and specific to
@@ -4139,5 +4174,38 @@ mod tests {
     fn extract_waiting_on_mr_iid_ignores_malformed() {
         let labels = vec!["waiting-on-mr:!abc".to_string()];
         assert_eq!(extract_waiting_on_mr_iid(&labels), None);
+    }
+
+    #[test]
+    fn extract_waiting_on_issue_iid_finds_label() {
+        let labels = vec![
+            "in-progress".to_string(),
+            "waiting-on-issue:#15".to_string(),
+        ];
+        assert_eq!(extract_waiting_on_issue_iid(&labels), Some(15));
+    }
+
+    #[test]
+    fn extract_waiting_on_issue_iid_returns_none_without_label() {
+        let labels = vec!["in-progress".to_string(), "priority::3".to_string()];
+        assert_eq!(extract_waiting_on_issue_iid(&labels), None);
+    }
+
+    #[test]
+    fn extract_waiting_on_issue_iid_ignores_malformed() {
+        let labels = vec!["waiting-on-issue:#abc".to_string()];
+        assert_eq!(extract_waiting_on_issue_iid(&labels), None);
+    }
+
+    #[test]
+    fn extract_waiting_on_issue_iid_distinguishes_from_mr_label() {
+        // Both labels present — the issue-dependency extractor must find the
+        // issue label, not the MR label.
+        let labels = vec![
+            "waiting-on-mr:!42".to_string(),
+            "waiting-on-issue:#7".to_string(),
+        ];
+        assert_eq!(extract_waiting_on_issue_iid(&labels), Some(7));
+        assert_eq!(extract_waiting_on_mr_iid(&labels), Some(42));
     }
 }

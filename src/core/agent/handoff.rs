@@ -8,6 +8,13 @@ pub struct HandoffSubIssue {
     pub description: String,
     #[serde(default)]
     pub priority: Option<u8>,
+    /// 1-based index of another sub-issue in the same split that this one
+    /// depends on (i.e. this sub-issue cannot start until the referenced
+    /// sub-issue is done). The PMO applies a `waiting-on-issue:#N` label
+    /// after both issues are created, and the worker skips the issue until
+    /// the dependency is closed. 0/absent means no dependency.
+    #[serde(default)]
+    pub depends_on: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
