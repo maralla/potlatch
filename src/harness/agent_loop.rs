@@ -707,6 +707,14 @@ impl AgentLoop {
             let args = tc["function"]["arguments"].as_str().unwrap_or("");
             let current = (name.to_string(), args.to_string());
 
+            // Polling a background job or sleeping between polls is expected
+            // repetitive behavior, not a stuck pattern. The model legitimately
+            // polls the same job_id multiple times while waiting for a
+            // long-running background task to finish.
+            if name == "shell" && (args.contains("\"job_id\"") || args.contains("sleep ")) {
+                continue;
+            }
+
             // Check if this exact call was in the recent window
             if self.recent_calls.iter().any(|prev| prev == &current) {
                 return true;
