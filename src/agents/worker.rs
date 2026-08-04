@@ -741,48 +741,86 @@ fn worker_cycle(
 
         // Check if this issue is parked waiting on a dependency MR.
         if let Some(dep_mr_iid) = extract_waiting_on_mr_iid(&issue.labels) {
-            let dep_merged = state
-                .glab
-                .get_merge_request(dep_mr_iid)
-                .map(|mr| mr.state == "merged")
-                .unwrap_or(false);
-            if !dep_merged {
-                debug!(
-                    "{}: Issue #{} waiting on MR !{} (not yet merged), skipping",
-                    &state.agent_id, issue.iid, dep_mr_iid
-                );
-                continue;
+            match state.glab.get_merge_request(dep_mr_iid) {
+                Ok(mr) if mr.state == "merged" => {
+                    // Dependency merged — strip the waiting label and proceed to claim.
+                    info!(
+                        "{}: Issue #{} dependency MR !{} merged, resuming",
+                        &state.agent_id, issue.iid, dep_mr_iid
+                    );
+                    let label = waiting_on_mr_label(dep_mr_iid);
+                    let _ = state.glab.remove_issue_label(issue.iid, &label);
+                }
+                Ok(_) => {
+                    debug!(
+                        "{}: Issue #{} waiting on MR !{} (not yet merged), skipping",
+                        &state.agent_id, issue.iid, dep_mr_iid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    // A 404 means the dependency MR was deleted (some GitLab
+                    // setups delete merged MRs) or never existed. Either way,
+                    // waiting is futile — drop the label and resume the issue.
+                    if err_str.contains("404") {
+                        info!(
+                            "{}: Issue #{} dependency MR !{} not found (deleted or never existed), dropping dependency label and resuming",
+                            &state.agent_id, issue.iid, dep_mr_iid
+                        );
+                        let label = waiting_on_mr_label(dep_mr_iid);
+                        let _ = state.glab.remove_issue_label(issue.iid, &label);
+                    } else {
+                        // Transient API error — skip this cycle, retry next poll.
+                        warn!(
+                            "{}: Issue #{} waiting on MR !{} — failed to check dependency state: {}, skipping this cycle",
+                            &state.agent_id, issue.iid, dep_mr_iid, err_str
+                        );
+                        continue;
+                    }
+                }
             }
-            // Dependency merged — strip the waiting label and proceed to claim.
-            info!(
-                "{}: Issue #{} dependency MR !{} merged, resuming",
-                &state.agent_id, issue.iid, dep_mr_iid
-            );
-            let label = waiting_on_mr_label(dep_mr_iid);
-            let _ = state.glab.remove_issue_label(issue.iid, &label);
         }
 
         // Check if this issue is parked waiting on a dependency issue.
         if let Some(dep_issue_iid) = extract_waiting_on_issue_iid(&issue.labels) {
-            let dep_closed = state
-                .glab
-                .get_issue(dep_issue_iid)
-                .map(|dep| dep.state == "closed")
-                .unwrap_or(false);
-            if !dep_closed {
-                debug!(
-                    "{}: Issue #{} waiting on issue #{} (not yet closed), skipping",
-                    &state.agent_id, issue.iid, dep_issue_iid
-                );
-                continue;
+            match state.glab.get_issue(dep_issue_iid) {
+                Ok(dep) if dep.state == "closed" => {
+                    // Dependency closed — strip the waiting label and proceed to claim.
+                    info!(
+                        "{}: Issue #{} dependency issue #{} closed, resuming",
+                        &state.agent_id, issue.iid, dep_issue_iid
+                    );
+                    let label = format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{dep_issue_iid}");
+                    let _ = state.glab.remove_issue_label(issue.iid, &label);
+                }
+                Ok(_) => {
+                    debug!(
+                        "{}: Issue #{} waiting on issue #{} (not yet closed), skipping",
+                        &state.agent_id, issue.iid, dep_issue_iid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    // A 404 means the dependency issue was deleted or never
+                    // existed — drop the label and resume.
+                    if err_str.contains("404") {
+                        info!(
+                            "{}: Issue #{} dependency issue #{} not found (deleted or never existed), dropping dependency label and resuming",
+                            &state.agent_id, issue.iid, dep_issue_iid
+                        );
+                        let label = format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{dep_issue_iid}");
+                        let _ = state.glab.remove_issue_label(issue.iid, &label);
+                    } else {
+                        warn!(
+                            "{}: Issue #{} waiting on issue #{} — failed to check dependency state: {}, skipping this cycle",
+                            &state.agent_id, issue.iid, dep_issue_iid, err_str
+                        );
+                        continue;
+                    }
+                }
             }
-            // Dependency closed — strip the waiting label and proceed to claim.
-            info!(
-                "{}: Issue #{} dependency issue #{} closed, resuming",
-                &state.agent_id, issue.iid, dep_issue_iid
-            );
-            let label = format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{dep_issue_iid}");
-            let _ = state.glab.remove_issue_label(issue.iid, &label);
         }
 
         if claim::is_claimed(&issue.labels) {
