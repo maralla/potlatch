@@ -41,16 +41,7 @@ Your workspace is the current working directory. It is the root of the repositor
 
 ## Tool Usage
 
-- **grep**: Your primary exploration tool. Always run this before `read`. Returns matching lines with file paths and line numbers — use those line numbers to read only the relevant section with `read`'s `start_line`/`end_line`. For example, grep for a function name, see it's at `handler.go:241`, then read `handler.go` lines 230-270.
-- **read**: Read file contents with line numbers. Pass a `files` array of `{path, start_line?, end_line?}` objects; reads run concurrently and a single call can read many files. **Always pass `start_line`/`end_line` for large files** — grep first to find the range, then read just that section. Omit the range only for small files (under ~150 lines) or when you need the full file. Per-file errors are reported inline and do not block the other reads.
-- **edit**: Replace exact strings in files. Pass an `edits` array of `{path, old_string, new_string}` objects. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The `old_string` must match uniquely within its file. If it doesn't match, the error shows fuzzy near-matches with line numbers and similarity scores — use these to re-read and retry.
-- **write**: Create new files or overwrite entirely. Creates parent directories automatically.
-- **shell**: Run any command — build, test, git, etc. Returns stdout, stderr, and exit code. Runs in the workspace directory.
-- **glob**: Find files by name pattern. Useful for discovering file structure, but prefer `grep` when you know what you're looking for (a symbol, a string, a concept).
-- **fetch**: Fetch web pages for documentation or references.
-- **todo**: Manage a task checklist that persists across context compaction. Send the full list of `{description, status}` items on every call — it replaces the entire list (replace-all API), so indices stay stable across updates. `status` is `pending`, `in_progress`, (mark exactly one item `in_progress` — the one you're working on) or `completed`. The checklist is always visible to you in the system prompt — check it before deciding what to do next. Optional; use it only when the task is complex enough to benefit from tracking.
-- **memory**: Save fundamental project facts that survive across sessions. Use this only for critical architecture rules, key conventions, or structural knowledge you discovered through exploration that is NOT already written in AGENTS.md, README, or other on-disk project files (those are re-read each session). Do not save build/test/lint commands — those are easy to discover. Be extremely selective.
-{plan_tool_line}
+{tools_section}
 
 ## Important Notes
 
@@ -67,28 +58,73 @@ Your workspace is the current working directory. It is the root of the repositor
 When you have completed the task, provide a clear, concise summary of what you did. If the task requires a specific output format (like structured data or a specific response), follow it exactly. Do not narrate every step — focus on the result.
 "#;
 
-/// Build the system prompt for the harness agent.
-///
-/// When `plan_mode` is true, includes the `plan` tool in the tool list so the
-/// model knows it can call it. When false (worker/review sessions), the `plan`
-/// tool is omitted — the model should never reference a tool that isn't
-/// registered.
-pub fn system_prompt(plan_mode: bool) -> String {
-    let plan_tool_line = if plan_mode {
-        "- **plan**: Emit a structured JSON plan as your canonical handoff. Only available in plan mode. Call this with the JSON your role expects (e.g. for PMO: `{decision, instructions?, sub_issues?, reason?, question?}`). Potlatch reads the tool's JSON directly — streamed text is secondary."
-    } else {
-        ""
-    };
-    BASE_PROMPT.replace("{plan_tool_line}", plan_tool_line)
+/// Build the system prompt for the harness agent. Tool descriptions are
+/// collected from the registered tools' `prompt_description()` methods and
+/// injected dynamically — no tool-specific knowledge here.
+pub fn system_prompt(tool_descriptions: &[(String, String)]) -> String {
+    let tools_section = tool_descriptions
+        .iter()
+        .map(|(name, desc)| format!("- **{name}**: {desc}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    BASE_PROMPT.replace("{tools_section}", &tools_section)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_descriptions() -> Vec<(String, String)> {
+        vec![
+            (
+                "grep".into(),
+                "Your primary exploration tool. Always run this before `read`.".into(),
+            ),
+            (
+                "read".into(),
+                "Read file contents with line numbers. Always pass `start_line`/`end_line` for large files.".into(),
+            ),
+            (
+                "shell".into(),
+                "Run any command — build, test, git, etc.".into(),
+            ),
+            (
+                "lsp".into(),
+                "Language server queries — definition, references, hover, symbols, diagnostics."
+                    .into(),
+            ),
+        ]
+    }
+
+    fn test_descriptions_no_lsp() -> Vec<(String, String)> {
+        vec![
+            (
+                "grep".into(),
+                "Your primary exploration tool. Always run this before `read`.".into(),
+            ),
+            (
+                "read".into(),
+                "Read file contents with line numbers. Always pass `start_line`/`end_line` for large files.".into(),
+            ),
+            (
+                "shell".into(),
+                "Run any command — build, test, git, etc.".into(),
+            ),
+        ]
+    }
+
+    fn test_descriptions_with_plan() -> Vec<(String, String)> {
+        let mut d = test_descriptions();
+        d.push((
+            "plan".into(),
+            "Emit a structured JSON plan as your canonical handoff.".into(),
+        ));
+        d
+    }
+
     #[test]
     fn system_prompt_covers_key_principles() {
-        let p = system_prompt(false);
+        let p = system_prompt(&test_descriptions());
         assert!(p.contains("Grep before you read"));
         assert!(p.contains("minimal, targeted edits"));
         assert!(p.contains("Verify your changes"));
@@ -98,7 +134,7 @@ mod tests {
 
     #[test]
     fn system_prompt_encourages_concise_reasoning() {
-        let p = system_prompt(false);
+        let p = system_prompt(&test_descriptions());
         assert!(
             p.contains("Keep reasoning concise"),
             "prompt should instruct the model to keep reasoning brief"
@@ -108,7 +144,7 @@ mod tests {
 
     #[test]
     fn system_prompt_encourages_batched_reads() {
-        let p = system_prompt(false);
+        let p = system_prompt(&test_descriptions());
         assert!(p.contains("files"));
         assert!(p.contains("Batch independent operations"));
         assert!(p.contains("Read targeted sections"));
@@ -116,61 +152,66 @@ mod tests {
 
     #[test]
     fn system_prompt_prescribes_grep_first_exploration() {
-        let p = system_prompt(false);
+        let p = system_prompt(&test_descriptions());
         // grep is the primary exploration tool — must be mentioned before read.
         let grep_pos = p.find("**grep**").unwrap();
         let read_pos = p.find("**read**").unwrap();
         assert!(grep_pos < read_pos, "grep should be listed before read");
         assert!(p.contains("Always run this before `read`"));
-        assert!(p.contains("start_line`/`end_line"));
     }
 
     #[test]
     fn system_prompt_discourages_whole_file_reads_for_large_files() {
-        let p = system_prompt(false);
+        let p = system_prompt(&test_descriptions());
         assert!(p.contains("Always pass `start_line`/`end_line` for large files"));
         assert!(!p.contains("Read whole files by omitting"));
     }
 
     #[test]
     fn system_prompt_encourages_acting_over_narrating() {
-        let p = system_prompt(false);
+        let p = system_prompt(&test_descriptions());
         assert!(p.contains("Act, don't narrate"));
         assert!(p.contains("make the edit immediately"));
-        // Should warn against long prose analysis.
         assert!(p.contains("Long prose explanations"));
     }
 
     #[test]
     fn system_prompt_discourages_re_reading_files() {
-        let p = system_prompt(false);
+        let p = system_prompt(&test_descriptions());
         assert!(p.contains("Don't re-read files you've already read"));
         assert!(p.contains("conversation summary"));
     }
 
     #[test]
-    fn system_prompt_includes_plan_tool_in_plan_mode() {
-        let p = system_prompt(true);
+    fn system_prompt_includes_plan_tool_when_provided() {
+        let p = system_prompt(&test_descriptions_with_plan());
         assert!(p.contains("**plan**"));
         assert!(p.contains("canonical handoff"));
     }
 
     #[test]
-    fn system_prompt_excludes_plan_tool_in_non_plan_mode() {
-        let p = system_prompt(false);
+    fn system_prompt_excludes_plan_tool_when_not_provided() {
+        let p = system_prompt(&test_descriptions_no_lsp());
         assert!(!p.contains("**plan**"));
         assert!(!p.contains("canonical handoff"));
-        // The placeholder must be fully replaced — no literal {plan_tool_line}.
-        assert!(!p.contains("{plan_tool_line}"));
+    }
+
+    #[test]
+    fn system_prompt_includes_lsp_tool_when_provided() {
+        let p = system_prompt(&test_descriptions());
+        assert!(p.contains("**lsp**"));
+        assert!(p.contains("definition"));
+    }
+
+    #[test]
+    fn system_prompt_excludes_lsp_tool_when_not_provided() {
+        let p = system_prompt(&test_descriptions_no_lsp());
+        assert!(!p.contains("**lsp**"));
     }
 
     #[test]
     fn system_prompt_does_not_concatenate_agents_md() {
-        // The prompt must not embed AGENTS.md content or project instructions —
-        // those are read from disk by the agent per its task prompt. Mentioning
-        // the filename in tool guidance (e.g. "don't duplicate AGENTS.md") is
-        // fine; embedding its actual content is not.
-        let p = system_prompt(false);
+        let p = system_prompt(&test_descriptions());
         assert!(!p.contains("Agent Instructions"));
         assert!(!p.contains("Code Quality"));
         assert!(!p.contains("For Worker Agent"));

@@ -232,17 +232,27 @@ impl Default for JobTable {
     }
 }
 
+impl super::SessionState for JobTable {
+    fn shutdown(&self) {
+        self.kill_all();
+    }
+}
+
 pub struct ShellTool {
     timeout_secs: u64,
     jobs: Arc<JobTable>,
 }
 
 impl ShellTool {
-    pub fn new() -> Self {
-        Self {
-            timeout_secs: DEFAULT_TIMEOUT_SECS,
-            jobs: Arc::new(JobTable::new()),
+    /// Construct with session-scoped state. Creates a `JobTable` in
+    /// `SessionStates` if not already present (first prompt), then retrieves
+    /// it so background jobs survive across prompts and are killed on
+    /// session close.
+    pub fn new(states: &mut super::SessionStates, _cwd: &str) -> Self {
+        if states.get::<JobTable>().is_none() {
+            states.insert(Arc::new(JobTable::new()));
         }
+        Self::with_job_table(states.get::<JobTable>().unwrap())
     }
 
     /// Construct with an externally-owned job table, so background jobs are
@@ -575,7 +585,7 @@ mod tests {
 
     #[test]
     fn runs_echo_command() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "echo hello"});
         let result = tool.execute(&args, "/tmp").unwrap();
         assert!(result.contains("hello"));
@@ -584,7 +594,7 @@ mod tests {
 
     #[test]
     fn captures_stderr() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "echo err >&2"});
         let result = tool.execute(&args, "/tmp").unwrap();
         assert!(result.contains("err"));
@@ -592,7 +602,7 @@ mod tests {
 
     #[test]
     fn captures_nonzero_exit() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "exit 42"});
         let result = tool.execute(&args, "/tmp").unwrap();
         assert!(result.contains("exit code: 42"));
@@ -600,7 +610,7 @@ mod tests {
 
     #[test]
     fn kills_on_timeout() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "sleep 60", "timeout_secs": 2});
         let start = Instant::now();
         let result = tool.execute(&args, "/tmp").unwrap();
@@ -697,7 +707,7 @@ mod tests {
         // The QA agent legitimately `cd`s into its session test-scripts dir to
         // run scripts. With outside_cwd: true, the wrong-directory cd warning
         // must not appear in the tool result.
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let temp = test_util::unique_test_dir();
         let outside = temp.path().to_path_buf();
         let args = json!({
@@ -716,7 +726,7 @@ mod tests {
     fn execute_warns_on_cd_outside_when_outside_cwd_absent() {
         // Default (outside_cwd false/absent): a cd to a path that isn't cwd
         // still produces the warning.
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let temp = test_util::unique_test_dir();
         let outside = temp.path().to_path_buf();
         let args = json!({
@@ -731,7 +741,7 @@ mod tests {
 
     #[test]
     fn spawn_background_returns_job_id() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "echo hi", "background": true});
         let result = tool.execute(&args, "/tmp").unwrap();
         assert!(result.starts_with("Background job started:"));
@@ -760,7 +770,7 @@ mod tests {
 
     #[test]
     fn poll_running_job_returns_running_status() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "sleep 2", "background": true});
         let result = tool.execute(&args, "/tmp").unwrap();
         let id = result
@@ -782,7 +792,7 @@ mod tests {
 
     #[test]
     fn kill_terminates_background_job() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "sleep 60", "background": true});
         let result = tool.execute(&args, "/tmp").unwrap();
         let id = result
@@ -829,7 +839,7 @@ mod tests {
 
     #[test]
     fn poll_unknown_job_id_returns_error() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"job_id": "nonexistent-id"});
         let result = tool.execute(&args, "/tmp");
         assert!(result.is_err());
@@ -841,7 +851,7 @@ mod tests {
     fn foreground_execution_unchanged() {
         // `background` defaults to false — the command runs synchronously and
         // returns the full output, not a job id.
-        let tool = ShellTool::new();
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "echo foreground"});
         let result = tool.execute(&args, "/tmp").unwrap();
         assert!(result.contains("foreground"));

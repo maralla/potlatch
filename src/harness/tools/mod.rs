@@ -2,6 +2,7 @@
 
 pub mod edit;
 pub mod fetch;
+pub mod lsp;
 pub mod memory;
 pub mod plan_tool;
 pub mod read;
@@ -10,6 +11,7 @@ pub mod shell;
 pub mod todo;
 pub mod write;
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -169,10 +171,73 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
 
     /// JSON schema for the tool's parameters (OpenAI function-calling format).
+    /// The `description` field is used both for the API tool schema and for
+    /// the system prompt's Tool Usage section.
     fn schema(&self) -> Value;
 
     /// Execute the tool with parsed arguments. Returns a string result for the model.
     fn execute(&self, args: &Value, cwd: &str) -> Result<String>;
+}
+
+/// Session-level state that needs cleanup on `session/close`. Tools that hold
+/// long-lived resources (background processes, language servers, etc.) implement
+/// this trait so the `Session` can shut them all down generically without
+/// knowing their concrete types.
+pub trait SessionState: Send + Sync {
+    /// Release all resources (kill processes, close connections, etc.).
+    /// Called once when the session is closed.
+    fn shutdown(&self);
+}
+
+/// A type-keyed map of session state objects. Stores `Arc<T>` values keyed by
+/// `TypeId`, so tools can retrieve their state by concrete type without the
+/// session knowing about specific tools. All stored state is shut down in
+/// reverse insertion order on [`Self::shutdown`].
+pub struct SessionStates {
+    /// `Arc<T>` boxed as `dyn Any` for typed retrieval via [`Self::get`].
+    typed: HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>,
+    /// `Arc<dyn SessionState>` for generic shutdown (insertion order).
+    for_shutdown: Vec<Arc<dyn SessionState>>,
+}
+
+impl SessionStates {
+    pub fn new() -> Self {
+        Self {
+            typed: HashMap::new(),
+            for_shutdown: Vec::new(),
+        }
+    }
+
+    /// Insert a typed state object. Stores the `Arc<T>` for retrieval and an
+    /// `Arc<dyn SessionState>` for shutdown.
+    pub fn insert<T: SessionState + 'static>(&mut self, state: Arc<T>) {
+        let tid = std::any::TypeId::of::<T>();
+        self.typed.insert(tid, Box::new(Arc::clone(&state)));
+        self.for_shutdown.push(state);
+    }
+
+    /// Retrieve a typed `Arc<T>` by concrete type. Returns `None` if no state
+    /// of type `T` was inserted.
+    pub fn get<T: SessionState + 'static>(&self) -> Option<Arc<T>> {
+        let tid = std::any::TypeId::of::<T>();
+        self.typed
+            .get(&tid)
+            .and_then(|b| b.downcast_ref::<Arc<T>>())
+            .cloned()
+    }
+
+    /// Shut down all stored state in reverse insertion order.
+    pub fn shutdown(&self) {
+        for state in self.for_shutdown.iter().rev() {
+            state.shutdown();
+        }
+    }
+}
+
+impl Default for SessionStates {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Registry of available tools. Builds the OpenAI `tools` array and dispatches calls.
@@ -189,16 +254,19 @@ impl ToolRegistry {
         }
     }
 
-    /// Build a registry with all built-in tools.
-    pub fn with_builtin_tools() -> Self {
+    /// Build a registry with all built-in tools. Session-scoped tools (shell,
+    /// lsp) receive `&mut SessionStates` so they can create/retrieve their
+    /// long-lived state. Stateless tools don't take it.
+    pub fn with_builtin_tools(states: &mut SessionStates, cwd: &str) -> Self {
         let mut reg = Self::new();
-        reg.register(Arc::new(shell::ShellTool::new()));
+        reg.register(Arc::new(shell::ShellTool::new(states, cwd)));
         reg.register(Arc::new(read::ReadTool));
         reg.register(Arc::new(edit::EditTool));
         reg.register(Arc::new(write::WriteTool));
         reg.register(Arc::new(search::GrepTool));
         reg.register(Arc::new(search::GlobTool));
         reg.register(Arc::new(fetch::FetchTool::new()));
+        reg.register(Arc::new(lsp::LspTool::new(states, cwd)));
         reg
     }
 
@@ -248,6 +316,24 @@ impl ToolRegistry {
             Some(tool) => tool.execute(args, cwd),
             None => anyhow::bail!("unknown tool: {name}"),
         }
+    }
+
+    /// Collect `(name, description)` pairs for the system prompt, in
+    /// registration order. Uses each tool's schema description.
+    pub fn tool_descriptions(&self) -> Vec<(String, String)> {
+        self.order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .filter_map(|tool| {
+                let schema = tool.schema();
+                let desc = schema["description"].as_str().unwrap_or("");
+                if desc.is_empty() {
+                    None
+                } else {
+                    Some((tool.name().to_string(), desc.to_string()))
+                }
+            })
+            .collect()
     }
 }
 
@@ -399,7 +485,7 @@ mod tests {
 
     #[test]
     fn unregister_removes_tool_from_registry() {
-        let mut reg = ToolRegistry::with_builtin_tools();
+        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "");
         assert!(reg.tool_names().contains(&"edit"));
         reg.unregister("edit");
         assert!(!reg.tool_names().contains(&"edit"));
@@ -417,7 +503,7 @@ mod tests {
 
     #[test]
     fn unregister_is_noop_for_unknown_tool() {
-        let mut reg = ToolRegistry::with_builtin_tools();
+        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "");
         let before: Vec<String> = reg.tool_names().iter().map(|s| s.to_string()).collect();
         reg.unregister("nonexistent");
         let after: Vec<String> = reg.tool_names().iter().map(|s| s.to_string()).collect();
@@ -426,7 +512,7 @@ mod tests {
 
     #[test]
     fn unregister_preserves_order_of_remaining_tools() {
-        let mut reg = ToolRegistry::with_builtin_tools();
+        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "");
         reg.unregister("edit");
         let names = reg.tool_names();
         // edit was in the middle; the rest keep their relative order.
