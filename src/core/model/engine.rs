@@ -9,11 +9,13 @@ use crate::core::model::acp::AcpRuntime;
 #[derive(Debug, Clone, Default)]
 pub struct ModelSessionOptions {
     pub preferred_session_mode: Option<&'static str>,
+    pub structured_output_tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AcpBuildOptions {
     pub preferred_session_mode: Option<&'static str>,
+    pub structured_output_tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,7 @@ impl ModelEngine {
         let acp_spawn = config.resolve_acp_spawn(section)?;
         let acp_opts = AcpBuildOptions {
             preferred_session_mode: session.preferred_session_mode,
+            structured_output_tools: session.structured_output_tools,
         };
         Ok(Self::build_from_acp_spawn(acp_spawn, acp_opts, runtime))
     }
@@ -74,6 +77,7 @@ impl ModelEngine {
             acp_spawn.command,
             acp_spawn.env,
             opts.preferred_session_mode,
+            opts.structured_output_tools,
             runtime.shutdown,
             runtime.agent_id,
         ))

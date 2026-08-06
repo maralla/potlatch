@@ -81,6 +81,10 @@ pub(crate) struct AcpRuntime {
     acp_env: std::collections::HashMap<String, String>,
     /// When set, applied after `session/new` via ACP mode APIs.
     preferred_session_mode: Option<&'static str>,
+    /// Caller-defined structured-output tool definitions, passed to the
+    /// harness via `session/new` params. Each entry has `name`, `description`,
+    /// and `parameters` (JSON schema).
+    structured_output_tools: Option<Vec<serde_json::Value>>,
     shutdown: Arc<AtomicBool>,
     agent_id: String,
     acp: Mutex<Option<AcpSession>>,
@@ -95,6 +99,7 @@ impl AcpRuntime {
         acp_command: Vec<String>,
         acp_env: std::collections::HashMap<String, String>,
         preferred_session_mode: Option<&'static str>,
+        structured_output_tools: Option<Vec<serde_json::Value>>,
         shutdown: Arc<AtomicBool>,
         agent_id: String,
     ) -> Self {
@@ -105,6 +110,7 @@ impl AcpRuntime {
             acp_command,
             acp_env,
             preferred_session_mode,
+            structured_output_tools,
             shutdown,
             agent_id,
             acp: Mutex::new(None),
@@ -498,6 +504,7 @@ impl AcpRuntime {
             .session_new(&NewSessionParams {
                 cwd: cwd.to_string_lossy().into_owned(),
                 mcp_servers: vec![],
+                structured_output_tools: self.structured_output_tools.clone(),
             })
             .context("ACP session/new")?;
 
@@ -758,11 +765,22 @@ fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> Agent
         .filter(|v| !v.is_null())
         .cloned();
 
+    // Extract captured structured-output tool calls (e.g. `handoff`). A JSON
+    // object mapping tool name to captured args; `None` when no
+    // structured-output tools were registered or the backend didn't include
+    // the field.
+    let structured_outputs = pr
+        .extra
+        .get("structured_outputs")
+        .filter(|v| !v.is_null() && v.is_object())
+        .cloned();
+
     AgentHandoff {
         response,
         has_final_result_text,
         cursor_plan_paths,
         plan_output,
+        structured_outputs,
         ..Default::default()
     }
 }

@@ -13,6 +13,12 @@ use super::{InvokeOptions, ModelResponse};
 #[derive(Debug, Clone, Default)]
 pub struct ModelPreferences {
     pub preferred_session_mode: Option<&'static str>,
+    /// Caller-defined structured-output tool definitions. Each entry is a JSON
+    /// object with `name`, `description`, and `parameters` (JSON schema).
+    /// Passed to the harness via `session/new` params. The harness creates a
+    /// generic `StructuredOutputTool` per definition and returns captured
+    /// output in the `session/prompt` response.
+    pub structured_output_tools: Option<Vec<serde_json::Value>>,
 }
 
 /// Agent-facing model API. Engine construction is internal to core.
@@ -45,6 +51,7 @@ impl AgentModel {
             Arc::clone(&shutdown),
             ModelSessionOptions {
                 preferred_session_mode: prefs.preferred_session_mode,
+                structured_output_tools: prefs.structured_output_tools,
             },
         )?;
         Ok(Self {
@@ -93,6 +100,7 @@ impl AgentModel {
             Arc::clone(&shutdown),
             ModelSessionOptions {
                 preferred_session_mode: prefs.preferred_session_mode,
+                structured_output_tools: prefs.structured_output_tools,
             },
         )?;
         Ok(Self {

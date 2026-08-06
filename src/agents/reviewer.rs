@@ -152,6 +152,7 @@ impl CoreAgent for ReviewerAgent {
             reviewer_dir.clone(),
             ModelPreferences {
                 preferred_session_mode: Some(ACP_SESSION_MODE_ASK),
+                structured_output_tools: None,
             },
         )?;
         let agent_settings = settings::settings();
@@ -1047,10 +1048,7 @@ Error: T: Connection stalled"#
 
     #[test]
     fn extract_approval_message_is_always_short_lgtm() {
-        let output = AgentHandoff {
-            lgtm: Some("Long narrative that must not appear in the GitLab thread.".to_string()),
-            ..Default::default()
-        };
+        let output = AgentHandoff::default();
 
         assert_eq!(extract_approval_message(&output), "LGTM");
     }

@@ -117,6 +117,13 @@ impl AgentLoop {
             .and_then(super::tools::plan_tool::PlanTool::take)
     }
 
+    /// Take all captured structured-output JSONs from caller-defined
+    /// structured-output tools. Returns a JSON object mapping tool name to
+    /// captured args. Tools that were never called are omitted.
+    pub fn take_structured_outputs(&self) -> Value {
+        self.tools.take_structured_outputs()
+    }
+
     /// Names of all registered tools (built-ins + mode-specific tools like
     /// `plan`, plus `todo` and `memory` added by the constructor), in
     /// insertion order. Useful for diagnostics at session startup.
