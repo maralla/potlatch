@@ -492,6 +492,7 @@ impl SubagentTool {
     }
 
     /// Construct with an externally-owned table (for tests).
+    #[cfg(test)]
     pub fn with_table(table: Arc<SubagentTable>, model: &str) -> Self {
         Self {
             table,
