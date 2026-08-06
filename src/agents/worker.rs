@@ -1791,14 +1791,22 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         return Ok(true);
     }
 
-    // If the agent provided updated MR_TITLE / MR_DESCRIPTION (e.g. the
-    // reviewer asked for a better title), update the MR metadata.
+    // If the agent provided updated MR_TITLE / MR_DESCRIPTION that differ from
+    // the current MR metadata (e.g. the reviewer asked for a better title),
+    // update the MR. With the `handoff` tool, the model always provides
+    // mr_title/mr_description — only write when something actually changed.
     let new_title = extract_explicit_mr_title(&agent_output);
     let new_desc = extract_explicit_mr_description(&agent_output);
-    if new_title.is_some() || new_desc != "Implementation completed." {
-        let title = new_title.as_deref().unwrap_or(&latest_mr.title);
+    let title_changed = new_title.as_deref().is_some_and(|t| t != latest_mr.title);
+    let desc_changed = new_desc != "Implementation completed." && new_desc != latest_mr.description;
+    if title_changed || desc_changed {
+        let title = if title_changed {
+            new_title.as_deref().unwrap_or(&latest_mr.title)
+        } else {
+            &latest_mr.title
+        };
 
-        let desc = if new_desc != "Implementation completed." {
+        let desc = if desc_changed {
             &new_desc
         } else {
             &latest_mr.description
@@ -3683,17 +3691,11 @@ fn extract_mr_title(agent_output: &AgentHandoff, issue_title: &str) -> String {
 /// caller can distinguish "no title provided" from "title provided". Unlike
 /// [`extract_mr_title`], this does NOT fall back to CHANGES_SUMMARY or the
 /// issue title — a metadata update should only overwrite the title when the
-/// agent explicitly said to.
+/// agent explicitly said to. Does NOT read from the `handoff` tool's
+/// `mr_title` field — that is for MR creation, not metadata updates. Only
+/// text markers (`MR_TITLE_BEGIN…END`, `MR_TITLE:`) are used here, so the
+/// model must explicitly emit them when a reviewer asks for a title change.
 fn extract_explicit_mr_title(agent_output: &AgentHandoff) -> Option<String> {
-    // Structured field first (from the `handoff` tool).
-    if let Some(s) = handoff_output(agent_output)
-        .and_then(|ho| ho.get("mr_title").and_then(serde_json::Value::as_str))
-    {
-        let cleaned = strip_markdown_formatting(s.trim());
-        if !cleaned.is_empty() {
-            return Some(cleaned);
-        }
-    }
     if let Some(block) =
         extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
     {

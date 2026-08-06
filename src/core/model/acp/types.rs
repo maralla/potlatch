@@ -66,7 +66,11 @@ pub struct NewSessionParams {
     /// creates a generic `StructuredOutputTool` per definition and returns
     /// captured output in the `session/prompt` response. Potlatch extension —
     /// not part of the ACP spec; ignored by non-potlatch backends.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "structured_output_tools"
+    )]
     pub structured_output_tools: Option<Vec<Value>>,
 }
 
