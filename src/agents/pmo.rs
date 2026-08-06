@@ -803,6 +803,37 @@ fn process_action_required_issue(
         return Ok(false);
     }
 
+    // --- WAIT_FOR_DEPENDENCY: issue depends on another open issue, park it ---
+    if pmo_wait_for_dependency(&agent_output) {
+        let Some(dep_iid) = agent_output.depends_on_issue else {
+            warn!(
+                "PMO: wait_for_dependency decision for issue #{} but no dependency_issue_iid provided, releasing claim for retry",
+                issue.iid
+            );
+            anyhow::bail!(
+                "PMO wait_for_dependency for issue #{} missing dependency_issue_iid; retrying later",
+                issue.iid
+            );
+        };
+        info!(
+            "PMO: Issue #{} depends on open issue #{}, parking",
+            issue.iid, dep_iid
+        );
+        let label = format!("waiting-on-issue:#{dep_iid}");
+        let _ = gitlab.add_issue_label(issue.iid, &label);
+        let _ = gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL);
+        let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
+        gitlab.add_issue_comment(
+            issue.iid,
+            &format!(
+                "**PMO: Parking — this issue depends on issue #{dep_iid} which is still open.**\n\n\
+                 The worker will skip this issue until #{} is closed, then resume automatically.",
+                dep_iid
+            ),
+        )?;
+        return Ok(false);
+    }
+
     // --- GUIDE_WORKER: single focused retry instruction ---
     if pmo_guides_worker(&agent_output) {
         let guidance = strip_internal_markers(&extract_guidance(&agent_output));
@@ -1148,11 +1179,12 @@ CRITICAL REQUIREMENTS:
 
 Call the `plan` tool with your decision as its arguments. Potlatch reads the tool's arguments directly — your streamed text is ignored for decision parsing. This is the ONLY output channel; you MUST call `plan` with your decision. The tool's parameters are:
 
-- `decision` (required): one of `guide_worker`, `split`, `already_done`, `needs_clarification`
+- `decision` (required): one of `guide_worker`, `split`, `already_done`, `needs_clarification`, `wait_for_dependency`
 - `instructions` (for guide_worker): 3-5 sentences, one clear action for the worker — posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.
 - `sub_issues` (for split): array of `{{"title": "...", "description": "...", "priority": 1-3, "depends_on": N}}` where `depends_on` is the 1-based index of another sub-issue this one depends on (omit or 0 if none). Example: if sub-issue 2 builds on sub-issue 1's work, set `"depends_on": 1`. The system automatically labels dependent issues so the worker won't start them until their dependency is closed.
 - `reason` (for already_done): why the codebase already satisfies the issue
 - `question` (for needs_clarification): specific questions for a human
+- `dependency_issue_iid` (for wait_for_dependency): the IID of the existing open issue this issue depends on and must wait for
 
 Only fill the parameter(s) relevant to your decision. Everything you put in `instructions`, `reason`, or `question` is human-facing and posted to GitLab verbatim — do not include any internal markers, harness instructions, or meta-commentary.
 
@@ -1193,6 +1225,13 @@ DECISION — choose EXACTLY ONE of the following:
    - You need specific information from a human (e.g. which modules to cover, what the acceptance criteria are)
    Do **not** use this option because you skipped reading the task context file.
 
+5. WAIT_FOR_DEPENDENCY — Use when this issue cannot be implemented until another EXISTING OPEN issue is closed:
+   - The dependency is a real build-order blocker (the code from the other issue is a prerequisite)
+   - Set `dependency_issue_iid` to the IID of the blocking issue (it must appear in the EXISTING OPEN ISSUES list)
+   - The system parks this issue (labels it `waiting-on-issue:#N`) so the worker skips it until the dependency closes, then resumes automatically
+   - Do NOT use this for issues that are merely related or could run in parallel — only for real prerequisites
+   - Do NOT use this as a substitute for SPLIT's `depends_on` (that's for sub-issues you're creating now); use WAIT_FOR_DEPENDENCY only when the dependency is an already-existing separate issue
+
 DUPLICATE / OVERLAP RULES (STRICT):
 - Review the EXISTING OPEN ISSUES list above before creating any sub-issue.
 - Do NOT create a sub-issue that duplicates or substantially overlaps with an existing open issue.
@@ -1209,9 +1248,10 @@ INSTRUCTIONS:
 6. ENUMERATION TEST: If your guidance would list 2+ independent modules, files, or components → SPLIT, not GUIDE_WORKER.
 7. CLARITY TEST: Only if the task context file plus (if needed) repo inspection still leaves intent unclear → NEEDS_CLARIFICATION.
 8. COMPLETION TEST: Does the worker's output, the comments in the file, or your direct inspection of the current project state indicate the work is already fully implemented in the codebase? If YES → ALREADY_DONE.
-9. Choose EXACTLY ONE of GUIDE_WORKER, SPLIT, ALREADY_DONE, or NEEDS_CLARIFICATION — never combine them.
-10. When in doubt between GUIDE_WORKER and SPLIT, prefer SPLIT — it's better to create focused sub-issues than to give the worker a laundry list.
-11. Call the `plan` tool with the JSON shape above. This is the last step — your turn is not complete until you call `plan`.
+9. DEPENDENCY TEST: Does this issue require code from another EXISTING OPEN issue to be implemented first? If YES → WAIT_FOR_DEPENDENCY (set `dependency_issue_iid`).
+10. Choose EXACTLY ONE of GUIDE_WORKER, SPLIT, ALREADY_DONE, NEEDS_CLARIFICATION, or WAIT_FOR_DEPENDENCY — never combine them.
+11. When in doubt between GUIDE_WORKER and SPLIT, prefer SPLIT — it's better to create focused sub-issues than to give the worker a laundry list.
+12. Call the `plan` tool with the JSON shape above. This is the last step — your turn is not complete until you call `plan`.
 
 Proceed with analyzing the issue autonomously.
 "#,
@@ -1263,6 +1303,14 @@ fn is_pmo_already_done_response(output: &AgentHandoff) -> bool {
         .decision
         .as_deref()
         .is_some_and(|d| d.eq_ignore_ascii_case("already_done"))
+}
+
+fn pmo_wait_for_dependency(output: &AgentHandoff) -> bool {
+    output
+        .decision
+        .as_deref()
+        .is_some_and(|d| d.eq_ignore_ascii_case("wait_for_dependency"))
+        || output.depends_on_issue.is_some()
 }
 
 // --- Field extractors (structured-fields only) ---
@@ -1338,6 +1386,19 @@ fn pmo_truncate_utf8_by_bytes(s: &str, max_bytes: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// Parse a JSON value as an issue IID, accepting numbers, numeric strings,
+/// and strings with a leading `#` (e.g. `727`, `"727"`, `"#727"`). Returns
+/// `None` for zero or non-numeric values.
+fn parse_iid_value(val: &Value) -> Option<u64> {
+    let n = val.as_u64().or_else(|| {
+        let s = val.as_str()?;
+        let s = s.trim().trim_start_matches('#').trim();
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().ok()
+    });
+    n.filter(|n| *n > 0)
+}
+
 /// Apply the structured plan JSON the model emitted via the `plan` tool.
 /// Populates the handoff's structured fields (`decision`, `instructions`,
 /// `sub_issues`, `reason`, `question`, `needs_clarification`) from the JSON.
@@ -1374,6 +1435,24 @@ fn apply_pmo_plan_output(mut handoff: AgentHandoff) -> AgentHandoff {
         if !t.is_empty() {
             handoff.question = Some(t.to_string());
             handoff.needs_clarification = Some(t.to_string());
+        }
+    }
+
+    // PMO wait_for_dependency: the model may use different field names or
+    // provide the IID as a string (e.g. "#727" or "727"). Accept any of a
+    // set of plausible keys and parse the leading digits.
+    for key in [
+        "dependency_issue_iid",
+        "dependency_iid",
+        "depends_on_issue",
+        "blocked_by",
+        "dependency",
+    ] {
+        if let Some(val) = plan.get(key)
+            && let Some(n) = parse_iid_value(val)
+        {
+            handoff.depends_on_issue = Some(n);
+            break;
         }
     }
 
@@ -1790,6 +1869,72 @@ mod tests {
     }
 
     #[test]
+    fn apply_pmo_plan_output_populates_depends_on_issue_for_wait_for_dependency() {
+        let handoff = AgentHandoff {
+            plan_output: Some(serde_json::json!({
+                "decision": "wait_for_dependency",
+                "dependency_issue_iid": 47
+            })),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert_eq!(applied.decision.as_deref(), Some("wait_for_dependency"));
+        assert_eq!(applied.depends_on_issue, Some(47));
+        assert!(pmo_wait_for_dependency(&applied));
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_ignores_zero_dependency_issue_iid() {
+        let handoff = AgentHandoff {
+            plan_output: Some(serde_json::json!({
+                "decision": "wait_for_dependency",
+                "dependency_issue_iid": 0
+            })),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert_eq!(applied.decision.as_deref(), Some("wait_for_dependency"));
+        assert_eq!(applied.depends_on_issue, None);
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_accepts_string_dependency_issue_iid() {
+        let handoff = AgentHandoff {
+            plan_output: Some(serde_json::json!({
+                "decision": "wait_for_dependency",
+                "dependency_issue_iid": "#727"
+            })),
+            ..Default::default()
+        };
+        let applied = apply_pmo_plan_output(handoff);
+        assert_eq!(applied.depends_on_issue, Some(727));
+    }
+
+    #[test]
+    fn apply_pmo_plan_output_accepts_alternative_field_names() {
+        for key in [
+            "dependency_iid",
+            "depends_on_issue",
+            "blocked_by",
+            "dependency",
+        ] {
+            let handoff = AgentHandoff {
+                plan_output: Some(serde_json::json!({
+                    "decision": "wait_for_dependency",
+                    key: 727
+                })),
+                ..Default::default()
+            };
+            let applied = apply_pmo_plan_output(handoff);
+            assert_eq!(
+                applied.depends_on_issue,
+                Some(727),
+                "failed for alternative field name `{key}`"
+            );
+        }
+    }
+
+    #[test]
     fn apply_pmo_plan_output_none_leaves_handoff_unchanged() {
         let handoff = AgentHandoff {
             response: "some text".into(),
@@ -1954,11 +2099,30 @@ mod tests {
         assert!(is_pmo_already_done_response(&ad));
         assert!(!pmo_guides_worker(&ad));
 
+        // wait_for_dependency
+        let wd = AgentHandoff {
+            decision: Some("wait_for_dependency".into()),
+            depends_on_issue: Some(42),
+            ..Default::default()
+        };
+        assert!(pmo_wait_for_dependency(&wd));
+        assert!(!pmo_guides_worker(&wd));
+        assert!(!is_pmo_already_done_response(&wd));
+        assert!(!pmo_needs_clarification(&wd));
+
+        // depends_on_issue alone also triggers the predicate (structured field)
+        let wd_field = AgentHandoff {
+            depends_on_issue: Some(7),
+            ..Default::default()
+        };
+        assert!(pmo_wait_for_dependency(&wd_field));
+
         // No decision
         let none = AgentHandoff::default();
         assert!(!pmo_needs_clarification(&none));
         assert!(!pmo_guides_worker(&none));
         assert!(!is_pmo_already_done_response(&none));
+        assert!(!pmo_wait_for_dependency(&none));
     }
 
     #[test]

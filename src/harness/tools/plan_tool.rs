@@ -48,9 +48,9 @@ impl Tool for PlanTool {
                 "type": "object",
                 "properties": {
                     "decision": {
-                        "description": "Your triage decision. Must be exactly one of: \"guide_worker\", \"split\", \"already_done\", \"needs_clarification\".",
+                        "description": "Your triage decision. Must be exactly one of: \"guide_worker\", \"split\", \"already_done\", \"needs_clarification\", \"wait_for_dependency\".",
                         "type": "string",
-                        "enum": ["guide_worker", "split", "already_done", "needs_clarification"]
+                        "enum": ["guide_worker", "split", "already_done", "needs_clarification", "wait_for_dependency"]
                     },
                     "instructions": {
                         "description": "For guide_worker: 3-5 sentences with one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.",
@@ -86,6 +86,10 @@ impl Tool for PlanTool {
                     "question": {
                         "description": "For needs_clarification: specific questions for a human.",
                         "type": "string"
+                    },
+                    "dependency_issue_iid": {
+                        "description": "For wait_for_dependency: the IID (number) of the existing open issue this issue depends on and must wait for. Must be a positive integer.",
+                        "type": "integer"
                     }
                 },
                 "required": ["decision"]
@@ -198,7 +202,8 @@ mod tests {
                 "guide_worker",
                 "split",
                 "already_done",
-                "needs_clarification"
+                "needs_clarification",
+                "wait_for_dependency"
             ]
         );
         // Sub-issues have explicit title/description/priority.
@@ -208,6 +213,12 @@ mod tests {
         assert!(sub_issue_props.contains_key("title"));
         assert!(sub_issue_props.contains_key("description"));
         assert!(sub_issue_props.contains_key("priority"));
+        // The dependency_issue_iid field is advertised for wait_for_dependency.
+        assert!(props.contains_key("dependency_issue_iid"));
+        assert_eq!(
+            props["dependency_issue_iid"]["type"].as_str(),
+            Some("integer")
+        );
         // No wrapping "plan" key — fields are top-level.
         assert!(!props.contains_key("plan"));
     }

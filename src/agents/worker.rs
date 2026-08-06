@@ -33,9 +33,6 @@ const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
 const WORKER_PENDING_LABEL: &str = "pending";
 /// Reviewer-only workflow: worker skips and stops tracking while reviewer may still process the MR.
 const WORKER_REVIEW_ONLY_LABEL: &str = "review-only";
-/// Prefix for labels that park an issue until a dependency MR merges.
-/// The full label is `waiting-on-mr:!N` where N is the dependency MR IID.
-const WAITING_ON_MR_LABEL_PREFIX: &str = "waiting-on-mr:!";
 /// ACP runtime message when `cancel_check` returns true.
 const WORKER_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
 
@@ -739,49 +736,6 @@ fn worker_cycle(
             continue;
         }
 
-        // Check if this issue is parked waiting on a dependency MR.
-        if let Some(dep_mr_iid) = extract_waiting_on_mr_iid(&issue.labels) {
-            match state.glab.get_merge_request(dep_mr_iid) {
-                Ok(mr) if mr.state == "merged" => {
-                    // Dependency merged — strip the waiting label and proceed to claim.
-                    info!(
-                        "{}: Issue #{} dependency MR !{} merged, resuming",
-                        &state.agent_id, issue.iid, dep_mr_iid
-                    );
-                    let label = waiting_on_mr_label(dep_mr_iid);
-                    let _ = state.glab.remove_issue_label(issue.iid, &label);
-                }
-                Ok(_) => {
-                    debug!(
-                        "{}: Issue #{} waiting on MR !{} (not yet merged), skipping",
-                        &state.agent_id, issue.iid, dep_mr_iid
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    // A 404 means the dependency MR was deleted (some GitLab
-                    // setups delete merged MRs) or never existed. Either way,
-                    // waiting is futile — drop the label and resume the issue.
-                    if err_str.contains("404") {
-                        info!(
-                            "{}: Issue #{} dependency MR !{} not found (deleted or never existed), dropping dependency label and resuming",
-                            &state.agent_id, issue.iid, dep_mr_iid
-                        );
-                        let label = waiting_on_mr_label(dep_mr_iid);
-                        let _ = state.glab.remove_issue_label(issue.iid, &label);
-                    } else {
-                        // Transient API error — skip this cycle, retry next poll.
-                        warn!(
-                            "{}: Issue #{} waiting on MR !{} — failed to check dependency state: {}, skipping this cycle",
-                            &state.agent_id, issue.iid, dep_mr_iid, err_str
-                        );
-                        continue;
-                    }
-                }
-            }
-        }
-
         // Check if this issue is parked waiting on a dependency issue.
         if let Some(dep_issue_iid) = extract_waiting_on_issue_iid(&issue.labels) {
             match state.glab.get_issue(dep_issue_iid) {
@@ -1372,6 +1326,52 @@ fn process_issue(
         return Ok(None);
     }
 
+    // If the agent declared a dependency on another issue that is not yet
+    // closed, park this issue: label it `waiting-on-issue:#N`, remove
+    // `in-progress`, release the claim, and reset git state. No MR is
+    // created — the work can't proceed until the dependency closes. When
+    // the dependency issue closes, the worker resume-path strips the label
+    // and the issue becomes claimable again.
+    if let Some(dep_issue_iid) = extract_depends_on_issue(&agent_output) {
+        let dep_closed = state
+            .glab
+            .get_issue(dep_issue_iid)
+            .map(|dep| dep.state == "closed")
+            .unwrap_or(false);
+        if !dep_closed {
+            let label = waiting_on_issue_label(dep_issue_iid);
+            let _ = state.glab.add_issue_label(issue.iid, &label);
+            let _ = state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
+            let _ = state.glab.add_issue_comment(
+                issue.iid,
+                &format!(
+                    "Implementation cannot proceed until issue #{} is closed. \
+                     Parking this issue until the dependency resolves.",
+                    dep_issue_iid
+                ),
+            );
+            let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
+            state.cleanup_session(issue.iid);
+
+            // Reset git to a clean state — keep the remote branch for resume.
+            let default_branch = state
+                .git_repo
+                .get_default_branch()
+                .unwrap_or("main".to_string());
+            let _ = state.git_repo.reset_hard();
+            let _ = state.git_repo.checkout_remote_branch(&default_branch);
+            let _ = state.git_repo.delete_local_branch(&branch_name);
+
+            info!(
+                "{}: Issue #{} parked waiting on issue #{} (dependency open), released claim",
+                &state.agent_id, issue.iid, dep_issue_iid
+            );
+            current.mr_created = false;
+            current.branch_name = None;
+            return Ok(None);
+        }
+    }
+
     // The agent may have already committed changes itself (it has full shell
     // access). Stage+commit any remaining uncommitted work, then check whether
     // the branch diverges from the base at all.
@@ -1421,43 +1421,6 @@ fn process_issue(
 
     let impl_summary = extract_mr_description(&agent_output);
     state.save_session_with_summary(issue.iid, mr_iid, &impl_summary)?;
-
-    // If the agent declared a dependency on an unmerged MR, park the issue:
-    // label it `waiting-on-mr:!N`, remove `in-progress`, release the claim,
-    // and clear `current` so the caller doesn't track it as active. The MR
-    // stays open — it just can't merge until the dependency does.
-    if let Some(dep_mr_iid) = extract_depends_on_mr(&agent_output) {
-        let dep_merged = state
-            .glab
-            .get_merge_request(dep_mr_iid)
-            .map(|mr| mr.state == "merged")
-            .unwrap_or(false);
-        if !dep_merged {
-            let label = waiting_on_mr_label(dep_mr_iid);
-            let _ = state.glab.add_issue_label(issue.iid, &label);
-            let _ = state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
-            let _ = state.glab.add_issue_comment(
-                issue.iid,
-                &format!(
-                    "Implementation complete in MR !{}, but it depends on MR !{} which is not yet merged. \
-                     Parking this issue until the dependency merges.",
-                    mr_iid, dep_mr_iid
-                ),
-            );
-            let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
-            state.cleanup_session(issue.iid);
-            info!(
-                "{}: Issue #{} parked waiting on MR !{} (dependency unmerged), released claim",
-                &state.agent_id, issue.iid, dep_mr_iid
-            );
-            // Signal to the caller that the MR was created but the issue is
-            // parked — `mr_created = false` makes the caller's else-branch run
-            // (idempotent release_claim, no git cleanup, no active tracking).
-            current.mr_created = false;
-            current.branch_name = None;
-            return Ok(Some(mr_iid));
-        }
-    }
 
     Ok(Some(mr_iid))
 }
@@ -3305,9 +3268,9 @@ MR_DESCRIPTION_END
 
 IMPORTANT: The MR_TITLE and MR_DESCRIPTION markers are REQUIRED. Without them, the system cannot create the merge request properly.
 
-If your implementation depends on another merge request that is not yet merged, include this line:
-DEPENDS_ON_MR: !<N>
-where <N> is the IID of the dependency MR. Only use this when the dependency is real — your MR cannot merge until the other one does. The system will park this issue until the dependency merges, then resume it automatically. Omit this line if there is no dependency.
+If your implementation depends on another issue that is not yet closed, include this line on its own line:
+DEPENDS_ON_ISSUE: #<N>
+where <N> is the IID of the dependency issue. Only use this when the dependency is real — your work cannot proceed until the other issue is closed. The system will park this issue until the dependency closes, then resume it automatically. Omit this line if there is no dependency. Put this marker on a line by itself — do not embed it in a sentence.
 
 Do NOT put PUBLIC_COMMENT_BEGIN / PUBLIC_COMMENT_END inside MR_DESCRIPTION or MR_DESCRIPTION_BEGIN…END — those blocks are only for GitLab thread replies. The MR description must be plain documentation (goal, implementation, testing); reply text belongs in a separate PUBLIC_COMMENT block after the MR description.
 
@@ -3374,39 +3337,78 @@ fn extract_clarification(agent_output: &AgentHandoff) -> String {
     "This issue needs clarification. Please provide more details.".to_string()
 }
 
-/// Extract a dependency MR IID from the agent's output. The model emits
-/// `DEPENDS_ON_MR: !42` when its implementation relies on an unmerged MR.
-/// Returns the first IID found, or `None` if the marker is absent/malformed.
-fn extract_depends_on_mr(agent_output: &AgentHandoff) -> Option<u64> {
+/// Extract a dependency issue IID from the agent's output. The model emits
+/// `DEPENDS_ON_ISSUE: #42` when its implementation relies on another issue
+/// that is not yet closed. Returns the first IID found, or `None` if the
+/// marker is absent/malformed.
+fn extract_depends_on_issue(agent_output: &AgentHandoff) -> Option<u64> {
     let response = &agent_output.response;
-    let pos = response.find("DEPENDS_ON_MR:")?;
-    let rest = &response[pos + "DEPENDS_ON_MR:".len()..];
-    let line = rest.lines().next()?;
-    let line = line.trim();
-    // Accept "!42", "42", "!42, !43" — take the first IID.
-    let first = line.split(',').next()?.trim();
-    let num = first.trim_start_matches('!').trim();
-    num.parse::<u64>().ok()
+
+    // Primary: explicit marker `DEPENDS_ON_ISSUE: #N`.
+    if let Some(pos) = response.find("DEPENDS_ON_ISSUE:") {
+        let rest = &response[pos + "DEPENDS_ON_ISSUE:".len()..];
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix('#').unwrap_or(rest);
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = num.parse::<u64>() {
+            return Some(n);
+        }
+    }
+
+    // Fallback: prose declarations like "blocked on #727", "depends on #727",
+    // "cannot proceed until #727 is closed". The model often describes the
+    // dependency without using the explicit marker, so scan for issue
+    // references preceded by dependency keywords.
+    extract_depends_on_issue_from_prose(response)
 }
 
-/// Build the `waiting-on-mr:!N` label for a dependency MR IID.
-fn waiting_on_mr_label(mr_iid: u64) -> String {
-    format!("{WAITING_ON_MR_LABEL_PREFIX}{mr_iid}")
-}
-
-/// Extract the dependency MR IID from a `waiting-on-mr:!N` issue label.
-fn extract_waiting_on_mr_iid(labels: &[String]) -> Option<u64> {
-    labels.iter().find_map(|l| {
-        l.strip_prefix(WAITING_ON_MR_LABEL_PREFIX)
-            .and_then(|s| s.parse::<u64>().ok())
-    })
+/// Scan prose for dependency phrases followed by `#<N>` issue references.
+/// Matches patterns like "blocked on #727", "depends on #727",
+/// "cannot proceed until #727", "waiting on #727", "blocked by #727".
+fn extract_depends_on_issue_from_prose(text: &str) -> Option<u64> {
+    let lower = text.to_lowercase();
+    let keywords = [
+        "blocked on",
+        "blocked by",
+        "depends on",
+        "waiting on",
+        "waiting for",
+        "cannot proceed until",
+        "cannot start until",
+        "hard-blocked on",
+        "blocked until",
+    ];
+    for kw in keywords {
+        let mut search_from = 0;
+        while let Some(pos) = lower[search_from..].find(kw) {
+            let abs = search_from + pos + kw.len();
+            let rest = &text[abs..];
+            // Skip whitespace, then expect '#'.
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('#') {
+                let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = num.parse::<u64>()
+                    && n > 0
+                {
+                    return Some(n);
+                }
+            }
+            search_from = abs;
+        }
+    }
+    None
 }
 
 /// Prefix for labels that park an issue until a dependency issue is closed.
 /// The full label is `waiting-on-issue:#N` where N is the dependency issue IID.
 const WAITING_ON_ISSUE_LABEL_PREFIX: &str = "waiting-on-issue:#";
 
-/// Extract the dependency issue IID from a `waiting-on-issue:#N` label.
+/// Build the `waiting-on-issue:#N` label for a dependency issue IID.
+fn waiting_on_issue_label(issue_iid: u64) -> String {
+    format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{issue_iid}")
+}
+
+/// Extract the dependency issue IID from a `waiting-on-issue:#N` issue label.
 fn extract_waiting_on_issue_iid(labels: &[String]) -> Option<u64> {
     labels.iter().find_map(|l| {
         l.strip_prefix(WAITING_ON_ISSUE_LABEL_PREFIX)
@@ -4147,71 +4149,131 @@ mod tests {
     }
 
     #[test]
-    fn extract_depends_on_mr_parses_single_iid() {
+    fn extract_depends_on_issue_parses_single_iid() {
         let out = AgentHandoff {
-            response: "DEPENDS_ON_MR: !42".to_string(),
+            response: "DEPENDS_ON_ISSUE: #42".to_string(),
             ..Default::default()
         };
-        assert_eq!(extract_depends_on_mr(&out), Some(42));
+        assert_eq!(extract_depends_on_issue(&out), Some(42));
     }
 
     #[test]
-    fn extract_depends_on_mr_parses_bangless_iid() {
+    fn extract_depends_on_issue_parses_hashless_iid() {
         let out = AgentHandoff {
-            response: "DEPENDS_ON_MR: 42".to_string(),
+            response: "DEPENDS_ON_ISSUE: 42".to_string(),
             ..Default::default()
         };
-        assert_eq!(extract_depends_on_mr(&out), Some(42));
+        assert_eq!(extract_depends_on_issue(&out), Some(42));
     }
 
     #[test]
-    fn extract_depends_on_mr_takes_first_of_multiple() {
+    fn extract_depends_on_issue_takes_first_of_multiple() {
         let out = AgentHandoff {
-            response: "DEPENDS_ON_MR: !42, !43".to_string(),
+            response: "DEPENDS_ON_ISSUE: #42, #43".to_string(),
             ..Default::default()
         };
-        assert_eq!(extract_depends_on_mr(&out), Some(42));
+        assert_eq!(extract_depends_on_issue(&out), Some(42));
     }
 
     #[test]
-    fn extract_depends_on_mr_returns_none_when_absent() {
+    fn extract_depends_on_issue_parses_embedded_in_prose() {
+        // The model often embeds the marker in a sentence rather than on its
+        // own line, e.g. "Parked via DEPENDS_ON_ISSUE: #727 so this
+        // auto-resumes once #727 merges." The parser must extract 727, not
+        // fail on the trailing prose.
+        let out = AgentHandoff {
+            response: "Parked via DEPENDS_ON_ISSUE: #727 so this auto-resumes once #727 merges."
+                .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_issue(&out), Some(727));
+    }
+
+    #[test]
+    fn extract_depends_on_issue_parses_no_space_after_colon() {
+        let out = AgentHandoff {
+            response: "DEPENDS_ON_ISSUE:#42".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_issue(&out), Some(42));
+    }
+
+    #[test]
+    fn extract_depends_on_issue_returns_none_when_absent() {
         let out = AgentHandoff {
             response: "MR_TITLE: something\nMR_DESCRIPTION: done".to_string(),
             ..Default::default()
         };
-        assert_eq!(extract_depends_on_mr(&out), None);
+        assert_eq!(extract_depends_on_issue(&out), None);
     }
 
     #[test]
-    fn extract_depends_on_mr_returns_none_for_garbage() {
+    fn extract_depends_on_issue_returns_none_for_garbage() {
         let out = AgentHandoff {
-            response: "DEPENDS_ON_MR: !abc".to_string(),
+            response: "DEPENDS_ON_ISSUE: #abc".to_string(),
             ..Default::default()
         };
-        assert_eq!(extract_depends_on_mr(&out), None);
+        assert_eq!(extract_depends_on_issue(&out), None);
     }
 
     #[test]
-    fn waiting_on_mr_label_format() {
-        assert_eq!(waiting_on_mr_label(42), "waiting-on-mr:!42");
+    fn extract_depends_on_issue_fallback_blocked_on() {
+        let out = AgentHandoff {
+            response: "Issue #733 is hard-blocked on #727 and cannot be started yet.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_issue(&out), Some(727));
     }
 
     #[test]
-    fn extract_waiting_on_mr_iid_finds_label() {
-        let labels = vec!["in-progress".to_string(), "waiting-on-mr:!42".to_string()];
-        assert_eq!(extract_waiting_on_mr_iid(&labels), Some(42));
+    fn extract_depends_on_issue_fallback_depends_on() {
+        let out = AgentHandoff {
+            response: "This work depends on #727 which is not yet closed.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_issue(&out), Some(727));
     }
 
     #[test]
-    fn extract_waiting_on_mr_iid_returns_none_without_label() {
-        let labels = vec!["in-progress".to_string(), "priority::3".to_string()];
-        assert_eq!(extract_waiting_on_mr_iid(&labels), None);
+    fn extract_depends_on_issue_fallback_cannot_proceed_until() {
+        let out = AgentHandoff {
+            response: "I cannot proceed until #727 is closed; it cannot compile.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_issue(&out), Some(727));
     }
 
     #[test]
-    fn extract_waiting_on_mr_iid_ignores_malformed() {
-        let labels = vec!["waiting-on-mr:!abc".to_string()];
-        assert_eq!(extract_waiting_on_mr_iid(&labels), None);
+    fn extract_depends_on_issue_fallback_blocked_by() {
+        let out = AgentHandoff {
+            response: "Implementation is blocked by #47 and needs its API.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_issue(&out), Some(47));
+    }
+
+    #[test]
+    fn extract_depends_on_issue_fallback_waiting_on() {
+        let out = AgentHandoff {
+            response: "Parked — waiting on #99 to merge first.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_issue(&out), Some(99));
+    }
+
+    #[test]
+    fn extract_depends_on_issue_prose_fallback_ignores_unrelated_issue_refs() {
+        // "See #42 for context" should NOT trigger — no dependency keyword.
+        let out = AgentHandoff {
+            response: "See #42 for background. The work is done.".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(extract_depends_on_issue(&out), None);
+    }
+
+    #[test]
+    fn waiting_on_issue_label_format() {
+        assert_eq!(waiting_on_issue_label(42), "waiting-on-issue:#42");
     }
 
     #[test]
@@ -4233,17 +4295,5 @@ mod tests {
     fn extract_waiting_on_issue_iid_ignores_malformed() {
         let labels = vec!["waiting-on-issue:#abc".to_string()];
         assert_eq!(extract_waiting_on_issue_iid(&labels), None);
-    }
-
-    #[test]
-    fn extract_waiting_on_issue_iid_distinguishes_from_mr_label() {
-        // Both labels present — the issue-dependency extractor must find the
-        // issue label, not the MR label.
-        let labels = vec![
-            "waiting-on-mr:!42".to_string(),
-            "waiting-on-issue:#7".to_string(),
-        ];
-        assert_eq!(extract_waiting_on_issue_iid(&labels), Some(7));
-        assert_eq!(extract_waiting_on_mr_iid(&labels), Some(42));
     }
 }

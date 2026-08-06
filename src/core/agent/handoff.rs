@@ -49,6 +49,12 @@ pub struct AgentHandoff {
     pub lgtm: Option<String>,
     #[serde(default)]
     pub sub_issues: Vec<HandoffSubIssue>,
+    /// IID of an existing open issue that this issue depends on, declared by
+    /// the PMO via the `wait_for_dependency` decision. The PMO applies a
+    /// `waiting-on-issue:#N` label so the worker parks the issue until the
+    /// dependency closes. `None` when not declared.
+    #[serde(default)]
+    pub depends_on_issue: Option<u64>,
     /// Absolute paths from Cursor plan-mode `tool_call_update` ("Plan saved to file://…").
     #[serde(default)]
     pub cursor_plan_paths: Vec<String>,
