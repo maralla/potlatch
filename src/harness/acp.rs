@@ -39,6 +39,10 @@ struct Session {
     /// retrieve their state by concrete type via `SessionStates::get`.
     /// All state is shut down on session close.
     states: super::tools::SessionStates,
+    /// Optional allow-list of tool names. `None` means all built-in tools;
+    /// `Some(names)` registers only the named tools. Set via the `tools`
+    /// extension field of `session/new`.
+    allowed_tools: Option<Vec<String>>,
 }
 
 impl Session {
@@ -50,6 +54,7 @@ impl Session {
             mode: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             states: super::tools::SessionStates::new(),
+            allowed_tools: None,
         }
     }
 }
@@ -126,7 +131,18 @@ impl AcpServer {
         let cwd = params["cwd"].as_str().unwrap_or(".").to_string();
         info!("harness ACP: creating session with cwd={cwd}");
 
-        let session = Session::new(cwd);
+        let mut session = Session::new(cwd);
+        // Optional `tools` extension: an allow-list of tool names. When
+        // present, only those tools are registered for this session.
+        if let Some(arr) = params.get("tools").and_then(|v| v.as_array()) {
+            let names: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            if !names.is_empty() {
+                session.allowed_tools = Some(names);
+            }
+        }
         let session_id = session.id.clone();
 
         let models = self.llm.list_models().unwrap_or_default();
@@ -219,10 +235,16 @@ impl AcpServer {
         let cwd = session.cwd.clone();
         let model = session.model.clone();
         let mode = session.mode.clone();
+        let allowed_tools = session.allowed_tools.clone();
         let cancel = session.cancel.clone();
         cancel.store(false, Ordering::SeqCst);
 
-        let mut tools = ToolRegistry::with_builtin_tools(&mut session.states, &cwd);
+        let mut tools = ToolRegistry::with_builtin_tools(
+            &mut session.states,
+            &cwd,
+            &model,
+            allowed_tools.as_deref(),
+        );
         // In plan mode: drop `edit` (the PMO triages and decides, it
         // must not mutate code) and let the agent loop register the `plan`
         // tool. The ACP runtime sets the mode via session/set_config_option

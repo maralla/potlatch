@@ -8,6 +8,7 @@ pub mod plan_tool;
 pub mod read;
 pub mod search;
 pub mod shell;
+pub mod subagent;
 pub mod todo;
 pub mod write;
 
@@ -255,18 +256,54 @@ impl ToolRegistry {
     }
 
     /// Build a registry with all built-in tools. Session-scoped tools (shell,
-    /// lsp) receive `&mut SessionStates` so they can create/retrieve their
-    /// long-lived state. Stateless tools don't take it.
-    pub fn with_builtin_tools(states: &mut SessionStates, cwd: &str) -> Self {
+    /// lsp, subagent) receive `&mut SessionStates` so they can create/retrieve
+    /// their long-lived state. Stateless tools don't take it.
+    ///
+    /// `model` is the session model, forwarded to the subagent tool so spawned
+    /// subagents default to the parent's model.
+    ///
+    /// `allowed_tools` filters which tools are registered: `None` registers
+    /// all; `Some(names)` registers only tools whose name is in the list.
+    pub fn with_builtin_tools(
+        states: &mut SessionStates,
+        cwd: &str,
+        model: &str,
+        allowed_tools: Option<&[String]>,
+    ) -> Self {
         let mut reg = Self::new();
-        reg.register(Arc::new(shell::ShellTool::new(states, cwd)));
-        reg.register(Arc::new(read::ReadTool));
-        reg.register(Arc::new(edit::EditTool));
-        reg.register(Arc::new(write::WriteTool));
-        reg.register(Arc::new(search::GrepTool));
-        reg.register(Arc::new(search::GlobTool));
-        reg.register(Arc::new(fetch::FetchTool::new()));
-        reg.register(Arc::new(lsp::LspTool::new(states, cwd)));
+        let allowed = |name: &str| -> bool {
+            allowed_tools
+                .map(|names| names.iter().any(|n| n == name))
+                .unwrap_or(true)
+        };
+
+        if allowed("shell") {
+            reg.register(Arc::new(shell::ShellTool::new(states, cwd)));
+        }
+        if allowed("read") {
+            reg.register(Arc::new(read::ReadTool));
+        }
+        if allowed("edit") {
+            reg.register(Arc::new(edit::EditTool));
+        }
+        if allowed("write") {
+            reg.register(Arc::new(write::WriteTool));
+        }
+        if allowed("grep") {
+            reg.register(Arc::new(search::GrepTool));
+        }
+        if allowed("glob") {
+            reg.register(Arc::new(search::GlobTool));
+        }
+        if allowed("fetch") {
+            reg.register(Arc::new(fetch::FetchTool::new()));
+        }
+        if allowed("lsp") {
+            reg.register(Arc::new(lsp::LspTool::new(states, cwd)));
+        }
+        if allowed("subagent") {
+            reg.register(Arc::new(subagent::SubagentTool::new(states, cwd, model)));
+        }
         reg
     }
 
@@ -485,7 +522,7 @@ mod tests {
 
     #[test]
     fn unregister_removes_tool_from_registry() {
-        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "");
+        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "", "", None);
         assert!(reg.tool_names().contains(&"edit"));
         reg.unregister("edit");
         assert!(!reg.tool_names().contains(&"edit"));
@@ -503,7 +540,7 @@ mod tests {
 
     #[test]
     fn unregister_is_noop_for_unknown_tool() {
-        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "");
+        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "", "", None);
         let before: Vec<String> = reg.tool_names().iter().map(|s| s.to_string()).collect();
         reg.unregister("nonexistent");
         let after: Vec<String> = reg.tool_names().iter().map(|s| s.to_string()).collect();
@@ -512,7 +549,7 @@ mod tests {
 
     #[test]
     fn unregister_preserves_order_of_remaining_tools() {
-        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "");
+        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "", "", None);
         reg.unregister("edit");
         let names = reg.tool_names();
         // edit was in the middle; the rest keep their relative order.

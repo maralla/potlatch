@@ -869,8 +869,12 @@ mod tests {
             },
         ]));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
 
@@ -905,8 +909,12 @@ mod tests {
             },
         ]));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
 
@@ -941,8 +949,12 @@ mod tests {
             },
         ]));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(true)); // Pre-cancelled
         let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
 
@@ -1056,8 +1068,12 @@ mod tests {
             },
         ]));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
 
@@ -1101,8 +1117,12 @@ mod tests {
             },
         ]));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent =
             AgentLoop::new_with_plan_mode(llm, tools, "test-model".into(), 100_000, cancel, true);
@@ -1130,8 +1150,12 @@ mod tests {
             reasoning: String::new(),
         }]));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
 
@@ -1159,8 +1183,12 @@ mod tests {
 
         let llm = Arc::new(FakeChatClient::new(responses));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent =
             AgentLoop::new_with_plan_mode(llm, tools, "test-model".into(), 100_000, cancel, true);
@@ -1214,8 +1242,12 @@ mod tests {
             },
         ]));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent =
             AgentLoop::new_with_plan_mode(llm, tools, "test-model".into(), 100_000, cancel, true);
@@ -1329,8 +1361,12 @@ mod tests {
             vec![tool_call],
         ));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
 
@@ -1434,8 +1470,12 @@ mod tests {
             },
         ]));
 
-        let tools =
-            ToolRegistry::with_builtin_tools(&mut crate::harness::tools::SessionStates::new(), "");
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
 
