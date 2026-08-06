@@ -36,6 +36,70 @@ const WORKER_REVIEW_ONLY_LABEL: &str = "review-only";
 /// ACP runtime message when `cancel_check` returns true.
 const WORKER_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
 
+/// The worker's structured-output tool definition. Passed to the harness via
+/// `session/new` so the harness registers a generic `StructuredOutputTool`
+/// named `handoff`. The model calls it with structured JSON instead of
+/// emitting text markers.
+fn handoff_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name": "handoff",
+        "description": "Emit your implementation output as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response. Call this once when you're done (or when you need to signal a dependency/split/clarification). All fields are optional — include only the ones relevant to your outcome.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "mr_title": {
+                    "type": "string",
+                    "description": "Short MR title (max 8-10 words). Focus on WHAT, not HOW. No markdown."
+                },
+                "mr_description": {
+                    "type": "string",
+                    "description": "Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections."
+                },
+                "changes_summary": {
+                    "type": "string",
+                    "description": "A concise sentence summarizing the substance of changes made (for commit messages)."
+                },
+                "depends_on_issue": {
+                    "type": "integer",
+                    "description": "IID of a dependency issue that must close before this work can proceed. Set when the issue is hard-blocked on another open issue."
+                },
+                "needs_split": {
+                    "type": "string",
+                    "description": "Reason the issue needs splitting into smaller issues."
+                },
+                "needs_clarification": {
+                    "type": "string",
+                    "description": "What information is needed from a human to proceed."
+                },
+                "cannot_implement": {
+                    "type": "boolean",
+                    "description": "Set to true when the issue cannot be implemented (too broad, unclear, blocked)."
+                },
+                "cannot_resolve": {
+                    "type": "boolean",
+                    "description": "Set to true when reviewer feedback cannot be resolved autonomously."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Explanation for cannot_implement, cannot_resolve, or no-code-changes."
+                },
+                "public_comment": {
+                    "type": "string",
+                    "description": "Human-facing GitLab comment text (separate from MR description)."
+                },
+                "mark_discussions_resolved": {
+                    "type": "boolean",
+                    "description": "Whether to mark open review discussions as resolved after your reply."
+                },
+                "post_plain_comment": {
+                    "type": "boolean",
+                    "description": "Whether to post a new plain MR comment (non-resolvable)."
+                }
+            }
+        }
+    })
+}
+
 #[derive(Debug, Clone)]
 struct WorkerConfig {
     poll_interval_secs: u64,
@@ -309,7 +373,10 @@ impl CoreAgent for WorkerAgent {
             &ctx,
             "worker",
             state.working_dir.clone(),
-            ModelPreferences::default(),
+            ModelPreferences {
+                structured_output_tools: Some(vec![handoff_tool_definition()]),
+                ..ModelPreferences::default()
+            },
         )?;
         let agent_settings = settings::settings();
         let scope = agent_settings.scope_label_filter();
@@ -1268,7 +1335,7 @@ fn process_issue(
             ..InvokeOptions::default()
         },
     ) {
-        Ok(output) => output,
+        Ok(output) => apply_worker_handoff(output),
         Err(e) if handle_worker_issue_processing_cancelled(state, issue.iid, &e) => {
             return Ok(None);
         }
@@ -1667,7 +1734,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
                 ..InvokeOptions::default()
             },
         ) {
-            Ok(output) => output,
+            Ok(output) => apply_worker_handoff(output),
             Err(e) if handle_worker_issue_processing_cancelled(state, issue_iid, &e) => {
                 return Ok(false);
             }
@@ -1693,6 +1760,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
                 ..InvokeOptions::default()
             },
         )?;
+        let output = apply_worker_handoff(output);
         info!(
             "{}: Worker agent finished MR !{} feedback",
             &state.agent_id, latest_mr.iid
@@ -1892,7 +1960,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     }
 
     let reply_body = if needs_reply_body {
-        let reply_raw = if let Some(block) = extract_public_comment_block(&agent_output.response) {
+        let reply_raw = if let Some(block) = extract_worker_public_comment(&agent_output) {
             block
         } else if let Some(reply) = build_feedback_resolution_reply(
             &agent_output,
@@ -2467,7 +2535,9 @@ fn output_signals_cannot_resolve(agent_output: &AgentHandoff) -> bool {
 }
 
 fn output_needs_split(agent_output: &AgentHandoff) -> bool {
-    agent_output.needs_split.is_some()
+    handoff_output(agent_output)
+        .and_then(|ho| ho.get("needs_split").and_then(serde_json::Value::as_str))
+        .is_some_and(|s| !s.trim().is_empty())
         || agent_output
             .decision
             .as_deref()
@@ -2476,7 +2546,7 @@ fn output_needs_split(agent_output: &AgentHandoff) -> bool {
 }
 
 fn extract_cannot_resolve_reason(agent_output: &AgentHandoff) -> String {
-    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+    if let Some(block) = extract_worker_public_comment(agent_output) {
         return block;
     }
     if let Some(reason) = &agent_output.reason {
@@ -2511,8 +2581,11 @@ fn build_commit_message(title: &str, issue_iid: u64) -> String {
 }
 
 fn extract_changes_summary(agent_output: &AgentHandoff) -> String {
-    if let Some(summary) = &agent_output.changes_summary {
-        let trimmed = summary.trim();
+    if let Some(s) = handoff_output(agent_output).and_then(|ho| {
+        ho.get("changes_summary")
+            .and_then(serde_json::Value::as_str)
+    }) {
+        let trimmed = s.trim();
         if !trimmed.is_empty() {
             return strip_markdown_formatting(trimmed);
         }
@@ -2582,6 +2655,15 @@ fn strip_worker_reply_boilerplate(text: &str) -> String {
 
 /// Parses `MARK_DISCUSSIONS_RESOLVED: yes|no` from the agent response (case-insensitive value).
 fn parse_mark_discussions_resolved(agent_output: &AgentHandoff) -> Option<bool> {
+    // Structured field first (from the `handoff` tool).
+    if let Some(ho) = handoff_output(agent_output)
+        && let Some(v) = ho
+            .get("mark_discussions_resolved")
+            .and_then(serde_json::Value::as_bool)
+    {
+        return Some(v);
+    }
+    // Fallback: text marker `MARK_DISCUSSIONS_RESOLVED: yes/no`.
     const KEY: &str = "mark_discussions_resolved:";
     for line in agent_output.response.lines() {
         let lower = line.to_lowercase();
@@ -2600,6 +2682,15 @@ fn parse_mark_discussions_resolved(agent_output: &AgentHandoff) -> Option<bool> 
 }
 
 fn should_post_plain_comment(agent_output: &AgentHandoff) -> bool {
+    // Structured field first (from the `handoff` tool).
+    if let Some(ho) = handoff_output(agent_output)
+        && let Some(v) = ho
+            .get("post_plain_comment")
+            .and_then(serde_json::Value::as_bool)
+    {
+        return v;
+    }
+    // Fallback: text marker `POST_PLAIN_COMMENT: yes/no`.
     const KEY: &str = "post_plain_comment:";
     for line in agent_output.response.lines() {
         let lower = line.to_lowercase();
@@ -2945,8 +3036,11 @@ fn extract_no_change_resolution_reason(agent_output: &AgentHandoff) -> Option<St
             return Some(cleaned);
         }
     }
-    if let Some(summary) = &agent_output.changes_summary {
-        let trimmed = summary.trim();
+    if let Some(s) = handoff_output(agent_output).and_then(|ho| {
+        ho.get("changes_summary")
+            .and_then(serde_json::Value::as_str)
+    }) {
+        let trimmed = s.trim();
         if !trimmed.is_empty() {
             return Some(strip_markdown_formatting(trimmed));
         }
@@ -3244,21 +3338,37 @@ fn get_scope_rules(is_continuation: bool) -> String {
 }
 
 fn get_output_format() -> &'static str {
-    r#"MANDATORY OUTPUT — you MUST include these EXACT markers at the end of your response:
+    r#"MANDATORY OUTPUT — call the `handoff` tool with your output fields. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response.
 
-MR_TITLE: <SHORT title (max 8-10 words) stating the main feature or fix. Focus on WHAT, not HOW or HOW MUCH. It must describe the main idea of the whole MR, not a single incremental commit or the latest small fix. Keep the title stable across later follow-up commits unless the overall MR scope changes. Good: "Add unit tests for BaseProcessor". Bad: "Restore MySQL reporting tests, remove unrelated test files, and add 8 edge case tests to achieve 100% coverage". No markdown, no **, no backticks.>
+Call `handoff` with the fields relevant to your outcome:
 
+- `mr_title` (string): Short title (max 8-10 words) stating the main feature or fix. Focus on WHAT, not HOW or HOW MUCH. No markdown, no **, no backticks.
+- `mr_description` (string): Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections.
+- `changes_summary` (string): A concise sentence summarizing the substance of changes made.
+- `depends_on_issue` (integer): IID of a dependency issue that must close before this work can proceed. Only set when the dependency is real — your work cannot proceed until the other issue is closed. The system will park this issue until the dependency closes, then resume it automatically.
+- `needs_split` (string): Reason the issue needs splitting into smaller issues.
+- `needs_clarification` (string): What information is needed from a human to proceed.
+- `cannot_implement` (boolean): Set to true when the issue cannot be implemented.
+- `cannot_resolve` (boolean): Set to true when reviewer feedback cannot be resolved autonomously.
+- `reason` (string): Explanation for cannot_implement, cannot_resolve, or no-code-changes.
+- `public_comment` (string): Human-facing GitLab comment text (separate from MR description).
+- `mark_discussions_resolved` (boolean): Whether to mark open review discussions as resolved.
+- `post_plain_comment` (boolean): Whether to post a new plain MR comment.
+
+All fields are optional — include only the ones relevant to your outcome. Call `handoff` exactly once when you're done.
+
+TEXT MARKER FALLBACK — if for any reason you cannot call the `handoff` tool, you may use these text markers instead (the system parses them as a fallback):
+
+MR_TITLE: <title>
 MR_DESCRIPTION:
 ## Goal
-<What is the goal of this MR? What problem does it solve?>
-
+<goal>
 ## Implementation
-<How was it implemented? What approach was taken? What are the key changes?>
-
+<approach>
 ## Testing
-<What testing was done or should be done?>
+<testing>
 
-Stable alternative (preferred for parsing):
+Stable alternative:
 MR_TITLE_BEGIN
 <title text>
 MR_TITLE_END
@@ -3266,18 +3376,15 @@ MR_DESCRIPTION_BEGIN
 <full markdown description text>
 MR_DESCRIPTION_END
 
-IMPORTANT: The MR_TITLE and MR_DESCRIPTION markers are REQUIRED. Without them, the system cannot create the merge request properly.
-
-If your implementation depends on another issue that is not yet closed, include this line on its own line:
 DEPENDS_ON_ISSUE: #<N>
-where <N> is the IID of the dependency issue. Only use this when the dependency is real — your work cannot proceed until the other issue is closed. The system will park this issue until the dependency closes, then resume it automatically. Omit this line if there is no dependency. Put this marker on a line by itself — do not embed it in a sentence.
 
-Do NOT put PUBLIC_COMMENT_BEGIN / PUBLIC_COMMENT_END inside MR_DESCRIPTION or MR_DESCRIPTION_BEGIN…END — those blocks are only for GitLab thread replies. The MR description must be plain documentation (goal, implementation, testing); reply text belongs in a separate PUBLIC_COMMENT block after the MR description.
-
-For any human-facing GitLab comment text (separate from the MR description), also include:
 PUBLIC_COMMENT_BEGIN
-<final public comment only; no progress/status logs>
+<final public comment only>
 PUBLIC_COMMENT_END
+
+The `handoff` tool is preferred — use text markers only as a last resort.
+
+Do NOT put PUBLIC_COMMENT text inside mr_description — the MR description must be plain documentation (goal, implementation, testing); reply text belongs in the `public_comment` field or a separate PUBLIC_COMMENT block.
 
 NOTES.MD (agent-maintained in the repo — edit before you finish **only if** you earn real bullets):
 - Open or create notes.md at the repository root. Append **0–3** new "- " lines this run (often **0**). Each line is **one** short sentence capturing a **genuine surprise, near-mistake, or emotional friction** from the run — something you almost got wrong or that wasted time — expressed so a stranger learns the *habit of noticing*, not the *contents of this MR*.
@@ -3301,10 +3408,12 @@ Stay concise; no secrets. That file is committed with your other changes. Never 
 }
 
 fn extract_split_reason(agent_output: &AgentHandoff) -> String {
-    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+    if let Some(block) = extract_worker_public_comment(agent_output) {
         return block;
     }
-    if let Some(reason) = &agent_output.needs_split {
+    if let Some(reason) = handoff_output(agent_output)
+        .and_then(|ho| ho.get("needs_split").and_then(serde_json::Value::as_str))
+    {
         let trimmed = reason.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -3318,7 +3427,7 @@ fn extract_split_reason(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_clarification(agent_output: &AgentHandoff) -> String {
-    if let Some(block) = extract_public_comment_block(&agent_output.response) {
+    if let Some(block) = extract_worker_public_comment(agent_output) {
         return block;
     }
     if let Some(clarification) = &agent_output.needs_clarification {
@@ -3337,14 +3446,95 @@ fn extract_clarification(agent_output: &AgentHandoff) -> String {
     "This issue needs clarification. Please provide more details.".to_string()
 }
 
-/// Extract a dependency issue IID from the agent's output. The model emits
-/// `DEPENDS_ON_ISSUE: #42` when its implementation relies on another issue
-/// that is not yet closed. Returns the first IID found, or `None` if the
-/// marker is absent/malformed.
+/// Get a reference to the `handoff` tool's captured JSON from
+/// `agent_output.structured_outputs`, or `None` if the tool wasn't called.
+fn handoff_output(agent_output: &AgentHandoff) -> Option<&serde_json::Value> {
+    agent_output
+        .structured_outputs
+        .as_ref()
+        .and_then(|s| s.get("handoff"))
+}
+
+/// Extract the worker's public comment text. Checks the `handoff` tool's
+/// `public_comment` field first, then falls back to the `PUBLIC_COMMENT_BEGIN…
+/// END` text marker.
+fn extract_worker_public_comment(agent_output: &AgentHandoff) -> Option<String> {
+    if let Some(ho) = handoff_output(agent_output)
+        && let Some(s) = ho.get("public_comment").and_then(serde_json::Value::as_str)
+    {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    extract_public_comment_block(&agent_output.response)
+}
+
+/// Apply the structured JSON the model emitted via the `handoff` tool,
+/// populating the shared `AgentHandoff` fields that the worker and other
+/// agents read (`decision`, `reason`, `needs_clarification`,
+/// `depends_on_issue`). Worker-specific fields (`mr_title`, `mr_description`,
+/// `changes_summary`, `needs_split`, `public_comment`, etc.) are read directly
+/// from `structured_outputs["handoff"]` by the worker's own extractors — they
+/// don't live on `AgentHandoff`.
+fn apply_worker_handoff(mut handoff: AgentHandoff) -> AgentHandoff {
+    let Some(ho) = handoff_output(&handoff).cloned() else {
+        return handoff;
+    };
+
+    if let Some(s) = ho
+        .get("needs_clarification")
+        .and_then(serde_json::Value::as_str)
+    {
+        let t = s.trim();
+        if !t.is_empty() {
+            handoff.needs_clarification = Some(t.to_string());
+        }
+    }
+    if let Some(s) = ho.get("reason").and_then(serde_json::Value::as_str) {
+        let t = s.trim();
+        if !t.is_empty() {
+            handoff.reason = Some(t.to_string());
+        }
+    }
+    if let Some(n) = ho
+        .get("depends_on_issue")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        handoff.depends_on_issue = Some(n);
+    }
+    if ho
+        .get("cannot_implement")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        handoff.decision = Some("cannot_implement".to_string());
+    }
+    if ho
+        .get("cannot_resolve")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        handoff.decision = Some("cannot_resolve".to_string());
+    }
+
+    handoff
+}
+
+/// Extract a dependency issue IID from the agent's output. Checks the
+/// structured `depends_on_issue` field first (populated by `apply_worker_handoff`),
+/// then falls back to the `DEPENDS_ON_ISSUE:` text marker and prose patterns.
 fn extract_depends_on_issue(agent_output: &AgentHandoff) -> Option<u64> {
+    // Structured field first (populated by `apply_worker_handoff` from the
+    // `handoff` tool's `depends_on_issue` field).
+    if let Some(n) = agent_output.depends_on_issue {
+        return Some(n);
+    }
+
     let response = &agent_output.response;
 
-    // Primary: explicit marker `DEPENDS_ON_ISSUE: #N`.
+    // Fallback: explicit marker `DEPENDS_ON_ISSUE: #N`.
     if let Some(pos) = response.find("DEPENDS_ON_ISSUE:") {
         let rest = &response[pos + "DEPENDS_ON_ISSUE:".len()..];
         let rest = rest.trim_start();
@@ -3422,16 +3612,19 @@ fn extract_waiting_on_issue_iid(labels: &[String]) -> Option<u64> {
 /// the work, so it's a far better default than a placeholder that produces
 /// a stream of indistinguishable MRs.
 fn extract_mr_title(agent_output: &AgentHandoff, issue_title: &str) -> String {
-    if let Some(block) =
-        extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
+    // Structured field first (from the `handoff` tool).
+    if let Some(s) = handoff_output(agent_output)
+        .and_then(|ho| ho.get("mr_title").and_then(serde_json::Value::as_str))
     {
-        let cleaned = strip_markdown_formatting(block.trim());
+        let cleaned = strip_markdown_formatting(s.trim());
         if !cleaned.is_empty() {
             return cleaned;
         }
     }
-    if let Some(title) = &agent_output.mr_title {
-        let cleaned = strip_markdown_formatting(title.trim());
+    if let Some(block) =
+        extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
+    {
+        let cleaned = strip_markdown_formatting(block.trim());
         if !cleaned.is_empty() {
             return cleaned;
         }
@@ -3492,16 +3685,19 @@ fn extract_mr_title(agent_output: &AgentHandoff, issue_title: &str) -> String {
 /// issue title — a metadata update should only overwrite the title when the
 /// agent explicitly said to.
 fn extract_explicit_mr_title(agent_output: &AgentHandoff) -> Option<String> {
-    if let Some(block) =
-        extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
+    // Structured field first (from the `handoff` tool).
+    if let Some(s) = handoff_output(agent_output)
+        .and_then(|ho| ho.get("mr_title").and_then(serde_json::Value::as_str))
     {
-        let cleaned = strip_markdown_formatting(block.trim());
+        let cleaned = strip_markdown_formatting(s.trim());
         if !cleaned.is_empty() {
             return Some(cleaned);
         }
     }
-    if let Some(title) = &agent_output.mr_title {
-        let cleaned = strip_markdown_formatting(title.trim());
+    if let Some(block) =
+        extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
+    {
+        let cleaned = strip_markdown_formatting(block.trim());
         if !cleaned.is_empty() {
             return Some(cleaned);
         }
@@ -3559,18 +3755,21 @@ fn sanitize_mr_description_text(s: &str) -> String {
 }
 
 fn extract_mr_description(agent_output: &AgentHandoff) -> String {
+    // Structured field first (from the `handoff` tool).
+    if let Some(s) = handoff_output(agent_output)
+        .and_then(|ho| ho.get("mr_description").and_then(serde_json::Value::as_str))
+    {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return sanitize_mr_description_text(trimmed);
+        }
+    }
     if let Some(block) = extract_block_between_markers(
         &agent_output.response,
         "MR_DESCRIPTION_BEGIN",
         "MR_DESCRIPTION_END",
     ) {
         return sanitize_mr_description_text(&block);
-    }
-    if let Some(description) = &agent_output.mr_description {
-        let trimmed = description.trim();
-        if !trimmed.is_empty() {
-            return sanitize_mr_description_text(trimmed);
-        }
     }
     if let Some(pos) = agent_output.response.find("MR_DESCRIPTION:") {
         let desc_section = &agent_output.response[pos + 15..];
@@ -3608,18 +3807,21 @@ fn extract_mr_description(agent_output: &AgentHandoff) -> String {
 }
 
 fn extract_explicit_mr_description(agent_output: &AgentHandoff) -> String {
+    // Structured field first (from the `handoff` tool).
+    if let Some(s) = handoff_output(agent_output)
+        .and_then(|ho| ho.get("mr_description").and_then(serde_json::Value::as_str))
+    {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return sanitize_mr_description_text(trimmed);
+        }
+    }
     if let Some(block) = extract_block_between_markers(
         &agent_output.response,
         "MR_DESCRIPTION_BEGIN",
         "MR_DESCRIPTION_END",
     ) {
         return sanitize_mr_description_text(&block);
-    }
-    if let Some(description) = &agent_output.mr_description {
-        let trimmed = description.trim();
-        if !trimmed.is_empty() {
-            return sanitize_mr_description_text(trimmed);
-        }
     }
     if let Some(pos) = agent_output.response.find("MR_DESCRIPTION:") {
         let desc_section = &agent_output.response[pos + 15..];
@@ -4082,10 +4284,11 @@ mod tests {
     #[test]
     fn extract_mr_description_filters_control_markers() {
         let output = AgentHandoff {
-            mr_description: Some(
-                "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\nPOST_PLAIN_COMMENT: yes\n## Testing\ncargo test"
-                    .to_string(),
-            ),
+            structured_outputs: Some(serde_json::json!({
+                "handoff": {
+                    "mr_description": "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\nPOST_PLAIN_COMMENT: yes\n## Testing\ncargo test"
+                }
+            })),
             ..Default::default()
         };
         let desc = extract_mr_description(&output);
@@ -4099,10 +4302,11 @@ mod tests {
     #[test]
     fn extract_mr_description_strips_public_comment_blocks() {
         let output = AgentHandoff {
-            mr_description: Some(
-                "## Goal\npytest coverage.\nPUBLIC_COMMENT_BEGIN\nThanks for the review.\nPUBLIC_COMMENT_END\n## Testing\nuv run pytest"
-                    .to_string(),
-            ),
+            structured_outputs: Some(serde_json::json!({
+                "handoff": {
+                    "mr_description": "## Goal\npytest coverage.\nPUBLIC_COMMENT_BEGIN\nThanks for the review.\nPUBLIC_COMMENT_END\n## Testing\nuv run pytest"
+                }
+            })),
             ..Default::default()
         };
         let desc = extract_mr_description(&output);

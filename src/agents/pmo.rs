@@ -207,6 +207,7 @@ impl CoreAgent for PmoAgent {
             state.working_dir.clone(),
             ModelPreferences {
                 preferred_session_mode: Some(ACP_SESSION_MODE_PLAN),
+                structured_output_tools: None,
             },
         )?;
         let agent_settings = settings::settings();

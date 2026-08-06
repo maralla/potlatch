@@ -30,23 +30,13 @@ pub struct AgentHandoff {
     #[serde(default)]
     pub feedback: Option<String>,
     #[serde(default)]
-    pub mr_title: Option<String>,
-    #[serde(default)]
-    pub mr_description: Option<String>,
-    #[serde(default)]
-    pub changes_summary: Option<String>,
-    #[serde(default)]
     pub reason: Option<String>,
-    #[serde(default)]
-    pub needs_split: Option<String>,
     #[serde(default)]
     pub needs_clarification: Option<String>,
     #[serde(default)]
     pub instructions: Option<String>,
     #[serde(default)]
     pub question: Option<String>,
-    #[serde(default)]
-    pub lgtm: Option<String>,
     #[serde(default)]
     pub sub_issues: Vec<HandoffSubIssue>,
     /// IID of an existing open issue that this issue depends on, declared by
@@ -55,6 +45,12 @@ pub struct AgentHandoff {
     /// dependency closes. `None` when not declared.
     #[serde(default)]
     pub depends_on_issue: Option<u64>,
+    /// Captured JSON from caller-defined structured-output tools (e.g. the
+    /// worker's `handoff` tool). A JSON object mapping tool name to the args
+    /// the model passed. `None` when no structured-output tools were
+    /// registered or the model didn't call them.
+    #[serde(default)]
+    pub structured_outputs: Option<serde_json::Value>,
     /// Absolute paths from Cursor plan-mode `tool_call_update` ("Plan saved to file://…").
     #[serde(default)]
     pub cursor_plan_paths: Vec<String>,

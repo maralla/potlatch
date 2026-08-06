@@ -8,6 +8,7 @@ pub mod plan_tool;
 pub mod read;
 pub mod search;
 pub mod shell;
+pub mod structured_output;
 pub mod subagent;
 pub mod todo;
 pub mod write;
@@ -245,6 +246,10 @@ impl Default for SessionStates {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
+    /// Side-channel cells for structured-output tools, keyed by tool name.
+    /// Populated by [`Self::register_structured_output`]; read by
+    /// [`Self::take_structured_outputs`].
+    structured_outputs: HashMap<String, structured_output::StructuredOutputCell>,
 }
 
 impl ToolRegistry {
@@ -252,6 +257,7 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             order: Vec::new(),
+            structured_outputs: HashMap::new(),
         }
     }
 
@@ -322,6 +328,30 @@ impl ToolRegistry {
         if self.tools.remove(name).is_some() {
             self.order.retain(|n| n != name);
         }
+    }
+
+    /// Register a structured-output tool: a side-channel cell tool whose name,
+    /// description, and parameter schema are caller-defined. The harness
+    /// captures the model's call and returns it in the `session/prompt`
+    /// response via [`Self::take_structured_outputs`].
+    pub fn register_structured_output(&mut self, name: &str, description: &str, parameters: Value) {
+        let (tool, cell) =
+            structured_output::StructuredOutputTool::new(name.to_string(), description, parameters);
+        self.structured_outputs.insert(name.to_string(), cell);
+        self.register(Arc::new(tool));
+    }
+
+    /// Take all captured structured-output JSONs, clearing the cells. Returns
+    /// a JSON object mapping tool name to captured args. Tools that were never
+    /// called are omitted from the object.
+    pub fn take_structured_outputs(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        for (name, cell) in &self.structured_outputs {
+            if let Some(v) = cell.lock().unwrap().take() {
+                map.insert(name.clone(), v);
+            }
+        }
+        Value::Object(map)
     }
 
     /// Registered tool names in insertion order.

@@ -61,6 +61,13 @@ pub struct NewSessionParams {
     pub cwd: String,
     #[serde(default)]
     pub mcp_servers: Vec<Value>,
+    /// Caller-defined structured-output tool definitions. Each entry has
+    /// `name`, `description`, and `parameters` (JSON schema). The harness
+    /// creates a generic `StructuredOutputTool` per definition and returns
+    /// captured output in the `session/prompt` response. Potlatch extension —
+    /// not part of the ACP spec; ignored by non-potlatch backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output_tools: Option<Vec<Value>>,
 }
 
 /// One allowed value in a `select` session config option ([`SessionConfigOptionBrief`]).

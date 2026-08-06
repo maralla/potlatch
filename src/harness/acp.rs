@@ -43,6 +43,12 @@ struct Session {
     /// `Some(names)` registers only the named tools. Set via the `tools`
     /// extension field of `session/new`.
     allowed_tools: Option<Vec<String>>,
+    /// Caller-defined structured-output tool definitions, passed via the
+    /// `structured_output_tools` extension field of `session/new`. Each entry
+    /// is a JSON object with `name`, `description`, and `parameters` (JSON
+    /// schema). The harness creates a generic `StructuredOutputTool` per
+    /// definition at prompt time.
+    structured_output_tools: Option<Vec<Value>>,
 }
 
 impl Session {
@@ -55,6 +61,7 @@ impl Session {
             cancel: Arc::new(AtomicBool::new(false)),
             states: super::tools::SessionStates::new(),
             allowed_tools: None,
+            structured_output_tools: None,
         }
     }
 }
@@ -141,6 +148,26 @@ impl AcpServer {
                 .collect();
             if !names.is_empty() {
                 session.allowed_tools = Some(names);
+            }
+        }
+        // Optional `structured_output_tools` extension: caller-defined
+        // structured-output tool definitions. Each entry has `name`,
+        // `description`, and `parameters` (JSON schema). The harness
+        // registers a generic StructuredOutputTool per definition at prompt
+        // time and returns captured output in the session/prompt response.
+        if let Some(arr) = params
+            .get("structured_output_tools")
+            .and_then(|v| v.as_array())
+        {
+            let defs: Vec<Value> = arr
+                .iter()
+                .filter(|v| {
+                    v.get("name").and_then(Value::as_str).is_some() && v.get("parameters").is_some()
+                })
+                .cloned()
+                .collect();
+            if !defs.is_empty() {
+                session.structured_output_tools = Some(defs);
             }
         }
         let session_id = session.id.clone();
@@ -236,6 +263,7 @@ impl AcpServer {
         let model = session.model.clone();
         let mode = session.mode.clone();
         let allowed_tools = session.allowed_tools.clone();
+        let structured_output_defs = session.structured_output_tools.clone();
         let cancel = session.cancel.clone();
         cancel.store(false, Ordering::SeqCst);
 
@@ -245,6 +273,21 @@ impl AcpServer {
             &model,
             allowed_tools.as_deref(),
         );
+        // Register caller-defined structured-output tools (e.g. the worker's
+        // `handoff` tool). Each definition has `name`, `description`, and
+        // `parameters` (JSON schema). The harness captures the model's calls
+        // and returns them in the session/prompt response.
+        if let Some(defs) = &structured_output_defs {
+            for def in defs {
+                if let (Some(name), Some(desc), Some(params)) = (
+                    def.get("name").and_then(Value::as_str),
+                    def.get("description").and_then(Value::as_str),
+                    def.get("parameters"),
+                ) {
+                    tools.register_structured_output(name, desc, params.clone());
+                }
+            }
+        }
         // In plan mode: drop `edit` (the PMO triages and decides, it
         // must not mutate code) and let the agent loop register the `plan`
         // tool. The ACP runtime sets the mode via session/set_config_option
@@ -288,6 +331,8 @@ impl AcpServer {
         // Read the structured plan JSON the model emitted via the `plan` tool,
         // if it was registered (plan mode) and the model called it.
         let plan_output = agent.take_plan_output();
+        // Read all captured structured-output tool calls (e.g. `handoff`).
+        let structured_outputs = agent.take_structured_outputs();
 
         // Emit all collected progress as session/update notifications
         let collected = progress_buf.lock().unwrap();
@@ -312,6 +357,7 @@ impl AcpServer {
                 "stopReason": "end_turn",
                 "message": response,
                 "plan_output": plan_output,
+                "structured_outputs": structured_outputs,
             })),
             Err(e) => {
                 let err_msg = format!("Agent loop error: {e}");
