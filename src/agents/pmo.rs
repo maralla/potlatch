@@ -76,7 +76,11 @@ fn plan_tool_definition() -> serde_json::Value {
                     "type": "string"
                 },
                 "question": {
-                    "description": "For needs_clarification: specific questions for a human.",
+                    "description": "For needs_clarification: specific questions for a human. Posted as a GitLab comment.",
+                    "type": "string"
+                },
+                "plan_text": {
+                    "description": "For needs_clarification: your current best plan for this issue. The system will update the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version.",
                     "type": "string"
                 },
                 "dependency_issue_iid": {
@@ -366,8 +370,12 @@ fn pmo_cycle(
 
                 state.clear_state();
             } else if issue.labels.contains(&labels::PMO_PENDING.to_string()) {
-                // Still waiting for human input — keep the on-disk context file fresh (new comments).
-                match gitlab.list_issues() {
+                // PMO is in plan-refinement mode: the issue description holds
+                // the PMO's draft plan, and the comment thread has the Q&A.
+                // Re-triage only when there are new human comments since the
+                // last PMO triage — otherwise just wait.
+                let issues = gitlab.list_issues();
+                match issues {
                     Ok(issues) => {
                         if let Err(e) =
                             refresh_pmo_issue_context_file(state, gitlab, &issue, &issues)
@@ -377,17 +385,63 @@ fn pmo_cycle(
                                 &state.agent_id, held_iid, e
                             );
                         }
+
+                        if has_new_comments_since_last_pmo_comment(gitlab, &issue, &state.agent_id)
+                        {
+                            info!(
+                                "{}: Issue #{} has new comments, re-triaging pmo-pending refinement",
+                                &state.agent_id, held_iid
+                            );
+                            // Re-run triage with the refreshed context. The PMO
+                            // may refine the plan (needs_clarification again) or
+                            // reach a final decision. Either way, pmo-pending
+                            // stays — only a human removes it.
+                            match process_action_required_issue(
+                                state,
+                                gitlab,
+                                model,
+                                &issue,
+                                &issues,
+                                scope_label,
+                                Arc::clone(&shutdown),
+                                pmo_config,
+                            ) {
+                                Ok(keep_claim) => {
+                                    if !keep_claim {
+                                        // The PMO reached a final decision — but
+                                        // pmo-pending is still on the issue (the
+                                        // PMO never removes it). The decision
+                                        // was already acted on inside
+                                        // process_action_required_issue. Release
+                                        // the claim so the normal flow continues.
+                                        let _ =
+                                            claim::release_claim(gitlab, held_iid, &state.agent_id);
+                                        *claimed_issue_iid = None;
+                                        state.clear_state();
+                                    }
+                                    // If keep_claim, the PMO refined the plan and
+                                    // is still waiting. Keep the claim and wait
+                                    // for the next cycle.
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "{}: Failed to re-triage pmo-pending issue #{}: {}",
+                                        &state.agent_id, held_iid, e
+                                    );
+                                }
+                            }
+                        } else {
+                            debug!(
+                                "{}: Issue #{} still pmo-pending, no new comments, waiting",
+                                &state.agent_id, held_iid
+                            );
+                        }
                     }
                     Err(e) => warn!(
                         "{}: Could not list issues to refresh context (pmo-pending #{}): {}",
                         &state.agent_id, held_iid, e
                     ),
                 }
-
-                debug!(
-                    "{}: Issue #{} still pmo-pending, waiting for human input",
-                    &state.agent_id, held_iid
-                );
 
                 return Ok(());
             } else {
@@ -829,19 +883,36 @@ fn process_action_required_issue(
         );
     }
 
-    // --- NEEDS_CLARIFICATION: PMO itself cannot decide, ask human ---
+    // --- NEEDS_CLARIFICATION: PMO needs human input, refine plan ---
     if pmo_needs_clarification(&agent_output) {
         let question = strip_internal_markers(&extract_clarification_question(&agent_output));
         info!(
-            "PMO: Issue #{} needs human clarification, marking pmo-pending",
+            "PMO: Issue #{} needs clarification, marking pmo-pending and updating plan",
             issue.iid
         );
+
+        // Update the issue description with the PMO's current plan draft, so
+        // humans can see and refine the proposed approach directly in the
+        // GitLab issue body.
+        if let Some(plan_text) = extract_plan_text(&agent_output) {
+            let cleaned = strip_internal_markers(&plan_text);
+            if !cleaned.is_empty()
+                && let Err(e) = gitlab.update_issue_description(issue.iid, &cleaned)
+            {
+                warn!(
+                    "PMO: Failed to update issue #{} description with plan: {}",
+                    issue.iid, e
+                );
+            }
+        }
+
         gitlab.add_issue_comment(
             issue.iid,
             &format!(
                 "**PMO needs clarification before proceeding:**\n\n{}\n\n\
                  Please reply to this comment with the requested information. \
-                 Once clarified, remove the `pmo-pending` label to let the PMO retry.",
+                 The PMO will refine the plan based on your feedback. \
+                 Remove the `pmo-pending` label when you are satisfied with the plan to let the PMO proceed.",
                 question
             ),
         )?;
@@ -1247,7 +1318,8 @@ Call the `plan` tool with your decision as its arguments. Potlatch reads the too
 - `instructions` (for guide_worker): 3-5 sentences, one clear action for the worker — posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.
 - `sub_issues` (for split): array of `{{"title": "...", "description": "...", "priority": 1-3, "depends_on": N}}` where `depends_on` is the 1-based index of another sub-issue this one depends on (omit or 0 if none). Example: if sub-issue 2 builds on sub-issue 1's work, set `"depends_on": 1`. The system automatically labels dependent issues so the worker won't start them until their dependency is closed.
 - `reason` (for already_done): why the codebase already satisfies the issue
-- `question` (for needs_clarification): specific questions for a human
+- `question` (for needs_clarification): specific questions for a human. Posted as a GitLab comment.
+- `plan_text` (for needs_clarification): your current best plan for this issue. The system updates the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version.
 - `dependency_issue_iid` (for wait_for_dependency): the IID of the existing open issue this issue depends on and must wait for
 
 Only fill the parameter(s) relevant to your decision. Everything you put in `instructions`, `reason`, or `question` is human-facing and posted to GitLab verbatim — do not include any internal markers, harness instructions, or meta-commentary.
@@ -1266,6 +1338,7 @@ DECISION — choose EXACTLY ONE of the following:
    - The issue is too large (estimated >500 lines of non-test code, or >1500 lines total including tests; auto-generated code does not count)
    - The issue description or worker rejection lists multiple distinct things to do
    - Your guidance would need to enumerate 2+ independent items
+   Do NOT force a speculative split. If you cannot clearly define the sub-issues with concrete titles and descriptions, choose NEEDS_CLARIFICATION instead and draft your best understanding of the decomposition in `plan_text`.
    When splitting, the PARENT ISSUE will be CLOSED automatically as a task container. The sub-issues become the real tracked work.
    Each sub-issue should target ~500 lines of non-test code, ~1500 total including tests; auto-generated code does not count.
 
@@ -1283,11 +1356,13 @@ DECISION — choose EXACTLY ONE of the following:
    - There is nothing left to implement — the issue is simply outdated or redundant
    - Prefer ALREADY_DONE over GUIDE_WORKER or SPLIT when the required behavior is already present in the repository as it exists now
 
-4. NEEDS_CLARIFICATION — Use when you CANNOT make a decision because:
+4. NEEDS_CLARIFICATION — Use when you need more information from a human, OR when you are unsure how to decompose the issue:
    - After reading the **task context file** and (if needed) the repo, the issue is still too vague to determine scope or intent
    - The worker's rejection and the issue (as given in that file) still don't give enough to guide or split
    - You need specific information from a human (e.g. which modules to cover, what the acceptance criteria are)
+   - You are unsure how to split the issue into well-defined sub-issues
    Do **not** use this option because you skipped reading the task context file.
+   When you choose NEEDS_CLARIFICATION, write your current best plan in `plan_text` — the system will update the issue description so the human can see your proposed approach. Post your specific questions in `question` — they'll appear as a comment. You may be re-triaged multiple times as the human replies; each time, refine `plan_text` with your updated understanding. The `pmo-pending` label stays until a human removes it — when you reach a confident decision during refinement, still use `needs_clarification` and describe your recommendation in `question`. The human will remove the label to trigger final processing.
 
 5. WAIT_FOR_DEPENDENCY — Use when this issue cannot be implemented until another EXISTING OPEN issue is closed:
    - The dependency is a real build-order blocker (the code from the other issue is a prerequisite)
@@ -1405,6 +1480,41 @@ fn extract_clarification_question(agent_output: &AgentHandoff) -> String {
     "The PMO agent could not determine how to proceed with this issue. Please provide more details about the expected scope and acceptance criteria.".to_string()
 }
 
+/// Check whether there are new human comments on the issue since the last
+/// PMO comment. Used by the reconcile phase to decide whether to re-triage
+/// a `pmo-pending` issue. Comments are in chronological order from the
+/// GitLab discussions API. Returns `true` if any comment after the last
+/// PMO-authored comment was written by a different author.
+fn has_new_comments_since_last_pmo_comment(
+    gitlab: &GitLabClient,
+    issue: &Issue,
+    pmo_agent_id: &str,
+) -> bool {
+    let Ok(comments) = gitlab.get_issue_comments(issue.iid) else {
+        return false;
+    };
+
+    // Find the index of the last PMO-authored comment.
+    let last_pmo_idx = comments
+        .iter()
+        .rposition(|c| c.author == pmo_agent_id || c.body.contains("**PMO needs clarification"));
+
+    match last_pmo_idx {
+        Some(idx) => {
+            // Any non-system comment after the last PMO comment is a "new" human comment.
+            comments[idx + 1..]
+                .iter()
+                .any(|c| !c.author.is_empty() && c.author != pmo_agent_id)
+        }
+        None => {
+            // No PMO comment found — if there are any human comments, they're all "new".
+            comments
+                .iter()
+                .any(|c| !c.author.is_empty() && c.author != pmo_agent_id)
+        }
+    }
+}
+
 fn extract_guidance(agent_output: &AgentHandoff) -> String {
     if let Some(instructions) = &agent_output.instructions {
         let trimmed = instructions.trim();
@@ -1470,6 +1580,26 @@ fn handoff_has_plan_output(handoff: &AgentHandoff) -> bool {
         .structured_outputs
         .as_ref()
         .is_some_and(|s| s.get("plan").is_some())
+}
+
+/// Get a reference to the `plan` tool's captured JSON from
+/// `agent_output.structured_outputs`, or `None` if the tool wasn't called.
+fn plan_output(agent_output: &AgentHandoff) -> Option<&serde_json::Value> {
+    agent_output
+        .structured_outputs
+        .as_ref()
+        .and_then(|s| s.get("plan"))
+}
+
+/// Extract the `plan_text` field from the `plan` tool's structured output.
+/// This is the PMO's proposed plan that gets written into the issue description
+/// during the needs_clarification refinement loop.
+fn extract_plan_text(agent_output: &AgentHandoff) -> Option<String> {
+    let plan = plan_output(agent_output)?;
+    plan.get("plan_text")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Apply the structured JSON the model emitted via the `plan` structured-output
@@ -2251,6 +2381,42 @@ mod tests {
         let output = AgentHandoff::default();
         let q = extract_clarification_question(&output);
         assert!(!q.is_empty());
+    }
+
+    #[test]
+    fn extract_plan_text_reads_from_structured_output() {
+        let output = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "plan": {
+                    "decision": "needs_clarification",
+                    "plan_text": "## Plan Draft\n\n1. Implement X\n2. Test X\n\nOpen question: which config?"
+                }
+            })),
+            ..Default::default()
+        };
+        let plan = extract_plan_text(&output).unwrap();
+        assert!(plan.contains("## Plan Draft"));
+        assert!(plan.contains("Implement X"));
+    }
+
+    #[test]
+    fn extract_plan_text_returns_none_when_absent() {
+        let output = AgentHandoff::default();
+        assert!(extract_plan_text(&output).is_none());
+    }
+
+    #[test]
+    fn extract_plan_text_returns_none_when_empty() {
+        let output = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "plan": {
+                    "decision": "needs_clarification",
+                    "plan_text": "  "
+                }
+            })),
+            ..Default::default()
+        };
+        assert!(extract_plan_text(&output).is_none());
     }
 
     #[test]

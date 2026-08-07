@@ -539,5 +539,4 @@ mod tests {
         // Path outside cwd is returned as-is (absolute).
         assert_eq!(display_path(&file, dir.as_str()), file.to_string_lossy());
     }
-
 }

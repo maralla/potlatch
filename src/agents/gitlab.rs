@@ -1066,6 +1066,27 @@ impl GitLabClient {
         Ok(())
     }
 
+    pub fn update_issue_description(&self, iid: u64, description: &str) -> Result<()> {
+        debug!("Updating issue #{} description", iid);
+
+        let output = self.run_api_method(
+            &format!("issues/{iid}"),
+            "PUT",
+            &[("description", description)],
+        )?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to update issue #{} description: {}",
+                iid,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        info!("Updated issue #{} description", iid);
+        Ok(())
+    }
+
     pub fn update_mr_title_description(
         &self,
         iid: u64,
