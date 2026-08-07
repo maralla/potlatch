@@ -41,8 +41,6 @@ Treat this assignment as a fresh task. Do not rely on prior chat history or assu
 
 "#;
 
-/// ACP session mode for read-oriented work, permission before edits.
-pub const ACP_SESSION_MODE_ASK: &str = "ask";
 /// ACP session mode for planning and decomposition work.
 pub const ACP_SESSION_MODE_PLAN: &str = "plan";
 
