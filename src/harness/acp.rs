@@ -288,29 +288,13 @@ impl AcpServer {
                 }
             }
         }
-        // In plan mode: drop `edit` (the PMO triages and decides, it
-        // must not mutate code) and let the agent loop register the `plan`
-        // tool. The ACP runtime sets the mode via session/set_config_option
-        // with configId=mode when PMO requests plan mode.
-        let mut agent = if mode == "plan" {
-            tools.unregister("edit");
-            AgentLoop::new_with_plan_mode(
-                Arc::clone(&self.llm),
-                tools,
-                model,
-                CONTEXT_TOKEN_BUDGET,
-                cancel,
-                true,
-            )
-        } else {
-            AgentLoop::new(
-                Arc::clone(&self.llm),
-                tools,
-                model,
-                CONTEXT_TOKEN_BUDGET,
-                cancel,
-            )
-        };
+        let mut agent = AgentLoop::new(
+            Arc::clone(&self.llm),
+            tools,
+            model,
+            CONTEXT_TOKEN_BUDGET,
+            cancel,
+        );
         info!(
             "harness ACP: session {session_id} mode={}, registered tools: {:?}",
             if mode.is_empty() { "default" } else { &mode },
@@ -328,10 +312,7 @@ impl AcpServer {
         };
 
         let result = agent.run(&prompt_text, &cwd, Some(progress_cb));
-        // Read the structured plan JSON the model emitted via the `plan` tool,
-        // if it was registered (plan mode) and the model called it.
-        let plan_output = agent.take_plan_output();
-        // Read all captured structured-output tool calls (e.g. `handoff`).
+        // Read all captured structured-output tool calls (e.g. `handoff`, `plan`).
         let structured_outputs = agent.take_structured_outputs();
 
         // Emit all collected progress as session/update notifications
@@ -356,7 +337,6 @@ impl AcpServer {
             Ok(response) => Ok(json!({
                 "stopReason": "end_turn",
                 "message": response,
-                "plan_output": plan_output,
                 "structured_outputs": structured_outputs,
             })),
             Err(e) => {
@@ -611,10 +591,9 @@ mod tests {
     }
 
     #[test]
-    fn session_prompt_includes_plan_output_null_when_not_in_plan_mode() {
-        // A session that never had its mode set to "plan" should return
-        // plan_output: null in the session/prompt result (the plan tool is
-        // not registered, so the model can't call it).
+    fn session_prompt_includes_structured_outputs_when_no_tools_registered() {
+        // A session without structured-output tools should return
+        // structured_outputs: {} (empty object) in the session/prompt result.
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
         let mut server = AcpServer::new(llm);
 
@@ -644,9 +623,8 @@ mod tests {
         let (response, _) = collect_output(&mut server, &prompt_msg);
         match response {
             Some(Outbound::Response { result, .. }) => {
-                // plan_output should be present and null (tool not registered).
-                assert!(result.get("plan_output").is_some());
-                assert!(result["plan_output"].is_null());
+                // structured_outputs is present (empty object — no tools called).
+                assert!(result.get("structured_outputs").is_some());
             }
             _ => panic!("expected response"),
         }
@@ -656,9 +634,7 @@ mod tests {
     fn set_config_option_records_session_mode() {
         // session/set_config_option with configId=mode, value=plan should
         // record the mode on the session. We verify by checking that a
-        // subsequent session/prompt includes plan_output (the plan tool was
-        // registered, so the field is present even if the model didn't call
-        // it — it'll be null since StubClient doesn't call tools).
+        // subsequent session/prompt succeeds (the mode was stored).
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
         let mut server = AcpServer::new(llm);
 
@@ -689,8 +665,7 @@ mod tests {
         });
         let _ = collect_output(&mut server, &mode_msg);
 
-        // Now prompt — the plan tool should be registered, so plan_output
-        // appears in the result (null because StubClient doesn't call tools).
+        // Now prompt — the session/prompt should succeed.
         let prompt_msg = json!({
             "jsonrpc": "2.0",
             "id": 3,
@@ -703,10 +678,8 @@ mod tests {
         let (response, _) = collect_output(&mut server, &prompt_msg);
         match response {
             Some(Outbound::Response { result, .. }) => {
-                // plan_output is present (the field exists) but null (model
-                // didn't call the tool). The key point is that the field
-                // exists, proving the plan tool was registered.
-                assert!(result.get("plan_output").is_some());
+                // structured_outputs is present.
+                assert!(result.get("structured_outputs").is_some());
             }
             _ => panic!("expected response"),
         }
@@ -801,19 +774,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_drops_file_edit_from_registered_tools() {
-        let tools = run_session_prompt_in_mode("plan");
-        assert!(tools.contains(&"plan".to_string()), "plan tool registered");
-        assert!(
-            !tools.contains(&"edit".to_string()),
-            "edit must NOT be registered in plan mode"
-        );
-    }
-
-    #[test]
-    fn non_plan_mode_keeps_file_edit_registered() {
+    fn default_mode_keeps_file_edit_registered() {
         let tools = run_session_prompt_in_mode("");
         assert!(tools.contains(&"edit".to_string()));
-        assert!(!tools.contains(&"plan".to_string()));
     }
 }
