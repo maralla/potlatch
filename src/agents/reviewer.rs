@@ -16,11 +16,44 @@ use crate::core::agent::{AgentHandoff, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::model::acp::ACP_SESSION_MODE_ASK;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const REVIEWER_APPROVED_LABEL: &str = "reviewer-approved";
 const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
+
+/// The reviewer's structured-output tool definition. Passed to the harness
+/// via `session/new` so the harness registers a generic `StructuredOutputTool`
+/// named `review`. The model calls it with its review decision as structured
+/// JSON instead of emitting text markers.
+fn review_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name": "review",
+        "description": "Emit your review decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response. Call this exactly once with your decision and the fields relevant to it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "description": "Your review decision. Must be exactly one of: \"approve\", \"request_changes\".",
+                    "type": "string",
+                    "enum": ["approve", "request_changes"]
+                },
+                "summary": {
+                    "description": "For approve: a brief summary of what was reviewed and why the MR is good to merge.",
+                    "type": "string"
+                },
+                "feedback": {
+                    "description": "For request_changes: specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads.",
+                    "type": "string"
+                },
+                "public_comment": {
+                    "description": "Human-facing GitLab comment text (separate from feedback). Use for explanations, context, or recommendations that don't require code changes.",
+                    "type": "string"
+                }
+            },
+            "required": ["decision"]
+        }
+    })
+}
 
 #[derive(Debug, Clone)]
 struct ReviewerConfig {
@@ -151,8 +184,8 @@ impl CoreAgent for ReviewerAgent {
             "reviewer",
             reviewer_dir.clone(),
             ModelPreferences {
-                preferred_session_mode: Some(ACP_SESSION_MODE_ASK),
-                structured_output_tools: None,
+                structured_output_tools: Some(vec![review_tool_definition()]),
+                ..ModelPreferences::default()
             },
         )?;
         let agent_settings = settings::settings();
@@ -495,13 +528,13 @@ fn review_merge_request(
         sessions_dir,
     })?;
 
-    let agent_output = model.complete(
+    let agent_output = apply_reviewer_handoff(model.complete(
         &prompt,
         &InvokeOptions {
             activity_label: Some(format!("{} reviewing MR !{}", model.agent_id(), mr.iid)),
             ..InvokeOptions::default()
         },
-    )?;
+    )?);
     info!(
         "{}: Reviewer agent finished MR !{}",
         model.agent_id(),
@@ -727,7 +760,16 @@ FILE HYGIENE (STRICT — reject if violated):
 - Do NOT allow leftover artifacts: generated files that should be gitignored, editor config files, OS-specific metadata files (e.g. .DS_Store, Thumbs.db), or log files.
 - If unsure whether a file belongs, check the project structure and AGENTS.md for conventions.
 
-After your review, provide your decision:
+After your review, call the `review` tool with your decision:
+
+- `decision` (required): "approve" if the MR is good to merge, "request_changes" if changes are needed.
+- `summary` (for approve): a brief summary of what was reviewed and why the MR is good to merge.
+- `feedback` (for request_changes): specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads.
+- `public_comment` (optional): human-facing GitLab comment text for explanations or recommendations that don't require code changes.
+
+The `review` tool is the primary output channel — Potlatch reads the tool's JSON, not text markers. Call it exactly once.
+
+TEXT MARKER FALLBACK — if for any reason you cannot call the `review` tool, you may use these text markers instead:
 
 If the MR is good to merge:
 APPROVE
@@ -738,9 +780,8 @@ REQUEST_CHANGES
 FEEDBACK:
 - <specific issue 1>
 - <specific issue 2>
-- <etc>
 
-For any human-facing GitLab comment text, include a stable block (use the same style as above: no hollow opening paragraph; put the request first):
+For any human-facing GitLab comment text, include:
 PUBLIC_COMMENT_BEGIN
 <only final public comment text; no progress/status/tool logs>
 PUBLIC_COMMENT_END
@@ -832,6 +873,41 @@ fn is_generic_description(desc: &str) -> bool {
         || lower == "implementation changes."
 }
 
+/// Get a reference to the `review` tool's captured JSON from
+/// `agent_output.structured_outputs`, or `None` if the tool wasn't called.
+fn review_output(agent_output: &AgentHandoff) -> Option<&serde_json::Value> {
+    agent_output
+        .structured_outputs
+        .as_ref()
+        .and_then(|s| s.get("review"))
+}
+
+/// Apply the structured JSON the model emitted via the `review` structured-output
+/// tool. Populates the handoff's shared fields (`decision`, `feedback`) from the
+/// JSON. Returns the handoff unchanged when `structured_outputs` is absent or
+/// has no `review` entry.
+fn apply_reviewer_handoff(mut handoff: AgentHandoff) -> AgentHandoff {
+    let Some(review) = review_output(&handoff).cloned() else {
+        return handoff;
+    };
+
+    if let Some(d) = review.get("decision").and_then(serde_json::Value::as_str) {
+        let d = d.trim();
+        if !d.is_empty() {
+            handoff.decision = Some(d.to_lowercase());
+        }
+    }
+
+    if let Some(feedback) = review.get("feedback").and_then(serde_json::Value::as_str) {
+        let t = feedback.trim();
+        if !t.is_empty() {
+            handoff.feedback = Some(t.to_string());
+        }
+    }
+
+    handoff
+}
+
 fn reviewer_approves(agent_output: &AgentHandoff) -> bool {
     agent_output
         .decision
@@ -849,7 +925,15 @@ fn reviewer_requests_changes(agent_output: &AgentHandoff) -> bool {
 }
 
 /// Resolved approval thread on GitLab: keep the body minimal (no long LGTM narrative).
-fn extract_approval_message(_agent_output: &AgentHandoff) -> String {
+fn extract_approval_message(agent_output: &AgentHandoff) -> String {
+    if let Some(ro) = review_output(agent_output)
+        && let Some(summary) = ro.get("summary").and_then(serde_json::Value::as_str)
+    {
+        let trimmed = summary.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
     "LGTM".to_string()
 }
 
@@ -906,6 +990,22 @@ fn normalize_review_comment_body(text: &str) -> String {
 }
 
 fn extract_review_feedback(agent_output: &AgentHandoff) -> String {
+    // Structured output first (from the `review` tool).
+    if let Some(ro) = review_output(agent_output) {
+        if let Some(feedback) = ro.get("feedback").and_then(serde_json::Value::as_str) {
+            let out = normalize_review_comment_body(feedback.trim());
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        if let Some(comment) = ro.get("public_comment").and_then(serde_json::Value::as_str) {
+            let out = normalize_review_comment_body(comment.trim());
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    // Fallback: text markers.
     if let Some(block) = extract_public_comment_block(&agent_output.response) {
         let out = normalize_review_comment_body(block.trim());
         if !out.is_empty() {
@@ -1051,6 +1151,79 @@ Error: T: Connection stalled"#
         let output = AgentHandoff::default();
 
         assert_eq!(extract_approval_message(&output), "LGTM");
+    }
+
+    #[test]
+    fn extract_approval_message_uses_structured_summary() {
+        let output = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "review": {
+                    "decision": "approve",
+                    "summary": "LGTM: all tests pass, code is clean"
+                }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_approval_message(&output),
+            "LGTM: all tests pass, code is clean"
+        );
+    }
+
+    #[test]
+    fn extract_review_feedback_uses_structured_feedback() {
+        let output = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "review": {
+                    "decision": "request_changes",
+                    "feedback": "- Fix the error handling in main.go\n- Add test for edge case"
+                }
+            })),
+            ..Default::default()
+        };
+        let feedback = extract_review_feedback(&output);
+        assert!(feedback.contains("Fix the error handling"));
+        assert!(feedback.contains("Add test for edge case"));
+    }
+
+    #[test]
+    fn reviewer_approves_reads_structured_decision() {
+        let output = apply_reviewer_handoff(AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "review": {"decision": "approve"}
+            })),
+            ..Default::default()
+        });
+        assert!(reviewer_approves(&output));
+        assert!(!reviewer_requests_changes(&output));
+    }
+
+    #[test]
+    fn reviewer_requests_changes_reads_structured_decision() {
+        let output = apply_reviewer_handoff(AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "review": {"decision": "request_changes"}
+            })),
+            ..Default::default()
+        });
+        assert!(reviewer_requests_changes(&output));
+        assert!(!reviewer_approves(&output));
+    }
+
+    #[test]
+    fn apply_reviewer_handoff_populates_decision_and_feedback() {
+        let handoff = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "review": {
+                    "decision": "request_changes",
+                    "feedback": "- Fix X"
+                }
+            })),
+            ..Default::default()
+        };
+        let applied = apply_reviewer_handoff(handoff);
+        assert_eq!(applied.decision.as_deref(), Some("request_changes"));
+        assert_eq!(applied.feedback.as_deref(), Some("- Fix X"));
     }
 
     #[test]
