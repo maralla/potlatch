@@ -3287,7 +3287,17 @@ fn get_common_requirements() -> &'static str {
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
 - Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed. PMO guidance appears as a comment starting with **PMO guidance for the worker agent:** — treat the body of that comment as authoritative worker instructions and follow it exactly.
 - Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules (see MANDATORY OUTPUT): not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments
-- ACT QUICKLY. The task context is already in your prompt — do not read it from disk. After reading AGENTS.md, grep for the first symbol you need to change, read the surrounding lines, and make the edit. Do not write long analysis prose — each turn should produce a tool call that makes progress (a grep, a read, or an edit). If you catch yourself writing more than 2 sentences of "Let me analyze..." or "I notice that...", stop and make the edit instead. The first edit should happen within your first 5 tool calls."#
+
+NO WORKAROUNDS — STRICTLY PROHIBITED:
+- NEVER apply a workaround, hack, or shortcut to make code "work" without addressing the root cause.
+- The ONLY exception is an explicit instruction in a code comment or doc comment within the existing codebase that says to use a specific approach. In that case, follow the comment's instruction exactly.
+- If the correct fix is unclear or too large, REJECT the issue (CANNOT_IMPLEMENT) rather than shipping a workaround.
+
+RESOURCE AWARENESS — MANDATORY:
+- Before committing to an implementation approach, evaluate its resource footprint: memory, CPU, disk I/O, file descriptors, and goroutine/thread usage. An approach that has the potential to exhaust machine resources is UNACCEPTABLE, even if it produces correct output.
+- Specifically avoid: unbounded buffering (loading entire files/datasets into memory), O(n^2) or worse algorithms on large inputs, spawning unbounded goroutines/threads without a semaphore, holding large data in memory across iterations, redundant re-reads of large files, or creating temp files without cleanup.
+- If the correct, resource-safe implementation is too large for a single MR, REJECT with NEEDS_SPLIT and explain the resource concern.
+- If you are unsure whether your approach is resource-safe under production-scale inputs, REJECT with CANNOT_IMPLEMENT and explain the concern. Do not ship code that might OOM, hang, or exhaust file descriptors on real data."#
 }
 
 fn get_evidence_bound_scope_bullets() -> &'static str {
