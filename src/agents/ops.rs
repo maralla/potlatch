@@ -27,6 +27,50 @@ const MAX_INSTANCES: usize = 1;
 
 const OPS_ISSUES_BEGIN: &str = "OPS_ISSUES_BEGIN";
 const OPS_ISSUES_END: &str = "OPS_ISSUES_END";
+
+/// The ops agent's structured-output tool definition. Passed to the harness
+/// via `session/new` so the harness registers a generic `StructuredOutputTool`
+/// named `ops_report`. The model calls it with its log analysis findings as
+/// structured JSON instead of emitting text markers.
+fn ops_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name": "ops_report",
+        "description": "Emit your log analysis findings as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response. Call this exactly once with your findings.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "issues": {
+                    "description": "New actionable issues found in the logs. Empty array if nothing new.",
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "description": "Short actionable issue title.",
+                                "type": "string"
+                            },
+                            "description": {
+                                "description": "Markdown body with log evidence, likely code area, impact, and suggested remediation.",
+                                "type": "string"
+                            },
+                            "priority": {
+                                "description": "Priority: 1 (critical/blocking), 2 (high), 3 (normal).",
+                                "type": "integer",
+                                "enum": [1, 2, 3]
+                            },
+                            "log_line": {
+                                "description": "Exact representative log line from the session file.",
+                                "type": "string"
+                            }
+                        },
+                        "required": ["title", "description", "log_line"]
+                    }
+                }
+            },
+            "required": ["issues"]
+        }
+    })
+}
 const LOG_WINDOW_HOURS: i64 = 2;
 const MAX_TAIL_LINES: u32 = 100_000;
 const MAX_SCRAPE_FILES_KEPT: usize = 10;
@@ -274,7 +318,15 @@ impl CoreAgent for OpsAgent {
                 .collect(),
         };
         let gitlab = GitLabClient::new(working_dir.clone(), &gitlab_repo)?;
-        let model = AgentModel::connect(&ctx, "ops", working_dir, ModelPreferences::default())?;
+        let model = AgentModel::connect(
+            &ctx,
+            "ops",
+            working_dir,
+            ModelPreferences {
+                structured_output_tools: Some(vec![ops_tool_definition()]),
+                ..ModelPreferences::default()
+            },
+        )?;
         let global = settings::settings();
         Ok(Self {
             state,
@@ -484,7 +536,9 @@ Use the project codebase to map log errors to likely code paths, root causes, an
 
 For each NEW distinct problem that is not already covered, propose one GitLab issue.
 
-Return ONLY a machine-readable block:
+Call the `ops_report` tool with your findings. The tool's `issues` field is a JSON array of objects with `title`, `description`, `priority` (1-3), and `log_line`. Return an empty array if there are no new actionable errors. This is the primary output channel — Potlatch reads the tool's JSON, not text markers.
+
+TEXT MARKER FALLBACK — if for any reason you cannot call the `ops_report` tool, you may use this format instead:
 
 {begin}
 [
@@ -793,7 +847,69 @@ fn parse_ops_issues_json(json: &str) -> Vec<OpsIssueProposal> {
         .collect()
 }
 
+/// Get a reference to the `ops_report` tool's captured JSON from
+/// `agent_output.structured_outputs`, or `None` if the tool wasn't called.
+fn ops_output(agent_output: &AgentHandoff) -> Option<&serde_json::Value> {
+    agent_output
+        .structured_outputs
+        .as_ref()
+        .and_then(|s| s.get("ops_report"))
+}
+
+/// Parse issue proposals directly from the `ops_report` structured output.
+fn extract_ops_issues_from_structured(
+    agent_output: &AgentHandoff,
+) -> Option<Vec<OpsIssueProposal>> {
+    let report = ops_output(agent_output)?;
+    let issues = report.get("issues").and_then(|v| v.as_array())?;
+    let proposals: Vec<OpsIssueProposal> = issues
+        .iter()
+        .filter_map(|item| {
+            let title = item.get("title").and_then(|v| v.as_str())?.trim();
+            if title.is_empty() {
+                return None;
+            }
+            let description = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if description.is_empty() {
+                return None;
+            }
+            let log_line = item
+                .get("log_line")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if log_line.is_empty() {
+                return None;
+            }
+            let priority = item
+                .get("priority")
+                .and_then(|v| v.as_u64())
+                .filter(|p| (1..=3).contains(p))
+                .map(|p| p as u8);
+            Some(OpsIssueProposal {
+                title: title.to_string(),
+                description,
+                priority,
+                log_line,
+            })
+        })
+        .collect();
+    Some(proposals)
+}
+
 fn extract_ops_issues(agent_output: &AgentHandoff) -> Vec<OpsIssueProposal> {
+    // Structured output first (from the `ops_report` tool).
+    if let Some(proposals) = extract_ops_issues_from_structured(agent_output) {
+        return proposals;
+    }
+
+    // Fallback: text markers.
     let text = if !agent_output.response.trim().is_empty() {
         agent_output.response.as_str()
     } else {
@@ -1044,5 +1160,66 @@ mod tests {
         assert!(validate_instance_count(0).is_ok());
         assert!(validate_instance_count(1).is_ok());
         assert!(validate_instance_count(2).is_err());
+    }
+
+    #[test]
+    fn extract_ops_issues_reads_structured_output() {
+        let output = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "ops_report": {
+                    "issues": [
+                        {
+                            "title": "Fix DB timeout",
+                            "description": "The DB connection pool is exhausted",
+                            "priority": 1,
+                            "log_line": "ERROR timeout connecting to DB"
+                        },
+                        {
+                            "title": "Fix memory leak",
+                            "description": "Goroutine leak in worker",
+                            "priority": 2,
+                            "log_line": "panic: goroutine leak detected"
+                        }
+                    ]
+                }
+            })),
+            has_final_result_text: true,
+            ..AgentHandoff::default()
+        };
+        let issues = extract_ops_issues(&output);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].title, "Fix DB timeout");
+        assert_eq!(issues[0].priority, Some(1));
+        assert_eq!(issues[1].title, "Fix memory leak");
+        assert_eq!(issues[1].priority, Some(2));
+    }
+
+    #[test]
+    fn extract_ops_issues_structured_empty_array() {
+        let output = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "ops_report": {
+                    "issues": []
+                }
+            })),
+            has_final_result_text: true,
+            ..AgentHandoff::default()
+        };
+        let issues = extract_ops_issues(&output);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn extract_ops_issues_falls_back_to_text_when_no_structured() {
+        let output = AgentHandoff {
+            response: format!(
+                "{OPS_ISSUES_BEGIN}\n[{{\"title\":\"Fix X\",\"description\":\"d\",\"priority\":3,\"log_line\":\"ERR\"}}]\n{OPS_ISSUES_END}"
+            ),
+            has_final_result_text: true,
+            ..AgentHandoff::default()
+        };
+        let issues = extract_ops_issues(&output);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].title, "Fix X");
     }
 }
