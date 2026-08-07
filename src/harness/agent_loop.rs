@@ -34,42 +34,19 @@ pub struct AgentLoop {
     /// Task checklist that survives context compaction and collapse.
     /// Injected as a system message before every API call.
     todo: Arc<super::todo::TodoList>,
-    /// Side-channel cell holding the JSON the model emitted via the `plan`
-    /// tool, if that tool was registered (plan mode only). `None` when the
-    /// tool wasn't registered or the model never called it.
-    plan_output: Option<super::tools::plan_tool::PlanCell>,
     /// Sliding window of recent tool calls for stuck detection.
     recent_calls: VecDeque<(String, String)>,
     /// Number of stuck signals encountered.
     stuck_count: u32,
-    /// Number of times the model stopped in plan mode without calling `plan`.
-    /// After 2 nudges, the harness accepts the stop and lets the caller decide.
-    plan_nudge_count: u32,
 }
 
 impl AgentLoop {
     pub fn new(
         llm: Arc<dyn ChatClient>,
-        tools: ToolRegistry,
-        model: String,
-        token_budget: usize,
-        cancel: Arc<AtomicBool>,
-    ) -> Self {
-        Self::new_with_plan_mode(llm, tools, model, token_budget, cancel, false)
-    }
-
-    /// Construct with an explicit `plan_mode` flag. When true, registers the
-    /// `plan` tool and wires a side-channel cell so [`Self::take_plan_output`]
-    /// can read the model's structured plan after `run()`. When false, the
-    /// `plan` tool is not registered and `take_plan_output` always returns
-    /// `None`.
-    pub fn new_with_plan_mode(
-        llm: Arc<dyn ChatClient>,
         mut tools: ToolRegistry,
         model: String,
         token_budget: usize,
         cancel: Arc<AtomicBool>,
-        plan_mode: bool,
     ) -> Self {
         let todo = Arc::new(super::todo::TodoList::new());
         // Register the todo tool so the model can manage its task checklist.
@@ -78,19 +55,6 @@ impl AgentLoop {
         ))));
         // Register the memory tool so the model can save fundamental project facts.
         tools.register(Arc::new(super::tools::memory::MemoryTool));
-        // In plan mode, register the `plan` tool backed by a side-channel
-        // cell the harness reads after the run. The cell is created here so
-        // the `ToolRegistry` stays symmetric (generic `register`/`unregister`
-        // only) and callers don't have to wire the cell themselves.
-        let plan_output = if plan_mode {
-            let cell: super::tools::plan_tool::PlanCell = Arc::new(std::sync::Mutex::new(None));
-            tools.register(Arc::new(super::tools::plan_tool::PlanTool::new(
-                Arc::clone(&cell),
-            )));
-            Some(cell)
-        } else {
-            None
-        };
         // Build tool schemas once — the tool set is fixed for the harness lifetime.
         let tool_schemas = tools.tools_schema();
         Self {
@@ -101,20 +65,9 @@ impl AgentLoop {
             model,
             cancel,
             todo,
-            plan_output,
             recent_calls: VecDeque::with_capacity(8),
             stuck_count: 0,
-            plan_nudge_count: 0,
         }
-    }
-
-    /// Take the structured plan JSON the model emitted via the `plan` tool,
-    /// if any. Returns `None` when the tool wasn't registered (non-plan
-    /// session) or the model never called it. Clears the cell.
-    pub fn take_plan_output(&self) -> Option<Value> {
-        self.plan_output
-            .as_ref()
-            .and_then(super::tools::plan_tool::PlanTool::take)
     }
 
     /// Take all captured structured-output JSONs from caller-defined
@@ -495,43 +448,6 @@ impl AgentLoop {
 
     fn handle_response(&mut self, response: &ChatResponse, cwd: &str) -> Result<LoopControl> {
         if response.finish_reason == "stop" || response.tool_calls.is_empty() {
-            // In plan mode, the model MUST call the `plan` tool before
-            // stopping. If it finishes with `stop` without calling `plan`,
-            // inject a nudge and continue the loop instead of accepting the
-            // stop. This handles the common case where the model writes its
-            // analysis as prose and forgets to call `plan`. After 2 nudges,
-            // give up and accept the stop (the caller will handle the missing
-            // plan_output).
-            if self.plan_output.is_some() && response.tool_calls.is_empty() {
-                let called_plan = self
-                    .plan_output
-                    .as_ref()
-                    .and_then(|cell| cell.lock().unwrap().clone())
-                    .is_some();
-                if !called_plan && self.plan_nudge_count < 2 {
-                    self.plan_nudge_count += 1;
-                    if !response.content.is_empty() {
-                        self.context.push_assistant_text_with_reasoning(
-                            &response.content,
-                            &response.reasoning,
-                        );
-                    }
-                    self.context.push(
-                        Role::System,
-                        ContextKind::System,
-                        "You finished without calling the `plan` tool. Your analysis is noted, \
-                         but you MUST call the `plan` tool with your decision as JSON before \
-                         this turn is complete. Call `plan` now with the JSON shape from your \
-                         instructions. Do not write more prose — just call `plan`.",
-                    );
-                    warn!(
-                        "harness: model stopped in plan mode without calling `plan` tool, nudging (attempt {})",
-                        self.plan_nudge_count
-                    );
-                    return Ok(LoopControl::Continue);
-                }
-            }
-
             // Model is done — store the final text
             if !response.content.is_empty() {
                 self.context
@@ -1090,182 +1006,6 @@ mod tests {
         // proving sequential execution preserved the order.
         let written = std::fs::read_to_string(dir.path().join("out.txt")).unwrap_or_default();
         assert_eq!(written, "written");
-    }
-
-    #[test]
-    fn plan_tool_output_captured_via_take_plan_output() {
-        // When the model calls the `plan` tool, the harness captures its JSON
-        // in the side-channel cell. take_plan_output() returns it after run().
-        let llm = Arc::new(FakeChatClient::new(vec![
-            ChatResponse {
-                content: String::new(),
-                tool_calls: vec![json!({
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "plan",
-                        "arguments": "{\"decision\":\"split\",\"sub_issues\":[{\"title\":\"A\"}]}"
-                    }
-                })],
-                finish_reason: "tool_calls".into(),
-                usage: super::super::client::Usage::default(),
-                tool_results: vec![],
-                elapsed_ms: 0,
-                reasoning: String::new(),
-            },
-            ChatResponse {
-                content: "Done.".into(),
-                tool_calls: vec![],
-                finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
-                tool_results: vec![],
-                elapsed_ms: 0,
-                reasoning: String::new(),
-            },
-        ]));
-
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
-            "",
-            "",
-            None,
-        );
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent =
-            AgentLoop::new_with_plan_mode(llm, tools, "test-model".into(), 100_000, cancel, true);
-
-        let result = agent.run("triage this", "/tmp", None).unwrap();
-        assert!(result.contains("Done"));
-        let captured = agent.take_plan_output();
-        assert_eq!(
-            captured,
-            Some(json!({"decision": "split", "sub_issues": [{"title": "A"}]}))
-        );
-    }
-
-    #[test]
-    fn take_plan_output_none_when_tool_not_registered() {
-        // When the plan tool wasn't registered (non-plan session),
-        // take_plan_output returns None.
-        let llm = Arc::new(FakeChatClient::new(vec![ChatResponse {
-            content: "Done.".into(),
-            tool_calls: vec![],
-            finish_reason: "stop".into(),
-            usage: super::super::client::Usage::default(),
-            tool_results: vec![],
-            elapsed_ms: 0,
-            reasoning: String::new(),
-        }]));
-
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
-            "",
-            "",
-            None,
-        );
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
-
-        agent.run("do something", "/tmp", None).unwrap();
-        assert_eq!(agent.take_plan_output(), None);
-    }
-
-    #[test]
-    fn take_plan_output_none_when_tool_never_called() {
-        // When the plan tool was registered but the model never called it,
-        // the harness nudges up to 2 times, then accepts the stop.
-        // take_plan_output returns None.
-        // 3 responses: initial stop + 2 nudge stops (all without calling plan).
-        let responses: Vec<ChatResponse> = (0..3)
-            .map(|_| ChatResponse {
-                content: "Done without calling plan.".into(),
-                tool_calls: vec![],
-                finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
-                tool_results: vec![],
-                elapsed_ms: 0,
-                reasoning: String::new(),
-            })
-            .collect();
-
-        let llm = Arc::new(FakeChatClient::new(responses));
-
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
-            "",
-            "",
-            None,
-        );
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent =
-            AgentLoop::new_with_plan_mode(llm, tools, "test-model".into(), 100_000, cancel, true);
-
-        agent.run("do something", "/tmp", None).unwrap();
-        assert_eq!(agent.take_plan_output(), None);
-    }
-
-    #[test]
-    fn plan_mode_nudge_makes_model_call_plan() {
-        // When the model stops without calling `plan` in plan mode, the
-        // harness injects a nudge. On the retry, the model calls `plan` and
-        // the loop stops normally.
-        let llm = Arc::new(FakeChatClient::new(vec![
-            // First response: model writes prose, stops without calling plan.
-            ChatResponse {
-                content: "I analyzed the issue.".into(),
-                tool_calls: vec![],
-                finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
-                tool_results: vec![],
-                elapsed_ms: 0,
-                reasoning: String::new(),
-            },
-            // Second response: model calls plan after the nudge.
-            ChatResponse {
-                content: String::new(),
-                tool_calls: vec![json!({
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "plan",
-                        "arguments": "{\"decision\":\"guide_worker\",\"instructions\":\"do X\"}"
-                    }
-                })],
-                finish_reason: "tool_calls".into(),
-                usage: super::super::client::Usage::default(),
-                tool_results: vec![],
-                elapsed_ms: 0,
-                reasoning: String::new(),
-            },
-            // Third response: model stops after the tool call.
-            ChatResponse {
-                content: "Done.".into(),
-                tool_calls: vec![],
-                finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
-                tool_results: vec![],
-                elapsed_ms: 0,
-                reasoning: String::new(),
-            },
-        ]));
-
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
-            "",
-            "",
-            None,
-        );
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent =
-            AgentLoop::new_with_plan_mode(llm, tools, "test-model".into(), 100_000, cancel, true);
-
-        agent.run("triage this issue", "/tmp", None).unwrap();
-        // The plan tool was called on the second turn.
-        let captured = agent.take_plan_output();
-        assert_eq!(
-            captured,
-            Some(json!({"decision": "guide_worker", "instructions": "do X"}))
-        );
     }
 
     /// A fake client that simulates speculative tool execution by firing

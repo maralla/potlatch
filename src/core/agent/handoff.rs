@@ -54,12 +54,6 @@ pub struct AgentHandoff {
     /// Absolute paths from Cursor plan-mode `tool_call_update` ("Plan saved to file://…").
     #[serde(default)]
     pub cursor_plan_paths: Vec<String>,
-    /// Structured JSON plan emitted by the model via the `plan` tool
-    /// (potlatch harness ACP backend, plan mode only). `None` when the model
-    /// didn't call the tool, the session wasn't in plan mode, or when using
-    /// a non-potlatch ACP backend (e.g. Cursor).
-    #[serde(default)]
-    pub plan_output: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -67,40 +61,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_output_defaults_to_none() {
+    fn structured_outputs_defaults_to_none() {
         let h = AgentHandoff::default();
-        assert!(h.plan_output.is_none());
+        assert!(h.structured_outputs.is_none());
     }
 
     #[test]
-    fn plan_output_serializes_and_deserializes() {
+    fn structured_outputs_serializes_and_deserializes() {
         let h = AgentHandoff {
             response: "text".into(),
-            plan_output: Some(serde_json::json!({"decision": "split"})),
+            structured_outputs: Some(serde_json::json!({"plan": {"decision": "split"}})),
             ..Default::default()
         };
         let json = serde_json::to_string(&h).unwrap();
         let back: AgentHandoff = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            back.plan_output,
-            Some(serde_json::json!({"decision": "split"}))
+            back.structured_outputs,
+            Some(serde_json::json!({"plan": {"decision": "split"}}))
         );
     }
 
     #[test]
-    fn plan_output_absent_in_json_deserializes_to_none() {
-        // JSON without the plan_output field should deserialize to None.
+    fn structured_outputs_absent_in_json_deserializes_to_none() {
         let json = r#"{"response":"text"}"#;
         let h: AgentHandoff = serde_json::from_str(json).unwrap();
         assert_eq!(h.response, "text");
-        assert!(h.plan_output.is_none());
-    }
-
-    #[test]
-    fn plan_output_null_in_json_deserializes_to_none() {
-        let json = r#"{"response":"text","plan_output":null}"#;
-        let h: AgentHandoff = serde_json::from_str(json).unwrap();
-        assert_eq!(h.response, "text");
-        assert!(h.plan_output.is_none());
+        assert!(h.structured_outputs.is_none());
     }
 }

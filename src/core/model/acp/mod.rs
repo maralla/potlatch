@@ -15,5 +15,5 @@ pub mod transport;
 pub mod types;
 pub mod workspace_read;
 
+pub use runtime::ACP_SESSION_MODE_ASK;
 pub(crate) use runtime::AcpRuntime;
-pub use runtime::{ACP_SESSION_MODE_ASK, ACP_SESSION_MODE_PLAN};

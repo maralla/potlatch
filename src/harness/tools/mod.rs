@@ -4,7 +4,6 @@ pub mod edit;
 pub mod fetch;
 pub mod lsp;
 pub mod memory;
-pub mod plan_tool;
 pub mod read;
 pub mod search;
 pub mod shell;

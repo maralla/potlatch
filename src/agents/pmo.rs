@@ -19,11 +19,75 @@ use crate::core::agent::{AgentHandoff, HandoffSubIssue, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::model::acp::ACP_SESSION_MODE_PLAN;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
+
+/// The PMO's structured-output tool definition. Passed to the harness via
+/// `session/new` so the harness registers a generic `StructuredOutputTool`
+/// named `plan`. The model calls it with its triage decision as structured
+/// JSON.
+fn plan_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name": "plan",
+        "description": "Emit your triage decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your decision and the fields relevant to it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "description": "Your triage decision. Must be exactly one of: \"guide_worker\", \"split\", \"already_done\", \"needs_clarification\", \"wait_for_dependency\".",
+                    "type": "string",
+                    "enum": ["guide_worker", "split", "already_done", "needs_clarification", "wait_for_dependency"]
+                },
+                "instructions": {
+                    "description": "For guide_worker: 3-5 sentences, one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.",
+                    "type": "string"
+                },
+                "sub_issues": {
+                    "description": "For split: the sub-issues to create. Each must have a title and description.",
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "description": "Concise sub-issue title.",
+                                "type": "string"
+                            },
+                            "description": {
+                                "description": "Scope and acceptance criteria. If this sub-issue depends on another, reference it by title.",
+                                "type": "string"
+                            },
+                            "priority": {
+                                "description": "Priority: 1 (critical/blocking), 2 (high/depended-on), 3 (normal/independent).",
+                                "type": "integer",
+                                "enum": [1, 2, 3]
+                            },
+                            "depends_on": {
+                                "description": "1-based index of another sub-issue this one depends on (omit or 0 if none).",
+                                "type": "integer"
+                            }
+                        },
+                        "required": ["title", "description"]
+                    }
+                },
+                "reason": {
+                    "description": "For already_done: why the codebase already satisfies the issue.",
+                    "type": "string"
+                },
+                "question": {
+                    "description": "For needs_clarification: specific questions for a human.",
+                    "type": "string"
+                },
+                "dependency_issue_iid": {
+                    "description": "For wait_for_dependency: the IID (number) of the existing open issue this issue depends on and must wait for. Must be a positive integer.",
+                    "type": "integer"
+                }
+            },
+            "required": ["decision"]
+        }
+    })
+}
 
 #[derive(Debug, Clone)]
 struct PmoConfig {
@@ -206,8 +270,8 @@ impl CoreAgent for PmoAgent {
             "pmo",
             state.working_dir.clone(),
             ModelPreferences {
-                preferred_session_mode: Some(ACP_SESSION_MODE_PLAN),
-                structured_output_tools: None,
+                structured_output_tools: Some(vec![plan_tool_definition()]),
+                ..ModelPreferences::default()
             },
         )?;
         let agent_settings = settings::settings();
@@ -729,12 +793,11 @@ fn process_action_required_issue(
         "{}: PMO agent finished triaging issue #{}",
         &state.agent_id, issue.iid
     );
-    // Apply the structured plan JSON the model emitted via the `plan` tool.
+    // Apply the structured JSON the model emitted via the `plan` tool.
     // This populates the handoff's structured fields (decision, sub_issues,
-    // instructions, etc.) which the decision functions below read. The PMO
-    // runs in plan mode, so the model is expected to call the `plan` tool.
-    let had_plan_output = agent_output.plan_output.is_some();
-    agent_output = apply_pmo_plan_output(agent_output);
+    // instructions, etc.) which the decision functions below read.
+    let had_plan_output = handoff_has_plan_output(&agent_output);
+    agent_output = apply_pmo_handoff(agent_output);
     // The model must call the `plan` tool. If it didn't, bail with a clear
     // error rather than falling through to the decision predicates (which
     // would all return false and hit the SPLIT path with a misleading
@@ -857,7 +920,7 @@ fn process_action_required_issue(
 
     // --- SPLIT: create sub-issues, close the parent as a task container ---
     // Sub-issues come from the structured `plan` tool output (populated by
-    // `apply_pmo_plan_output` into `agent_output.sub_issues`). No text-marker
+    // `apply_pmo_handoff` into `agent_output.sub_issues`). No text-marker
     // parsing — the model must call the `plan` tool with a `sub_issues` array.
     let sub_issues = agent_output.sub_issues.clone();
 
@@ -1278,7 +1341,7 @@ struct PendingSplit {
 
 // --- Decision predicates (structured-fields only) ---
 // The PMO's decision is read from the `plan` tool's JSON via
-// `apply_pmo_plan_output`, which populates `AgentHandoff.decision` and the
+// `apply_pmo_handoff`, which populates `AgentHandoff.decision` and the
 // supporting fields. No text-marker parsing — the harness guarantees the
 // structured path.
 
@@ -1400,13 +1463,27 @@ fn parse_iid_value(val: &Value) -> Option<u64> {
     n.filter(|n| *n > 0)
 }
 
-/// Apply the structured plan JSON the model emitted via the `plan` tool.
-/// Populates the handoff's structured fields (`decision`, `instructions`,
-/// `sub_issues`, `reason`, `question`, `needs_clarification`) from the JSON.
-/// Returns the handoff unchanged when `plan_output` is `None` (tool not
-/// called or not in plan mode).
-fn apply_pmo_plan_output(mut handoff: AgentHandoff) -> AgentHandoff {
-    let Some(plan) = handoff.plan_output.take() else {
+/// Check whether the agent's structured output contains a `plan` entry
+/// (i.e. the model called the `plan` structured-output tool).
+fn handoff_has_plan_output(handoff: &AgentHandoff) -> bool {
+    handoff
+        .structured_outputs
+        .as_ref()
+        .is_some_and(|s| s.get("plan").is_some())
+}
+
+/// Apply the structured JSON the model emitted via the `plan` structured-output
+/// tool. Populates the handoff's structured fields (`decision`, `instructions`,
+/// `sub_issues`, `reason`, `question`, `needs_clarification`, `depends_on_issue`)
+/// from the JSON. Returns the handoff unchanged when `structured_outputs` is
+/// absent or has no `plan` entry.
+fn apply_pmo_handoff(mut handoff: AgentHandoff) -> AgentHandoff {
+    let Some(outputs) = handoff.structured_outputs.take() else {
+        return handoff;
+    };
+    let Some(plan) = outputs.get("plan").cloned() else {
+        // Put it back — not our tool.
+        handoff.structured_outputs = Some(outputs);
         return handoff;
     };
 
@@ -1501,7 +1578,7 @@ fn apply_pmo_plan_output(mut handoff: AgentHandoff) -> AgentHandoff {
     }
 
     info!(
-        "PMO: applied structured plan_output (decision={:?}, sub_issues={})",
+        "PMO: applied structured plan output (decision={:?}, sub_issues={})",
         handoff.decision.as_deref().unwrap_or(""),
         handoff.sub_issues.len()
     );
@@ -1798,18 +1875,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_pmo_plan_output_populates_structured_fields_for_split() {
+    fn apply_pmo_handoff_populates_structured_fields_for_split() {
         let handoff = AgentHandoff {
-            plan_output: Some(serde_json::json!({
+            structured_outputs: Some(serde_json::json!({"plan": {
                 "decision": "split",
                 "sub_issues": [
                     {"title": "First", "description": "Do the first thing", "priority": 1},
                     {"title": "Second", "description": "Do the second thing", "priority": 2, "depends_on": 1}
                 ]
-            })),
+            }})),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.decision.as_deref(), Some("split"));
         assert_eq!(applied.sub_issues.len(), 2);
         assert_eq!(applied.sub_issues[0].title, "First");
@@ -1818,19 +1895,19 @@ mod tests {
         assert_eq!(applied.sub_issues[1].title, "Second");
         assert_eq!(applied.sub_issues[1].priority, Some(2));
         assert_eq!(applied.sub_issues[1].depends_on, 1);
-        assert!(applied.plan_output.is_none());
+        assert!(applied.structured_outputs.is_none());
     }
 
     #[test]
-    fn apply_pmo_plan_output_populates_instructions_for_guide_worker() {
+    fn apply_pmo_handoff_populates_instructions_for_guide_worker() {
         let handoff = AgentHandoff {
-            plan_output: Some(serde_json::json!({
+            structured_outputs: Some(serde_json::json!({"plan": {
                 "decision": "guide_worker",
                 "instructions": "Use flag --foo instead of --bar."
-            })),
+            }})),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.decision.as_deref(), Some("guide_worker"));
         assert_eq!(
             applied.instructions.as_deref(),
@@ -1840,79 +1917,79 @@ mod tests {
     }
 
     #[test]
-    fn apply_pmo_plan_output_populates_reason_for_already_done() {
+    fn apply_pmo_handoff_populates_reason_for_already_done() {
         let handoff = AgentHandoff {
-            plan_output: Some(serde_json::json!({
+            structured_outputs: Some(serde_json::json!({"plan": {
                 "decision": "already_done",
                 "reason": "The feature exists in src/lib.rs."
-            })),
+            }})),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.decision.as_deref(), Some("already_done"));
         assert!(applied.reason.as_deref().unwrap().contains("src/lib.rs"));
         assert!(is_pmo_already_done_response(&applied));
     }
 
     #[test]
-    fn apply_pmo_plan_output_populates_question_for_needs_clarification() {
+    fn apply_pmo_handoff_populates_question_for_needs_clarification() {
         let handoff = AgentHandoff {
-            plan_output: Some(serde_json::json!({
+            structured_outputs: Some(serde_json::json!({"plan": {
                 "decision": "needs_clarification",
                 "question": "Which modules should be covered?"
-            })),
+            }})),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.decision.as_deref(), Some("needs_clarification"));
         assert!(applied.question.as_deref().unwrap().contains("modules"));
         assert!(pmo_needs_clarification(&applied));
     }
 
     #[test]
-    fn apply_pmo_plan_output_populates_depends_on_issue_for_wait_for_dependency() {
+    fn apply_pmo_handoff_populates_depends_on_issue_for_wait_for_dependency() {
         let handoff = AgentHandoff {
-            plan_output: Some(serde_json::json!({
+            structured_outputs: Some(serde_json::json!({"plan": {
                 "decision": "wait_for_dependency",
                 "dependency_issue_iid": 47
-            })),
+            }})),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.decision.as_deref(), Some("wait_for_dependency"));
         assert_eq!(applied.depends_on_issue, Some(47));
         assert!(pmo_wait_for_dependency(&applied));
     }
 
     #[test]
-    fn apply_pmo_plan_output_ignores_zero_dependency_issue_iid() {
+    fn apply_pmo_handoff_ignores_zero_dependency_issue_iid() {
         let handoff = AgentHandoff {
-            plan_output: Some(serde_json::json!({
+            structured_outputs: Some(serde_json::json!({"plan": {
                 "decision": "wait_for_dependency",
                 "dependency_issue_iid": 0
-            })),
+            }})),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.decision.as_deref(), Some("wait_for_dependency"));
         assert_eq!(applied.depends_on_issue, None);
     }
 
     #[test]
-    fn apply_pmo_plan_output_accepts_string_dependency_issue_iid() {
+    fn apply_pmo_handoff_accepts_string_dependency_issue_iid() {
         let handoff = AgentHandoff {
-            plan_output: Some(serde_json::json!({
+            structured_outputs: Some(serde_json::json!({"plan": {
                 "decision": "wait_for_dependency",
                 "dependency_issue_iid": "#727"
-            })),
+            }})),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.depends_on_issue, Some(727));
     }
 
     #[test]
-    fn apply_pmo_plan_output_accepts_alternative_field_names() {
+    fn apply_pmo_handoff_accepts_alternative_field_names() {
         for key in [
             "dependency_iid",
             "depends_on_issue",
@@ -1920,13 +1997,13 @@ mod tests {
             "dependency",
         ] {
             let handoff = AgentHandoff {
-                plan_output: Some(serde_json::json!({
+                structured_outputs: Some(serde_json::json!({"plan": {
                     "decision": "wait_for_dependency",
                     key: 727
-                })),
+                }})),
                 ..Default::default()
             };
-            let applied = apply_pmo_plan_output(handoff);
+            let applied = apply_pmo_handoff(handoff);
             assert_eq!(
                 applied.depends_on_issue,
                 Some(727),
@@ -1936,47 +2013,47 @@ mod tests {
     }
 
     #[test]
-    fn apply_pmo_plan_output_none_leaves_handoff_unchanged() {
+    fn apply_pmo_handoff_none_leaves_handoff_unchanged() {
         let handoff = AgentHandoff {
             response: "some text".into(),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.decision, None);
         assert_eq!(applied.instructions, None);
         assert_eq!(applied.response, "some text");
     }
 
     #[test]
-    fn apply_pmo_plan_output_skips_empty_sub_issue_titles() {
+    fn apply_pmo_handoff_skips_empty_sub_issue_titles() {
         let handoff = AgentHandoff {
-            plan_output: Some(serde_json::json!({
+            structured_outputs: Some(serde_json::json!({"plan": {
                 "decision": "split",
                 "sub_issues": [
                     {"title": "", "description": "no title"},
                     {"title": "Valid", "description": "has title"}
                 ]
-            })),
+            }})),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.sub_issues.len(), 1);
         assert_eq!(applied.sub_issues[0].title, "Valid");
     }
 
     #[test]
-    fn apply_pmo_plan_output_skips_empty_sub_issue_descriptions() {
+    fn apply_pmo_handoff_skips_empty_sub_issue_descriptions() {
         let handoff = AgentHandoff {
-            plan_output: Some(serde_json::json!({
+            structured_outputs: Some(serde_json::json!({"plan": {
                 "decision": "split",
                 "sub_issues": [
                     {"title": "No desc", "description": ""},
                     {"title": "Valid", "description": "has desc"}
                 ]
-            })),
+            }})),
             ..Default::default()
         };
-        let applied = apply_pmo_plan_output(handoff);
+        let applied = apply_pmo_handoff(handoff);
         assert_eq!(applied.sub_issues.len(), 1);
         assert_eq!(applied.sub_issues[0].title, "Valid");
     }
