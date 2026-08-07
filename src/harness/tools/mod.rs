@@ -320,15 +320,6 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
-    /// Unregister a tool by name. No-op when the tool isn't registered.
-    /// Used by mode-specific gating (e.g. plan mode drops `edit` so the
-    /// model can't mutate files while triaging).
-    pub fn unregister(&mut self, name: &str) {
-        if self.tools.remove(name).is_some() {
-            self.order.retain(|n| n != name);
-        }
-    }
-
     /// Register a structured-output tool: a side-channel cell tool whose name,
     /// description, and parameter schema are caller-defined. The harness
     /// captures the model's call and returns it in the `session/prompt`
@@ -549,45 +540,4 @@ mod tests {
         assert_eq!(display_path(&file, dir.as_str()), file.to_string_lossy());
     }
 
-    #[test]
-    fn unregister_removes_tool_from_registry() {
-        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "", "", None);
-        assert!(reg.tool_names().contains(&"edit"));
-        reg.unregister("edit");
-        assert!(!reg.tool_names().contains(&"edit"));
-        // Schemas reflect the removal too.
-        let schemas = reg.tools_schema();
-        let names: Vec<String> = schemas
-            .iter()
-            .map(|s| s["function"]["name"].as_str().unwrap_or("").to_string())
-            .collect();
-        assert!(!names.contains(&"edit".to_string()));
-        // Execution now fails with "unknown tool".
-        let res = reg.execute("edit", &json!({}), "/tmp");
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn unregister_is_noop_for_unknown_tool() {
-        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "", "", None);
-        let before: Vec<String> = reg.tool_names().iter().map(|s| s.to_string()).collect();
-        reg.unregister("nonexistent");
-        let after: Vec<String> = reg.tool_names().iter().map(|s| s.to_string()).collect();
-        assert_eq!(after, before);
-    }
-
-    #[test]
-    fn unregister_preserves_order_of_remaining_tools() {
-        let mut reg = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), "", "", None);
-        reg.unregister("edit");
-        let names = reg.tool_names();
-        // edit was in the middle; the rest keep their relative order.
-        let pos_shell = names.iter().position(|n| *n == "shell").unwrap();
-        let pos_read = names.iter().position(|n| *n == "read").unwrap();
-        let pos_write = names.iter().position(|n| *n == "write").unwrap();
-        let pos_grep = names.iter().position(|n| *n == "grep").unwrap();
-        assert!(pos_shell < pos_read);
-        assert!(pos_read < pos_write);
-        assert!(pos_write < pos_grep);
-    }
 }
