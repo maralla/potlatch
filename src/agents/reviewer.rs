@@ -28,7 +28,7 @@ const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
 fn review_tool_definition() -> serde_json::Value {
     serde_json::json!({
         "name": "review",
-        "description": "Emit your review decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response. Call this exactly once with your decision and the fields relevant to it.",
+        "description": "Emit your review decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response. Call this exactly once with your decision and the fields relevant to it. For approvals, keep `summary` to ONE LINE — do NOT write a multi-paragraph review narrative.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -38,7 +38,7 @@ fn review_tool_definition() -> serde_json::Value {
                     "enum": ["approve", "request_changes"]
                 },
                 "summary": {
-                    "description": "For approve: a brief summary of what was reviewed and why the MR is good to merge.",
+                    "description": "For approve: ignored — the posted GitLab comment is always just 'LGTM'. You may leave this empty.",
                     "type": "string"
                 },
                 "feedback": {
@@ -708,6 +708,7 @@ CRITICAL REQUIREMENTS:
 GITLAB COMMENT STYLE (STRICT — for REQUEST_CHANGES and any posted feedback):
 - Do NOT start with a long paragraph of hollow praise or thanks that only restates the diff or issue number (e.g. listing routes, files, or "aligns with #N" without adding a review decision). That adds no value and wastes the reader's time.
 - Lead with what matters: **what must change before merge**, or **why you approve**. Use a direct lead-in such as `Request before merge:` or `Blocking:` when the MR must not merge until the item is addressed.
+- For approvals, the posted GitLab comment is "LGTM" by default (no summary or description).
 - Only request MR description updates after you have read the full `## MR description` section in the task context file (including everything after any `Closes #N` line). Do **not** treat an opening `Closes #N` as “description is only the closing line” when the rest of that section documents the work. If it already states goal, implementation approach, and verification, do not ask to expand the description.
 - Public GitLab comments must use reader-facing wording only. Do NOT mention internal response fields or protocol tokens such as `MR_DESCRIPTION`, `MR_TITLE`, `FEEDBACK`, `PUBLIC_COMMENT_BEGIN`, or `PUBLIC_COMMENT_END`. For example, say "Please update the MR description to include the actual verification and testing performed", not "Update MR_DESCRIPTION with the actual verification/testing performed."
 - Keep the public comment focused: one short optional line of genuine substance is OK, but **never** pad with a multi-sentence "thanks for the thorough coverage" preface that duplicates the diff.
@@ -763,7 +764,7 @@ FILE HYGIENE (STRICT — reject if violated):
 After your review, call the `review` tool with your decision:
 
 - `decision` (required): "approve" if the MR is good to merge, "request_changes" if changes are needed.
-- `summary` (for approve): a brief summary of what was reviewed and why the MR is good to merge.
+- `summary` (for approve): ignored — the posted GitLab comment is always just 'LGTM'. You may leave this empty.
 - `feedback` (for request_changes): specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads.
 - `public_comment` (optional): human-facing GitLab comment text for explanations or recommendations that don't require code changes.
 
@@ -773,7 +774,7 @@ TEXT MARKER FALLBACK — if for any reason you cannot call the `review` tool, yo
 
 If the MR is good to merge:
 APPROVE
-LGTM: <brief summary of what was reviewed>
+LGTM
 
 If changes are needed:
 REQUEST_CHANGES
@@ -924,16 +925,8 @@ fn reviewer_requests_changes(agent_output: &AgentHandoff) -> bool {
         || agent_output.response.contains("REQUEST_CHANGES")
 }
 
-/// Resolved approval thread on GitLab: keep the body minimal (no long LGTM narrative).
-fn extract_approval_message(agent_output: &AgentHandoff) -> String {
-    if let Some(ro) = review_output(agent_output)
-        && let Some(summary) = ro.get("summary").and_then(serde_json::Value::as_str)
-    {
-        let trimmed = summary.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
+/// Resolved approval thread on GitLab: always just "LGTM" — no description.
+fn extract_approval_message(_agent_output: &AgentHandoff) -> String {
     "LGTM".to_string()
 }
 
@@ -1164,10 +1157,21 @@ Error: T: Connection stalled"#
             })),
             ..Default::default()
         };
-        assert_eq!(
-            extract_approval_message(&output),
-            "LGTM: all tests pass, code is clean"
-        );
+        assert_eq!(extract_approval_message(&output), "LGTM");
+    }
+
+    #[test]
+    fn extract_approval_message_truncates_long_summary_to_first_line() {
+        let output = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "review": {
+                    "decision": "approve",
+                    "summary": "LGTM: tests pass.\n\nThe implementation is thorough and follows project conventions. All edge cases are covered.\n\nAdditional details about the review..."
+                }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(extract_approval_message(&output), "LGTM");
     }
 
     #[test]
