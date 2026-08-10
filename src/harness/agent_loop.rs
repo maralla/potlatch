@@ -84,13 +84,27 @@ impl AgentLoop {
         self.tools.tool_names()
     }
 
-    /// Run the agentic loop for a single prompt. Calls `on_chunk` for streamed text deltas.
+    /// Run the agentic loop for a single prompt. Calls `on_chunk` for streamed
+    /// text deltas and `on_turn` after each complete LLM response turn.
     /// Returns the final assistant response text.
     pub fn run(
         &mut self,
         prompt: &str,
         cwd: &str,
         on_chunk: Option<&StreamCallback>,
+    ) -> Result<String> {
+        self.run_with_turn_callback(prompt, cwd, on_chunk, None)
+    }
+
+    /// Run the agentic loop with an optional turn callback invoked after each
+    /// complete LLM response. The callback receives the full `ChatResponse`
+    /// (content, reasoning, tool calls) for transcript logging.
+    pub fn run_with_turn_callback(
+        &mut self,
+        prompt: &str,
+        cwd: &str,
+        on_chunk: Option<&StreamCallback>,
+        on_turn: Option<&super::client::TurnCallback>,
     ) -> Result<String> {
         // Initialize context with the system prompt and user prompt.
         // Only advertise the `plan` tool when it's actually registered
@@ -424,6 +438,12 @@ impl AgentLoop {
                 && !response.content.is_empty()
             {
                 cb(&response.content);
+            }
+
+            // Invoke the turn callback (for transcript logging) with the full
+            // ChatResponse — content, reasoning, tool calls, etc.
+            if let Some(cb) = on_turn {
+                cb(&response);
             }
 
             // Check finish reason

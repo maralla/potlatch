@@ -7,8 +7,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-/// Callback for streaming chunks.
+/// Callback for streaming text deltas during the LLM response.
 pub type StreamCallback = dyn Fn(&str) + Send + Sync;
+
+/// Callback invoked after each complete LLM response turn, providing the full
+/// `ChatResponse` (content, reasoning, tool calls, etc.) for transcript
+/// logging and progress tracking.
+pub type TurnCallback = dyn Fn(&ChatResponse) + Send + Sync;
 
 /// Callback invoked when a single tool call's arguments appear complete during
 /// streaming (before `finish_reason`). Fires once per tool call, as soon as
