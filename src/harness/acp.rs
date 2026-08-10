@@ -49,6 +49,11 @@ struct Session {
     /// schema). The harness creates a generic `StructuredOutputTool` per
     /// definition at prompt time.
     structured_output_tools: Option<Vec<Value>>,
+    /// Optional path to a transcript file. When set, the harness writes a
+    /// human-readable transcript of each `session/prompt` turn (user prompt,
+    /// assistant response, reasoning, tool calls) to this file in real time.
+    /// The parent agent can read it to inspect subagent progress.
+    transcript_path: Option<std::path::PathBuf>,
 }
 
 impl Session {
@@ -62,6 +67,7 @@ impl Session {
             states: super::tools::SessionStates::new(),
             allowed_tools: None,
             structured_output_tools: None,
+            transcript_path: None,
         }
     }
 }
@@ -170,6 +176,16 @@ impl AcpServer {
                 session.structured_output_tools = Some(defs);
             }
         }
+        // Optional `transcript_path` extension: path to a transcript file
+        // where the harness writes a human-readable log of each session/prompt
+        // turn (user prompt, assistant response, reasoning, tool calls).
+        if let Some(path) = params
+            .get("transcript_path")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            session.transcript_path = Some(std::path::PathBuf::from(path));
+        }
         let session_id = session.id.clone();
 
         let models = self.llm.list_models().unwrap_or_default();
@@ -264,6 +280,7 @@ impl AcpServer {
         let mode = session.mode.clone();
         let allowed_tools = session.allowed_tools.clone();
         let structured_output_defs = session.structured_output_tools.clone();
+        let transcript_path = session.transcript_path.clone();
         let cancel = session.cancel.clone();
         cancel.store(false, Ordering::SeqCst);
 
@@ -311,7 +328,27 @@ impl AcpServer {
             }
         };
 
-        let result = agent.run(&prompt_text, &cwd, Some(progress_cb));
+        // Write the user prompt to the transcript file at the start.
+        let turn_counter = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        if let Some(ref tp) = transcript_path {
+            write_transcript_entry(tp, "## User", &prompt_text);
+        }
+
+        // Turn callback: writes each turn's content, reasoning, and tool calls
+        // to the transcript file in real time.
+        let transcript_path_for_cb = transcript_path.clone();
+        let turn_counter_for_cb = Arc::clone(&turn_counter);
+        let turn_cb: &super::client::TurnCallback =
+            &move |_response: &super::client::ChatResponse| {
+                if let Some(ref tp) = transcript_path_for_cb {
+                    let mut count = turn_counter_for_cb.lock().unwrap();
+                    *count += 1;
+                    write_transcript_turn(tp, *count, _response);
+                }
+            };
+
+        let result =
+            agent.run_with_turn_callback(&prompt_text, &cwd, Some(progress_cb), Some(turn_cb));
         // Read all captured structured-output tool calls (e.g. `handoff`, `plan`).
         let structured_outputs = agent.take_structured_outputs();
 
@@ -366,6 +403,65 @@ impl AcpServer {
             info!("harness ACP: cancel requested for session {session_id}");
         }
         Ok(json!({}))
+    }
+}
+
+/// Append a section to the transcript file.
+fn write_transcript_entry(path: &std::path::Path, header: &str, body: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "\n{header}\n\n{body}");
+        let _ = f.flush();
+    }
+}
+
+/// Append a full turn (assistant content, reasoning, tool calls) to the
+/// transcript file.
+fn write_transcript_turn(
+    path: &std::path::Path,
+    turn: u32,
+    response: &super::client::ChatResponse,
+) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "\n=== Turn {turn} ===");
+
+        if !response.content.is_empty() {
+            let _ = writeln!(f, "\n## Assistant\n\n{}\n", response.content);
+        }
+
+        if !response.reasoning.is_empty() {
+            let _ = writeln!(f, "\n## Thinking\n\n{}\n", response.reasoning);
+        }
+
+        if !response.tool_calls.is_empty() {
+            let _ = writeln!(f, "\n## Tool Calls");
+            for tc in &response.tool_calls {
+                let name = tc["function"]["name"].as_str().unwrap_or("(unknown)");
+                let args = tc["function"]["arguments"].as_str().unwrap_or("");
+                let _ = writeln!(f, "\n- **{name}**: `{args}`");
+            }
+            let _ = writeln!(f);
+        }
+
+        if !response.tool_results.is_empty() {
+            let _ = writeln!(f, "\n## Tool Results");
+            for (i, result) in response.tool_results.iter().enumerate() {
+                let preview: String = result.chars().take(500).collect();
+                let suffix = if result.len() > 500 { "..." } else { "" };
+                let _ = writeln!(f, "\n### Result {i}\n\n{preview}{suffix}\n");
+            }
+        }
+
+        let _ = f.flush();
     }
 }
 

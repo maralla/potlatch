@@ -29,6 +29,10 @@ struct Subagent {
     /// dropped or killed; dropping it signals EOF to the child.
     stdin: Option<ChildStdin>,
     started_at: Instant,
+    /// Path to the transcript file written by the child harness. The parent
+    /// agent can read this file to inspect the subagent's full conversation
+    /// (prompt, response, reasoning, tool calls) in real time.
+    transcript_path: std::path::PathBuf,
     /// Accumulated output from `session/update` notifications and the final
     /// `session/prompt` response. Shared with the reader thread.
     output_buf: Arc<Mutex<String>>,
@@ -102,11 +106,29 @@ impl SubagentTable {
 
         // Synchronous ACP handshake.
         driver.send_request("initialize", json!({}))?;
-        let session_params = if let Some(names) = tools {
-            json!({ "cwd": cwd, "mcpServers": [], "tools": names })
-        } else {
-            json!({ "cwd": cwd, "mcpServers": [] })
-        };
+
+        // Generate a transcript file path for the child harness to write to.
+        // The parent agent can read this file to inspect the subagent's full
+        // conversation (prompt, response, reasoning, tool calls) in real time.
+        let subagent_num = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = format!("subagent-{subagent_num}");
+        let transcript_path = std::path::Path::new(cwd)
+            .join(".potlatch-transcripts")
+            .join(format!("{id}.transcript.md"));
+        let _ = std::fs::create_dir_all(
+            transcript_path
+                .parent()
+                .unwrap_or(std::path::Path::new(".")),
+        );
+        // Truncate any previous transcript for this id.
+        let _ = std::fs::write(&transcript_path, "");
+
+        let transcript_path_str = transcript_path.to_string_lossy().to_string();
+        let mut session_params = json!({ "cwd": cwd, "mcpServers": [] });
+        if let Some(names) = tools {
+            session_params["tools"] = json!(names);
+        }
+        session_params["transcript_path"] = json!(transcript_path_str);
         let new_result = driver.send_request("session/new", session_params)?;
         let session_id = new_result["sessionId"]
             .as_str()
@@ -160,11 +182,11 @@ impl SubagentTable {
 
         // Keep the stdin handle alive on the Subagent so we can close it on
         // kill (dropping stdin signals EOF to the child).
-        let id = format!("subagent-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let subagent = Subagent {
             child,
             stdin: Some(driver.stdin),
             started_at: Instant::now(),
+            transcript_path,
             output_buf,
             done,
             killed,
@@ -204,11 +226,13 @@ impl SubagentTable {
         let output = sub.output_buf.lock().unwrap().clone();
         let error = sub.error.lock().unwrap().clone();
         let elapsed = sub.started_at.elapsed();
+        let transcript_path = sub.transcript_path.clone();
 
         let mut result = format!(
             "subagent: {subagent_id}\nstatus: {status}\nelapsed: {:.1}s",
             elapsed.as_secs_f64()
         );
+        result.push_str(&format!("\ntranscript: {}", transcript_path.display()));
         if let Some(ref err) = error {
             result.push_str(&format!("\nerror: {err}"));
         }
