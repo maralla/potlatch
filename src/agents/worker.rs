@@ -1681,10 +1681,7 @@ INSTRUCTIONS:
 12. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), respond with:
    CANNOT_RESOLVE
    REASON: <explain concisely why this cannot be resolved autonomously and what input is needed>
-13. If the reviewer asked you to fix the MR title or description, include updated versions in your response:
-   MR_TITLE: <SHORT title (max 8-10 words) stating the main feature or fix — no enumeration of details, no markdown. It must describe the overall MR, not just the latest incremental change. Do NOT change the title just because you made another follow-up commit; keep it stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.>
-   MR_DESCRIPTION:
-   <full description with goal, implementation, and testing sections — NEVER include PUBLIC_COMMENT_BEGIN/END here; those markers are only for thread replies below; NEVER paste or quote text from repo-root notes.md here>
+13. If the reviewer asked you to fix the MR title or description, include updated versions in your `handoff` tool call (`mr_title` and `mr_description` fields). Do NOT change the title just because you made another follow-up commit; keep it stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
 14. After addressing feedback, provide a summary:
    CHANGES_SUMMARY: <A concise sentence summarizing the substance of the changes made — this will be used as the git commit message, so it must convey the main idea of what was changed>
    The summary must reflect the actual source/MR metadata changes you made in this run. Do not mention a reviewer concern as fixed unless the final diff or MR metadata actually changed to address it.
@@ -3701,11 +3698,19 @@ fn extract_mr_title(agent_output: &AgentHandoff, issue_title: &str) -> String {
 /// caller can distinguish "no title provided" from "title provided". Unlike
 /// [`extract_mr_title`], this does NOT fall back to CHANGES_SUMMARY or the
 /// issue title — a metadata update should only overwrite the title when the
-/// agent explicitly said to. Does NOT read from the `handoff` tool's
-/// `mr_title` field — that is for MR creation, not metadata updates. Only
-/// text markers (`MR_TITLE_BEGIN…END`, `MR_TITLE:`) are used here, so the
-/// model must explicitly emit them when a reviewer asks for a title change.
+/// agent explicitly said to. Reads from the `handoff` tool's `mr_title` field
+/// first, then falls back to text markers (`MR_TITLE_BEGIN…END`, `MR_TITLE:`).
 fn extract_explicit_mr_title(agent_output: &AgentHandoff) -> Option<String> {
+    // Structured field first (from the `handoff` tool).
+    if let Some(s) = handoff_output(agent_output)
+        .and_then(|ho| ho.get("mr_title").and_then(serde_json::Value::as_str))
+    {
+        let cleaned = strip_markdown_formatting(s.trim());
+        if !cleaned.is_empty() {
+            return Some(cleaned);
+        }
+    }
+    // Text marker fallbacks.
     if let Some(block) =
         extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
     {
@@ -4032,6 +4037,22 @@ mod tests {
         assert_eq!(
             extract_mr_title(&output, "Issue title"),
             "Fix reviewer follow-up lint issue."
+        );
+    }
+
+    #[test]
+    fn extract_explicit_mr_title_reads_handoff_structured_field() {
+        let output = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "handoff": {
+                    "mr_title": "Add comment chunk truncation docs"
+                }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_explicit_mr_title(&output),
+            Some("Add comment chunk truncation docs".into())
         );
     }
 
