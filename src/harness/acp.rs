@@ -7,9 +7,10 @@
 //! During `session/prompt`, the agent loop runs and emits `session/update` notifications
 //! in real-time (streamed to stdout as they're produced, not buffered).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
@@ -25,6 +26,25 @@ use crate::core::model::acp::jsonrpc::Outbound;
 /// 60% and targets 30% of this value (see `Context::enforce_budget`).
 const CONTEXT_TOKEN_BUDGET: usize = 200_000;
 
+/// Channel handles for a session, shared between the main thread (which owns
+/// the `AcpServer` and runs agent loops) and the reader thread (which reads
+/// stdin continuously). The reader thread uses these to handle `session/inject`
+/// and `session/cancel` while the main thread is blocked running
+/// `session/prompt`.
+#[derive(Clone)]
+pub struct SessionChannels {
+    /// Sender for mid-run message injection. Messages pushed here are drained
+    /// by the `AgentLoop` at the top of each iteration.
+    pub inject_tx: Arc<Mutex<VecDeque<String>>>,
+    /// Cancel flag. Setting this to `true` causes the running agent loop to
+    /// exit at the top of its next iteration.
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// Shared map of session id → channels. Wrapped in `Arc<Mutex<...>>` so both
+/// the reader thread and main thread can access it.
+pub type SharedSessionChannels = Arc<std::sync::Mutex<HashMap<String, SessionChannels>>>;
+
 /// A session in the ACP server.
 struct Session {
     id: String,
@@ -35,6 +55,11 @@ struct Session {
     /// `configId=mode` when PMO requests plan mode.
     mode: String,
     cancel: Arc<AtomicBool>,
+    /// The persistent agent loop for this session. Created at `session/new`,
+    /// reused across all `session/prompt` calls. Owns the `Context`, so
+    /// conversation history accumulates across prompts — true single long
+    /// session.
+    agent: Option<AgentLoop>,
     /// Session-level state (background jobs, language servers, etc.). Tools
     /// retrieve their state by concrete type via `SessionStates::get`.
     /// All state is shut down on session close.
@@ -64,6 +89,7 @@ impl Session {
             model: std::env::var("BREEZE_MODEL").unwrap_or_default(),
             mode: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+            agent: None,
             states: super::tools::SessionStates::new(),
             allowed_tools: None,
             structured_output_tools: None,
@@ -76,6 +102,10 @@ impl Session {
 pub struct AcpServer {
     llm: Arc<dyn ChatClient>,
     sessions: HashMap<String, Session>,
+    /// Shared map of session id → channels. The reader thread uses this to
+    /// handle `session/inject` and `session/cancel` while the main thread is
+    /// blocked running `session/prompt`.
+    shared_channels: SharedSessionChannels,
 }
 
 impl AcpServer {
@@ -83,7 +113,14 @@ impl AcpServer {
         Self {
             llm,
             sessions: HashMap::new(),
+            shared_channels: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Get the shared session channels map. The reader thread uses this to
+    /// handle `session/inject` and `session/cancel` directly.
+    pub fn shared_channels(&self) -> SharedSessionChannels {
+        Arc::clone(&self.shared_channels)
     }
 
     /// Handle an incoming JSON-RPC message. Writes notifications directly to `writer`
@@ -111,8 +148,11 @@ impl AcpServer {
                 // session/prompt streams notifications directly to the writer
                 self.handle_session_prompt(&params, writer)?
             }
+            // session/inject and session/cancel are handled directly by the
+            // reader thread via shared channels (they work mid-run, while the
+            // main thread is blocked in session/prompt). They never reach
+            // handle_message.
             "session/close" => self.handle_session_close(&params)?,
-            "session/cancel" => self.handle_session_cancel(&params)?,
             other => {
                 warn!("harness ACP: unhandled method: {other}");
                 json!({})
@@ -144,7 +184,7 @@ impl AcpServer {
         let cwd = params["cwd"].as_str().unwrap_or(".").to_string();
         info!("harness ACP: creating session with cwd={cwd}");
 
-        let mut session = Session::new(cwd);
+        let mut session = Session::new(cwd.clone());
         // Optional `tools` extension: an allow-list of tool names. When
         // present, only those tools are registered for this session.
         if let Some(arr) = params.get("tools").and_then(|v| v.as_array()) {
@@ -186,7 +226,65 @@ impl AcpServer {
         {
             session.transcript_path = Some(std::path::PathBuf::from(path));
         }
+
+        // Build the tool registry with built-in tools + caller-defined
+        // structured-output tools. The tool set is fixed for the session
+        // lifetime.
+        let mut tools = ToolRegistry::with_builtin_tools(
+            &mut session.states,
+            &cwd,
+            &session.model,
+            session.allowed_tools.as_deref(),
+        );
+        if let Some(defs) = &session.structured_output_tools {
+            for def in defs {
+                if let (Some(name), Some(desc), Some(params)) = (
+                    def.get("name").and_then(Value::as_str),
+                    def.get("description").and_then(Value::as_str),
+                    def.get("parameters"),
+                ) {
+                    tools.register_structured_output(name, desc, params.clone());
+                }
+            }
+        }
+
+        // Create the inject channel and the persistent AgentLoop. The agent
+        // loop owns the Context and is reused across all session/prompt calls
+        // — true single long session. The inject_tx is stored in the shared
+        // channels map so session/inject can push messages into the running
+        // loop.
+        let inject_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let mut agent = AgentLoop::new(
+            Arc::clone(&self.llm),
+            tools,
+            session.model.clone(),
+            CONTEXT_TOKEN_BUDGET,
+            Arc::clone(&session.cancel),
+            Arc::clone(&inject_queue),
+        );
+        agent.init_context(&cwd);
+        info!(
+            "harness ACP: session {} created, registered tools: {:?}",
+            session.id,
+            agent.tool_names()
+        );
+        session.agent = Some(agent);
+
+        // Register the inject channel and cancel flag in the shared channels
+        // map so the reader thread can handle session/inject and
+        // session/cancel while the main thread is blocked running
+        // session/prompt.
         let session_id = session.id.clone();
+        {
+            let mut sc = self.shared_channels.lock().unwrap();
+            sc.insert(
+                session_id.clone(),
+                SessionChannels {
+                    inject_tx: inject_queue,
+                    cancel: Arc::clone(&session.cancel),
+                },
+            );
+        }
 
         let models = self.llm.list_models().unwrap_or_default();
         let model_options: Vec<Value> = if models.is_empty() {
@@ -276,47 +374,19 @@ impl AcpServer {
         };
 
         let cwd = session.cwd.clone();
-        let model = session.model.clone();
-        let mode = session.mode.clone();
-        let allowed_tools = session.allowed_tools.clone();
-        let structured_output_defs = session.structured_output_tools.clone();
         let transcript_path = session.transcript_path.clone();
         let cancel = session.cancel.clone();
         cancel.store(false, Ordering::SeqCst);
 
-        let mut tools = ToolRegistry::with_builtin_tools(
-            &mut session.states,
-            &cwd,
-            &model,
-            allowed_tools.as_deref(),
-        );
-        // Register caller-defined structured-output tools (e.g. the worker's
-        // `handoff` tool). Each definition has `name`, `description`, and
-        // `parameters` (JSON schema). The harness captures the model's calls
-        // and returns them in the session/prompt response.
-        if let Some(defs) = &structured_output_defs {
-            for def in defs {
-                if let (Some(name), Some(desc), Some(params)) = (
-                    def.get("name").and_then(Value::as_str),
-                    def.get("description").and_then(Value::as_str),
-                    def.get("parameters"),
-                ) {
-                    tools.register_structured_output(name, desc, params.clone());
-                }
+        let agent = match session.agent.as_mut() {
+            Some(a) => a,
+            None => {
+                return Ok(json!({
+                    "stopReason": "error",
+                    "message": "session agent not initialized"
+                }));
             }
-        }
-        let mut agent = AgentLoop::new(
-            Arc::clone(&self.llm),
-            tools,
-            model,
-            CONTEXT_TOKEN_BUDGET,
-            cancel,
-        );
-        info!(
-            "harness ACP: session {session_id} mode={}, registered tools: {:?}",
-            if mode.is_empty() { "default" } else { &mode },
-            agent.tool_names()
-        );
+        };
 
         // Collect progress text; the agent loop calls this callback after each LLM response.
         // We emit notifications by writing to the writer after collection.
@@ -391,18 +461,11 @@ impl AcpServer {
         let session_id = params["sessionId"].as_str().unwrap_or("");
         if let Some(session) = self.sessions.remove(session_id) {
             session.states.shutdown();
+            // Also remove from the shared channels map.
+            self.shared_channels.lock().unwrap().remove(session_id);
             debug!("harness ACP: closed session {session_id}");
         }
         Ok(json!(null))
-    }
-
-    fn handle_session_cancel(&mut self, params: &Value) -> Result<Value> {
-        let session_id = params["sessionId"].as_str().unwrap_or("");
-        if let Some(session) = self.sessions.get(session_id) {
-            session.cancel.store(true, Ordering::SeqCst);
-            info!("harness ACP: cancel requested for session {session_id}");
-        }
-        Ok(json!({}))
     }
 }
 
@@ -684,6 +747,65 @@ mod tests {
             { "type": "text", "text": "world" }
         ]);
         assert_eq!(extract_prompt_text(&prompt), "hello \nworld");
+    }
+
+    #[test]
+    fn multiple_session_prompts_reuse_same_agent_loop() {
+        // Multiple session/prompt calls on the same session should succeed —
+        // the AgentLoop persists on the Session and is reused. Context
+        // accumulates across prompts (single long session).
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let mut server = AcpServer::new(llm);
+
+        let new_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": { "cwd": "/tmp" }
+        });
+        let (resp, _) = collect_output(&mut server, &new_msg);
+        let session_id = match resp {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected response"),
+        };
+
+        // First prompt.
+        let prompt1 = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "first prompt" }]
+            }
+        });
+        let (resp1, _) = collect_output(&mut server, &prompt1);
+        match resp1 {
+            Some(Outbound::Response { result, .. }) => {
+                assert_eq!(result["stopReason"], "end_turn");
+            }
+            _ => panic!("expected response for first prompt"),
+        }
+
+        // Second prompt on the same session — should reuse the AgentLoop.
+        let prompt2 = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "second prompt" }]
+            }
+        });
+        let (resp2, _) = collect_output(&mut server, &prompt2);
+        match resp2 {
+            Some(Outbound::Response { result, .. }) => {
+                assert_eq!(result["stopReason"], "end_turn");
+            }
+            _ => panic!("expected response for second prompt"),
+        }
     }
 
     #[test]

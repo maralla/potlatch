@@ -22,7 +22,7 @@ use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::core::model::acp::jsonrpc::Outbound;
 
@@ -153,15 +153,20 @@ fn home_dir() -> std::path::PathBuf {
 
 /// Entry point for `potlatch harness`. Reads JSON-RPC from stdin, writes to stdout.
 ///
-/// Notifications (e.g. `session/update` during `session/prompt`) are written directly
-/// to stdout in real-time as they're produced, not buffered.
+/// Uses a reader thread + main thread architecture:
+/// - **Reader thread**: reads stdin continuously, parses JSON-RPC. Routes
+///   `session/inject` and `session/cancel` directly via shared channels (so
+///   they work mid-run while the main thread is blocked in `session/prompt`).
+///   All other messages go to the main thread via an mpsc channel.
+/// - **Main thread**: owns the `AcpServer`, processes messages from the
+///   mpsc channel. `session/prompt` blocks until the agent loop finishes;
+///   queued messages wait in the channel.
+///
+/// Notifications (e.g. `session/update` during `session/prompt`) are written
+/// directly to stdout in real-time as they're produced, not buffered.
 pub fn run_acp_server() -> Result<()> {
     let log_writer = init_logging();
     tracing::info!("potlatch harness starting (pid={})", std::process::id());
-
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
 
     let base_url = std::env::var("BREEZE_BASE_URL")
         .context("BREEZE_BASE_URL env var is required for potlatch harness")?;
@@ -170,28 +175,41 @@ pub fn run_acp_server() -> Result<()> {
     let llm_client = Arc::new(client::OpenAiClient::new(base_url, api_key));
     let mut server = acp::AcpServer::new(llm_client);
 
-    let reader = stdin.lock();
-    for line in reader.lines() {
-        let line = line.context("read stdin line")?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let msg: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("invalid JSON from stdin: {e}");
-                eprintln!("harness: invalid JSON: {e}");
-                continue;
-            }
-        };
+    // Shared channels map: session_id → inject_tx + cancel flag.
+    // The reader thread uses this to handle session/inject and session/cancel
+    // directly, bypassing the main thread (which may be blocked in
+    // session/prompt).
+    let shared_channels = server.shared_channels();
 
+    // Shared stdout: both threads write responses/notifications to stdout.
+    let shared_stdout: Arc<Mutex<std::io::Stdout>> = Arc::new(Mutex::new(std::io::stdout()));
+
+    // mpsc channel: reader thread → main thread for all non-inject/non-cancel
+    // messages. Messages queue here when the main thread is blocked in
+    // session/prompt.
+    let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Value>();
+
+    // Spawn the reader thread.
+    let shared_stdout_reader = Arc::clone(&shared_stdout);
+    let msg_tx_clone = msg_tx.clone();
+    std::thread::Builder::new()
+        .name("acp-reader".into())
+        .spawn(move || {
+            run_reader_thread(shared_channels, shared_stdout_reader, msg_tx_clone);
+        })
+        .context("spawn ACP reader thread")?;
+
+    // Main thread: process messages from the reader thread.
+    drop(msg_tx); // Close our copy so msg_rx closes when the reader thread exits.
+    let shared_stdout_main = Arc::clone(&shared_stdout);
+    while let Ok(msg) = msg_rx.recv() {
         let method = msg["method"].as_str().unwrap_or("(unknown)");
         tracing::info!("ACP request: {method}");
 
         // When a session is created, switch to per-session log file
         if method == "session/new" {
-            let response = server.handle_message(&msg, &mut out)?;
+            let mut out = shared_stdout_main.lock().unwrap();
+            let response = server.handle_message(&msg, &mut *out)?;
             if let Some(ref resp) = response {
                 let line = resp.to_json_line().context("serialize response")?;
                 out.write_all(line.as_bytes())?;
@@ -206,7 +224,8 @@ pub fn run_acp_server() -> Result<()> {
             continue;
         }
 
-        let response = server.handle_message(&msg, &mut out)?;
+        let mut out = shared_stdout_main.lock().unwrap();
+        let response = server.handle_message(&msg, &mut *out)?;
         if let Some(resp) = response {
             let line = resp.to_json_line().context("serialize response")?;
             out.write_all(line.as_bytes())?;
@@ -215,4 +234,119 @@ pub fn run_acp_server() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Reader thread body: reads stdin continuously, parses JSON-RPC, and routes
+/// messages. `session/inject` and `session/cancel` are handled directly via
+/// shared channels (they work mid-run). All other messages go to the main
+/// thread via the mpsc channel.
+fn run_reader_thread(
+    shared_channels: acp::SharedSessionChannels,
+    shared_stdout: Arc<Mutex<std::io::Stdout>>,
+    msg_tx: std::sync::mpsc::Sender<Value>,
+) {
+    let stdin = std::io::stdin();
+    let reader = stdin.lock();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("ACP reader: stdin read error: {e}");
+                break;
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let msg: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("invalid JSON from stdin: {e}");
+                eprintln!("harness: invalid JSON: {e}");
+                continue;
+            }
+        };
+
+        let method = msg["method"].as_str().unwrap_or("");
+        let id = msg.get("id").cloned();
+
+        // Route session/inject directly via shared channels. This works
+        // mid-run: the inject_tx pushes to the agent loop's inject channel,
+        // which is drained at the top of the next iteration.
+        if method == "session/inject" {
+            let session_id = msg["params"]["sessionId"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let message = msg["params"]["message"].as_str().unwrap_or("").to_string();
+            let result = {
+                let sc = shared_channels.lock().unwrap();
+                if let Some(chans) = sc.get(&session_id) {
+                    chans.inject_tx.lock().unwrap().push_back(message);
+                    tracing::debug!("ACP reader: injected message into session {session_id}");
+                    json!({})
+                } else {
+                    tracing::warn!("ACP reader: inject for unknown session {session_id}");
+                    json!({ "error": "unknown session" })
+                }
+            };
+            // Write the response to stdout.
+            if let Some(ref id) = id {
+                let resp = Outbound::Response {
+                    id: id.clone(),
+                    result,
+                };
+                if let Ok(line) = resp.to_json_line() {
+                    let mut out = shared_stdout.lock().unwrap();
+                    let _ = out.write_all(line.as_bytes());
+                    let _ = out.flush();
+                }
+            }
+            continue;
+        }
+
+        // Route session/cancel directly via shared channels. This works
+        // mid-run: the cancel flag is checked at the top of each iteration.
+        if method == "session/cancel" {
+            let session_id = msg["params"]["sessionId"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let result = {
+                let sc = shared_channels.lock().unwrap();
+                if let Some(chans) = sc.get(&session_id) {
+                    chans
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    tracing::info!("ACP reader: cancel requested for session {session_id}");
+                    json!({})
+                } else {
+                    tracing::warn!("ACP reader: cancel for unknown session {session_id}");
+                    json!({ "error": "unknown session" })
+                }
+            };
+            // Write the response to stdout.
+            if let Some(ref id) = id {
+                let resp = Outbound::Response {
+                    id: id.clone(),
+                    result,
+                };
+                if let Ok(line) = resp.to_json_line() {
+                    let mut out = shared_stdout.lock().unwrap();
+                    let _ = out.write_all(line.as_bytes());
+                    let _ = out.flush();
+                }
+            }
+            continue;
+        }
+
+        // All other messages go to the main thread. If the main thread is
+        // blocked in session/prompt, the message queues in the channel.
+        if msg_tx.send(msg).is_err() {
+            tracing::warn!("ACP reader: main thread channel closed, exiting");
+            break;
+        }
+    }
 }

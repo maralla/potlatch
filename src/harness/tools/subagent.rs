@@ -1,14 +1,15 @@
 //! Subagent tool: spawn `potlatch harness` as a child process and drive it via
 //! ACP JSON-RPC over stdio. The subagent runs asynchronously — the parent gets
-//! a `subagent_id` immediately and polls for accumulated output. Subagents are
-//! one-shot: each runs a single `session/prompt` and terminates when it
-//! finishes. The harness does not preserve conversation history across
-//! `session/prompt` calls, so follow-up messages would start fresh anyway.
+//! a `subagent_id` immediately and polls for accumulated output. Subagents
+//! support multi-turn conversations: the parent can send follow-up messages
+//! via `session/inject`, which are injected into the running agent loop's
+//! context before the next model call. The harness persists context across
+//! all prompts and injections — a single long session.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -25,9 +26,11 @@ const MAX_OUTPUT: usize = 50_000;
 /// shared output buffer the reader thread appends to.
 struct Subagent {
     child: Child,
-    /// Kept alive so the child's stdin pipe stays open until the subagent is
-    /// dropped or killed; dropping it signals EOF to the child.
-    stdin: Option<ChildStdin>,
+    /// The ACP driver, wrapped in `Arc<Mutex>` so both the main thread and
+    /// reader thread can send messages. Owns the stdin handle.
+    driver: Arc<Mutex<AcpDriver>>,
+    /// The session id assigned by the child harness during `session/new`.
+    session_id: String,
     started_at: Instant,
     /// Path to the transcript file written by the child harness. The parent
     /// agent can read this file to inspect the subagent's full conversation
@@ -36,13 +39,14 @@ struct Subagent {
     /// Accumulated output from `session/update` notifications and the final
     /// `session/prompt` response. Shared with the reader thread.
     output_buf: Arc<Mutex<String>>,
-    /// Set once the reader thread observes the `session/prompt` response or
-    /// the process exits.
-    done: Arc<std::sync::atomic::AtomicBool>,
-    /// Set when the subagent was killed via `kill`/`kill_all`.
-    killed: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once the reader thread observes EOF or an error (process exited).
+    done: Arc<AtomicBool>,
+    /// Set when the subagent was killed via `kill` (forceful).
+    killed: Arc<AtomicBool>,
+    /// Set when the parent sent `session/close` (graceful shutdown).
+    closed: Arc<AtomicBool>,
     /// Populated when the reader thread hits an error or the process exits
-    /// with a non-zero code.
+    /// unexpectedly (not via `session/close` or `kill`).
     error: Arc<Mutex<Option<String>>>,
 }
 
@@ -74,7 +78,7 @@ impl SubagentTable {
 
     /// Spawn a `potlatch harness` subprocess, drive the ACP handshake, send the
     /// prompt, and return the subagent id. The reader thread collects
-    /// `session/update` notifications and the final response asynchronously.
+    /// `session/update` notifications and all responses asynchronously.
     pub fn spawn(
         &self,
         prompt: &str,
@@ -143,14 +147,15 @@ impl SubagentTable {
         }
 
         let output_buf = Arc::new(Mutex::new(String::new()));
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let killed = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None::<String>));
 
-        // Fire the prompt and hand the stdout reader to a background thread.
-        // The prompt request id is tracked so the reader recognizes the final
-        // response and marks the subagent done.
-        let prompt_id = driver.send_request_raw(
+        // Fire the first prompt (fire-and-forget) and hand the stdout reader
+        // to a background thread. The reader thread is persistent — it
+        // accumulates all output from all turns and only exits on EOF/error.
+        driver.send_request_raw(
             "session/prompt",
             json!({
                 "sessionId": session_id,
@@ -165,31 +170,35 @@ impl SubagentTable {
         let output_buf_r = Arc::clone(&output_buf);
         let done_r = Arc::clone(&done);
         let killed_r = Arc::clone(&killed);
+        let closed_r = Arc::clone(&closed);
         let error_r = Arc::clone(&error);
         thread::Builder::new()
             .name("subagent-reader".into())
             .spawn(move || {
                 run_reader(
                     reader_stdout,
-                    prompt_id,
                     output_buf_r,
                     done_r,
                     killed_r,
+                    closed_r,
                     error_r,
                 );
             })
             .context("spawn subagent reader thread")?;
 
-        // Keep the stdin handle alive on the Subagent so we can close it on
-        // kill (dropping stdin signals EOF to the child).
+        // Wrap the driver in Arc<Mutex> so both send_message and kill can
+        // access it. The stdin handle stays alive inside the driver.
+        let driver = Arc::new(Mutex::new(driver));
         let subagent = Subagent {
             child,
-            stdin: Some(driver.stdin),
+            driver,
+            session_id: session_id.clone(),
             started_at: Instant::now(),
             transcript_path,
             output_buf,
             done,
             killed,
+            closed,
             error,
         };
         self.subagents.lock().unwrap().insert(id.clone(), subagent);
@@ -208,15 +217,28 @@ impl SubagentTable {
             && let Some(code) = sub.try_reap()
             && code != 0
             && !sub.killed.load(Ordering::SeqCst)
+            && !sub.closed.load(Ordering::SeqCst)
             && sub.error.lock().unwrap().is_none()
         {
             *sub.error.lock().unwrap() = Some(format!("subagent exited with code {code}"));
         }
 
+        // Detect unexpected exit: done but neither closed nor killed.
+        if sub.done.load(Ordering::SeqCst)
+            && !sub.killed.load(Ordering::SeqCst)
+            && !sub.closed.load(Ordering::SeqCst)
+            && sub.error.lock().unwrap().is_none()
+        {
+            *sub.error.lock().unwrap() = Some("unexpected exit".into());
+        }
+
         let running = !sub.done.load(Ordering::SeqCst) && sub.try_reap().is_none();
         let killed = sub.killed.load(Ordering::SeqCst);
+        let closed = sub.closed.load(Ordering::SeqCst);
         let status = if killed {
             "killed"
+        } else if closed {
+            "closed"
         } else if running {
             "running"
         } else {
@@ -251,6 +273,107 @@ impl SubagentTable {
         Ok(result)
     }
 
+    /// Send a follow-up message to a running subagent via `session/prompt`.
+    /// Fire-and-forget: sends the prompt and returns immediately. If the
+    /// subagent is still running a previous prompt, this one queues behind it
+    /// (the harness processes `session/prompt` calls sequentially). If the
+    /// subagent has finished its previous turn, this starts a new turn. Context
+    /// persists across all prompts — true single long session.
+    pub fn send_message(&self, subagent_id: &str, message: &str) -> Result<String> {
+        let mut subagents = self.subagents.lock().unwrap();
+        let sub = subagents
+            .get_mut(subagent_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown subagent id: {subagent_id}"))?;
+
+        if sub.done.load(Ordering::SeqCst) {
+            anyhow::bail!("subagent {subagent_id} has exited");
+        }
+
+        // Write the user message to the transcript file.
+        write_transcript_entry(&sub.transcript_path, "## User", message);
+
+        // Send session/prompt via the driver (fire-and-forget). The harness
+        // queues prompts sequentially and shares context across all of them.
+        let driver = Arc::clone(&sub.driver);
+        let session_id = sub.session_id.clone();
+        drop(subagents);
+
+        let mut driver = driver.lock().unwrap();
+        driver.send_request_raw(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": message }],
+            }),
+        )?;
+
+        Ok(subagent_id.to_string())
+    }
+
+    /// Inject a message into a running subagent's context via `session/inject`.
+    /// Fire-and-forget: pushes the message into the child harness's inject
+    /// channel and returns immediately. The agent loop drains it at the top of
+    /// the next iteration and adds it to context before the next model call.
+    /// Unlike `send_message`, this does NOT start a new turn — it redirects
+    /// the currently running turn. If the agent has already stopped, the
+    /// message sits in the channel until the next `session/prompt` drains it.
+    pub fn send_inject(&self, subagent_id: &str, message: &str) -> Result<String> {
+        let mut subagents = self.subagents.lock().unwrap();
+        let sub = subagents
+            .get_mut(subagent_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown subagent id: {subagent_id}"))?;
+
+        if sub.done.load(Ordering::SeqCst) {
+            anyhow::bail!("subagent {subagent_id} has exited");
+        }
+
+        // Write the user message to the transcript file.
+        write_transcript_entry(&sub.transcript_path, "## User (inject)", message);
+
+        // Send session/inject via the driver (fire-and-forget).
+        let driver = Arc::clone(&sub.driver);
+        let session_id = sub.session_id.clone();
+        drop(subagents);
+
+        let mut driver = driver.lock().unwrap();
+        driver.send_request_raw(
+            "session/inject",
+            json!({
+                "sessionId": session_id,
+                "message": message,
+            }),
+        )?;
+
+        Ok(subagent_id.to_string())
+    }
+
+    /// Gracefully close a subagent: send `session/close`, set the `closed`
+    /// flag, and reap the child. The child harness shuts down cleanly.
+    pub fn close(&self, subagent_id: &str) -> Result<String> {
+        let mut subagents = self.subagents.lock().unwrap();
+        let sub = subagents
+            .get_mut(subagent_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown subagent id: {subagent_id}"))?;
+
+        if sub.done.load(Ordering::SeqCst) {
+            drop(subagents);
+            return self.poll(subagent_id);
+        }
+
+        sub.closed.store(true, Ordering::SeqCst);
+        let driver = Arc::clone(&sub.driver);
+        let session_id = sub.session_id.clone();
+        drop(subagents);
+
+        // Send session/close (best effort — the child may have already exited).
+        let _ = driver
+            .lock()
+            .unwrap()
+            .send_request_raw("session/close", json!({ "sessionId": session_id }));
+
+        self.poll(subagent_id)
+    }
+
     /// Kill a subagent. Drops stdin (EOF), sends nothing more, and reaps the
     /// child. Marks it killed so `poll` reports `killed` rather than `done`.
     pub fn kill(&self, subagent_id: &str) -> Result<String> {
@@ -265,18 +388,21 @@ impl SubagentTable {
         }
 
         sub.killed.store(true, Ordering::SeqCst);
-        // Drop stdin to signal EOF, then kill the process group to be sure.
-        sub.stdin.take();
+        // Drop stdin to signal EOF by taking it from the driver, then kill.
+        {
+            let mut driver = sub.driver.lock().unwrap();
+            driver.take_stdin();
+        }
         let _ = sub.child.kill();
         drop(subagents);
         self.poll(subagent_id)
     }
 
-    /// Kill all running subagents. Called on session close.
-    pub fn kill_all(&self) {
+    /// Close all running subagents gracefully. Called on session close.
+    pub fn close_all(&self) {
         let ids: Vec<String> = self.subagents.lock().unwrap().keys().cloned().collect();
         for id in ids {
-            let _ = self.kill(&id);
+            let _ = self.close(&id);
         }
     }
 }
@@ -289,15 +415,15 @@ impl Default for SubagentTable {
 
 impl super::SessionState for SubagentTable {
     fn shutdown(&self) {
-        self.kill_all();
+        self.close_all();
     }
 }
 
 /// Minimal inline ACP JSON-RPC driver for the synchronous handshake phase.
 /// The stdout reader is moved into the reader thread after the handshake; the
-/// stdin stays with the driver (and is handed back to the `Subagent`).
+/// stdin stays with the driver (wrapped in `Arc<Mutex>` on the `Subagent`).
 struct AcpDriver {
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: Option<BufReader<std::process::ChildStdout>>,
     next_id: u64,
 }
@@ -305,10 +431,15 @@ struct AcpDriver {
 impl AcpDriver {
     fn new(stdin: ChildStdin, stdout: std::process::ChildStdout) -> Self {
         Self {
-            stdin,
+            stdin: Some(stdin),
             stdout: Some(BufReader::new(stdout)),
             next_id: 1,
         }
+    }
+
+    /// Take the stdin handle (drops it, signaling EOF to the child).
+    fn take_stdin(&mut self) {
+        self.stdin.take();
     }
 
     /// Send a request and read lines until the matching response arrives.
@@ -331,10 +462,14 @@ impl AcpDriver {
         });
         let mut s = serde_json::to_string(&line).context("serialize ACP request")?;
         s.push('\n');
-        self.stdin
+        let stdin = self
+            .stdin
+            .as_mut()
+            .context("subagent stdin already closed")?;
+        stdin
             .write_all(s.as_bytes())
             .with_context(|| format!("write ACP request `{method}`"))?;
-        self.stdin.flush()?;
+        stdin.flush()?;
         debug!("subagent: sent `{method}` (id={id})");
         Ok(id)
     }
@@ -385,14 +520,16 @@ impl AcpDriver {
 }
 
 /// Reader thread body: drain the subagent's stdout, append `session/update`
-/// text chunks to the shared buffer, and mark done when the `session/prompt`
-/// response (matching `prompt_id`) arrives or the stream ends.
+/// text chunks and response messages to the shared buffer. The reader is
+/// persistent — it loops forever, accumulating all output from all turns.
+/// It only exits on EOF or error (process exited). `done` means the process
+/// is gone, not that a specific prompt finished.
 fn run_reader(
     mut reader: impl BufRead,
-    prompt_id: u64,
     output_buf: Arc<Mutex<String>>,
-    done: Arc<std::sync::atomic::AtomicBool>,
-    killed: Arc<std::sync::atomic::AtomicBool>,
+    done: Arc<AtomicBool>,
+    killed: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
 ) {
     loop {
@@ -417,15 +554,12 @@ fn run_reader(
             }
         };
 
-        // Agent→client request (e.g. session/request_permission). Reply with
-        // an auto-allow so the subagent keeps running.
+        // Agent→client request (e.g. session/request_permission). Drop it;
+        // the harness treats a missing permission reply as a deny.
         if msg.get("method").is_some()
             && msg.get("id").is_some()
             && msg.get("id") != Some(&Value::Null)
         {
-            // We can't write back here (stdin is owned by the Subagent), so
-            // just drop it; the harness treats a missing permission reply as
-            // a deny, which is acceptable for a one-shot subagent.
             debug!(
                 "subagent reader: dropping agent→client request: {}",
                 msg["method"]
@@ -441,31 +575,29 @@ fn run_reader(
             continue;
         }
 
-        // Response to our session/prompt request.
+        // Response (no `method` field). Append the result message to the
+        // output buffer if non-empty. Don't mark done — the reader stays
+        // alive for subsequent prompts and injections.
         if msg.get("method").is_none() {
-            let resp_id = msg.get("id").and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            });
-            if resp_id == Some(prompt_id) {
-                if let Some(message) = msg
-                    .get("result")
-                    .and_then(|r| r.get("message"))
-                    .and_then(|m| m.as_str())
-                    && !message.is_empty()
-                {
-                    output_buf.lock().unwrap().push_str(message);
-                }
-                done.store(true, Ordering::SeqCst);
-                return;
+            if let Some(message) = msg
+                .get("result")
+                .and_then(|r| r.get("message"))
+                .and_then(|m| m.as_str())
+                && !message.is_empty()
+            {
+                output_buf.lock().unwrap().push_str(message);
             }
+            continue;
         }
     }
 
-    // Stream ended without a matching response. If we weren't killed, record
-    // an error; otherwise just mark done.
-    if !killed.load(Ordering::SeqCst) && error.lock().unwrap().is_none() {
-        *error.lock().unwrap() = Some("subagent stream ended before response".into());
+    // Stream ended (EOF or error). Mark done. If neither killed nor closed,
+    // this is an unexpected exit — the error will be set by `poll`.
+    if !killed.load(Ordering::SeqCst)
+        && !closed.load(Ordering::SeqCst)
+        && error.lock().unwrap().is_none()
+    {
+        *error.lock().unwrap() = Some("unexpected exit".into());
     }
     done.store(true, Ordering::SeqCst);
 }
@@ -494,6 +626,19 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Append a section to the transcript file.
+fn write_transcript_entry(path: &std::path::Path, header: &str, body: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "\n{header}\n\n{body}");
+        let _ = f.flush();
+    }
 }
 
 pub struct SubagentTool {
@@ -532,7 +677,7 @@ impl Tool for SubagentTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Spawn a subagent — a separate potlatch harness instance with its own LLM session. The subagent runs asynchronously in the background. Returns a subagent_id immediately; poll with subagent_id to get accumulated output. Use for parallel exploration, independent research tasks, or dividing complex work. The subagent has no context from the parent session — provide everything it needs in the prompt.",
+            "description": "Spawn a subagent — a separate potlatch harness instance with its own LLM session. The subagent runs asynchronously in the background. Returns a subagent_id immediately; poll with subagent_id to get accumulated output. Use for parallel exploration, independent research tasks, or dividing complex work. The subagent has no context from the parent session — provide everything it needs in the prompt. Send follow-up messages to a running subagent with subagent_id + message (mid-run injection into the agent's context).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -551,7 +696,15 @@ impl Tool for SubagentTool {
                     },
                     "subagent_id": {
                         "type": "string",
-                        "description": "Poll a running subagent. Returns accumulated output and status."
+                        "description": "A running subagent id. Use with message to send a follow-up, with kill to terminate, or alone to poll for accumulated output."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Send a follow-up message to a running subagent as a new session/prompt turn. Returns the subagent_id immediately. If the subagent is still running a previous turn, this one queues behind it. Context persists across all turns. Poll with subagent_id to read the response."
+                    },
+                    "inject": {
+                        "type": "string",
+                        "description": "Inject a message into a running subagent's context mid-run via session/inject. The message is added before the next model call in the current turn — it redirects the agent without starting a new turn. Returns the subagent_id immediately. If the agent has already stopped, the message waits for the next session/prompt. Poll with subagent_id to read the response."
                     },
                     "kill": {
                         "type": "boolean",
@@ -566,8 +719,16 @@ impl Tool for SubagentTool {
     fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
         let subagent_id = args["subagent_id"].as_str();
         let kill = args["kill"].as_bool().unwrap_or(false);
+        let message = args["message"].as_str().filter(|s| !s.is_empty());
+        let inject = args["inject"].as_str().filter(|s| !s.is_empty());
 
         if let Some(id) = subagent_id {
+            if let Some(msg) = message {
+                return self.table.send_message(id, msg);
+            }
+            if let Some(msg) = inject {
+                return self.table.send_inject(id, msg);
+            }
             if kill {
                 return self.table.kill(id);
             }
@@ -676,7 +837,27 @@ mod tests {
         assert!(props.contains_key("model"));
         assert!(props.contains_key("tools"));
         assert!(props.contains_key("subagent_id"));
+        assert!(props.contains_key("message"));
+        assert!(props.contains_key("inject"));
         assert!(props.contains_key("kill"));
+    }
+
+    #[test]
+    fn execute_send_message_unknown_id_returns_error() {
+        let tool = SubagentTool::with_table(Arc::new(SubagentTable::new()), "m");
+        let args = json!({"subagent_id": "nope", "message": "hello"});
+        let result = tool.execute(&args, "/tmp");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown subagent"));
+    }
+
+    #[test]
+    fn execute_inject_unknown_id_returns_error() {
+        let tool = SubagentTool::with_table(Arc::new(SubagentTable::new()), "m");
+        let args = json!({"subagent_id": "nope", "inject": "hello"});
+        let result = tool.execute(&args, "/tmp");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown subagent"));
     }
 
     /// Spawn a subagent that runs `echo hi` via the shell tool and verifies we

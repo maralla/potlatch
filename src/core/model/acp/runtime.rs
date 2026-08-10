@@ -90,6 +90,7 @@ pub(crate) struct AcpRuntime {
 }
 
 impl AcpRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo_path: String,
         model_uri: Option<String>,
