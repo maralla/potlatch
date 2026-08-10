@@ -328,6 +328,9 @@ impl AcpServer {
 
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.model = model_id.to_string();
+            if let Some(ref mut agent) = session.agent {
+                agent.set_model(model_id);
+            }
             debug!("harness ACP: set model to {model_id} for session {session_id}");
         }
 
@@ -342,6 +345,9 @@ impl AcpServer {
         if let Some(session) = self.sessions.get_mut(session_id) {
             if config_id == "model" {
                 session.model = value.to_string();
+                if let Some(ref mut agent) = session.agent {
+                    agent.set_model(value);
+                }
                 info!("harness ACP: session {session_id} set model={value}");
             } else if config_id == "mode" {
                 session.mode = value.to_string();

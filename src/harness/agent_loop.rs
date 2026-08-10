@@ -86,6 +86,12 @@ impl AgentLoop {
         self.tools.take_structured_outputs()
     }
 
+    /// Update the model used for LLM calls. Called when the client sends
+    /// `session/set_model` or `session/set_config_option` with `configId=model`.
+    pub fn set_model(&mut self, model: &str) {
+        self.model = model.to_string();
+    }
+
     /// Names of all registered tools (built-ins + mode-specific tools like
     /// `plan`, plus `todo` and `memory` added by the constructor), in
     /// insertion order. Useful for diagnostics at session startup.
