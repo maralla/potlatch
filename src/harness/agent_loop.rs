@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
@@ -31,6 +32,12 @@ pub struct AgentLoop {
     context: Context,
     model: String,
     cancel: Arc<AtomicBool>,
+    /// Channel for mid-run message injection. Messages drained at the top of
+    /// each loop iteration are pushed into context as user messages before the
+    /// next model call. Enables `session/inject` to redirect a running agent.
+    /// Uses `Arc<Mutex<VecDeque>>` instead of `mpsc` so `&AgentLoop` is `Send`
+    /// (needed for `std::thread::scope` in concurrent tool execution).
+    inject_rx: Arc<Mutex<VecDeque<String>>>,
     /// Task checklist that survives context compaction and collapse.
     /// Injected as a system message before every API call.
     todo: Arc<super::todo::TodoList>,
@@ -47,6 +54,7 @@ impl AgentLoop {
         model: String,
         token_budget: usize,
         cancel: Arc<AtomicBool>,
+        inject_rx: Arc<Mutex<VecDeque<String>>>,
     ) -> Self {
         let todo = Arc::new(super::todo::TodoList::new());
         // Register the todo tool so the model can manage its task checklist.
@@ -64,6 +72,7 @@ impl AgentLoop {
             context: Context::new(token_budget),
             model,
             cancel,
+            inject_rx,
             todo,
             recent_calls: VecDeque::with_capacity(8),
             stuck_count: 0,
@@ -84,9 +93,30 @@ impl AgentLoop {
         self.tools.tool_names()
     }
 
+    /// Initialize the context with the system prompt and project facts.
+    /// Called once at session creation. Subsequent `session/prompt` calls
+    /// reuse this context — true single long session.
+    pub fn init_context(&mut self, cwd: &str) {
+        let descriptions = self.tools.tool_descriptions();
+        let system_prompt = prompt::system_prompt(&descriptions);
+        self.context
+            .push(Role::System, ContextKind::System, &system_prompt);
+
+        // Load persistent project facts (if any) and inject as a system message.
+        // These are fundamental facts about the project that were extracted during
+        // previous sessions' context compaction — build commands, architecture,
+        // key file locations, conventions. They survive across sessions.
+        if let Some(facts) = super::memory::load_facts(cwd) {
+            let facts_prompt = format!("## Project Facts\n\n{facts}");
+            self.context
+                .push(Role::System, ContextKind::System, &facts_prompt);
+        }
+    }
+
     /// Run the agentic loop for a single prompt. Calls `on_chunk` for streamed
     /// text deltas and `on_turn` after each complete LLM response turn.
     /// Returns the final assistant response text.
+    #[cfg(test)]
     pub fn run(
         &mut self,
         prompt: &str,
@@ -106,31 +136,24 @@ impl AgentLoop {
         on_chunk: Option<&StreamCallback>,
         on_turn: Option<&super::client::TurnCallback>,
     ) -> Result<String> {
-        // Initialize context with the system prompt and user prompt.
-        // Only advertise the `plan` tool when it's actually registered
-        // (plan mode). Otherwise the model might try to call an unregistered
-        // tool and fail.
-        let descriptions = self.tools.tool_descriptions();
-        let system_prompt = prompt::system_prompt(&descriptions);
-        self.context
-            .push(Role::System, ContextKind::System, &system_prompt);
-
-        // Load persistent project facts (if any) and inject as a system message.
-        // These are fundamental facts about the project that were extracted during
-        // previous sessions' context compaction — build commands, architecture,
-        // key file locations, conventions. They survive across sessions.
-        if let Some(facts) = super::memory::load_facts(cwd) {
-            let facts_prompt = format!("## Project Facts\n\n{facts}");
-            self.context
-                .push(Role::System, ContextKind::System, &facts_prompt);
-        }
-
+        // Push the user prompt into the existing context (system prompt + facts
+        // were already initialized by `init_context` at session creation).
         self.context
             .push(Role::User, ContextKind::UserPrompt, prompt);
 
         loop {
             if self.cancel.load(Ordering::SeqCst) {
                 return Ok("[cancelled]".into());
+            }
+
+            // Drain injected messages into context before the next model call.
+            // `session/inject` pushes here; messages are `UserPrompt` (non-evictable)
+            // so they survive compaction. This enables mid-run redirection.
+            {
+                let mut queue = self.inject_rx.lock().unwrap();
+                while let Some(msg) = queue.pop_front() {
+                    self.context.push(Role::User, ContextKind::UserPrompt, &msg);
+                }
             }
 
             // Build messages and enforce context budget. When compacting, use
@@ -819,7 +842,15 @@ mod tests {
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
+        let mut agent = AgentLoop::new(
+            llm,
+            tools,
+            "test-model".into(),
+            100_000,
+            cancel,
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        agent.init_context("/tmp");
 
         let result = agent.run("run echo hi", "/tmp", None).unwrap();
         assert!(result.contains("Done"));
@@ -859,7 +890,15 @@ mod tests {
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
+        let mut agent = AgentLoop::new(
+            llm,
+            tools,
+            "test-model".into(),
+            100_000,
+            cancel,
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        agent.init_context("/tmp");
 
         let result = agent.run("test error recovery", "/tmp", None).unwrap();
         assert!(result.contains("Recovered"));
@@ -899,10 +938,100 @@ mod tests {
             None,
         );
         let cancel = Arc::new(AtomicBool::new(true)); // Pre-cancelled
-        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
+        let mut agent = AgentLoop::new(
+            llm,
+            tools,
+            "test-model".into(),
+            100_000,
+            cancel,
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        agent.init_context("/tmp");
 
         let result = agent.run("test cancel", "/tmp", None).unwrap();
         assert!(result.contains("cancelled"));
+    }
+
+    #[test]
+    fn loop_drains_injected_messages_before_next_model_call() {
+        // The agent loop drains the inject queue at the top of each iteration.
+        // A message pushed to the queue between turns appears in the messages
+        // sent to the LLM on the next call. We verify by capturing the
+        // messages array and checking that the injected text is present.
+        let captured_messages: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured_messages);
+
+        let llm = Arc::new(FakeChatClient::with_callback(
+            vec![
+                ChatResponse {
+                    content: String::new(),
+                    tool_calls: vec![json!({
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
+                    })],
+                    finish_reason: "tool_calls".into(),
+                    usage: super::super::client::Usage::default(),
+                    tool_results: vec![],
+                    elapsed_ms: 0,
+                    reasoning: String::new(),
+                },
+                ChatResponse {
+                    content: "Done with injected message.".into(),
+                    tool_calls: vec![],
+                    finish_reason: "stop".into(),
+                    usage: super::super::client::Usage::default(),
+                    tool_results: vec![],
+                    elapsed_ms: 0,
+                    reasoning: String::new(),
+                },
+            ],
+            move |messages| {
+                captured_clone.lock().unwrap().push(messages.to_vec());
+            },
+        ));
+
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut crate::harness::tools::SessionStates::new(),
+            "",
+            "",
+            None,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let inject_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let mut agent = AgentLoop::new(
+            llm,
+            tools,
+            "test-model".into(),
+            100_000,
+            cancel,
+            Arc::clone(&inject_queue),
+        );
+        agent.init_context("/tmp");
+
+        // Push an injected message before running — it will be drained on
+        // the first iteration and appear in the first LLM call.
+        inject_queue
+            .lock()
+            .unwrap()
+            .push_back("injected message".into());
+
+        let result = agent.run("original prompt", "/tmp", None).unwrap();
+        assert!(result.contains("Done with injected message"));
+
+        // The first LLM call should contain both the original prompt and the
+        // injected message.
+        let captured = captured_messages.lock().unwrap();
+        assert!(captured.len() >= 1);
+        let first_call = &captured[0];
+        let all_text: String = first_call
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()).map(String::from))
+            .collect();
+        assert!(
+            all_text.contains("injected message"),
+            "expected injected message in first LLM call, got: {all_text}"
+        );
     }
 
     #[test]
@@ -1018,7 +1147,15 @@ mod tests {
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
+        let mut agent = AgentLoop::new(
+            llm,
+            tools,
+            "test-model".into(),
+            100_000,
+            cancel,
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        agent.init_context(dir.as_str());
 
         let result = agent.run("write then read", dir.as_str(), None).unwrap();
         assert!(result.contains("Done"));
@@ -1135,7 +1272,15 @@ mod tests {
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
+        let mut agent = AgentLoop::new(
+            llm,
+            tools,
+            "test-model".into(),
+            100_000,
+            cancel,
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        agent.init_context(dir.as_str());
 
         let result = agent.run("read target.txt", dir.as_str(), None).unwrap();
         // The file content should appear in the context (via tool result) even
@@ -1244,7 +1389,15 @@ mod tests {
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut agent = AgentLoop::new(llm, tools, "test-model".into(), 100_000, cancel);
+        let mut agent = AgentLoop::new(
+            llm,
+            tools,
+            "test-model".into(),
+            100_000,
+            cancel,
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        agent.init_context("/tmp");
 
         let result = agent.run("do something", "/tmp", None);
         // The 400 propagates because sanitization found nothing to fix

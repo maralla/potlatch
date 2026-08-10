@@ -622,6 +622,7 @@ fn is_transient_llm_error(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 pub struct FakeChatClient {
     responses: std::sync::Mutex<Vec<ChatResponse>>,
+    on_chat: Option<Box<dyn Fn(&[Value]) + Send + Sync>>,
 }
 
 #[cfg(test)]
@@ -629,6 +630,20 @@ impl FakeChatClient {
     pub fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: std::sync::Mutex::new(responses),
+            on_chat: None,
+        }
+    }
+
+    /// Create a fake client that invokes `on_chat` with the messages array
+    /// before returning each scripted response. Useful for verifying that
+    /// injected messages appear in the LLM call.
+    pub fn with_callback(
+        responses: Vec<ChatResponse>,
+        on_chat: impl Fn(&[Value]) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            responses: std::sync::Mutex::new(responses),
+            on_chat: Some(Box::new(on_chat)),
         }
     }
 }
@@ -638,12 +653,15 @@ impl ChatClient for FakeChatClient {
     fn chat(
         &self,
         _model: &str,
-        _messages: &[Value],
+        messages: &[Value],
         _tools: &[Value],
         _on_chunk: Option<&StreamCallback>,
         _on_tool_calls: Option<&ToolExecCallback<'_>>,
         _on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
     ) -> Result<ChatResponse> {
+        if let Some(ref cb) = self.on_chat {
+            cb(messages);
+        }
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
             return Ok(ChatResponse {
