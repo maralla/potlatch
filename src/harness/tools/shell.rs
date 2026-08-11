@@ -523,11 +523,21 @@ fn detect_wrong_cd(command: &str, cwd: &str) -> Option<String> {
         .trim_matches('"');
 
     // Canonicalize both paths to compare. If we can't canonicalize (path
-    // doesn't exist), treat the cd as wrong.
+    // doesn't exist), treat the cd as wrong — but only for absolute paths.
+    // Relative paths (e.g. `cd subdir && go build`) are legitimate: the model
+    // is cd-ing into a subdirectory to run a command there, not guessing the
+    // wrong project root.
     let cwd_canonical = std::path::Path::new(cwd)
         .canonicalize()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| cwd.to_string());
+
+    let cd_path_absolute = std::path::Path::new(cd_path).is_absolute();
+
+    if !cd_path_absolute {
+        // Relative cd paths are always legitimate — no warning.
+        return None;
+    }
 
     let cd_canonical = std::path::Path::new(cd_path)
         .canonicalize()
@@ -665,6 +675,20 @@ mod tests {
             detect_wrong_cd("cd /tmp && echo hi", "/tmp").is_none(),
             "no warning for redundant cd to cwd"
         );
+    }
+
+    #[test]
+    fn detect_wrong_cd_silent_for_relative_dot() {
+        // `cd .` is the same directory — no warning (relative path).
+        assert!(detect_wrong_cd("cd . && go build ./...", "/tmp").is_none());
+    }
+
+    #[test]
+    fn detect_wrong_cd_silent_for_relative_subdirectory() {
+        // Relative cd paths are always legitimate — no warning, even if the
+        // subdirectory doesn't exist (the command will fail naturally).
+        assert!(detect_wrong_cd("cd subdir && go build ./...", "/tmp").is_none());
+        assert!(detect_wrong_cd("cd inventory/pdf && go build ./...", "/tmp").is_none());
     }
 
     #[test]
