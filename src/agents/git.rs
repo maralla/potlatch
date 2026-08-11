@@ -58,7 +58,45 @@ impl GitRepo {
                 .context("Failed to execute git fetch")?;
 
             if !output.status.success() {
-                anyhow::bail!("Git fetch failed: {}", Self::command_error(&output));
+                let err = Self::command_error(&output);
+                // Ref namespace conflict: a branch like `hotfix` conflicts
+                // with `hotfix/branch` because Git can't have both a file
+                // and a directory at the same ref path. Prune stale refs and
+                // retry once. If it still fails, the conflict is on the
+                // remote (both branches exist) — fetch only the default
+                // branch ref to avoid the conflicting ref path.
+                if err.contains("cannot lock ref") || err.contains("could not be updated") {
+                    debug!("git fetch ref conflict, pruning and retrying: {err}");
+                    let _ = Command::new("git")
+                        .args(["remote", "prune", "origin"])
+                        .current_dir(&self.path)
+                        .output();
+                    let retry = Command::new("git")
+                        .args(["fetch", "origin"])
+                        .current_dir(&self.path)
+                        .output()
+                        .context("Failed to execute git fetch (retry)")?;
+                    if retry.status.success() {
+                        return Ok(());
+                    }
+                    let retry_err = Self::command_error(&retry);
+                    if retry_err.contains("cannot lock ref")
+                        || retry_err.contains("could not be updated")
+                    {
+                        debug!("git fetch still has ref conflict after prune, fetching HEAD only");
+                        let head = Command::new("git")
+                            .args(["fetch", "origin", "HEAD"])
+                            .current_dir(&self.path)
+                            .output()
+                            .context("Failed to execute git fetch HEAD")?;
+                        if head.status.success() {
+                            return Ok(());
+                        }
+                        anyhow::bail!("Git fetch failed: {}", Self::command_error(&head));
+                    }
+                    anyhow::bail!("Git fetch failed: {retry_err}");
+                }
+                anyhow::bail!("Git fetch failed: {err}");
             }
 
             Ok(())
