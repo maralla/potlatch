@@ -285,7 +285,7 @@ impl AgentLoop {
             if action != super::context::BudgetAction::None {
                 info!(
                     "harness: context {action:?}, {} tokens after",
-                    self.context.total_tokens()
+                    format_tokens(self.context.total_tokens() as u64)
                 );
             }
 
@@ -442,9 +442,9 @@ impl AgentLoop {
                 messages.len(),
                 self.model,
                 response.elapsed_ms,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                response.usage.cached_tokens,
+                format_tokens(response.usage.input_tokens),
+                format_tokens(response.usage.output_tokens),
+                format_tokens(response.usage.cached_tokens),
                 response.finish_reason,
                 response.tool_calls.len()
             );
@@ -809,6 +809,22 @@ fn truncate_tool_result(result: &str) -> String {
     )
 }
 
+/// Format a token count in human-readable form (e.g. 1.2k, 30k, 1.5M).
+/// Trims trailing `.0` so whole numbers show as `30k` not `30.0k`.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        let v = n as f64 / 1_000_000.0;
+        let s = format!("{v:.1}M");
+        s.replace(".0M", "M")
+    } else if n >= 1_000 {
+        let v = n as f64 / 1_000.0;
+        let s = format!("{v:.1}k");
+        s.replace(".0k", "k")
+    } else {
+        format!("{n}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::client::{EarlyToolExecCallback, FakeChatClient, ToolExecCallback};
@@ -1051,6 +1067,19 @@ mod tests {
         assert!(!is_read_only_tool("edit"));
         assert!(!is_read_only_tool("shell"));
         assert!(!is_read_only_tool("unknown_tool"));
+    }
+
+    #[test]
+    fn format_tokens_formats_human_readable() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(500), "500");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1k");
+        assert_eq!(format_tokens(1_500), "1.5k");
+        assert_eq!(format_tokens(30_000), "30k");
+        assert_eq!(format_tokens(30684), "30.7k");
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
     }
 
     #[test]
