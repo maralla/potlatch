@@ -438,10 +438,10 @@ impl AgentLoop {
             };
 
             info!(
-                "harness: turn {} messages, model={}, elapsed={}ms, tokens in={} out={} cached={} finish={} tool_calls={}",
+                "harness: turn {} messages, model={}, elapsed={}, tokens in={} out={} cached={} finish={} tool_calls={}",
                 messages.len(),
                 self.model,
-                response.elapsed_ms,
+                format_duration(response.elapsed_ms),
                 format_tokens(response.usage.input_tokens),
                 format_tokens(response.usage.output_tokens),
                 format_tokens(response.usage.cached_tokens),
@@ -825,6 +825,22 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+/// Format an elapsed time (in milliseconds) in human-readable form with a
+/// single unit: < 1s → `350ms`, < 60s → `2.3s`, >= 60s → `1.2m`.
+fn format_duration(ms: u128) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        let s = ms as f64 / 1_000.0;
+        let s_str = format!("{s:.1}s");
+        s_str.replace(".0s", "s")
+    } else {
+        let m = ms as f64 / 60_000.0;
+        let m_str = format!("{m:.1}m");
+        m_str.replace(".0m", "m")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::client::{EarlyToolExecCallback, FakeChatClient, ToolExecCallback};
@@ -1080,6 +1096,20 @@ mod tests {
         assert_eq!(format_tokens(30684), "30.7k");
         assert_eq!(format_tokens(1_000_000), "1M");
         assert_eq!(format_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn format_duration_formats_human_readable() {
+        assert_eq!(format_duration(0), "0ms");
+        assert_eq!(format_duration(350), "350ms");
+        assert_eq!(format_duration(999), "999ms");
+        assert_eq!(format_duration(1_000), "1s");
+        assert_eq!(format_duration(1_500), "1.5s");
+        assert_eq!(format_duration(3_062), "3.1s");
+        assert_eq!(format_duration(35_398), "35.4s");
+        assert_eq!(format_duration(60_000), "1m");
+        assert_eq!(format_duration(65_000), "1.1m");
+        assert_eq!(format_duration(125_000), "2.1m");
     }
 
     #[test]
