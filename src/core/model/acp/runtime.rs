@@ -133,6 +133,8 @@ impl AcpRuntime {
     ) -> Result<AgentHandoff> {
         let prompt = prepare_task_prompt(prompt);
         const MAX_UNFINISHED_TASK_RETRIES: u32 = 5;
+        const MAX_EMPTY_OUTPUT_RETRIES: u32 = 5;
+        let mut empty_output_retries: u32 = 0;
         if let Some(model_uri) = &self.model_uri {
             info!(
                 "Running ACP agent {} model={:?} prompt_len={} (new session per task, same process)",
@@ -230,7 +232,111 @@ impl AcpRuntime {
             hooks.set_cursor_ask_question_handler(None);
 
             match handoff_result {
-                Ok(h) => return Ok(h),
+                Ok(h) => {
+                    // When structured-output tools were registered but the
+                    // model didn't call any (empty structured_outputs), retry
+                    // with a nudge. The harness retains context across
+                    // session/prompt calls (single long session), so the
+                    // retry sees the full conversation history.
+                    if self.structured_output_tools.is_some()
+                        && h.structured_outputs.is_none()
+                        && empty_output_retries < MAX_EMPTY_OUTPUT_RETRIES
+                    {
+                        empty_output_retries += 1;
+                        warn!(
+                            "ACP agent {} produced no structured output. Retry {empty_output_retries}/{MAX_EMPTY_OUTPUT_RETRIES}",
+                            self.agent_id()
+                        );
+                        // Keep the same session — context is retained. Just
+                        // send a new session/prompt with a nudge.
+                        let nudge = "You stopped without calling the structured-output tool. Call the tool now with your result. Do not repeat your previous work — the conversation context is retained.";
+                        drop(h);
+                        let prompt = nudge.to_string();
+                        // Re-enter the loop with the nudge prompt.
+                        // The session is still alive (no rotation needed).
+                        let (client, session_id, hooks) = {
+                            let g = self.acp.lock().unwrap();
+                            let s = g
+                                .as_ref()
+                                .context("ACP session missing after empty output")?;
+                            (
+                                Arc::clone(&s.client),
+                                s.session_id.clone(),
+                                Arc::clone(&s.hooks),
+                            )
+                        };
+                        hooks.clear();
+                        hooks.set_cursor_ask_question_handler(cursor_ask_question_handler.clone());
+                        let prompt_owned = prompt;
+                        let (tx, rx) = std::sync::mpsc::channel::<Result<PromptResult, String>>();
+                        thread::spawn(move || {
+                            let out = client
+                                .session_prompt(&session_id, &prompt_owned)
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(out);
+                        });
+                        // Re-run the inner wait loop with the nudge.
+                        let handoff_result = loop {
+                            if self.shutdown.load(Ordering::SeqCst) {
+                                self.kill_child();
+                                break Err(anyhow::anyhow!("Agent interrupted by shutdown"));
+                            }
+                            if let Some(exit) = self.take_child_exit_status()? {
+                                self.kill_child();
+                                break Err(anyhow::anyhow!(
+                                    "agent {} exited during prompt ({})",
+                                    self.agent_id(),
+                                    exit
+                                ));
+                            }
+                            match rx.recv_timeout(Duration::from_millis(200)) {
+                                Ok(Ok(pr)) => {
+                                    self.wait_for_plan_followup_updates(&hooks, cancel_check)?;
+                                    break Ok(handoff_from_prompt_hooks(&hooks, pr));
+                                }
+                                Ok(Err(e)) => {
+                                    break Err(anyhow::anyhow!("ACP session/prompt: {}", e));
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    continue;
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    break Err(anyhow::anyhow!(
+                                        "ACP prompt thread died for {}",
+                                        self.agent_id()
+                                    ));
+                                }
+                            }
+                        };
+                        hooks.set_cursor_ask_question_handler(None);
+                        match handoff_result {
+                            Ok(h) => return Ok(h),
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if msg.contains("exited during prompt")
+                                    || msg.contains("ACP session/prompt")
+                                {
+                                    unfinished_task_retries += 1;
+                                    if unfinished_task_retries > MAX_UNFINISHED_TASK_RETRIES {
+                                        return Err(e);
+                                    }
+                                    warn!(
+                                        "ACP task failed for {} ({msg}). Retry {unfinished_task_retries}/{MAX_UNFINISHED_TASK_RETRIES}",
+                                        self.agent_id(),
+                                    );
+                                    self.unexpected_quits_count.fetch_add(1, Ordering::SeqCst);
+                                    thread::sleep(retry_backoff_for_unfinished_task(
+                                        unfinished_task_retries,
+                                    ));
+                                    self.ensure_acp_session_for_retry()?;
+                                    continue;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                    return Ok(h);
+                }
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("exited during prompt") || msg.contains("ACP session/prompt") {
