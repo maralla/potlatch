@@ -96,7 +96,13 @@ impl ModelEngine {
             .cancel_check
             .as_ref()
             .map(|check| check.as_ref() as &dyn Fn() -> bool);
-        let handoff = self.inner.run_with_cancel(prompt, cancel_check)?;
+        let follow_up_poll = options
+            .follow_up_poll
+            .as_ref()
+            .map(|f| f.as_ref() as &dyn Fn() -> Vec<String>);
+        let handoff = self
+            .inner
+            .run_with_cancel(prompt, cancel_check, follow_up_poll)?;
         Ok(crate::core::agent::ModelResponse { handoff })
     }
 
