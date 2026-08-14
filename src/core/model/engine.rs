@@ -96,12 +96,16 @@ impl ModelEngine {
             .cancel_check
             .as_ref()
             .map(|check| check.as_ref() as &dyn Fn() -> bool);
-        let handoff = self.inner.run_with_cancel(
-            prompt,
-            cancel_check,
-            options.cursor_ask_question_handler.clone(),
-        )?;
+        let handoff = self.inner.run_with_cancel(prompt, cancel_check)?;
         Ok(crate::core::agent::ModelResponse { handoff })
+    }
+
+    /// Set the capability provider (called by the agent at construction).
+    pub fn set_capability_provider(
+        &self,
+        provider: Option<Arc<dyn crate::core::model::acp::capabilities::CapabilityProvider>>,
+    ) {
+        self.inner.set_capability_provider(provider);
     }
 }
 

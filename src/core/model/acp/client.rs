@@ -24,22 +24,13 @@ type PendingTx = std::sync::mpsc::Sender<Result<Value, JsonRpcError>>;
 type PendingMap = HashMap<u64, PendingTx>;
 type SharedPending = Arc<Mutex<PendingMap>>;
 
-/// Handle agent-initiated JSON-RPC (permission prompts, Cursor extensions, etc.).
+/// Handle agent-initiated JSON-RPC (permission prompts, etc.).
 pub trait AcpHooks: Send + Sync {
     /// The agent sent a request that expects a JSON `result` on the wire.
     fn handle_agent_request(&self, method: &str, params: &Value, id: &Value) -> Value;
 
     /// The agent sent a notification (no response).
     fn on_agent_notification(&self, method: &str, params: &Value);
-}
-
-/// Optional override for the Cursor ACP extension `cursor/ask_question`.
-///
-/// Role-specific implementations (e.g. GitLab) live outside this module; the ACP client only
-/// invokes this when installed on [`crate::core::model::acp::orchestrator_hooks::StreamTextHooks`].
-pub trait CursorAskQuestionHandler: Send + Sync {
-    /// JSON-RPC `result` for `cursor/ask_question`.
-    fn handle_ask_question(&self, params: &Value) -> Value;
 }
 
 fn permission_option_id(opt: &Value) -> Option<&str> {
@@ -82,147 +73,11 @@ fn pick_auto_permission_option_id(params: &Value) -> String {
         .to_string()
 }
 
-/// Markdown body from a Cursor [`cursor/create_plan`](https://cursor.com/docs/cli/acp) request.
-pub fn extract_cursor_create_plan_text(params: &Value) -> Option<String> {
-    let plan = params.get("plan").and_then(Value::as_str)?.trim();
-    if plan.is_empty() {
-        return None;
-    }
-
-    let mut out = String::new();
-    if let Some(name) = params.get("name").and_then(Value::as_str) {
-        let name = name.trim();
-        if !name.is_empty() {
-            out.push_str("# ");
-            out.push_str(name);
-            out.push_str("\n\n");
-        }
-    }
-    if let Some(overview) = params.get("overview").and_then(Value::as_str) {
-        let overview = overview.trim();
-        if !overview.is_empty() {
-            out.push_str(overview);
-            out.push_str("\n\n");
-        }
-    }
-    out.push_str(plan);
-    Some(out)
-}
-
-/// Headless JSON-RPC `result` for [`cursor/create_plan`](https://cursor.com/docs/cli/acp).
-pub fn headless_cursor_create_plan_reply() -> Value {
-    json!({
-        "outcome": {
-            "outcome": "accepted"
-        }
-    })
-}
-
-/// Headless JSON-RPC `result` for [`cursor/ask_question`](https://cursor.com/docs/cli/acp).
-pub fn headless_cursor_ask_question_reply(params: &Value) -> Value {
-    if let Some(opts) = params.get("options").and_then(|v| v.as_array())
-        && let Some(first) = opts.first()
-        && let Some(id) = first
-            .get("id")
-            .or_else(|| first.get("optionId"))
-            .or_else(|| first.get("option_id"))
-            .and_then(|v| v.as_str())
-    {
-        return json!({
-            "outcome": {
-                "outcome": "answered",
-                "answers": [{
-                    "questionId": params
-                        .get("questions")
-                        .and_then(|v| v.as_array())
-                        .and_then(|q| q.first())
-                        .and_then(|q| q.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("q1"),
-                    "selectedOptionIds": [id]
-                }]
-            }
-        });
-    }
-    if let Some(questions) = params.get("questions").and_then(|v| v.as_array())
-        && let Some(first_q) = questions.first()
-        && let Some(qid) = first_q.get("id").and_then(|v| v.as_str())
-        && let Some(opts) = first_q.get("options").and_then(|v| v.as_array())
-        && let Some(first_opt) = opts.first()
-        && let Some(oid) = first_opt.get("id").and_then(|v| v.as_str())
-    {
-        return json!({
-            "outcome": {
-                "outcome": "answered",
-                "answers": [{
-                    "questionId": qid,
-                    "selectedOptionIds": [oid]
-                }]
-            }
-        });
-    }
-    json!({
-        "outcome": {
-            "outcome": "answered",
-            "answers": [{
-                "questionId": "q1",
-                "selectedOptionIds": ["0"]
-            }]
-        }
-    })
-}
-
-fn headless_cursor_extension_reply(method: &str, params: &Value) -> Value {
-    match method {
-        "cursor/create_plan" => headless_cursor_create_plan_reply(),
-        "cursor/ask_question" => headless_cursor_ask_question_reply(params),
-        "cursor/update_todos" => json!({
-            "outcome": {
-                "outcome": "accepted",
-                "todos": params.get("todos").cloned().unwrap_or_else(|| json!([]))
-            }
-        }),
-        "cursor/task" => json!({
-            "outcome": {
-                "outcome": "completed"
-            }
-        }),
-        "cursor/generate_image" => json!({
-            "outcome": {
-                "outcome": "generated",
-                "filePath": params
-                    .get("filePath")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-            }
-        }),
-        other => {
-            warn!(
-                target: "potlatch::acp_cursor",
-                "auto-accepting unhandled Cursor extension request `{other}`"
-            );
-            json!({
-                "outcome": {
-                    "outcome": "accepted"
-                }
-            })
-        }
-    }
-}
-
-fn cursor_extension_headless_reply(method: &str, params: &Value) -> Option<Value> {
-    if method.starts_with("cursor/") {
-        Some(headless_cursor_extension_reply(method, params))
-    } else {
-        None
-    }
-}
-
 /// JSON-RPC `result` for agent→client requests when no interactive UI is available.
 ///
-/// Implements [Cursor ACP extension methods](https://cursor.com/docs/cli/acp) (`cursor/create_plan`,
-/// `cursor/ask_question` when no [`CursorAskQuestionHandler`] is installed) and permission
-/// auto-selection. Used by [`crate::core::model::acp::orchestrator_hooks::StreamTextHooks`] and tests.
+/// Handles permission auto-selection for non-interactive clients.
+/// Vendor-specific extension requests (e.g. `cursor/`) are handled by the
+/// vendor state on `StreamTextHooks`, not here.
 pub fn headless_agent_request_result(method: &str, params: &Value) -> Value {
     if method == "session/request_permission" {
         let option_id = pick_auto_permission_option_id(params);
@@ -232,22 +87,6 @@ pub fn headless_agent_request_result(method: &str, params: &Value) -> Value {
                 "optionId": option_id
             }
         });
-    }
-
-    if let Some(reply) = cursor_extension_headless_reply(method, params) {
-        debug!(
-            target: "potlatch::acp_cursor",
-            %method,
-            "headless auto-reply for Cursor ACP extension request"
-        );
-        return reply;
-    }
-
-    if method.starts_with("cursor/") {
-        warn!(
-            target: "potlatch::acp_cursor",
-            "unhandled Cursor extension request `{method}`; returning empty result (agent may stall)"
-        );
     }
 
     Value::Object(serde_json::Map::new())
@@ -611,38 +450,6 @@ mod tests {
             &json!({ "sessionId": "s", "toolCall": {}, "options": [] }),
         );
         assert_eq!(r["outcome"]["optionId"], "allow-once");
-    }
-
-    #[test]
-    fn headless_cursor_create_plan_approves() {
-        let r = headless_agent_request_result("cursor/create_plan", &json!({ "sessionId": "s" }));
-        assert_eq!(r["outcome"]["outcome"], "accepted");
-    }
-
-    #[test]
-    fn extract_cursor_create_plan_text_includes_name_overview_and_plan() {
-        let text = extract_cursor_create_plan_text(&json!({
-            "name": "Issue triage",
-            "overview": "Split into focused sub-issues.",
-            "plan": "SUB_ISSUE_1:\nTITLE: Add tests\nPRIORITY: 2\nDESCRIPTION:\nDo it."
-        }))
-        .unwrap();
-        assert!(text.contains("# Issue triage"));
-        assert!(text.contains("Split into focused sub-issues."));
-        assert!(text.contains("SUB_ISSUE_1:"));
-    }
-
-    #[test]
-    fn headless_cursor_ask_question_picks_first_option_id() {
-        let r = headless_agent_request_result(
-            "cursor/ask_question",
-            &json!({
-                "sessionId": "s",
-                "options": [{ "id": "opt-a", "label": "A" }, { "id": "opt-b" }]
-            }),
-        );
-        assert_eq!(r["outcome"]["outcome"], "answered");
-        assert_eq!(r["outcome"]["answers"][0]["selectedOptionIds"][0], "opt-a");
     }
 
     fn from_line_transport(

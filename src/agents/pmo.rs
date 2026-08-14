@@ -1,16 +1,18 @@
 use anyhow::{Context, Result};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-use super::{claim, issue_in_scope, labels, pmo_cursor_ask, strip_internal_markers};
+use super::{claim, issue_in_scope, labels, strip_internal_markers};
 use crate::agents::git::GitRepo;
-use crate::agents::gitlab::{self, GitLabClient, Issue};
+use crate::agents::gitlab::{self, GitLabClient, Issue, IssueThreadNote};
 use crate::agents::settings;
 use crate::agents::workspace::{
     ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
@@ -19,6 +21,7 @@ use crate::core::agent::{AgentHandoff, HandoffSubIssue, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
+use crate::core::model::acp::capabilities::{AskAnswer, AskQuestion, CapabilityProvider};
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
@@ -96,8 +99,8 @@ fn plan_tool_definition() -> serde_json::Value {
 #[derive(Debug, Clone)]
 struct PmoConfig {
     poll_interval_secs: u64,
-    cursor_ask_via_gitlab: bool,
-    cursor_ask_gitlab_timeout_secs: u64,
+    ask_via_gitlab: bool,
+    ask_gitlab_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -105,16 +108,16 @@ struct PmoAgentSettings {
     #[serde(default = "default_pmo_poll_interval")]
     poll_interval_secs: u64,
     #[serde(default)]
-    cursor_ask_via_gitlab: bool,
-    #[serde(default = "default_cursor_ask_gitlab_timeout_secs")]
-    cursor_ask_gitlab_timeout_secs: u64,
+    ask_via_gitlab: bool,
+    #[serde(default = "default_ask_gitlab_timeout_secs")]
+    ask_gitlab_timeout_secs: u64,
 }
 
 fn default_pmo_poll_interval() -> u64 {
     180
 }
 
-fn default_cursor_ask_gitlab_timeout_secs() -> u64 {
+fn default_ask_gitlab_timeout_secs() -> u64 {
     600
 }
 
@@ -264,8 +267,8 @@ impl CoreAgent for PmoAgent {
         state.ensure_sessions_dir()?;
         let config = PmoConfig {
             poll_interval_secs: settings.poll_interval_secs,
-            cursor_ask_via_gitlab: settings.cursor_ask_via_gitlab,
-            cursor_ask_gitlab_timeout_secs: settings.cursor_ask_gitlab_timeout_secs,
+            ask_via_gitlab: settings.ask_via_gitlab,
+            ask_gitlab_timeout_secs: settings.ask_gitlab_timeout_secs,
         };
         let git_repo = GitRepo::new(state.working_dir.clone());
         let gitlab = GitLabClient::new(state.working_dir.clone(), &gitlab_repo)?;
@@ -809,27 +812,27 @@ fn process_action_required_issue(
     let context_path = refresh_pmo_issue_context_file(state, gitlab, issue, all_issues)?;
     let prompt = build_split_prompt(state, issue, &context_path, parent_priority)?;
 
-    let ask_handler: Option<
-        std::sync::Arc<dyn crate::core::model::acp::client::CursorAskQuestionHandler>,
-    > = if pmo_config.cursor_ask_via_gitlab {
-        let timeout = if pmo_config.cursor_ask_gitlab_timeout_secs > 0 {
+    let provider: Option<
+        std::sync::Arc<dyn crate::core::model::acp::capabilities::CapabilityProvider>,
+    > = if pmo_config.ask_via_gitlab {
+        let timeout = if pmo_config.ask_gitlab_timeout_secs > 0 {
             Some(std::time::Duration::from_secs(
-                pmo_config.cursor_ask_gitlab_timeout_secs,
+                pmo_config.ask_gitlab_timeout_secs,
             ))
         } else {
             None
         };
-        Some(std::sync::Arc::new(
-            pmo_cursor_ask::GitLabIssueCursorAskHandler::new(
-                issue.iid,
-                gitlab.clone(),
-                Arc::clone(&shutdown),
-                timeout,
-            ),
-        ))
+        Some(std::sync::Arc::new(GitLabIssueAskHandler::new(
+            issue.iid,
+            gitlab.clone(),
+            Arc::clone(&shutdown),
+            timeout,
+        )))
     } else {
         None
     };
+
+    model.set_capability_provider(provider);
 
     info!(
         "{}: PMO agent triaging issue #{}",
@@ -838,11 +841,11 @@ fn process_action_required_issue(
     let mut agent_output = model.complete(
         &prompt,
         &InvokeOptions {
-            cursor_ask_question_handler: ask_handler,
             activity_label: Some(format!("{} triaging issue #{}", &state.agent_id, issue.iid)),
             ..InvokeOptions::default()
         },
     )?;
+    model.set_capability_provider(None);
     info!(
         "{}: PMO agent finished triaging issue #{}",
         &state.agent_id, issue.iid
@@ -1963,6 +1966,297 @@ fn resume_split(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// GitLab-based ask question handler (CapabilityProvider::ask)
+// ---------------------------------------------------------------------------
+
+const ASK_POLL_INTERVAL: Duration = Duration::from_secs(4);
+
+fn new_ask_id() -> String {
+    let mut r = rand::rng();
+    format!("{:016x}{:016x}", r.random::<u64>(), r.random::<u64>())
+}
+
+fn ask_marker_snippet(ask_id: &str) -> String {
+    format!("<!-- potlatch-pmo-acp-ask:{ask_id} -->")
+}
+
+/// Renders the question's choices for the GitLab comment body.
+fn format_choices_for_comment(question: &AskQuestion) -> String {
+    if question.choices.is_empty() {
+        return "_Reply with an option id, or a number like `0` for the first choice._\n"
+            .to_string();
+    }
+    let mut lines = Vec::new();
+    for (i, c) in question.choices.iter().enumerate() {
+        if c.id.is_empty() {
+            lines.push(format!("{}. {}", i + 1, c.label));
+        } else {
+            lines.push(format!("{}. `{}` — {}", i + 1, c.id, c.label));
+        }
+    }
+    lines.join("\n")
+}
+
+fn build_issue_comment(ask_id: &str, question: &AskQuestion) -> String {
+    let q = &question.text;
+    let opts = format_choices_for_comment(question);
+    let marker = ask_marker_snippet(ask_id);
+    format!(
+        "{marker}\n\n\
+         **Agent question**\n\n\
+         {q}\n\n\
+         **Choices**\n\n\
+         {opts}\n\n\
+         ---\n\n\
+         **Reply to this comment** (use GitLab’s *Reply* on this note so your answer stays in this thread). \
+         Your reply text is the answer — usually one line: an option id, a number (`0` = first choice), or a short answer.\n\n\
+         The `{}` label is set until Potlatch forwards your reply to the running agent.",
+        labels::PMO_PENDING
+    )
+}
+
+/// First non-empty line of the reply body (trimmed), or empty string if none.
+fn reply_body_as_choice(body: &str) -> String {
+    body.trim()
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn find_root_note<'a>(notes: &'a [IssueThreadNote], ask_id: &str) -> Option<&'a IssueThreadNote> {
+    let needle = ask_marker_snippet(ask_id);
+    notes.iter().find(|n| n.body.contains(&needle))
+}
+
+/// First **direct** reply in the same discussion as `root` (GitLab thread), excluding system notes and new ask posts.
+fn pick_direct_thread_reply<'a>(
+    notes: &'a [IssueThreadNote],
+    root: &'a IssueThreadNote,
+) -> Option<&'a IssueThreadNote> {
+    let mut candidates: Vec<&IssueThreadNote> = notes
+        .iter()
+        .filter(|n| {
+            if n.id == root.id || n.system {
+                return false;
+            }
+            if n.body.contains("potlatch-pmo-acp-ask:") {
+                return false;
+            }
+            same_discussion_or_sequential_fallback(n, root)
+        })
+        .collect();
+    candidates.sort_by_key(|n| n.id);
+    candidates.into_iter().next()
+}
+
+fn same_discussion_or_sequential_fallback(n: &IssueThreadNote, root: &IssueThreadNote) -> bool {
+    match (&root.discussion_id, &n.discussion_id) {
+        (Some(rd), Some(nd)) => rd == nd,
+        _ => n.id > root.id,
+    }
+}
+
+/// Resolve a human reply to a neutral [`AskAnswer`].
+///
+/// - empty → [`AskAnswer::Auto`] (let the vendor pick its default)
+/// - numeric index → [`AskAnswer::Choice`] with the matching choice id (1-based; `0` = first)
+/// - matching choice id → [`AskAnswer::Choice`]
+/// - otherwise → [`AskAnswer::FreeText`]
+fn resolve_reply_to_answer(question: &AskQuestion, choice_raw: &str) -> AskAnswer {
+    let choice_trim = choice_raw.trim();
+    if choice_trim.is_empty() {
+        return AskAnswer::Auto;
+    }
+    if let Ok(idx) = choice_trim.parse::<usize>() {
+        let selected = if idx == 0 {
+            question.choices.first()
+        } else {
+            question.choices.get(idx - 1)
+        };
+        if let Some(opt) = selected
+            && !opt.id.is_empty()
+        {
+            return AskAnswer::Choice(opt.id.clone());
+        }
+        // No matching choice by index: fall through to free-text.
+    }
+    for opt in &question.choices {
+        if !opt.id.is_empty() && opt.id == choice_trim {
+            return AskAnswer::Choice(opt.id.clone());
+        }
+    }
+    warn!(
+        target: "potlatch::pmo_ask",
+        choice = %choice_trim,
+        "PMO thread reply did not match a listed option; echoing as free text"
+    );
+    AskAnswer::FreeText(choice_trim.to_string())
+}
+
+fn clear_pmo_pending_label(gitlab: &GitLabClient, issue_iid: u64) {
+    let _ = gitlab.remove_issue_label(issue_iid, labels::PMO_PENDING);
+}
+
+/// Posts the question note, then **blocks** until a **thread reply** arrives (same process only).
+pub struct GitLabIssueAskHandler {
+    issue_iid: u64,
+    gitlab: GitLabClient,
+    shutdown: Arc<AtomicBool>,
+    wait_deadline: Option<Instant>,
+}
+
+impl GitLabIssueAskHandler {
+    pub fn new(
+        issue_iid: u64,
+        gitlab: GitLabClient,
+        shutdown: Arc<AtomicBool>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        let wait_deadline = timeout.map(|d| Instant::now() + d);
+        Self {
+            issue_iid,
+            gitlab,
+            shutdown,
+            wait_deadline,
+        }
+    }
+
+    fn finish_with_reply(&self, question: &AskQuestion, reply: &IssueThreadNote) -> AskAnswer {
+        let choice = reply_body_as_choice(&reply.body);
+        let answer = resolve_reply_to_answer(question, &choice);
+        clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+        info!(
+            target: "potlatch::pmo_ask",
+            issue_iid = self.issue_iid,
+            note_id = reply.id,
+            author = %reply.author_username(),
+            "Using direct thread reply as ask answer"
+        );
+        answer
+    }
+}
+
+impl CapabilityProvider for GitLabIssueAskHandler {
+    fn ask(&self, question: &AskQuestion) -> AskAnswer {
+        let ask_id = new_ask_id();
+        let comment = build_issue_comment(&ask_id, question);
+
+        if let Err(e) = self.gitlab.add_issue_comment(self.issue_iid, &comment) {
+            warn!(
+                target: "potlatch::pmo_ask",
+                err = %e,
+                "failed to post ask question to GitLab; using automatic answer"
+            );
+            return AskAnswer::Auto;
+        }
+
+        if let Err(e) = self
+            .gitlab
+            .add_issue_label(self.issue_iid, labels::PMO_PENDING)
+        {
+            warn!(
+                target: "potlatch::pmo_ask",
+                err = %e,
+                "failed to add pmo-pending for ask question"
+            );
+        }
+
+        let notes = match self.gitlab.get_issue_thread_notes(self.issue_iid) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(
+                    target: "potlatch::pmo_ask",
+                    err = %e,
+                    "failed to list thread notes after posting ask question"
+                );
+                clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+                return AskAnswer::Auto;
+            }
+        };
+
+        let Some(root) = find_root_note(&notes, &ask_id) else {
+            warn!(
+                target: "potlatch::pmo_ask",
+                ask_id = %ask_id,
+                "could not find posted ask note by marker; using automatic answer"
+            );
+            clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+            return AskAnswer::Auto;
+        };
+
+        let root_note_id = root.id;
+
+        info!(
+            target: "potlatch::pmo_ask",
+            issue_iid = self.issue_iid,
+            root_note_id = root.id,
+            ask_id = %ask_id,
+            "Posted ask question; waiting for direct thread reply"
+        );
+        eprintln!(
+            "potlatch PMO: Posted question on issue #{} — **Reply to that GitLab comment** (thread). Waiting…",
+            self.issue_iid
+        );
+
+        loop {
+            if let Some(dl) = self.wait_deadline
+                && Instant::now() >= dl
+            {
+                eprintln!(
+                    "potlatch PMO: GitLab thread wait timed out on issue #{}; using automatic answer.",
+                    self.issue_iid
+                );
+                let _ = self.gitlab.add_issue_comment(
+                    self.issue_iid,
+                    "**PMO:** Timed out waiting for a **reply** to the question comment; proceeding with an automatic choice.",
+                );
+                clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+                return AskAnswer::Auto;
+            }
+
+            if self.shutdown.load(Ordering::SeqCst) {
+                warn!(
+                    target: "potlatch::pmo_ask",
+                    "shutdown during ask wait; using automatic answer"
+                );
+                clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+                return AskAnswer::Auto;
+            }
+
+            thread::sleep(ASK_POLL_INTERVAL);
+
+            let notes = match self.gitlab.get_issue_thread_notes(self.issue_iid) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(target: "potlatch::pmo_ask", err = %e, "poll thread notes failed");
+                    continue;
+                }
+            };
+
+            let Some(root) = notes.iter().find(|n| n.id == root_note_id) else {
+                warn!(
+                    target: "potlatch::pmo_ask",
+                    root_note_id,
+                    "root note disappeared during wait"
+                );
+                clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+                return AskAnswer::Auto;
+            };
+
+            if let Some(reply) = pick_direct_thread_reply(&notes, root) {
+                let choice = reply_body_as_choice(&reply.body);
+                if choice.is_empty() {
+                    continue;
+                }
+                return self.finish_with_reply(question, reply);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2458,5 +2752,104 @@ mod tests {
         let result = truncate_diff_for_pmo(&diff);
         // Result is valid UTF-8 (no panic), and either truncated or full.
         assert!(result.contains('α'));
+    }
+
+    fn ask_thread_note(id: u64, body: &str, system: bool, disc: Option<&str>) -> IssueThreadNote {
+        let raw = format!(
+            r#"{{"id":{id},"body":{},"system":{system},"discussion_id":{},"author":{{"username":"u"}}}}"#,
+            serde_json::to_string(body).unwrap(),
+            serde_json::to_string(&disc).unwrap()
+        );
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn mode_question() -> AskQuestion {
+        use crate::core::model::acp::capabilities::AskChoice;
+        AskQuestion {
+            text: "Choose a mode".into(),
+            choices: vec![
+                AskChoice {
+                    id: "guide".into(),
+                    label: "Guide worker".into(),
+                },
+                AskChoice {
+                    id: "split".into(),
+                    label: "Split issue".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn ask_pick_reply_same_discussion() {
+        let root = ask_thread_note(10, "<!-- potlatch-pmo-acp-ask:abc -->", false, Some("d1"));
+        let r1 = ask_thread_note(11, "opt-b", false, Some("d1"));
+        let noise = ask_thread_note(9, "old", false, Some("d2"));
+        let notes = vec![noise, root.clone(), r1.clone()];
+        let root_ref = notes.iter().find(|x| x.id == 10).unwrap();
+        let got = pick_direct_thread_reply(&notes, root_ref).unwrap();
+        assert_eq!(got.id, 11);
+        assert_eq!(reply_body_as_choice(&got.body), "opt-b");
+    }
+
+    #[test]
+    fn ask_pick_first_reply_when_sorted() {
+        let root = ask_thread_note(5, "<!-- potlatch-pmo-acp-ask:x -->", false, None);
+        let r1 = ask_thread_note(6, "0", false, None);
+        let notes = vec![root.clone(), r1.clone()];
+        let root_ref = &notes[0];
+        let got = pick_direct_thread_reply(&notes, root_ref).unwrap();
+        assert_eq!(got.id, 6);
+    }
+
+    #[test]
+    fn ask_ignores_new_ask_in_thread() {
+        let root = ask_thread_note(1, "<!-- potlatch-pmo-acp-ask:a -->", false, Some("d"));
+        let bad = ask_thread_note(2, "<!-- potlatch-pmo-acp-ask:b -->", false, Some("d"));
+        let notes = vec![root.clone(), bad];
+        let root_ref = &notes[0];
+        assert!(pick_direct_thread_reply(&notes, root_ref).is_none());
+    }
+
+    #[test]
+    fn ask_resolves_reply_to_answer_by_number_index_and_id() {
+        let q = mode_question();
+
+        let by_number = resolve_reply_to_answer(&q, "2");
+        assert!(matches!(by_number, AskAnswer::Choice(ref id) if id == "split"));
+
+        let by_zero = resolve_reply_to_answer(&q, "0");
+        assert!(matches!(by_zero, AskAnswer::Choice(ref id) if id == "guide"));
+
+        let by_one = resolve_reply_to_answer(&q, "1");
+        assert!(matches!(by_one, AskAnswer::Choice(ref id) if id == "guide"));
+
+        let by_id = resolve_reply_to_answer(&q, "guide");
+        assert!(matches!(by_id, AskAnswer::Choice(ref id) if id == "guide"));
+    }
+
+    #[test]
+    fn ask_resolves_empty_reply_to_auto_and_unmatched_to_free_text() {
+        let q = mode_question();
+
+        assert!(matches!(resolve_reply_to_answer(&q, ""), AskAnswer::Auto));
+        assert!(matches!(
+            resolve_reply_to_answer(&q, "   "),
+            AskAnswer::Auto
+        ));
+
+        let free = resolve_reply_to_answer(&q, "something else");
+        assert!(matches!(free, AskAnswer::FreeText(ref t) if t == "something else"));
+    }
+
+    #[test]
+    fn ask_comment_uses_question_text_and_choices() {
+        let q = mode_question();
+        let comment = build_issue_comment("askid", &q);
+        assert!(comment.contains("Choose a mode"));
+        assert!(comment.contains("`guide`"));
+        assert!(comment.contains("Split issue"));
+        assert!(comment.contains("**Agent question**"));
+        assert!(!comment.contains("Cursor"));
     }
 }

@@ -11,13 +11,11 @@ use anyhow::Result;
 
 use crate::core::banner::Banner;
 use crate::core::config::{AgentSection, Config};
-use crate::core::model::acp::client::CursorAskQuestionHandler;
 use crate::core::periodic::run_periodic_scheduler;
 
 #[derive(Clone, Default)]
 pub struct InvokeOptions {
     pub cancel_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    pub cursor_ask_question_handler: Option<Arc<dyn CursorAskQuestionHandler>>,
     pub activity_label: Option<String>,
 }
 
