@@ -83,6 +83,15 @@ impl AgentModel {
         self.invoke(prompt, options).map(|r| r.handoff)
     }
 
+    /// Set the capability provider (called by the agent at construction).
+    /// The vendor extension reads from it to wire handlers to its protocol.
+    pub fn set_capability_provider(
+        &self,
+        provider: Option<Arc<dyn crate::core::model::acp::capabilities::CapabilityProvider>>,
+    ) {
+        self.engine.set_capability_provider(provider);
+    }
+
     #[cfg(test)]
     pub(crate) fn from_section_for_test(
         config: &crate::core::config::Config,

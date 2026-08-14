@@ -1,6 +1,6 @@
 mod acp;
 mod agent;
-mod uri;
+pub mod uri;
 
 pub use acp::{
     AcpClientProfile, AcpSpawnConfig, build_acp_spawn_command, build_profile_command,

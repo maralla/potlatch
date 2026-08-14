@@ -51,9 +51,6 @@ pub struct AgentHandoff {
     /// registered or the model didn't call them.
     #[serde(default)]
     pub structured_outputs: Option<serde_json::Value>,
-    /// Absolute paths from Cursor plan-mode `tool_call_update` ("Plan saved to file://…").
-    #[serde(default)]
-    pub cursor_plan_paths: Vec<String>,
 }
 
 #[cfg(test)]

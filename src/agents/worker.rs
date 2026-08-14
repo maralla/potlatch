@@ -1332,7 +1332,6 @@ fn process_issue(
                 "{} implementing issue #{}",
                 &state.agent_id, issue.iid
             )),
-            ..InvokeOptions::default()
         },
     ) {
         Ok(output) => apply_worker_handoff(output),
@@ -1728,7 +1727,6 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
                     "{} addressing MR !{} feedback",
                     &state.agent_id, latest_mr.iid
                 )),
-                ..InvokeOptions::default()
             },
         ) {
             Ok(output) => apply_worker_handoff(output),

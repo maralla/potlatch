@@ -8,7 +8,6 @@ pub mod gitlab;
 pub mod labels;
 pub mod ops;
 pub mod pmo;
-pub mod pmo_cursor_ask;
 pub(crate) mod qa;
 pub(crate) mod retry;
 pub mod reviewer;

@@ -19,20 +19,22 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
 
-use super::client::{AcpClient, CursorAskQuestionHandler};
+use super::capabilities::CapabilityProvider;
+use super::client::AcpClient;
+use super::cursor::CursorExtension;
 use super::orchestrator_hooks::StreamTextHooks;
 use super::types::{
     ClientCapabilities, ClientFsCapabilities, DEFAULT_PROTOCOL_VERSION, ImplementationInfo,
-    InitializeParams, InitializeResult, NewSessionParams, NewSessionResult, PromptResult,
-    mode_id_is_available, model_selector_for_session, select_option_allows_value,
-    session_mode_config_option,
+    InitializeParams, NewSessionParams, NewSessionResult, PromptResult, mode_id_is_available,
+    model_selector_for_session, select_option_allows_value,
 };
+use super::vendor::AcpVendorExtension;
 use crate::core::agent::AgentHandoff;
 use crate::core::config::build_acp_spawn_command;
 
@@ -40,9 +42,6 @@ const TASK_CONTEXT_RESET_GUIDANCE: &str = r#"IMPORTANT CONTEXT HANDLING:
 Treat this assignment as a fresh task. Do not rely on prior chat history or assumptions from earlier assignments unless this prompt explicitly refers to them. Use only the repository state, issue/MR context, and instructions present in this task.
 
 "#;
-
-/// ACP session mode for planning and decomposition work.
-pub const ACP_SESSION_MODE_PLAN: &str = "plan";
 
 struct AcpSession {
     client: Arc<AcpClient>,
@@ -77,8 +76,10 @@ pub(crate) struct AcpRuntime {
     endpoint_model: Option<String>,
     acp_command: Vec<String>,
     acp_env: std::collections::HashMap<String, String>,
-    /// When set, applied after `session/new` via ACP mode APIs.
-    preferred_session_mode: Option<&'static str>,
+    /// Vendor ACP extension — None when the vendor has no extension.
+    vendor_ext: Option<Arc<dyn AcpVendorExtension>>,
+    /// Capability provider (set by the agent at construction).
+    capability_provider: Mutex<Option<Arc<dyn CapabilityProvider>>>,
     /// Caller-defined structured-output tool definitions, passed to the
     /// harness via `session/new` params. Each entry has `name`, `description`,
     /// and `parameters` (JSON schema).
@@ -102,23 +103,33 @@ impl AcpRuntime {
         shutdown: Arc<AtomicBool>,
         agent_id: String,
     ) -> Self {
+        let mut vendor_ext = CursorExtension::new(model_uri.as_deref());
+        if let (Some(ext), Some(mode)) = (vendor_ext.as_mut(), preferred_session_mode) {
+            ext.set_preferred_session_mode(Some(mode));
+        }
         Self {
             repo_path,
             model_uri,
             endpoint_model,
             acp_command,
             acp_env,
-            preferred_session_mode,
             structured_output_tools,
             shutdown,
             agent_id,
             acp: Mutex::new(None),
             unexpected_quits_count: Arc::new(AtomicU64::new(0)),
+            vendor_ext: vendor_ext.map(|e| Arc::new(e) as Arc<dyn AcpVendorExtension>),
+            capability_provider: Mutex::new(None),
         }
     }
 
     pub fn agent_id(&self) -> &str {
         &self.agent_id
+    }
+
+    /// Set the capability provider (called by the agent at construction).
+    pub fn set_capability_provider(&self, provider: Option<Arc<dyn CapabilityProvider>>) {
+        *self.capability_provider.lock().unwrap() = provider;
     }
 
     /// Run one task: ensure a fresh ACP session (`session/close` then `session/new` on the same
@@ -129,7 +140,6 @@ impl AcpRuntime {
         &self,
         prompt: &str,
         cancel_check: Option<&dyn Fn() -> bool>,
-        cursor_ask_question_handler: Option<Arc<dyn CursorAskQuestionHandler>>,
     ) -> Result<AgentHandoff> {
         let prompt = prepare_task_prompt(prompt);
         const MAX_UNFINISHED_TASK_RETRIES: u32 = 5;
@@ -174,7 +184,10 @@ impl AcpRuntime {
             };
 
             hooks.clear();
-            hooks.set_cursor_ask_question_handler(cursor_ask_question_handler.clone());
+            if let Some(ref ext) = self.vendor_ext {
+                let provider = self.capability_provider.lock().unwrap().clone();
+                hooks.set_vendor_state(Some(ext.create_state(provider)));
+            }
             let prompt_owned = prompt.clone();
             let (tx, rx) = std::sync::mpsc::channel::<Result<PromptResult, String>>();
             thread::spawn(move || {
@@ -215,8 +228,12 @@ impl AcpRuntime {
 
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(Ok(pr)) => {
-                        self.wait_for_plan_followup_updates(&hooks, cancel_check)?;
-                        break Ok(handoff_from_prompt_hooks(&hooks, pr));
+                        self.wait_for_followup_if_vendor(&hooks, cancel_check)?;
+                        break Ok(handoff_from_prompt_hooks(
+                            &hooks,
+                            pr,
+                            self.vendor_ext.as_ref(),
+                        ));
                     }
                     Ok(Err(e)) => break Err(anyhow::anyhow!("ACP session/prompt: {}", e)),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -229,7 +246,7 @@ impl AcpRuntime {
                 }
             };
 
-            hooks.set_cursor_ask_question_handler(None);
+            hooks.set_vendor_state(None);
 
             match handoff_result {
                 Ok(h) => {
@@ -266,7 +283,10 @@ impl AcpRuntime {
                             )
                         };
                         hooks.clear();
-                        hooks.set_cursor_ask_question_handler(cursor_ask_question_handler.clone());
+                        if let Some(ref ext) = self.vendor_ext {
+                            let provider = self.capability_provider.lock().unwrap().clone();
+                            hooks.set_vendor_state(Some(ext.create_state(provider)));
+                        }
                         let prompt_owned = prompt;
                         let (tx, rx) = std::sync::mpsc::channel::<Result<PromptResult, String>>();
                         thread::spawn(move || {
@@ -291,8 +311,12 @@ impl AcpRuntime {
                             }
                             match rx.recv_timeout(Duration::from_millis(200)) {
                                 Ok(Ok(pr)) => {
-                                    self.wait_for_plan_followup_updates(&hooks, cancel_check)?;
-                                    break Ok(handoff_from_prompt_hooks(&hooks, pr));
+                                    self.wait_for_followup_if_vendor(&hooks, cancel_check)?;
+                                    break Ok(handoff_from_prompt_hooks(
+                                        &hooks,
+                                        pr,
+                                        self.vendor_ext.as_ref(),
+                                    ));
                                 }
                                 Ok(Err(e)) => {
                                     break Err(anyhow::anyhow!("ACP session/prompt: {}", e));
@@ -308,7 +332,7 @@ impl AcpRuntime {
                                 }
                             }
                         };
-                        hooks.set_cursor_ask_question_handler(None);
+                        hooks.set_vendor_state(None);
                         match handoff_result {
                             Ok(h) => return Ok(h),
                             Err(e) => {
@@ -359,48 +383,17 @@ impl AcpRuntime {
         }
     }
 
-    fn wait_for_plan_followup_updates(
+    fn wait_for_followup_if_vendor(
         &self,
         hooks: &StreamTextHooks,
         cancel_check: Option<&dyn Fn() -> bool>,
     ) -> Result<()> {
-        if self.preferred_session_mode != Some(ACP_SESSION_MODE_PLAN) {
-            return Ok(());
+        if let Some(ref ext) = self.vendor_ext
+            && let Some(vs) = hooks.vendor_state_snapshot()
+        {
+            ext.wait_for_followup(vs.as_ref(), cancel_check, &self.shutdown)?;
         }
-
-        const MAX_WAIT: Duration = Duration::from_secs(3);
-        const QUIET_WINDOW: Duration = Duration::from_millis(500);
-        const POLL: Duration = Duration::from_millis(100);
-
-        let start = Instant::now();
-        let mut last_change_at = Instant::now();
-        let mut last_seq = hooks.notification_seq();
-
-        loop {
-            if hooks.has_cursor_plan_paths() {
-                return Ok(());
-            }
-            if start.elapsed() >= MAX_WAIT || last_change_at.elapsed() >= QUIET_WINDOW {
-                return Ok(());
-            }
-            if self.shutdown.load(Ordering::SeqCst) {
-                self.kill_child();
-                anyhow::bail!("Agent interrupted by shutdown");
-            }
-            if let Some(check) = cancel_check
-                && check()
-            {
-                self.kill_child();
-                anyhow::bail!("Agent cancelled by external condition");
-            }
-
-            let seq = hooks.notification_seq();
-            if seq != last_seq {
-                last_seq = seq;
-                last_change_at = Instant::now();
-            }
-            thread::sleep(POLL);
-        }
+        Ok(())
     }
 
     fn kill_child(&self) {
@@ -410,116 +403,22 @@ impl AcpRuntime {
         }
     }
 
-    /// Applies [`Self::preferred_session_mode`] only when the agent advertises that mode:
-    ///
-    /// - Config option with `id`/`category` `mode` and the value in `options`, or
-    /// - Legacy `session/new` `modes.availableModes` non-empty and containing the id.
-    ///
-    /// Otherwise leaves the agent default and logs at `debug` (`potlatch::acp_modes`).
-    fn try_apply_preferred_session_mode(
+    /// Applies preferred session mode via the vendor extension when active.
+    fn try_apply_preferred_mode_if_vendor(
         &self,
         client: &AcpClient,
         session: &NewSessionResult,
         hooks: &StreamTextHooks,
     ) {
-        let Some(mode_id) = self.preferred_session_mode else {
-            return;
-        };
-
-        let legacy_advertises = session
-            .modes
-            .as_ref()
-            .is_some_and(|m| !m.available_modes.is_empty() && mode_id_is_available(m, mode_id));
-
-        if let Some(cfg) = session.config_options.as_deref()
-            && let Some(opt) = session_mode_config_option(cfg)
-            && select_option_allows_value(opt, mode_id)
+        if let Some(ref ext) = self.vendor_ext
+            && let Some(vs) = hooks.vendor_state_snapshot()
         {
-            match client.session_set_config_option(&session.session_id, &opt.id, mode_id) {
-                Ok(_) => {
-                    info!(
-                        "ACP session mode {:?} via session/set_config_option for {}",
-                        mode_id, self.agent_id
-                    );
-                    hooks.sync_tracked_current_mode(mode_id);
-                    return;
-                }
-                Err(e) => debug!(
-                    target: "potlatch::acp_modes",
-                    agent_id = %self.agent_id,
-                    err = %e,
-                    "session/set_config_option for mode failed",
-                ),
-            }
-            if legacy_advertises {
-                match client.session_set_mode(&session.session_id, mode_id) {
-                    Ok(_) => {
-                        info!(
-                            "ACP session mode {:?} via session/set_mode (fallback) for {}",
-                            mode_id, self.agent_id
-                        );
-                        hooks.sync_tracked_current_mode(mode_id);
-                    }
-                    Err(e) => debug!(
-                        target: "potlatch::acp_modes",
-                        agent_id = %self.agent_id,
-                        err = %e,
-                        "session/set_mode fallback after set_config_option failure also failed",
-                    ),
-                }
-            } else {
-                debug!(
-                    target: "potlatch::acp_modes",
-                    agent_id = %self.agent_id,
-                    preferred = mode_id,
-                    "set_config_option for mode failed and agent does not advertise this mode in legacy availableModes; leaving default",
-                );
-            }
-            return;
+            ext.try_apply_preferred_mode(client, session, vs.as_ref());
         }
-
-        if legacy_advertises {
-            match client.session_set_mode(&session.session_id, mode_id) {
-                Ok(_) => {
-                    info!(
-                        "ACP session mode {:?} via session/set_mode for {}",
-                        mode_id, self.agent_id
-                    );
-                    hooks.sync_tracked_current_mode(mode_id);
-                }
-                Err(e) => debug!(
-                    target: "potlatch::acp_modes",
-                    agent_id = %self.agent_id,
-                    err = %e,
-                    "session/set_mode failed",
-                ),
-            }
-            return;
-        }
-
-        debug!(
-            target: "potlatch::acp_modes",
-            agent_id = %self.agent_id,
-            preferred = mode_id,
-            "preferred session mode not advertised (no mode config option value match and no legacy availableModes entry); leaving agent default mode",
-        );
     }
 
-    /// True when [`InitializeResult::auth_methods`] includes Cursor's `cursor_login` method.
-    ///
-    /// Cursor ACP requires [`AcpClient::authenticate`] with `cursor_login` after `initialize` and
-    /// before `session/new` ([Cursor ACP docs](https://cursor.com/docs/cli/acp)).
-    fn acp_init_advertises_cursor_login(init: &InitializeResult) -> bool {
-        init.auth_methods.iter().any(|m| {
-            m.get("id")
-                .or_else(|| m.get("methodId"))
-                .and_then(|v| v.as_str())
-                .is_some_and(|id| id == "cursor_login")
-        })
-    }
-
-    /// Spawns the configured ACP server command, attaches stdio, `initialize`, and Cursor
-    /// `authenticate` when advertised — no `session/new` yet.
+    /// Spawn the configured ACP server command, attaches stdio, `initialize`,
+    /// and vendor-specific `authenticate` — no `session/new` yet.
     fn spawn_acp_connection(&self) -> Result<(Arc<AcpClient>, Child, Arc<StreamTextHooks>)> {
         let program = self
             .acp_command
@@ -577,21 +476,13 @@ impl AcpRuntime {
             })
             .context("ACP initialize")?;
 
-        if Self::acp_init_advertises_cursor_login(&init_result) {
-            debug!(
-                target: "potlatch::acp",
-                agent_id = %self.agent_id,
-                auth_methods = init_result.auth_methods.len(),
-                "initialize result includes authMethods; calling authenticate(cursor_login)"
-            );
-            client.authenticate_cursor_login().context(
-                "ACP authenticate (cursor_login). Run `agent login` or set CURSOR_API_KEY / CURSOR_AUTH_TOKEN; see https://cursor.com/docs/cli/acp",
-            )?;
+        if let Some(ref ext) = self.vendor_ext {
+            ext.authenticate(&client, &init_result)?;
         } else {
             debug!(
                 target: "potlatch::acp",
                 agent_id = %self.agent_id,
-                "initialize result has no authMethods; skipping authenticate"
+                "no vendor extension; skipping authenticate"
             );
         }
 
@@ -636,7 +527,7 @@ impl AcpRuntime {
             );
         }
 
-        self.try_apply_preferred_session_mode(client, &session, hooks);
+        self.try_apply_preferred_mode_if_vendor(client, &session, hooks);
 
         if let Some(model) = &self.endpoint_model {
             let mut applied = false;
@@ -832,12 +723,14 @@ fn final_text_from_prompt_extra(extra: &Map<String, Value>) -> Option<String> {
     }
 }
 
-fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> AgentHandoff {
+fn handoff_from_prompt_hooks(
+    hooks: &StreamTextHooks,
+    pr: PromptResult,
+    vendor_ext: Option<&Arc<dyn AcpVendorExtension>>,
+) -> AgentHandoff {
     let stream = hooks.take_text();
     let final_text = final_text_from_prompt_extra(&pr.extra);
-    let create_plan_text = hooks.take_cursor_create_plan_text();
-    let has_create_plan_text = !create_plan_text.trim().is_empty();
-    let has_final_result_text = final_text.is_some() || has_create_plan_text;
+    let has_final_result_text = final_text.is_some();
 
     // Prefer final prompt result text (`message` / `output`) over streamed chunks.
     // Streamed chunks can contain intermediate progress narration, while `extra` carries
@@ -848,16 +741,12 @@ fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> Agent
         stream
     };
 
-    if has_create_plan_text {
-        if response.trim().is_empty() {
-            response = create_plan_text;
-        } else {
-            response.push_str("\n\n");
-            response.push_str(&create_plan_text);
-        }
+    // Let the vendor extension merge its data into the response.
+    if let Some(ext) = vendor_ext
+        && let Some(vs) = hooks.vendor_state_snapshot()
+    {
+        ext.process_response(vs.as_ref(), &mut response);
     }
-
-    let cursor_plan_paths = hooks.take_cursor_plan_paths();
 
     // Extract captured structured-output tool calls (e.g. `handoff`, `plan`).
     // A JSON object mapping tool name to captured args; `None` when no
@@ -872,7 +761,7 @@ fn handoff_from_prompt_hooks(hooks: &StreamTextHooks, pr: PromptResult) -> Agent
     AgentHandoff {
         response,
         has_final_result_text,
-        cursor_plan_paths,
+
         structured_outputs,
         ..Default::default()
     }
@@ -899,28 +788,8 @@ impl Drop for AcpRuntime {
 #[cfg(test)]
 mod tests {
     use super::super::client::AcpHooks;
-    use super::super::types::InitializeResult;
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn acp_init_detects_cursor_login_in_auth_methods() {
-        let with_login: InitializeResult = serde_json::from_value(json!({
-            "protocolVersion": 1,
-            "agentCapabilities": {},
-            "authMethods": [{"id": "cursor_login", "name": "Cursor Login"}]
-        }))
-        .unwrap();
-        assert!(AcpRuntime::acp_init_advertises_cursor_login(&with_login));
-
-        let empty: InitializeResult = serde_json::from_value(json!({
-            "protocolVersion": 1,
-            "agentCapabilities": {},
-            "authMethods": []
-        }))
-        .unwrap();
-        assert!(!AcpRuntime::acp_init_advertises_cursor_login(&empty));
-    }
 
     #[test]
     fn prepends_fresh_context_guidance_to_each_task() {
@@ -946,22 +815,6 @@ mod tests {
     }
 
     #[test]
-    fn handoff_merges_cursor_create_plan_text() {
-        let hooks = StreamTextHooks::new();
-        let params = json!({
-            "plan": "SUB_ISSUE_1:\nTITLE: Add tests\nPRIORITY: 2\nDESCRIPTION:\nDo it."
-        });
-        hooks.handle_agent_request("cursor/create_plan", &params, &json!(1));
-        let pr: PromptResult = serde_json::from_value(json!({
-            "stopReason": "end_turn"
-        }))
-        .unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr);
-        assert!(h.has_final_result_text);
-        assert!(h.response.contains("SUB_ISSUE_1:"));
-    }
-
-    #[test]
     fn handoff_prefers_prompt_extra_over_stream_buffer() {
         let hooks = StreamTextHooks::new();
         let params = serde_json::json!({
@@ -976,7 +829,7 @@ mod tests {
             "message": "from result"
         }))
         .unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr);
+        let h = handoff_from_prompt_hooks(&hooks, pr, None);
         assert_eq!(h.response, "from result");
         assert!(h.has_final_result_text);
 
@@ -987,7 +840,7 @@ mod tests {
             "message": "SUB_ISSUE_1:\nTITLE: T\nDESCRIPTION:\nD"
         }))
         .unwrap();
-        let hm = handoff_from_prompt_hooks(&hooks_m, pr_m);
+        let hm = handoff_from_prompt_hooks(&hooks_m, pr_m, None);
         assert_eq!(hm.response, "SUB_ISSUE_1:\nTITLE: T\nDESCRIPTION:\nD");
         assert!(hm.has_final_result_text);
 
@@ -997,7 +850,7 @@ mod tests {
             "message": "only result"
         }))
         .unwrap();
-        let h2 = handoff_from_prompt_hooks(&hooks2, pr2);
+        let h2 = handoff_from_prompt_hooks(&hooks2, pr2, None);
         assert_eq!(h2.response, "only result");
         assert!(h2.has_final_result_text);
 
@@ -1007,7 +860,7 @@ mod tests {
             "stopReason": "end_turn"
         }))
         .unwrap();
-        let h3 = handoff_from_prompt_hooks(&hooks3, pr3);
+        let h3 = handoff_from_prompt_hooks(&hooks3, pr3, None);
         assert_eq!(h3.response, "from stream");
         assert!(!h3.has_final_result_text);
     }
@@ -1024,7 +877,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = handoff_from_prompt_hooks(&hooks, pr);
+        let out = handoff_from_prompt_hooks(&hooks, pr, None);
         assert!(out.has_final_result_text);
         assert!(out.response.contains("SUB_ISSUE_1:"));
         assert!(out.response.contains("TITLE: Refactor queue"));
@@ -1039,7 +892,7 @@ mod tests {
             "structured_outputs": {"plan": {"decision": "split", "sub_issues": [{"title": "A"}]}}
         }))
         .unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr);
+        let h = handoff_from_prompt_hooks(&hooks, pr, None);
         assert_eq!(
             h.structured_outputs,
             Some(json!({"plan": {"decision": "split", "sub_issues": [{"title": "A"}]}}))
@@ -1051,7 +904,7 @@ mod tests {
         let hooks = StreamTextHooks::new();
         let pr: PromptResult =
             serde_json::from_value(json!({"stopReason": "end_turn", "message": "done"})).unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr);
+        let h = handoff_from_prompt_hooks(&hooks, pr, None);
         assert!(h.structured_outputs.is_none());
     }
 
@@ -1064,7 +917,7 @@ mod tests {
             "structured_outputs": null
         }))
         .unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr);
+        let h = handoff_from_prompt_hooks(&hooks, pr, None);
         assert!(h.structured_outputs.is_none());
     }
 }
