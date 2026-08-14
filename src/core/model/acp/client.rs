@@ -317,6 +317,25 @@ impl AcpClient {
         Ok(())
     }
 
+    /// `session/inject` notification: push a follow-up message into the running
+    /// session's context before the next model call. Potlatch-harness extension;
+    /// backends that don't implement it silently ignore the notification.
+    pub fn session_inject(&self, session_id: &str, message: &str) -> Result<()> {
+        let line = Outbound::Notification {
+            method: "session/inject".to_string(),
+            params: json!({ "sessionId": session_id, "message": message }),
+        }
+        .to_json_line()
+        .context("serialize session/inject")?;
+        let wg = self.write_shared.lock().unwrap();
+        let Some(ref tx) = *wg else {
+            anyhow::bail!("ACP writer channel closed");
+        };
+        tx.send(line)
+            .map_err(|_| anyhow::anyhow!("ACP writer channel closed"))?;
+        Ok(())
+    }
+
     pub fn initialize(&self, params: &InitializeParams) -> Result<InitializeResult> {
         let v = serde_json::to_value(params).context("initialize params")?;
         let r = self.send_request("initialize", v)?;

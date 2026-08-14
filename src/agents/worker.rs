@@ -1328,6 +1328,7 @@ fn process_issue(
         &prompt,
         &InvokeOptions {
             cancel_check: Some(worker_issue_cancel_check(state.glab.clone(), issue.iid)),
+            follow_up_poll: None,
             activity_label: Some(format!(
                 "{} implementing issue #{}",
                 &state.agent_id, issue.iid
@@ -1494,6 +1495,31 @@ fn process_issue(
 // ---------------------------------------------------------------------------
 // MR comment handling
 // ---------------------------------------------------------------------------
+
+/// Collect new MR comments since `last_seen_id` as follow-up messages.
+///
+/// Returns formatted messages for each comment with an id greater than
+/// `last_seen_id`, and updates `last_seen_id` to the highest id seen. Pure /
+/// network-free so it can be unit-tested without a GitLab client.
+fn collect_new_follow_ups(
+    comments: &[crate::agents::gitlab::Comment],
+    last_seen_id: &mut u64,
+    mr_iid: u64,
+) -> Vec<String> {
+    let mut new_msgs = Vec::new();
+    for c in comments {
+        if c.id > *last_seen_id {
+            new_msgs.push(format!(
+                "**New comment from @{} on MR !{} (thread {}):**\n\n{}",
+                c.author, mr_iid, c.discussion_id, c.body
+            ));
+        }
+    }
+    if let Some(max_id) = comments.iter().map(|c| c.id).max() {
+        *last_seen_id = max_id;
+    }
+    new_msgs
+}
 
 /// Returns `Ok(true)` if the agent decided the issue cannot be resolved and
 /// the MR was closed + issue rejected.
@@ -1714,6 +1740,21 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         latest_mr.target_branch
     );
 
+    // Follow-up poll: while the agent works on this MR's feedback, watch for
+    // new comments added to the MR and forward them into the running session
+    // as follow-up context (via session/inject on the potlatch harness backend).
+    let seen_comment_id =
+        std::sync::Mutex::new(all_comments.iter().map(|c| c.id).max().unwrap_or(0));
+    let glab_for_poll = state.glab.clone();
+    let mr_iid_for_poll = latest_mr.iid;
+    let follow_up_poll: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(move || {
+        let Ok(comments) = glab_for_poll.get_mr_comments(mr_iid_for_poll) else {
+            return Vec::new();
+        };
+        let mut last = seen_comment_id.lock().unwrap();
+        collect_new_follow_ups(&comments, &mut last, mr_iid_for_poll)
+    });
+
     let agent_output = if let Some(issue_iid) = issue_number {
         info!(
             "{}: Worker agent addressing MR !{} feedback for issue #{}",
@@ -1723,6 +1764,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
             &prompt,
             &InvokeOptions {
                 cancel_check: Some(worker_issue_cancel_check(state.glab.clone(), issue_iid)),
+                follow_up_poll: Some(follow_up_poll.clone()),
                 activity_label: Some(format!(
                     "{} addressing MR !{} feedback",
                     &state.agent_id, latest_mr.iid
@@ -1748,11 +1790,12 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         let output = model.complete(
             &prompt,
             &InvokeOptions {
+                cancel_check: None,
+                follow_up_poll: Some(follow_up_poll.clone()),
                 activity_label: Some(format!(
                     "{} addressing MR !{} feedback",
                     &state.agent_id, latest_mr.iid
                 )),
-                ..InvokeOptions::default()
             },
         )?;
         let output = apply_worker_handoff(output);
@@ -4530,5 +4573,60 @@ mod tests {
     fn extract_waiting_on_issue_iid_ignores_malformed() {
         let labels = vec!["waiting-on-issue:#abc".to_string()];
         assert_eq!(extract_waiting_on_issue_iid(&labels), None);
+    }
+
+    fn mr_comment(
+        id: u64,
+        author: &str,
+        discussion_id: &str,
+        body: &str,
+    ) -> crate::agents::gitlab::Comment {
+        crate::agents::gitlab::Comment {
+            id,
+            body: body.to_string(),
+            author: author.to_string(),
+            discussion_id: discussion_id.to_string(),
+            discussion_resolvable: false,
+            location: None,
+            location_details: None,
+        }
+    }
+
+    #[test]
+    fn collect_new_follow_ups_returns_only_new_comments() {
+        let comments = vec![
+            mr_comment(10, "alice", "d1", "old comment"),
+            mr_comment(15, "bob", "d2", "new comment"),
+            mr_comment(20, "carol", "d1", "another new one"),
+        ];
+        let mut last_seen = 10u64;
+        let msgs = collect_new_follow_ups(&comments, &mut last_seen, 42);
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].contains("@bob"));
+        assert!(msgs[0].contains("MR !42"));
+        assert!(msgs[0].contains("new comment"));
+        assert!(msgs[1].contains("@carol"));
+        assert!(msgs[1].contains("another new one"));
+        assert_eq!(last_seen, 20);
+    }
+
+    #[test]
+    fn collect_new_follow_ups_skips_all_when_seen_is_max() {
+        let comments = vec![
+            mr_comment(5, "alice", "d1", "old"),
+            mr_comment(5, "bob", "d2", "also old"),
+        ];
+        let mut last_seen = 5u64;
+        let msgs = collect_new_follow_ups(&comments, &mut last_seen, 1);
+        assert!(msgs.is_empty());
+        assert_eq!(last_seen, 5);
+    }
+
+    #[test]
+    fn collect_new_follow_ups_handles_empty_comments() {
+        let mut last_seen = 3u64;
+        let msgs = collect_new_follow_ups(&[], &mut last_seen, 1);
+        assert!(msgs.is_empty());
+        assert_eq!(last_seen, 3);
     }
 }

@@ -27,7 +27,6 @@ use tracing::{debug, info, warn};
 
 use super::capabilities::CapabilityProvider;
 use super::client::AcpClient;
-use super::cursor::CursorExtension;
 use super::orchestrator_hooks::StreamTextHooks;
 use super::types::{
     ClientCapabilities, ClientFsCapabilities, DEFAULT_PROTOCOL_VERSION, ImplementationInfo,
@@ -103,10 +102,8 @@ impl AcpRuntime {
         shutdown: Arc<AtomicBool>,
         agent_id: String,
     ) -> Self {
-        let mut vendor_ext = CursorExtension::new(model_uri.as_deref());
-        if let (Some(ext), Some(mode)) = (vendor_ext.as_mut(), preferred_session_mode) {
-            ext.set_preferred_session_mode(Some(mode));
-        }
+        let vendor_ext =
+            super::vendor::resolve_vendor_extension(model_uri.as_deref(), preferred_session_mode);
         Self {
             repo_path,
             model_uri,
@@ -118,7 +115,7 @@ impl AcpRuntime {
             agent_id,
             acp: Mutex::new(None),
             unexpected_quits_count: Arc::new(AtomicU64::new(0)),
-            vendor_ext: vendor_ext.map(|e| Arc::new(e) as Arc<dyn AcpVendorExtension>),
+            vendor_ext,
             capability_provider: Mutex::new(None),
         }
     }
@@ -140,6 +137,7 @@ impl AcpRuntime {
         &self,
         prompt: &str,
         cancel_check: Option<&dyn Fn() -> bool>,
+        follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
     ) -> Result<AgentHandoff> {
         let prompt = prepare_task_prompt(prompt);
         const MAX_UNFINISHED_TASK_RETRIES: u32 = 5;
@@ -190,9 +188,11 @@ impl AcpRuntime {
             }
             let prompt_owned = prompt.clone();
             let (tx, rx) = std::sync::mpsc::channel::<Result<PromptResult, String>>();
+            let client_for_thread = Arc::clone(&client);
+            let session_id_for_thread = session_id.clone();
             thread::spawn(move || {
-                let out = client
-                    .session_prompt(&session_id, &prompt_owned)
+                let out = client_for_thread
+                    .session_prompt(&session_id_for_thread, &prompt_owned)
                     .map_err(|e| e.to_string());
                 let _ = tx.send(out);
             });
@@ -214,6 +214,18 @@ impl AcpRuntime {
                         );
                         self.kill_child();
                         break Err(anyhow::anyhow!("Agent cancelled by external condition"));
+                    }
+
+                    // Poll for follow-up messages and forward them to the
+                    // running session via the vendor extension (session/inject
+                    // on the potlatch harness backend; no-op on others).
+                    if let Some(poll) = follow_up_poll {
+                        let msgs = poll();
+                        if !msgs.is_empty()
+                            && let Some(ref ext) = self.vendor_ext
+                        {
+                            ext.forward_followups(&client, &session_id, &msgs);
+                        }
                     }
                 }
 

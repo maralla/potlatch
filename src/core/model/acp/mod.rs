@@ -6,6 +6,7 @@
 //! Primary entry points: [`client::AcpClient`]; subprocess orchestration in [`runtime`];
 //! in-memory transport is test-only ([`transport`]).
 
+pub mod potlatch;
 pub mod capabilities;
 pub mod client;
 pub mod cursor;

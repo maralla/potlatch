@@ -1,11 +1,13 @@
 //! Vendor extension abstraction for the ACP runtime.
 //!
-//! Vendors (e.g. Cursor CLI) provide protocol extensions beyond the standard
-//! ACP spec. This module defines traits that the generic ACP runtime calls
-//! through at each lifecycle stage, so vendor-specific method names (e.g.
-//! `cursor/ask_question`) never appear in generic code.
+//! Vendors (e.g. Cursor CLI, potlatch harness) provide protocol extensions beyond
+//! the standard ACP spec. This module defines traits that the generic ACP
+//! runtime calls through at each lifecycle stage, so vendor-specific method names
+//! (e.g. `cursor/ask_question`, `session/inject`) never appear in generic code.
 //!
-//! The only implementation lives in [`super::cursor`].
+//! Vendor selection lives in [`resolve_vendor_extension`]; the runtime calls it
+//! with the model URI and receives the right extension (or `None`). The
+//! implementations live in [`super::cursor`] and [`super::potlatch`].
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -90,4 +92,33 @@ pub trait AcpVendorExtension: Send + Sync {
     /// Merges vendor data (e.g. plan text, plan paths) into the response
     /// string. Called during handoff construction.
     fn process_response(&self, state: &dyn AcpVendorState, response: &mut String);
+
+    /// Forward follow-up messages to the running session mid-task.
+    /// Called by the runtime at the polling cadence during `session/prompt`.
+    /// The potlatch extension sends `session/inject`; other vendors no-op.
+    fn forward_followups(&self, _client: &AcpClient, _session_id: &str, _messages: &[String]) {}
+}
+
+/// Resolve the vendor extension for a model URI.
+///
+/// This is the single dispatch point: the runtime calls this with the model URI
+/// and receives the matching extension (or `None` when the vendor has no
+/// extension). Each vendor module owns its own detection; the runtime never
+/// references vendor names.
+///
+/// `preferred_session_mode` is forwarded to extensions that use it (Cursor).
+pub(super) fn resolve_vendor_extension(
+    model_uri: Option<&str>,
+    preferred_session_mode: Option<&'static str>,
+) -> Option<Arc<dyn AcpVendorExtension>> {
+    if let Some(mut ext) = super::cursor::CursorExtension::new(model_uri) {
+        if let Some(mode) = preferred_session_mode {
+            ext.set_preferred_session_mode(Some(mode));
+        }
+        return Some(Arc::new(ext));
+    }
+    if let Some(ext) = super::potlatch::PotlatchExtension::new(model_uri) {
+        return Some(Arc::new(ext));
+    }
+    None
 }
