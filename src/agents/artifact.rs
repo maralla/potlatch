@@ -1,24 +1,32 @@
+//! Agent-layer artifact writing: plain (non-JSON, unversioned) file content
+//! written atomically beneath one directory, with a path-safety check on
+//! the artifact name.
+//!
+//! Core must not own or assume any filesystem artifact/session persistence
+//! — this lives in the agent layer instead, alongside `crate::agents::state`
+//! (which it shares the atomic write primitive with).
+
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, ensure};
 
-use crate::core::state::atomic_write;
+use crate::agents::state::atomic_write;
 
 /// Writes named artifacts atomically beneath one directory.
-pub struct ArtifactStore {
+pub(crate) struct ArtifactStore {
     directory: PathBuf,
 }
 
 impl ArtifactStore {
     /// Create an artifact store rooted at `directory`.
-    pub fn new(directory: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
         }
     }
 
     /// Resolve a safe simple artifact name beneath the store directory.
-    pub fn path(&self, name: &str) -> Result<PathBuf> {
+    pub(crate) fn path(&self, name: &str) -> Result<PathBuf> {
         ensure!(
             is_simple_name(name),
             "artifact name must be a safe simple name"
@@ -27,7 +35,7 @@ impl ArtifactStore {
     }
 
     /// Atomically write an artifact and return its canonical path when available.
-    pub fn write(&self, name: &str, content: impl AsRef<[u8]>) -> Result<PathBuf> {
+    pub(crate) fn write(&self, name: &str, content: impl AsRef<[u8]>) -> Result<PathBuf> {
         let path = self.path(name)?;
         atomic_write(&path, content.as_ref())?;
         Ok(std::fs::canonicalize(&path).unwrap_or(path))
@@ -50,7 +58,7 @@ mod tests {
     use super::*;
 
     fn test_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("potlatch-artifacts-{}", std::process::id()))
+        std::env::temp_dir().join(format!("potlatch-agents-artifacts-{}", std::process::id()))
     }
 
     #[test]

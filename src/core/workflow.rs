@@ -11,6 +11,7 @@ use crate::core::agent::CoreAgent;
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::registry::AgentRegistry;
+use crate::core::runtime::AgentRuntime;
 
 pub struct WorkflowContext {
     pub config: Arc<Config>,
@@ -23,6 +24,10 @@ pub struct WorkflowContext {
 pub struct AgentSpawnContext {
     pub workflow: WorkflowContext,
     pub instance_id: usize,
+    /// The shared runtime for this planned instance, constructed once by
+    /// the [`crate::core::supervisor`] and handed to every construction
+    /// attempt across restarts.
+    pub runtime: AgentRuntime,
 }
 
 impl WorkflowContext {
@@ -46,15 +51,14 @@ fn prepare_shutdown_handlers(ctx: &WorkflowContext) -> Result<()> {
     Ok(())
 }
 
-/// Start and run a registered [`CoreAgent`] until workflow shutdown.
+/// Supervise a registered [`CoreAgent`] for one planned instance until
+/// global shutdown. See [`crate::core::supervisor`] for the restart,
+/// backoff, and panic-recovery behavior.
 pub(crate) fn spawn_core_agent<A>(workflow: WorkflowContext, instance_id: usize) -> Result<()>
 where
     A: CoreAgent<SpawnContext = AgentSpawnContext>,
 {
-    A::run_from(AgentSpawnContext {
-        workflow,
-        instance_id,
-    })
+    crate::core::supervisor::supervise::<A>(workflow, instance_id)
 }
 
 #[derive(Clone)]
@@ -98,6 +102,9 @@ fn plan_agent_spawns(config: &Config, registry: &AgentRegistry) -> Result<Vec<Ag
     Ok(plan)
 }
 
+/// Spawn one supervisor thread per planned instance. Called only after
+/// [`plan_agent_spawns`] has validated every configured agent, so the plan
+/// passed in is already fully valid and deterministic.
 fn execute_spawn_plan(
     ctx: &WorkflowContext,
     plan: Vec<AgentSpawnPlan>,
@@ -108,7 +115,7 @@ fn execute_spawn_plan(
             std::thread::spawn(move || {
                 if let Err(e) = (planned.spawn)(spawn_ctx, planned.instance_id) {
                     tracing::error!(
-                        "Agent {}-{} failed to start: {}",
+                        "Agent {}-{} supervisor exited with an error: {}",
                         planned.agent_name,
                         planned.instance_id,
                         e
@@ -251,11 +258,7 @@ mod tests {
             "alpha"
         }
 
-        fn agent_id(&self) -> &str {
-            unreachable!("test agent is never run")
-        }
-
-        fn shutdown(&self) -> &Arc<AtomicBool> {
+        fn runtime(&self) -> &AgentRuntime {
             unreachable!("test agent is never run")
         }
 
@@ -281,11 +284,7 @@ mod tests {
             "beta"
         }
 
-        fn agent_id(&self) -> &str {
-            unreachable!("test agent is never run")
-        }
-
-        fn shutdown(&self) -> &Arc<AtomicBool> {
+        fn runtime(&self) -> &AgentRuntime {
             unreachable!("test agent is never run")
         }
 
@@ -311,11 +310,7 @@ mod tests {
             "invalid"
         }
 
-        fn agent_id(&self) -> &str {
-            unreachable!("test agent is never run")
-        }
-
-        fn shutdown(&self) -> &Arc<AtomicBool> {
+        fn runtime(&self) -> &AgentRuntime {
             unreachable!("test agent is never run")
         }
 

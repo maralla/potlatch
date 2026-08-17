@@ -5,8 +5,10 @@ use std::time::Duration;
 use anyhow::Result;
 use tracing::{info, warn};
 
-const INITIAL_DELAY: Duration = Duration::from_secs(1);
-const MAX_DELAY: Duration = Duration::from_secs(3 * 60 * 60);
+/// Shared with [`crate::core::supervisor`], which restarts stopped agents
+/// with the same shutdown-aware exponential backoff.
+pub(crate) const INITIAL_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const MAX_DELAY: Duration = Duration::from_secs(3 * 60 * 60);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Error returned when shutdown cancels a retry loop or backoff wait.

@@ -7,27 +7,28 @@
 //! responsibility is the QA-issues context file. Creates GitLab issues for
 //! non-trivial findings.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient};
 use crate::agents::workspace::{
-    GitLabAgentBootstrap, gitlab_banner, validate_instance_id, validate_max_instances,
+    GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner, validate_instance_id,
+    validate_max_instances,
 };
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
-use crate::core::agent::{InvokeOptions, ObjectSchema, SchemaField, StructuredOutput};
+use crate::core::agent::{InvokeOptions, ObjectSchema, Schema, StructuredOutput, compat};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::periodic::PeriodicTaskSpec;
+use crate::core::runtime::AgentRuntime;
 
 pub(crate) const NAME: &str = "qa";
 const MAX_INSTANCES: usize = 1;
@@ -36,9 +37,11 @@ const QA_LABEL: &str = crate::agents::labels::QA;
 const DO_NOT_IMPLEMENT_LABEL: &str = crate::agents::labels::DO_NOT_IMPLEMENT;
 
 /// A finding's severity, as the model reports it via the `qa_report` tool.
-/// Unknown or missing values default to `Low`, preserving the pre-typed
-/// behavior of treating unrecognized severity as non-blocking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The contract only admits the four names below; a severity the model
+/// invents is folded to `Low` by [`QaOutput::normalize`], preserving the
+/// long-standing behavior of treating unrecognized severity as non-blocking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Severity {
     Critical,
     High,
@@ -47,20 +50,7 @@ enum Severity {
     Low,
 }
 
-impl<'de> Deserialize<'de> for Severity {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(match value.trim().to_ascii_lowercase().as_str() {
-            "critical" => Self::Critical,
-            "high" => Self::High,
-            "medium" => Self::Medium,
-            _ => Self::Low,
-        })
-    }
-}
+const SEVERITIES: &[&str] = &["critical", "high", "medium", "low"];
 
 impl Severity {
     fn as_str(&self) -> &'static str {
@@ -89,6 +79,7 @@ impl Severity {
 /// `findings` array, before the empty-title/description defensive filtering
 /// in [`normalize_qa_findings`] is applied.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawQaFinding {
     #[serde(default)]
     title: String,
@@ -104,6 +95,7 @@ struct RawQaFinding {
 /// `qa_report` tool's `clarifications` array, before the empty-question
 /// filtering in [`normalize_clarifications`] is applied.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawClarification {
     #[serde(default)]
     question: String,
@@ -116,6 +108,7 @@ struct RawClarification {
 /// deserializes the captured JSON into this type (see
 /// [`AgentModel::complete_typed`]).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QaOutput {
     #[serde(default)]
     findings: Vec<RawQaFinding>,
@@ -132,60 +125,72 @@ impl StructuredOutput for QaOutput {
         "Emit your QA test findings and clarification questions as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your results."
     }
 
-    fn schema() -> ObjectSchema {
-        ObjectSchema::new()
-            .property(
-                "findings",
-                SchemaField::array(
-                    "Test findings (bugs). Empty array if no bugs found.",
-                    SchemaField::object(
-                        ObjectSchema::new()
-                            .property(
-                                "title",
-                                SchemaField::string("Short actionable title for the finding."),
-                            )
-                            .property(
-                                "description",
-                                SchemaField::string(
-                                    "Detailed description with steps to reproduce, expected vs actual behavior, and impact.",
+    fn schema() -> Schema {
+        Schema::object(
+            ObjectSchema::new()
+                .describe("Everything this QA run found.")
+                .required_property(
+                    "findings",
+                    Schema::array(
+                        "Test findings (bugs). Empty array if no bugs found.",
+                        Schema::object(
+                            ObjectSchema::new()
+                                .describe("One bug this run reproduced.")
+                                .required_property(
+                                    "title",
+                                    Schema::string("Short actionable title for the finding."),
+                                )
+                                .required_property(
+                                    "description",
+                                    Schema::string(
+                                        "Detailed description with steps to reproduce, expected vs actual behavior, and impact.",
+                                    ),
+                                )
+                                .required_property(
+                                    "severity",
+                                    Schema::string_enum(
+                                        "Severity: \"critical\", \"high\", \"medium\", or \"low\".",
+                                        SEVERITIES,
+                                    ),
+                                )
+                                .property(
+                                    "file",
+                                    Schema::string(
+                                        "Source file and line number if known (e.g. \"src/path/to/file.rs:123\"). Omit if unknown.",
+                                    ),
                                 ),
-                            )
-                            .property(
-                                "severity",
-                                SchemaField::string_enum(
-                                    "Severity: \"critical\", \"high\", \"medium\", or \"low\".",
-                                    &["critical", "high", "medium", "low"],
+                        ),
+                    ),
+                )
+                .property(
+                    "clarifications",
+                    Schema::array(
+                        "Clarification questions for humans. Empty array if none.",
+                        Schema::object(
+                            ObjectSchema::new()
+                                .describe("One question a human has to answer.")
+                                .required_property(
+                                    "question",
+                                    Schema::string("The clarification question."),
+                                )
+                                .required_property(
+                                    "context",
+                                    Schema::string(
+                                        "Context explaining why the question is needed.",
+                                    ),
                                 ),
-                            )
-                            .property(
-                                "file",
-                                SchemaField::string(
-                                    "Source file and line number if known (e.g. \"src/path/to/file.rs:123\"). Omit if unknown.",
-                                ),
-                            )
-                            .required("title")
-                            .required("description")
-                            .required("severity"),
+                        ),
                     ),
                 ),
-            )
-            .property(
-                "clarifications",
-                SchemaField::array(
-                    "Clarification questions for humans. Empty array if none.",
-                    SchemaField::object(
-                        ObjectSchema::new()
-                            .property("question", SchemaField::string("The clarification question."))
-                            .property(
-                                "context",
-                                SchemaField::string("Context explaining why the question is needed."),
-                            )
-                            .required("question")
-                            .required("context"),
-                    ),
-                ),
-            )
-            .required("findings")
+        )
+    }
+
+    /// Tolerated: a severity the model invented or spelled differently, which
+    /// becomes `"low"` so an odd label never blocks a whole QA run.
+    fn normalize(value: &mut serde_json::Value) {
+        compat::each_in_array(value, "findings", |finding| {
+            compat::normalize_enum(finding, "severity", SEVERITIES, "low");
+        });
     }
 }
 
@@ -272,14 +277,28 @@ impl QaAgentSettings {
 // Agent state
 // ---------------------------------------------------------------------------
 
-struct AgentState {
-    agent_id: String,
-    sessions_dir: String,
-    git_repo: GitRepo,
-    glab: GitLabClient,
+/// A borrowing view over the [`GitLabAgentRuntime`] fields the QA cycle
+/// needs. Built fresh from `&GitLabAgentRuntime` at each use site rather
+/// than stored, so QA never owns a second `GitRepo`/`GitLabClient` — and,
+/// since it is never stored alongside the runtime it borrows from, it
+/// can't become self-referential.
+struct AgentState<'a> {
+    agent_id: &'a str,
+    sessions_dir: &'a str,
+    git_repo: &'a GitRepo,
+    glab: &'a GitLabClient,
 }
 
-impl AgentState {
+impl AgentState<'_> {
+    fn from_runtime(runtime: &GitLabAgentRuntime) -> AgentState<'_> {
+        AgentState {
+            agent_id: &runtime.agent_id,
+            sessions_dir: &runtime.sessions_dir,
+            git_repo: &runtime.git_repo,
+            glab: &runtime.gitlab,
+        }
+    }
+
     fn sha_history_path(&self) -> PathBuf {
         Path::new(&self.sessions_dir).join(format!("{}_qa_sha_history.json", self.agent_id))
     }
@@ -307,17 +326,15 @@ impl AgentState {
 }
 
 pub(crate) struct QaAgent {
-    state: AgentState,
-    model: AgentModel,
+    runtime: GitLabAgentRuntime,
     config: QaConfig,
-    scope_label: String,
 }
 
 // ---------------------------------------------------------------------------
 // Persistence types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 struct ShaHistory(HashMap<String, String>);
 
 // ---------------------------------------------------------------------------
@@ -349,12 +366,8 @@ impl CoreAgent for QaAgent {
         NAME
     }
 
-    fn agent_id(&self) -> &str {
-        &self.state.agent_id
-    }
-
-    fn shutdown(&self) -> &Arc<AtomicBool> {
-        self.model.shutdown()
+    fn runtime(&self) -> &AgentRuntime {
+        &self.runtime.core
     }
 
     fn banner(config: &Config, banner: &mut Banner) {
@@ -378,8 +391,9 @@ impl CoreAgent for QaAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "qa_poll" => {
-                let scope = crate::agents::scope_label_filter(&self.scope_label);
-                qa_cycle(&self.state, &self.config, &self.model, scope)
+                let scope = crate::agents::scope_label_filter(&self.runtime.scope_label);
+                let state = AgentState::from_runtime(&self.runtime);
+                qa_cycle(&state, &self.config, &self.runtime.model, scope)
             }
             _ => Ok(()),
         }
@@ -394,31 +408,12 @@ impl CoreAgent for QaAgent {
         validate_max_instances(NAME, section.core.instances, MAX_INSTANCES)?;
         validate_instance_id(NAME, ctx.instance_id, MAX_INSTANCES)?;
         let agent_settings = QaAgentSettings::from_raw(&section.raw)?;
-        let runtime = GitLabAgentBootstrap::new(
-            &ctx,
-            NAME,
-            ModelPreferences {
-                structured_output_tools: Some(vec![QaOutput::tool_definition()]),
-                ..ModelPreferences::default()
-            },
-        )
-        .build()?;
-        let state = AgentState {
-            agent_id: runtime.agent_id,
-            sessions_dir: runtime.sessions_dir,
-            git_repo: runtime.git_repo,
-            glab: runtime.gitlab,
-        };
+        let runtime = GitLabAgentBootstrap::new(&ctx, NAME, ModelPreferences::default()).build()?;
         let config = QaConfig {
             poll_interval_secs: agent_settings.poll_interval_secs,
             branches: agent_settings.branches,
         };
-        Ok(Self {
-            state,
-            model: runtime.model,
-            config,
-            scope_label: runtime.scope_label,
-        })
+        Ok(Self { runtime, config })
     }
 
     fn on_shutdown(&mut self) {}
@@ -428,274 +423,836 @@ impl CoreAgent for QaAgent {
 // QA cycle
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssueObservation {
+    iid: u64,
+    title: String,
+    description: String,
+    labels: Vec<String>,
+}
+
+impl From<&gitlab::Issue> for IssueObservation {
+    fn from(issue: &gitlab::Issue) -> Self {
+        Self {
+            iid: issue.iid,
+            title: issue.title.clone(),
+            description: issue.description.clone(),
+            labels: issue.labels.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommentObservation {
+    author: String,
+    body: String,
+}
+
+impl From<&gitlab::Comment> for CommentObservation {
+    fn from(comment: &gitlab::Comment) -> Self {
+        Self {
+            author: comment.author.clone(),
+            body: comment.body.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssueContextObservation {
+    issue: IssueObservation,
+    comments: Option<Vec<CommentObservation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QaQuery {
+    ShutdownRequested,
+    ShaHistory,
+    RemoteBranchSha { branch: String },
+    OpenIssues,
+    IssueComments { issue_iid: u64 },
+    CurrentTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QaFact {
+    ShutdownRequested(bool),
+    ShaHistory(ShaHistory),
+    RemoteBranchSha(String),
+    OpenIssues(Vec<IssueObservation>),
+    IssueComments(Option<Vec<CommentObservation>>),
+    CurrentTime(chrono::DateTime<chrono::Utc>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QaAction {
+    FetchRepository,
+    FetchBranches {
+        branches: Vec<String>,
+    },
+    CheckoutRemoteBranch {
+        branch: String,
+    },
+    WriteQaIssuesContext {
+        issues: Vec<IssueContextObservation>,
+    },
+    WriteOpenIssuesContext {
+        issues: Vec<IssueObservation>,
+    },
+    PrepareChangedFiles {
+        base: String,
+    },
+    InvokeQaModel {
+        prompt: String,
+        branch: String,
+    },
+    CloseAnsweredClarification {
+        issue_iid: u64,
+    },
+    CreateClarification {
+        title: String,
+        description: String,
+    },
+    AddQaLabel {
+        issue_iid: u64,
+    },
+    AddDoNotImplementLabel {
+        issue_iid: u64,
+    },
+    CreateFinding {
+        title: String,
+        description: String,
+    },
+    AddPriorityLabel {
+        issue_iid: u64,
+        priority: u8,
+    },
+    AddScopeLabel {
+        issue_iid: u64,
+    },
+    SaveShaHistory(ShaHistory),
+}
+
+enum QaOutcome {
+    Done,
+    Failed(anyhow::Error),
+    ChangedFiles(Vec<String>),
+    ModelCompleted {
+        findings: Vec<RawQaFinding>,
+        clarifications: Vec<RawClarification>,
+    },
+    IssueCreated(u64),
+}
+
+trait QaPort {
+    fn shutdown_requested(&self) -> bool;
+    fn sha_history(&self) -> ShaHistory;
+    fn remote_branch_sha(&self, branch: &str) -> Result<String>;
+    fn open_issues(&self) -> Result<Vec<IssueObservation>>;
+    /// Comments are best effort in both places the legacy cycle read them.
+    fn issue_comments(&self, issue_iid: u64) -> Option<Vec<CommentObservation>>;
+    fn current_time(&self) -> chrono::DateTime<chrono::Utc>;
+    fn execute(&mut self, action: &QaAction) -> QaOutcome;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QaStep {
+    Observe(QaQuery),
+    Act(QaAction),
+    Finish,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QaStage {
+    ShutdownBeforeCycle,
+    FetchRepository,
+    FetchBranches,
+    ObserveHistory,
+    NextBranch,
+    ObserveBranchSha,
+    CheckoutBranch,
+    ShutdownAfterCheckout,
+    ObserveIssues,
+    NextContextComments,
+    ObserveContextComments,
+    WriteQaContext,
+    WriteOpenContext,
+    ShutdownAfterContext,
+    PrepareChangedFiles,
+    InvokeModel,
+    ShutdownAfterModel,
+    NextAnsweredClarification,
+    ObserveAnswerComments,
+    CloseAnsweredClarification,
+    NextClarification,
+    CreateClarification,
+    LabelClarificationQa,
+    LabelClarificationDoNotImplement,
+    NextFinding,
+    ObserveFindingTime,
+    CreateFinding,
+    LabelFindingPriority,
+    LabelFindingQa,
+    LabelFindingScope,
+    SaveHistory,
+    Finish,
+}
+
+struct QaMachine<'a> {
+    agent_id: &'a str,
+    branches: VecDeque<String>,
+    all_branches: Vec<String>,
+    scope_label: Option<&'a str>,
+    qa_issues_path: String,
+    open_issues_path: String,
+    knowledge_dir: String,
+    test_scripts_dir: String,
+    stage: QaStage,
+    history: ShaHistory,
+    selected_branch: Option<(String, String, String)>,
+    branch: String,
+    prev_sha: String,
+    cur_sha: String,
+    all_issues: Vec<IssueObservation>,
+    qa_issues: Vec<IssueObservation>,
+    context_issues: Vec<IssueContextObservation>,
+    context_queue: VecDeque<IssueObservation>,
+    current_issue: Option<IssueObservation>,
+    changed_files: Vec<String>,
+    clarifications: VecDeque<ClarificationQuestion>,
+    clarification: Option<ClarificationQuestion>,
+    findings: VecDeque<QaFinding>,
+    finding: Option<QaFinding>,
+    created_iid: Option<u64>,
+    now: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl<'a> QaMachine<'a> {
+    fn new(
+        agent_id: &'a str,
+        branches: &[String],
+        scope_label: Option<&'a str>,
+        input: AnalysisInput<'_>,
+    ) -> Self {
+        Self {
+            agent_id,
+            branches: branches.iter().cloned().collect(),
+            all_branches: branches.to_vec(),
+            scope_label,
+            qa_issues_path: input.qa_issues_path.to_string(),
+            open_issues_path: input.open_issues_path.to_string(),
+            knowledge_dir: input.knowledge_dir.to_string(),
+            test_scripts_dir: input.test_scripts_dir.to_string(),
+            stage: QaStage::ShutdownBeforeCycle,
+            history: ShaHistory::default(),
+            selected_branch: None,
+            branch: String::new(),
+            prev_sha: String::new(),
+            cur_sha: String::new(),
+            all_issues: Vec::new(),
+            qa_issues: Vec::new(),
+            context_issues: Vec::new(),
+            context_queue: VecDeque::new(),
+            current_issue: None,
+            changed_files: Vec::new(),
+            clarifications: VecDeque::new(),
+            clarification: None,
+            findings: VecDeque::new(),
+            finding: None,
+            created_iid: None,
+            now: None,
+        }
+    }
+
+    fn next_step(&mut self) -> QaStep {
+        loop {
+            match self.stage {
+                QaStage::ShutdownBeforeCycle
+                | QaStage::ShutdownAfterCheckout
+                | QaStage::ShutdownAfterContext
+                | QaStage::ShutdownAfterModel => {
+                    return QaStep::Observe(QaQuery::ShutdownRequested);
+                }
+                QaStage::FetchRepository => return QaStep::Act(QaAction::FetchRepository),
+                QaStage::FetchBranches => {
+                    return QaStep::Act(QaAction::FetchBranches {
+                        branches: self.all_branches.clone(),
+                    });
+                }
+                QaStage::ObserveHistory => return QaStep::Observe(QaQuery::ShaHistory),
+                QaStage::NextBranch => match self.branches.pop_front() {
+                    Some(branch) => {
+                        self.branch = branch;
+                        self.stage = QaStage::ObserveBranchSha;
+                    }
+                    None => match self.selected_branch.take() {
+                        Some((branch, prev_sha, cur_sha)) => {
+                            self.branch = branch;
+                            self.prev_sha = prev_sha;
+                            self.cur_sha = cur_sha;
+                            self.stage = QaStage::CheckoutBranch;
+                        }
+                        None => self.stage = QaStage::Finish,
+                    },
+                },
+                QaStage::ObserveBranchSha => {
+                    return QaStep::Observe(QaQuery::RemoteBranchSha {
+                        branch: self.branch.clone(),
+                    });
+                }
+                QaStage::CheckoutBranch => {
+                    return QaStep::Act(QaAction::CheckoutRemoteBranch {
+                        branch: self.branch.clone(),
+                    });
+                }
+                QaStage::ObserveIssues => return QaStep::Observe(QaQuery::OpenIssues),
+                QaStage::NextContextComments => match self.context_queue.pop_front() {
+                    Some(issue) => {
+                        self.current_issue = Some(issue);
+                        self.stage = QaStage::ObserveContextComments;
+                    }
+                    None => self.stage = QaStage::WriteQaContext,
+                },
+                QaStage::ObserveContextComments | QaStage::ObserveAnswerComments => {
+                    return QaStep::Observe(QaQuery::IssueComments {
+                        issue_iid: self.current_issue().iid,
+                    });
+                }
+                QaStage::WriteQaContext => {
+                    return QaStep::Act(QaAction::WriteQaIssuesContext {
+                        issues: self.context_issues.clone(),
+                    });
+                }
+                QaStage::WriteOpenContext => {
+                    return QaStep::Act(QaAction::WriteOpenIssuesContext {
+                        issues: self.all_issues.clone(),
+                    });
+                }
+                QaStage::PrepareChangedFiles => {
+                    let base = if self.prev_sha.is_empty() {
+                        "HEAD~1".to_string()
+                    } else {
+                        self.prev_sha.clone()
+                    };
+                    return QaStep::Act(QaAction::PrepareChangedFiles { base });
+                }
+                QaStage::InvokeModel => {
+                    return QaStep::Act(QaAction::InvokeQaModel {
+                        prompt: self.prompt(),
+                        branch: self.branch.clone(),
+                    });
+                }
+                QaStage::NextAnsweredClarification => match self.context_queue.pop_front() {
+                    Some(issue) => {
+                        self.current_issue = Some(issue);
+                        self.stage = QaStage::ObserveAnswerComments;
+                    }
+                    None => self.stage = QaStage::NextClarification,
+                },
+                QaStage::CloseAnsweredClarification => {
+                    return QaStep::Act(QaAction::CloseAnsweredClarification {
+                        issue_iid: self.current_issue().iid,
+                    });
+                }
+                QaStage::NextClarification => match self.clarifications.pop_front() {
+                    Some(clarification) => {
+                        self.clarification = Some(clarification);
+                        self.stage = QaStage::CreateClarification;
+                    }
+                    None => self.stage = QaStage::NextFinding,
+                },
+                QaStage::CreateClarification => {
+                    let question = self.clarification();
+                    return QaStep::Act(QaAction::CreateClarification {
+                        title: question.question.clone(),
+                        description: clarification_description(question),
+                    });
+                }
+                QaStage::LabelClarificationQa => {
+                    return QaStep::Act(QaAction::AddQaLabel {
+                        issue_iid: self.created_iid(),
+                    });
+                }
+                QaStage::LabelClarificationDoNotImplement => {
+                    return QaStep::Act(QaAction::AddDoNotImplementLabel {
+                        issue_iid: self.created_iid(),
+                    });
+                }
+                QaStage::NextFinding => match self.findings.pop_front() {
+                    Some(finding)
+                        if !finding.severity.is_non_trivial()
+                            || self
+                                .qa_issues
+                                .iter()
+                                .any(|issue| issue.title == finding.title) =>
+                    {
+                        continue;
+                    }
+                    Some(finding) => {
+                        self.finding = Some(finding);
+                        self.stage = QaStage::ObserveFindingTime;
+                    }
+                    None => self.stage = QaStage::SaveHistory,
+                },
+                QaStage::ObserveFindingTime => return QaStep::Observe(QaQuery::CurrentTime),
+                QaStage::CreateFinding => {
+                    let finding = self.finding();
+                    return QaStep::Act(QaAction::CreateFinding {
+                        title: finding.title.clone(),
+                        description: finding_description(
+                            finding,
+                            &self.branch,
+                            &self.cur_sha,
+                            self.now.expect("finding time observed before creation"),
+                        ),
+                    });
+                }
+                QaStage::LabelFindingPriority => {
+                    return QaStep::Act(QaAction::AddPriorityLabel {
+                        issue_iid: self.created_iid(),
+                        priority: self.finding().severity.priority(),
+                    });
+                }
+                QaStage::LabelFindingQa => {
+                    return QaStep::Act(QaAction::AddQaLabel {
+                        issue_iid: self.created_iid(),
+                    });
+                }
+                QaStage::LabelFindingScope => {
+                    if self.scope_label.is_none() {
+                        self.stage = QaStage::NextFinding;
+                        continue;
+                    }
+                    return QaStep::Act(QaAction::AddScopeLabel {
+                        issue_iid: self.created_iid(),
+                    });
+                }
+                QaStage::SaveHistory => {
+                    self.history
+                        .0
+                        .insert(self.branch.clone(), self.cur_sha.clone());
+                    return QaStep::Act(QaAction::SaveShaHistory(self.history.clone()));
+                }
+                QaStage::Finish => return QaStep::Finish,
+            }
+        }
+    }
+
+    fn current_issue(&self) -> &IssueObservation {
+        self.current_issue
+            .as_ref()
+            .expect("issue stage has an issue")
+    }
+
+    fn clarification(&self) -> &ClarificationQuestion {
+        self.clarification
+            .as_ref()
+            .expect("clarification stage has a question")
+    }
+
+    fn finding(&self) -> &QaFinding {
+        self.finding.as_ref().expect("finding stage has a finding")
+    }
+
+    fn created_iid(&self) -> u64 {
+        self.created_iid
+            .expect("label stage follows issue creation")
+    }
+
+    fn prompt(&self) -> String {
+        build_qa_prompt(
+            self.agent_id,
+            &GitContext {
+                branch: &self.branch,
+                prev_sha: &self.prev_sha,
+                cur_sha: &self.cur_sha,
+                changed_files: &self.changed_files,
+            },
+            &AnalysisInput {
+                qa_issues_path: &self.qa_issues_path,
+                open_issues_path: &self.open_issues_path,
+                knowledge_dir: &self.knowledge_dir,
+                test_scripts_dir: &self.test_scripts_dir,
+            },
+        )
+    }
+
+    fn apply_fact(&mut self, fact: Result<QaFact>) -> Result<()> {
+        match (&self.stage, fact) {
+            (QaStage::ShutdownBeforeCycle, Ok(QaFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    QaStage::Finish
+                } else {
+                    QaStage::FetchRepository
+                };
+            }
+            (QaStage::ShutdownAfterCheckout, Ok(QaFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    QaStage::Finish
+                } else {
+                    QaStage::ObserveIssues
+                };
+            }
+            (QaStage::ShutdownAfterContext, Ok(QaFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    QaStage::Finish
+                } else {
+                    QaStage::PrepareChangedFiles
+                };
+            }
+            (QaStage::ShutdownAfterModel, Ok(QaFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    QaStage::Finish
+                } else {
+                    self.context_queue = self
+                        .qa_issues
+                        .iter()
+                        .filter(|issue| {
+                            issue
+                                .labels
+                                .iter()
+                                .any(|label| label == DO_NOT_IMPLEMENT_LABEL)
+                        })
+                        .cloned()
+                        .collect();
+                    QaStage::NextAnsweredClarification
+                };
+            }
+            (QaStage::ObserveHistory, Ok(QaFact::ShaHistory(history))) => {
+                self.history = history;
+                self.stage = QaStage::NextBranch;
+            }
+            (QaStage::ObserveBranchSha, Ok(QaFact::RemoteBranchSha(sha))) => {
+                let previous = self
+                    .history
+                    .0
+                    .get(&self.branch)
+                    .cloned()
+                    .unwrap_or_default();
+                if previous != sha && self.selected_branch.is_none() {
+                    self.selected_branch = Some((self.branch.clone(), previous, sha));
+                }
+                self.stage = QaStage::NextBranch;
+            }
+            (QaStage::ObserveIssues, Ok(QaFact::OpenIssues(issues))) => {
+                self.all_issues = issues;
+                self.qa_issues = self
+                    .all_issues
+                    .iter()
+                    .filter(|issue| issue.labels.iter().any(|label| label == QA_LABEL))
+                    .cloned()
+                    .collect();
+                self.context_queue = self.qa_issues.iter().cloned().collect();
+                self.stage = QaStage::NextContextComments;
+            }
+            (QaStage::ObserveContextComments, Ok(QaFact::IssueComments(comments))) => {
+                self.context_issues.push(IssueContextObservation {
+                    issue: self.current_issue().clone(),
+                    comments,
+                });
+                self.stage = QaStage::NextContextComments;
+            }
+            (QaStage::ObserveAnswerComments, Ok(QaFact::IssueComments(comments))) => {
+                let answered = comments
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|comment| !is_potlatch_author(&comment.author));
+                self.stage = if answered {
+                    QaStage::CloseAnsweredClarification
+                } else {
+                    QaStage::NextAnsweredClarification
+                };
+            }
+            (QaStage::ObserveFindingTime, Ok(QaFact::CurrentTime(now))) => {
+                self.now = Some(now);
+                self.stage = QaStage::CreateFinding;
+            }
+            (stage, Ok(fact)) => anyhow::bail!("qa port answered {stage:?} with {fact:?}"),
+            (_, Err(error)) => return Err(error),
+        }
+        Ok(())
+    }
+
+    fn apply_outcome(&mut self, outcome: QaOutcome) -> Result<()> {
+        match (&self.stage, outcome) {
+            (QaStage::FetchRepository, QaOutcome::Done) => self.stage = QaStage::FetchBranches,
+            (QaStage::FetchBranches, QaOutcome::Done) => self.stage = QaStage::ObserveHistory,
+            (QaStage::CheckoutBranch, QaOutcome::Done) => {
+                self.stage = QaStage::ShutdownAfterCheckout
+            }
+            (QaStage::WriteQaContext, QaOutcome::Done) => self.stage = QaStage::WriteOpenContext,
+            (QaStage::WriteOpenContext, QaOutcome::Done) => {
+                self.stage = QaStage::ShutdownAfterContext
+            }
+            (QaStage::PrepareChangedFiles, QaOutcome::ChangedFiles(files)) => {
+                self.changed_files = files;
+                self.stage = QaStage::InvokeModel;
+            }
+            (
+                QaStage::InvokeModel,
+                QaOutcome::ModelCompleted {
+                    findings,
+                    clarifications,
+                },
+            ) => {
+                self.findings = normalize_qa_findings(findings).into();
+                self.clarifications = normalize_clarifications(clarifications).into();
+                self.stage = QaStage::ShutdownAfterModel;
+            }
+            (QaStage::CloseAnsweredClarification, QaOutcome::Done | QaOutcome::Failed(_)) => {
+                self.stage = QaStage::NextAnsweredClarification
+            }
+            (QaStage::CreateClarification, QaOutcome::IssueCreated(iid)) => {
+                self.created_iid = Some(iid);
+                self.stage = QaStage::LabelClarificationQa;
+            }
+            (QaStage::CreateClarification, QaOutcome::Failed(_)) => {
+                self.stage = QaStage::NextClarification
+            }
+            (QaStage::LabelClarificationQa, QaOutcome::Done | QaOutcome::Failed(_)) => {
+                self.stage = QaStage::LabelClarificationDoNotImplement
+            }
+            (QaStage::LabelClarificationDoNotImplement, QaOutcome::Done | QaOutcome::Failed(_)) => {
+                self.stage = QaStage::NextClarification
+            }
+            (QaStage::CreateFinding, QaOutcome::IssueCreated(iid)) => {
+                self.created_iid = Some(iid);
+                self.stage = QaStage::LabelFindingPriority;
+            }
+            (QaStage::CreateFinding, QaOutcome::Failed(_)) => self.stage = QaStage::NextFinding,
+            (QaStage::LabelFindingPriority, QaOutcome::Done | QaOutcome::Failed(_)) => {
+                self.stage = QaStage::LabelFindingQa
+            }
+            (QaStage::LabelFindingQa, QaOutcome::Done | QaOutcome::Failed(_)) => {
+                self.stage = QaStage::LabelFindingScope
+            }
+            (QaStage::LabelFindingScope, QaOutcome::Done | QaOutcome::Failed(_)) => {
+                self.stage = QaStage::NextFinding
+            }
+            (QaStage::SaveHistory, QaOutcome::Done | QaOutcome::Failed(_)) => {
+                self.stage = QaStage::Finish
+            }
+            (_, QaOutcome::Failed(error)) => return Err(error),
+            (stage, _) => anyhow::bail!("qa port reported an unexpected outcome for {stage:?}"),
+        }
+        Ok(())
+    }
+}
+
+fn observe_qa(port: &dyn QaPort, query: &QaQuery) -> Result<QaFact> {
+    Ok(match query {
+        QaQuery::ShutdownRequested => QaFact::ShutdownRequested(port.shutdown_requested()),
+        QaQuery::ShaHistory => QaFact::ShaHistory(port.sha_history()),
+        QaQuery::RemoteBranchSha { branch } => {
+            QaFact::RemoteBranchSha(port.remote_branch_sha(branch)?)
+        }
+        QaQuery::OpenIssues => QaFact::OpenIssues(port.open_issues()?),
+        QaQuery::IssueComments { issue_iid } => {
+            QaFact::IssueComments(port.issue_comments(*issue_iid))
+        }
+        QaQuery::CurrentTime => QaFact::CurrentTime(port.current_time()),
+    })
+}
+
+fn drive_qa(machine: &mut QaMachine, port: &mut dyn QaPort) -> Result<()> {
+    loop {
+        match machine.next_step() {
+            QaStep::Observe(query) => machine.apply_fact(observe_qa(port, &query))?,
+            QaStep::Act(action) => {
+                let outcome = port.execute(&action);
+                machine.apply_outcome(outcome)?;
+            }
+            QaStep::Finish => return Ok(()),
+        }
+    }
+}
+
+struct LiveQaPort<'a> {
+    state: &'a AgentState<'a>,
+    model: &'a AgentModel,
+    scope_label: Option<&'a str>,
+}
+
+fn qa_required(result: Result<()>) -> QaOutcome {
+    match result {
+        Ok(()) => QaOutcome::Done,
+        Err(error) => QaOutcome::Failed(error),
+    }
+}
+
+impl QaPort for LiveQaPort<'_> {
+    fn shutdown_requested(&self) -> bool {
+        self.model.shutdown().load(Ordering::SeqCst)
+    }
+
+    fn sha_history(&self) -> ShaHistory {
+        load_sha_history(self.state)
+    }
+
+    fn remote_branch_sha(&self, branch: &str) -> Result<String> {
+        self.state.git_repo.remote_short_sha(branch)
+    }
+
+    fn open_issues(&self) -> Result<Vec<IssueObservation>> {
+        Ok(self
+            .state
+            .glab
+            .list_issues()?
+            .iter()
+            .map(IssueObservation::from)
+            .collect())
+    }
+
+    fn issue_comments(&self, issue_iid: u64) -> Option<Vec<CommentObservation>> {
+        match self.state.glab.get_issue_comments(issue_iid) {
+            Ok(comments) => Some(comments.iter().map(CommentObservation::from).collect()),
+            Err(error) => {
+                warn!("Failed to fetch comments for issue #{issue_iid}: {error}");
+                None
+            }
+        }
+    }
+
+    fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+
+    fn execute(&mut self, action: &QaAction) -> QaOutcome {
+        match action {
+            QaAction::FetchRepository => qa_required(self.state.git_repo.fetch()),
+            QaAction::FetchBranches { branches } => {
+                let branches: Vec<&str> = branches.iter().map(String::as_str).collect();
+                qa_required(self.state.git_repo.fetch_branches(&branches))
+            }
+            QaAction::CheckoutRemoteBranch { branch } => {
+                qa_required(self.state.git_repo.checkout_remote_branch(branch))
+            }
+            QaAction::WriteQaIssuesContext { issues } => {
+                qa_required(write_qa_issues_context(self.state, issues))
+            }
+            QaAction::WriteOpenIssuesContext { issues } => {
+                qa_required(write_open_issues_context(self.state, issues))
+            }
+            QaAction::PrepareChangedFiles { base } => QaOutcome::ChangedFiles(
+                self.state
+                    .git_repo
+                    .changed_files_since(base)
+                    .unwrap_or_default(),
+            ),
+            QaAction::InvokeQaModel { prompt, branch } => {
+                match self.model.complete_typed::<QaOutput>(
+                    prompt,
+                    &InvokeOptions {
+                        activity_label: Some(format!(
+                            "{} QA analysis on {}",
+                            self.state.agent_id, branch
+                        )),
+                        ..InvokeOptions::default()
+                    },
+                ) {
+                    Ok(completion) => QaOutcome::ModelCompleted {
+                        findings: completion.output.findings,
+                        clarifications: completion.output.clarifications,
+                    },
+                    Err(error) => QaOutcome::Failed(error),
+                }
+            }
+            QaAction::CloseAnsweredClarification { issue_iid } => {
+                qa_required(self.state.glab.close_issue(*issue_iid))
+            }
+            QaAction::CreateClarification { title, description }
+            | QaAction::CreateFinding { title, description } => {
+                match self.state.glab.create_issue(title, description) {
+                    Ok(iid) => QaOutcome::IssueCreated(iid),
+                    Err(error) => QaOutcome::Failed(error),
+                }
+            }
+            QaAction::AddQaLabel { issue_iid } => {
+                qa_required(self.state.glab.add_issue_label(*issue_iid, QA_LABEL))
+            }
+            QaAction::AddDoNotImplementLabel { issue_iid } => qa_required(
+                self.state
+                    .glab
+                    .add_issue_label(*issue_iid, DO_NOT_IMPLEMENT_LABEL),
+            ),
+            QaAction::AddPriorityLabel {
+                issue_iid,
+                priority,
+            } => qa_required(
+                self.state
+                    .glab
+                    .add_issue_label(*issue_iid, &gitlab::priority_label(*priority)),
+            ),
+            QaAction::AddScopeLabel { issue_iid } => {
+                let Some(label) = self.scope_label else {
+                    return QaOutcome::Done;
+                };
+                qa_required(self.state.glab.add_issue_label(*issue_iid, label))
+            }
+            QaAction::SaveShaHistory(history) => qa_required(save_sha_history(self.state, history)),
+        }
+    }
+}
+
 fn qa_cycle(
     state: &AgentState,
     config: &QaConfig,
     model: &AgentModel,
     scope_label: Option<&str>,
 ) -> Result<()> {
-    let shutdown = model.shutdown();
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    // --- Branch commit detection ---
-
-    state.git_repo.fetch()?;
-    let branch_strs: Vec<&str> = config.branches.iter().map(|s| s.as_str()).collect();
-    state.git_repo.fetch_branches(&branch_strs)?;
-
-    let mut sha_history = load_sha_history(state);
-    let mut branches_with_new_commits: Vec<(&str, String, String)> = Vec::new();
-    for branch in &config.branches {
-        let cur_sha = state.git_repo.remote_short_sha(branch)?;
-        let prev_sha = sha_history.0.get(branch).cloned();
-        match prev_sha {
-            Some(prev) if prev == cur_sha => {
-                debug!("Branch {branch} unchanged at {cur_sha}");
-            }
-            _ => {
-                info!(
-                    "{}: Branch {} has new commits ({} -> {})",
-                    state.agent_id,
-                    branch,
-                    prev_sha.as_deref().unwrap_or("(none)"),
-                    cur_sha
-                );
-                branches_with_new_commits.push((branch, prev_sha.unwrap_or_default(), cur_sha));
-            }
-        }
-    }
-
-    if branches_with_new_commits.is_empty() {
-        debug!(
-            "{}: No new commits on any watched branch, skipping",
-            state.agent_id
-        );
-        return Ok(());
-    }
-
-    let (branch, prev_sha, cur_sha) = &branches_with_new_commits[0];
-    state.git_repo.checkout_remote_branch(branch)?;
-
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    // --- Gather GitLab context: all open issues + QA-labeled subset ---
-
-    let all_issues = state.glab.list_issues()?;
-    let qa_issues: Vec<gitlab::Issue> = all_issues
-        .iter()
-        .filter(|i| i.labels.iter().any(|l| l == QA_LABEL))
-        .cloned()
-        .collect();
-    let qa_issue_titles: Vec<String> = qa_issues.iter().map(|i| i.title.clone()).collect();
-    write_qa_issues_context(state, &qa_issues)?;
-    write_open_issues_context(state, &all_issues)?;
-    debug!(
-        "{}: {} open issue(s) total, {} QA-labeled",
+    let qa_issues_path = state.qa_issues_path();
+    let open_issues_path = state.open_issues_path();
+    let knowledge_dir = state.knowledge_dir();
+    let test_scripts_dir = state.test_scripts_dir();
+    let mut machine = QaMachine::new(
         state.agent_id,
-        all_issues.len(),
-        qa_issues.len()
+        &config.branches,
+        scope_label,
+        AnalysisInput {
+            qa_issues_path: &qa_issues_path.to_string_lossy(),
+            open_issues_path: &open_issues_path.to_string_lossy(),
+            knowledge_dir: &knowledge_dir.to_string_lossy(),
+            test_scripts_dir: &test_scripts_dir.to_string_lossy(),
+        },
     );
-
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    // --- QA analysis ---
-
-    let changed_files = if prev_sha.is_empty() {
-        state
-            .git_repo
-            .changed_files_since("HEAD~1")
-            .unwrap_or_default()
-    } else {
-        state
-            .git_repo
-            .changed_files_since(prev_sha)
-            .unwrap_or_default()
+    let mut port = LiveQaPort {
+        state,
+        model,
+        scope_label,
     };
+    drive_qa(&mut machine, &mut port)
+}
 
-    let prompt = build_qa_prompt(
-        &state.agent_id,
-        &GitContext {
-            branch,
-            prev_sha,
-            cur_sha,
-            changed_files: &changed_files,
+fn clarification_description(question: &ClarificationQuestion) -> String {
+    format!(
+        "{}\n\n---\n*This is a QA clarification question. Please answer in a comment. The QA agent will pick up answers automatically.*",
+        question.context
+    )
+}
+
+fn finding_description(
+    finding: &QaFinding,
+    branch: &str,
+    cur_sha: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "**Severity:** {}\n**File:** {}\n**Branch:** {}\n**Commit:** {}\n\n{}\n\n---\n*Found by QA agent on {}*",
+        finding.severity.as_str(),
+        if finding.file.is_empty() {
+            "n/a"
+        } else {
+            &finding.file
         },
-        &AnalysisInput {
-            qa_issues_path: &state.qa_issues_path().to_string_lossy(),
-            open_issues_path: &state.open_issues_path().to_string_lossy(),
-            knowledge_dir: &state.knowledge_dir().to_string_lossy(),
-            test_scripts_dir: &state.test_scripts_dir().to_string_lossy(),
-        },
-    );
-
-    let completion = model.complete_typed::<QaOutput>(
-        &prompt,
-        &InvokeOptions {
-            activity_label: Some(format!("{} QA analysis on {}", state.agent_id, branch)),
-            ..InvokeOptions::default()
-        },
-    )?;
-
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    // --- Parse outputs ---
-
-    let findings = normalize_qa_findings(completion.output.findings);
-    let clarification_questions = normalize_clarifications(completion.output.clarifications);
-
-    // --- Close answered clarification issues ---
-    // A clarification issue carries QA + DO_NOT_IMPLEMENT; if a non-potlatch user
-    // has commented on it, the question is answered and the issue can be closed.
-
-    for issue in &qa_issues {
-        if !issue.labels.iter().any(|l| l == DO_NOT_IMPLEMENT_LABEL) {
-            continue;
-        }
-        match state.glab.get_issue_comments(issue.iid) {
-            Ok(comments) => {
-                let answered = comments.iter().any(|c| !is_potlatch_author(&c.author));
-                if answered {
-                    if let Err(e) = state.glab.close_issue(issue.iid) {
-                        warn!(
-                            "{}: Failed to close answered clarification issue #{}: {}",
-                            state.agent_id, issue.iid, e
-                        );
-                    } else {
-                        info!(
-                            "{}: Closed clarification issue #{} (answered)",
-                            state.agent_id, issue.iid
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "{}: Failed to fetch comments for clarification issue #{}: {}",
-                    state.agent_id, issue.iid, e
-                );
-            }
-        }
-    }
-
-    // --- Create new clarification issues ---
-
-    for q in &clarification_questions {
-        let description = format!(
-            "{}\n\n---\n*This is a QA clarification question. Please answer in a comment. The QA agent will pick up answers automatically.*",
-            q.context
-        );
-        match state.glab.create_issue(&q.question, &description) {
-            Ok(issue_iid) => {
-                let _ = state.glab.add_issue_label(issue_iid, QA_LABEL);
-                let _ = state
-                    .glab
-                    .add_issue_label(issue_iid, DO_NOT_IMPLEMENT_LABEL);
-                info!(
-                    "{}: Created clarification issue #{}: {}",
-                    state.agent_id, issue_iid, q.question
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "{}: Failed to create clarification issue: {}",
-                    state.agent_id, e
-                );
-            }
-        }
-    }
-
-    // --- Create GitLab issues for non-trivial findings ---
-    // Dedup against currently-open QA-labeled issue titles so we don't re-file
-    // an issue that's still open. Closed issues are not in the list, so a
-    // regression after a fix can legitimately be re-filed.
-
-    let scope = scope_label;
-    let mut created_count = 0;
-    for finding in &findings {
-        if !finding.severity.is_non_trivial() {
-            info!(
-                "{}: Skipping low-severity finding: {}",
-                state.agent_id, finding.title
-            );
-            continue;
-        }
-        if qa_issue_titles.iter().any(|t| t == &finding.title) {
-            debug!(
-                "{}: Open QA issue with same title exists, skipping: {}",
-                state.agent_id, finding.title
-            );
-            continue;
-        }
-
-        let description = format!(
-            "**Severity:** {}\n**File:** {}\n**Branch:** {}\n**Commit:** {}\n\n{}\n\n---\n*Found by QA agent on {}*",
-            finding.severity.as_str(),
-            if finding.file.is_empty() {
-                "n/a".to_string()
-            } else {
-                finding.file.clone()
-            },
-            branch,
-            cur_sha,
-            finding.description,
-            chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
-        );
-
-        match state.glab.create_issue(&finding.title, &description) {
-            Ok(issue_iid) => {
-                let priority = finding.severity.priority();
-                let _ = state
-                    .glab
-                    .add_issue_label(issue_iid, &gitlab::priority_label(priority));
-                let _ = state.glab.add_issue_label(issue_iid, QA_LABEL);
-                if let Some(lbl) = scope {
-                    let _ = state.glab.add_issue_label(issue_iid, lbl);
-                }
-                info!(
-                    "{}: Created GitLab issue #{} for finding: {}",
-                    state.agent_id, issue_iid, finding.title
-                );
-                created_count += 1;
-            }
-            Err(e) => {
-                warn!(
-                    "{}: Failed to create GitLab issue for finding '{}': {}",
-                    state.agent_id, finding.title, e
-                );
-            }
-        }
-    }
-
-    if created_count > 0 {
-        info!(
-            "{}: Created {} new GitLab issue(s) from QA findings",
-            state.agent_id, created_count
-        );
-    }
-
-    // --- Update SHA history ---
-    //
-    // The `qa_report` tool call is mandatory (enforced by `complete_typed`),
-    // so every successful run means the model called it — with an empty
-    // `findings` array at minimum — and is therefore considered tested, even
-    // if it also asked clarification questions.
-    sha_history.0.insert(branch.to_string(), cur_sha.clone());
-    save_sha_history(state, &sha_history);
-
-    Ok(())
+        branch,
+        cur_sha,
+        finding.description,
+        now.format("%Y-%m-%d %H:%M UTC")
+    )
 }
 
 /// Render the QA-labeled issues (with comments) to the agent's context file.
 /// The model reads this file directly; it never calls any tool to fetch GitLab.
-fn write_qa_issues_context(state: &AgentState, issues: &[gitlab::Issue]) -> Result<()> {
+fn write_qa_issues_context(state: &AgentState, issues: &[IssueContextObservation]) -> Result<()> {
     let mut out = String::new();
     out.push_str("# QA-labeled open issues\n\n");
     out.push_str(&format!(
@@ -708,7 +1265,8 @@ fn write_qa_issues_context(state: &AgentState, issues: &[gitlab::Issue]) -> Resu
             "_No open QA-labeled issues. Test the changes in this commit as an end user._\n",
         );
     } else {
-        for issue in issues {
+        for context in issues {
+            let issue = &context.issue;
             out.push_str(&format!("## #{} — {}\n", issue.iid, issue.title));
             let labels = if issue.labels.is_empty() {
                 "(none)".to_string()
@@ -720,10 +1278,10 @@ fn write_qa_issues_context(state: &AgentState, issues: &[gitlab::Issue]) -> Resu
                 out.push_str(issue.description.trim());
                 out.push_str("\n\n");
             }
-            match state.glab.get_issue_comments(issue.iid) {
-                Ok(comments) if !comments.is_empty() => {
+            match &context.comments {
+                Some(comments) if !comments.is_empty() => {
                     out.push_str("### Comments\n\n");
-                    for c in &comments {
+                    for c in comments {
                         let author = if is_potlatch_author(&c.author) {
                             format!("{} (potlatch)", c.author)
                         } else {
@@ -732,12 +1290,8 @@ fn write_qa_issues_context(state: &AgentState, issues: &[gitlab::Issue]) -> Resu
                         out.push_str(&format!("**{author}:**\n{}\n\n", c.body.trim()));
                     }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(
-                        "{}: Failed to fetch comments for issue #{}: {}",
-                        state.agent_id, issue.iid, e
-                    );
+                Some(_) => {}
+                None => {
                     out.push_str("### Comments\n\n_(failed to load comments)_\n\n");
                 }
             }
@@ -769,7 +1323,7 @@ fn write_qa_issues_context(state: &AgentState, issues: &[gitlab::Issue]) -> Resu
 /// acceptance-criteria detail lives in the QA-issues file. Keeping this view
 /// compact lets the model scan the full open-issue set cheaply for duplicates
 /// without a second copy of every issue body.
-fn write_open_issues_context(state: &AgentState, issues: &[gitlab::Issue]) -> Result<()> {
+fn write_open_issues_context(state: &AgentState, issues: &[IssueObservation]) -> Result<()> {
     let mut out = String::new();
     out.push_str("# All open project issues (for duplicate checking)\n\n");
     out.push_str(&format!(
@@ -834,19 +1388,20 @@ fn is_potlatch_author(author: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn load_sha_history(state: &AgentState) -> ShaHistory {
-    // Missing, unreadable, and corrupt history have historically reset QA history.
-    crate::core::state::StateStore::new(state.sha_history_path())
-        .load()
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+    // Missing, unreadable, and corrupt history have historically reset QA
+    // history: tolerant, warn and default rather than failing the cycle.
+    match crate::agents::state::StateStore::new(state.sha_history_path()).load() {
+        Ok(history) => history.unwrap_or_default(),
+        Err(error) => {
+            warn!("Failed to load SHA history: {:#}", error);
+            ShaHistory::default()
+        }
+    }
 }
 
-fn save_sha_history(state: &AgentState, history: &ShaHistory) {
-    let store = crate::core::state::StateStore::new(state.sha_history_path());
-    if let Err(e) = store.save(history) {
-        warn!("Failed to save SHA history: {}", e);
-    }
+fn save_sha_history(state: &AgentState, history: &ShaHistory) -> Result<()> {
+    let store = crate::agents::state::StateStore::new(state.sha_history_path());
+    store.save(history)
 }
 
 // ---------------------------------------------------------------------------
@@ -961,7 +1516,342 @@ Only critical, high, and medium findings will be created as GitLab issues; low-s
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use chrono::TimeZone;
+
     use super::*;
+    use crate::core::agent::schema::conformance;
+
+    struct FakeQaPort {
+        trace: RefCell<Vec<String>>,
+        shutdown: RefCell<VecDeque<bool>>,
+        history: ShaHistory,
+        shas: HashMap<String, String>,
+        issues: Vec<IssueObservation>,
+        comments: HashMap<u64, Option<Vec<CommentObservation>>>,
+        findings: Vec<RawQaFinding>,
+        clarifications: Vec<RawClarification>,
+        next_iid: Cell<u64>,
+        fail_required: Option<&'static str>,
+        fail_best_effort: Vec<&'static str>,
+        saved: RefCell<Option<ShaHistory>>,
+    }
+
+    impl FakeQaPort {
+        fn successful() -> Self {
+            Self {
+                trace: RefCell::new(Vec::new()),
+                shutdown: RefCell::new(VecDeque::new()),
+                history: ShaHistory::default(),
+                shas: HashMap::from([("main".to_string(), "new123".to_string())]),
+                issues: Vec::new(),
+                comments: HashMap::new(),
+                findings: Vec::new(),
+                clarifications: Vec::new(),
+                next_iid: Cell::new(100),
+                fail_required: None,
+                fail_best_effort: Vec::new(),
+                saved: RefCell::new(None),
+            }
+        }
+
+        fn record(&self, event: impl Into<String>) {
+            self.trace.borrow_mut().push(event.into());
+        }
+
+        fn failed(&self, name: &'static str) -> bool {
+            self.fail_required == Some(name) || self.fail_best_effort.contains(&name)
+        }
+    }
+
+    impl QaPort for FakeQaPort {
+        fn shutdown_requested(&self) -> bool {
+            self.record("observe:shutdown");
+            self.shutdown.borrow_mut().pop_front().unwrap_or(false)
+        }
+
+        fn sha_history(&self) -> ShaHistory {
+            self.record("observe:history");
+            self.history.clone()
+        }
+
+        fn remote_branch_sha(&self, branch: &str) -> Result<String> {
+            self.record(format!("observe:sha:{branch}"));
+            Ok(self.shas.get(branch).cloned().unwrap())
+        }
+
+        fn open_issues(&self) -> Result<Vec<IssueObservation>> {
+            self.record("observe:issues");
+            Ok(self.issues.clone())
+        }
+
+        fn issue_comments(&self, issue_iid: u64) -> Option<Vec<CommentObservation>> {
+            self.record(format!("observe:comments:{issue_iid}"));
+            self.comments.get(&issue_iid).cloned().unwrap_or_default()
+        }
+
+        fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
+            self.record("observe:time");
+            chrono::Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap()
+        }
+
+        fn execute(&mut self, action: &QaAction) -> QaOutcome {
+            let (name, event) = match action {
+                QaAction::FetchRepository => ("fetch", "act:fetch".to_string()),
+                QaAction::FetchBranches { .. } => ("fetch_branches", "act:fetch_branches".into()),
+                QaAction::CheckoutRemoteBranch { branch } => {
+                    ("checkout", format!("act:checkout:{branch}"))
+                }
+                QaAction::WriteQaIssuesContext { .. } => ("write_qa", "act:write_qa".into()),
+                QaAction::WriteOpenIssuesContext { .. } => ("write_open", "act:write_open".into()),
+                QaAction::PrepareChangedFiles { base } => {
+                    ("changed_files", format!("act:changed_files:{base}"))
+                }
+                QaAction::InvokeQaModel { .. } => ("model", "act:model".into()),
+                QaAction::CloseAnsweredClarification { issue_iid } => {
+                    ("close", format!("act:close:{issue_iid}"))
+                }
+                QaAction::CreateClarification { title, .. } => (
+                    "create_clarification",
+                    format!("act:create_clarification:{title}"),
+                ),
+                QaAction::AddQaLabel { issue_iid } => ("qa_label", format!("act:qa:{issue_iid}")),
+                QaAction::AddDoNotImplementLabel { issue_iid } => {
+                    ("dni_label", format!("act:dni:{issue_iid}"))
+                }
+                QaAction::CreateFinding { title, .. } => {
+                    ("create_finding", format!("act:create_finding:{title}"))
+                }
+                QaAction::AddPriorityLabel {
+                    issue_iid,
+                    priority,
+                } => (
+                    "priority_label",
+                    format!("act:priority:{issue_iid}:{priority}"),
+                ),
+                QaAction::AddScopeLabel { issue_iid } => {
+                    ("scope_label", format!("act:scope:{issue_iid}"))
+                }
+                QaAction::SaveShaHistory(_) => ("save", "act:save".into()),
+            };
+            self.record(event);
+            if self.failed(name) {
+                return QaOutcome::Failed(anyhow::anyhow!("injected {name} failure"));
+            }
+            match action {
+                QaAction::PrepareChangedFiles { .. } => {
+                    QaOutcome::ChangedFiles(vec!["src/lib.rs".to_string()])
+                }
+                QaAction::InvokeQaModel { .. } => QaOutcome::ModelCompleted {
+                    findings: self.findings.clone(),
+                    clarifications: self.clarifications.clone(),
+                },
+                QaAction::CreateClarification { .. } | QaAction::CreateFinding { .. } => {
+                    let iid = self.next_iid.get();
+                    self.next_iid.set(iid + 1);
+                    QaOutcome::IssueCreated(iid)
+                }
+                QaAction::SaveShaHistory(history) => {
+                    *self.saved.borrow_mut() = Some(history.clone());
+                    QaOutcome::Done
+                }
+                _ => QaOutcome::Done,
+            }
+        }
+    }
+
+    fn qa_issue(iid: u64, title: &str, clarification: bool) -> IssueObservation {
+        let mut labels = vec![QA_LABEL.to_string()];
+        if clarification {
+            labels.push(DO_NOT_IMPLEMENT_LABEL.to_string());
+        }
+        IssueObservation {
+            iid,
+            title: title.to_string(),
+            description: "existing issue".to_string(),
+            labels,
+        }
+    }
+
+    fn run_fake(port: &mut FakeQaPort) -> Result<()> {
+        let mut machine = QaMachine::new(
+            "qa-0",
+            &["main".to_string()],
+            Some("scope::test"),
+            AnalysisInput {
+                qa_issues_path: "/sessions/qa.md",
+                open_issues_path: "/sessions/open.md",
+                knowledge_dir: "/sessions/knowledge",
+                test_scripts_dir: "/sessions/scripts",
+            },
+        );
+        drive_qa(&mut machine, port)
+    }
+
+    #[test]
+    fn qa_machine_records_full_ordered_trace_and_uses_generated_iids() {
+        let mut port = FakeQaPort::successful();
+        port.issues = vec![qa_issue(7, "Old question", true)];
+        port.comments.insert(
+            7,
+            Some(vec![CommentObservation {
+                author: "alice".into(),
+                body: "Use staging".into(),
+            }]),
+        );
+        port.clarifications = vec![RawClarification {
+            question: "Which tenant?".into(),
+            context: "Needed for coverage".into(),
+        }];
+        port.findings = vec![RawQaFinding {
+            title: "Search fails".into(),
+            description: "Search returned 500".into(),
+            severity: Severity::High,
+            file: "src/search.rs:9".into(),
+        }];
+
+        run_fake(&mut port).unwrap();
+
+        assert_eq!(
+            *port.trace.borrow(),
+            vec![
+                "observe:shutdown",
+                "act:fetch",
+                "act:fetch_branches",
+                "observe:history",
+                "observe:sha:main",
+                "act:checkout:main",
+                "observe:shutdown",
+                "observe:issues",
+                "observe:comments:7",
+                "act:write_qa",
+                "act:write_open",
+                "observe:shutdown",
+                "act:changed_files:HEAD~1",
+                "act:model",
+                "observe:shutdown",
+                // Answered clarification closure is complete before either
+                // kind of issue creation begins.
+                "observe:comments:7",
+                "act:close:7",
+                "act:create_clarification:Which tenant?",
+                "act:qa:100",
+                "act:dni:100",
+                "observe:time",
+                "act:create_finding:Search fails",
+                "act:priority:101:2",
+                "act:qa:101",
+                "act:scope:101",
+                "act:save",
+            ]
+        );
+        assert_eq!(
+            port.saved.borrow().as_ref().unwrap().0.get("main"),
+            Some(&"new123".to_string())
+        );
+    }
+
+    #[test]
+    fn qa_machine_aborts_required_failures_and_never_saves_sha() {
+        for failure in ["fetch", "write_qa", "write_open", "model"] {
+            let mut port = FakeQaPort::successful();
+            port.fail_required = Some(failure);
+            assert!(run_fake(&mut port).is_err(), "{failure}");
+            assert!(port.saved.borrow().is_none(), "{failure}");
+        }
+    }
+
+    #[test]
+    fn qa_machine_continues_after_best_effort_failures_and_saves_sha_last() {
+        let mut port = FakeQaPort::successful();
+        port.issues = vec![qa_issue(7, "Old question", true)];
+        port.comments.insert(
+            7,
+            Some(vec![CommentObservation {
+                author: "alice".into(),
+                body: "answered".into(),
+            }]),
+        );
+        port.findings = vec![RawQaFinding {
+            title: "Bug".into(),
+            description: "broken".into(),
+            severity: Severity::Medium,
+            file: String::new(),
+        }];
+        port.fail_best_effort = vec!["close", "priority_label", "qa_label", "scope_label"];
+
+        run_fake(&mut port).unwrap();
+        assert!(port.saved.borrow().is_some());
+        assert_eq!(
+            port.trace.borrow().last().map(String::as_str),
+            Some("act:save")
+        );
+    }
+
+    #[test]
+    fn qa_machine_honors_shutdown_at_start_and_after_model_without_saving_sha() {
+        let mut stopped = FakeQaPort::successful();
+        stopped.shutdown.borrow_mut().push_back(true);
+        run_fake(&mut stopped).unwrap();
+        assert_eq!(*stopped.trace.borrow(), vec!["observe:shutdown"]);
+
+        let mut cancelled = FakeQaPort::successful();
+        cancelled
+            .shutdown
+            .borrow_mut()
+            .extend([false, false, false, true]);
+        run_fake(&mut cancelled).unwrap();
+        assert!(cancelled.trace.borrow().contains(&"act:model".to_string()));
+        assert!(!cancelled.trace.borrow().contains(&"act:save".to_string()));
+        assert!(cancelled.saved.borrow().is_none());
+    }
+
+    #[test]
+    fn qa_machine_honors_shutdown_after_checkout_and_context_preparation() {
+        for (answers, last_event) in [
+            (vec![false, true], "observe:shutdown"),
+            (vec![false, false, true], "observe:shutdown"),
+        ] {
+            let mut port = FakeQaPort::successful();
+            port.shutdown.borrow_mut().extend(answers);
+            run_fake(&mut port).unwrap();
+            assert_eq!(
+                port.trace.borrow().last().map(String::as_str),
+                Some(last_event)
+            );
+            assert!(!port.trace.borrow().contains(&"act:model".to_string()));
+            assert!(port.saved.borrow().is_none());
+        }
+    }
+
+    #[test]
+    fn qa_machine_observes_all_branch_shas_but_tests_only_first_changed_branch() {
+        let mut port = FakeQaPort::successful();
+        port.shas.insert("release".into(), "release-new".into());
+        let mut machine = QaMachine::new(
+            "qa-0",
+            &["main".to_string(), "release".to_string()],
+            None,
+            AnalysisInput {
+                qa_issues_path: "/q",
+                open_issues_path: "/o",
+                knowledge_dir: "/k",
+                test_scripts_dir: "/t",
+            },
+        );
+        drive_qa(&mut machine, &mut port).unwrap();
+        let trace = port.trace.borrow();
+        assert!(trace.windows(3).any(|steps| steps
+            == [
+                "observe:sha:main",
+                "observe:sha:release",
+                "act:checkout:main"
+            ]));
+    }
 
     // --- Config parsing ---
 
@@ -993,11 +1883,16 @@ mod tests {
         assert!(QaAgentSettings::from_raw(&raw).is_err());
     }
 
-    // --- QaOutput deserialization ---
+    // --- QaOutput contract ---
+
+    #[test]
+    fn qa_contract_passes_the_shared_conformance_suite() {
+        conformance::assert_contract::<QaOutput>();
+    }
 
     #[test]
     fn qa_output_deserializes_findings_and_clarifications() {
-        let output: QaOutput = serde_json::from_value(serde_json::json!({
+        let output = conformance::assert_accepts::<QaOutput>(serde_json::json!({
             "findings": [
                 {
                     "title": "SQL injection in query.rs",
@@ -1009,8 +1904,7 @@ mod tests {
             "clarifications": [
                 {"question": "What framework?", "context": "Need to know the test framework"}
             ]
-        }))
-        .unwrap();
+        }));
         let findings = normalize_qa_findings(output.findings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].title, "SQL injection in query.rs");
@@ -1024,23 +1918,65 @@ mod tests {
     }
 
     #[test]
-    fn qa_output_defaults_to_empty_when_fields_absent() {
-        let output: QaOutput = serde_json::from_value(serde_json::json!({})).unwrap();
+    fn qa_output_accepts_a_clean_run_with_no_findings() {
+        let output = conformance::assert_accepts::<QaOutput>(serde_json::json!({"findings": []}));
         assert!(output.findings.is_empty());
         assert!(output.clarifications.is_empty());
     }
 
     #[test]
+    fn qa_output_requires_the_findings_array_even_when_empty() {
+        assert_eq!(
+            conformance::assert_rejects::<QaOutput>(serde_json::json!({})),
+            "$.findings: required property is missing"
+        );
+    }
+
+    #[test]
     fn qa_output_normalizes_case_and_defaults_unknown_severity_to_low() {
-        let output = serde_json::from_value::<QaOutput>(serde_json::json!({
+        let output = conformance::assert_accepts::<QaOutput>(serde_json::json!({
             "findings": [
                 {"title": "Bug", "description": "d", "severity": "HIGH"},
                 {"title": "Odd", "description": "d", "severity": "apocalyptic"}
             ]
-        }))
-        .unwrap();
+        }));
         assert_eq!(output.findings[0].severity, Severity::High);
         assert_eq!(output.findings[1].severity, Severity::Low);
+    }
+
+    #[test]
+    fn qa_output_reports_the_offending_finding_by_index() {
+        assert_eq!(
+            conformance::assert_rejects::<QaOutput>(serde_json::json!({
+                "findings": [
+                    {"title": "Bug", "description": "d", "severity": "high"},
+                    {"title": "Missing description", "severity": "low"}
+                ]
+            })),
+            "$.findings[1].description: required property is missing"
+        );
+    }
+
+    #[test]
+    fn qa_output_rejects_undeclared_finding_properties() {
+        let error = conformance::assert_rejects::<QaOutput>(serde_json::json!({
+            "findings": [{"title": "Bug", "description": "d", "severity": "high", "owner": "me"}]
+        }));
+        assert!(
+            error.starts_with("$.findings[0].owner: unexpected property"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn qa_output_requires_context_on_every_clarification() {
+        assert_eq!(
+            conformance::assert_rejects::<QaOutput>(serde_json::json!({
+                "findings": [],
+                "clarifications": [{"question": "Which env?"}]
+            })),
+            "$.clarifications[0].context: required property is missing"
+        );
     }
 
     #[test]
@@ -1131,6 +2067,158 @@ mod tests {
         let json = serde_json::to_string(&h).unwrap();
         let back: ShaHistory = serde_json::from_str(&json).unwrap();
         assert_eq!(back.0.get("main").map(String::as_str), Some("abc123"));
+    }
+
+    // Real-file round trip through `load_sha_history`/`save_sha_history`,
+    // which is the mechanism `qa_cycle` relies on to only advance a branch's
+    // recorded SHA once a cycle has fully completed (findings/clarifications
+    // processed and `model.complete_typed` returned `Ok`). `GitRepo::new` and
+    // `GitLabClient::for_test` are file/network-free constructors, so this
+    // exercises the real `AgentState` methods without touching git or GitLab.
+
+    /// Owns the resources a test [`AgentState`] borrows from, standing in
+    /// for the [`GitLabAgentRuntime`] fields QA's cycle needs.
+    struct TestRuntime {
+        agent_id: String,
+        sessions_dir: String,
+        git_repo: GitRepo,
+        glab: GitLabClient,
+    }
+
+    fn test_runtime(sessions_dir: &str, agent_id: &str) -> TestRuntime {
+        TestRuntime {
+            agent_id: agent_id.to_string(),
+            sessions_dir: sessions_dir.to_string(),
+            git_repo: GitRepo::new(
+                std::env::temp_dir().to_string_lossy().into_owned(),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            glab: GitLabClient::for_test("/tmp/unused-repo"),
+        }
+    }
+
+    fn test_agent_state(rt: &TestRuntime) -> AgentState<'_> {
+        AgentState {
+            agent_id: &rt.agent_id,
+            sessions_dir: &rt.sessions_dir,
+            git_repo: &rt.git_repo,
+            glab: &rt.glab,
+        }
+    }
+
+    #[test]
+    fn load_sha_history_defaults_to_empty_when_no_file_exists_yet() {
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-qa-sha-history-missing-{}",
+            std::process::id()
+        ));
+        let rt = test_runtime(&dir.to_string_lossy(), "qa-0");
+        let state = test_agent_state(&rt);
+        let history = load_sha_history(&state);
+        assert!(history.0.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_sha_history_round_trips_a_branchs_recorded_sha() {
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-qa-sha-history-roundtrip-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let rt = test_runtime(&dir.to_string_lossy(), "qa-1");
+        let state = test_agent_state(&rt);
+
+        let mut history = load_sha_history(&state);
+        assert!(history.0.is_empty());
+
+        // Mirrors the single line at the end of `qa_cycle` that advances the
+        // watched branch's SHA — this only runs after every required step
+        // upstream (fetch, list_issues, model.complete_typed) succeeded.
+        history
+            .0
+            .insert("main".to_string(), "cur-sha-1".to_string());
+        save_sha_history(&state, &history).unwrap();
+
+        let reloaded = load_sha_history(&state);
+        assert_eq!(
+            reloaded.0.get("main").map(String::as_str),
+            Some("cur-sha-1")
+        );
+
+        let _ = fs::remove_file(state.sha_history_path());
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn corrupt_sha_history_file_resets_to_empty_instead_of_failing() {
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-qa-sha-history-corrupt-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let rt = test_runtime(&dir.to_string_lossy(), "qa-2");
+        let state = test_agent_state(&rt);
+        fs::write(state.sha_history_path(), b"not valid json").unwrap();
+
+        let history = load_sha_history(&state);
+        assert!(history.0.is_empty());
+
+        // Tolerant, but not lossy: the bad file is quarantined beside the
+        // original rather than being deleted outright.
+        assert!(!state.sha_history_path().exists());
+        let quarantined: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("quarantined"))
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsupported_sha_history_version_resets_to_empty_instead_of_failing() {
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-qa-sha-history-unsupported-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let rt = test_runtime(&dir.to_string_lossy(), "qa-3");
+        let state = test_agent_state(&rt);
+        fs::write(state.sha_history_path(), br#"{"version":5,"state":{}}"#).unwrap();
+
+        let history = load_sha_history(&state);
+        assert!(history.0.is_empty());
+        assert!(!state.sha_history_path().exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_sha_history_reads_the_legacy_unversioned_format_and_migrates_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-qa-sha-history-legacy-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let rt = test_runtime(&dir.to_string_lossy(), "qa-4");
+        let state = test_agent_state(&rt);
+        let path = state.sha_history_path();
+
+        // The bare pre-envelope payload written by older builds: a plain
+        // JSON object of branch -> SHA (matches `ShaHistory`'s newtype
+        // transparent serialization).
+        fs::write(&path, br#"{"main":"abc123"}"#).unwrap();
+
+        let history = load_sha_history(&state);
+        assert_eq!(history.0.get("main").map(String::as_str), Some("abc123"));
+
+        // Transparently migrated to the v1 envelope on disk.
+        let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 1);
+        assert_eq!(on_disk["state"]["main"], "abc123");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // --- is_potlatch_author ---
@@ -1257,7 +2345,7 @@ mod tests {
         let tool = QaOutput::tool_definition();
         assert_eq!(tool.name, "qa_report");
 
-        let output: QaOutput = serde_json::from_value(serde_json::json!({
+        let output = conformance::assert_accepts::<QaOutput>(serde_json::json!({
             "findings": [
                 {
                     "title": "Search returns 500 on empty query",
@@ -1271,8 +2359,7 @@ mod tests {
                     "severity": "medium"
                 }
             ]
-        }))
-        .unwrap();
+        }));
         let findings = normalize_qa_findings(output.findings);
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].title, "Search returns 500 on empty query");
