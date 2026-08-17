@@ -233,7 +233,7 @@ impl StructuredOutput for WorkerImplementationOutput {
     }
 
     fn tool_description() -> &'static str {
-        "Hand your implementation run back to Potlatch as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once, with `outcome` set to the one branch that describes how the run ended, and only that branch's fields."
+        "The final outcome of this worker implementation run."
     }
 
     fn schema() -> Schema {
@@ -307,7 +307,7 @@ impl StructuredOutput for WorkerFeedbackOutput {
     }
 
     fn tool_description() -> &'static str {
-        "Hand your merge-request feedback run back to Potlatch as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once, with `outcome` set to the one branch that describes how the run ended, and only that branch's fields."
+        "The final outcome of this merge-request feedback run."
     }
 
     fn schema() -> Schema {
@@ -329,19 +329,19 @@ impl StructuredOutput for WorkerFeedbackOutput {
                     .property(
                         "public_comment",
                         Schema::string(
-                            "The exact human-facing reply to post on the review threads. Only the final comment text — no progress updates, no command output.",
+                            "The exact concise human-facing reply to post on review threads. It must match the committed code/MR metadata and contain only final comment text: no progress updates, command output, validation section, test/lint lists, or unrelated backlog notes.",
                         ),
                     )
                     .property(
                         "mark_discussions_resolved",
                         Schema::boolean(
-                            "Whether Potlatch may mark the open review discussions resolved after posting your reply. Omit to let Potlatch infer it from whether the branch changed.",
+                            "Whether Potlatch may mark open review discussions resolved after posting your reply. True only when the request is fully fixed in code/MR metadata, or the branch was verified to already satisfy it and the public comment explains how. For merge-conflict feedback, true only after a pushed branch merges cleanly with no conflict markers. False for partial progress, disagreement, or anything still needing review. Omit to let Potlatch infer from branch changes; set explicitly for metadata-only fixes.",
                         ),
                     )
                     .property(
                         "post_plain_comment",
                         Schema::boolean(
-                            "Whether to post a new plain (non-resolvable) merge request comment with your reply.",
+                            "Whether to post a new plain (non-resolvable) merge request comment with `public_comment`. True only when a plain MR comment needs a new public reply; omit or use false when no reply is needed or it would only repeat that no changes were necessary.",
                         ),
                     ),
             )
@@ -3972,33 +3972,14 @@ INSTRUCTIONS:
 8. Make the necessary code changes to address all unresolved threaded feedback and any actionable plain MR comments
 9. If the reviewer asked you to delete, rename, or move files, make those file changes.
 10. Ensure changes align with both the original requirements and reviewer feedback
-11. MANDATORY OUTPUT — call the `handoff` tool exactly once when you are done, with `outcome` set to the ONE branch that describes how this run ended, and only that branch's fields:
-   - `outcome: "addressed"` — you handled the feedback (in code, in MR metadata, or by explaining the branch already satisfies it). Optional fields: `mr_title`, `mr_description`, `changes_summary`, `reason`, `public_comment`, `mark_discussions_resolved`, `post_plain_comment`.
-   - `outcome: "cannot_resolve"` — the feedback cannot be resolved autonomously. Required field: `reason`. Optional: `public_comment`.
-   Sending another branch's fields is rejected and you will be asked to call the tool again.
-12. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
+11. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
    a) Adjust your implementation to reduce changed lines — simplify, remove unnecessary changes, trim scope
-   b) If you cannot reasonably reduce the size, call `handoff` with `outcome: "cannot_resolve"` so the issue is rejected and the problem is reported back
+   b) If you cannot reasonably reduce the size, report that the feedback cannot be resolved autonomously
    Do NOT try to split the issue yourself — that is handled by the PMO agent, not you.
-13. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), call `handoff` with `outcome: "cannot_resolve"` and put the concise explanation and needed input in `reason`.
-14. If the reviewer asked you to fix the MR title or description, include updated versions in your `handoff` tool call (`mr_title` and `mr_description` fields). Do NOT change the title just because you made another follow-up commit; keep it stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
-15. After addressing feedback, put a concise sentence summarizing the substance of the changes in the `changes_summary` field. This will be used as the git commit message, so it must convey the main idea of what changed.
-   The summary must reflect the actual source/MR metadata changes you made in this run. Do not mention a reviewer concern as fixed unless the final diff or MR metadata actually changed to address it.
-   If you resolved the feedback without touching the branch, explain why no code change was needed in `reason` instead.
-16. Put any human-facing GitLab comment/reply text in the `public_comment` field of the `handoff` tool. Include only the final comment text to post publicly; no progress updates or tool/log output.
-   Keep this public reply concise. Do NOT include a `Validation:` section, test/lint command lists, passed/failed command output, or unrelated repository backlog notes.
-   The public reply must exactly match the committed changes from this run. Mention only feedback items you actually resolved in code or MR metadata. If you did not change code/metadata for an item, set `mark_discussions_resolved` to false instead of implying it was fixed.
-17. Control whether GitLab should mark open review discussions as resolved after your reply:
-   - Set `mark_discussions_resolved` to true only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
-   - For merge-conflict feedback: use true only after you committed and pushed a branch that merges cleanly with `origin/{}` with no conflict markers left. If conflicts remain, use false.
-   - True is also correct when you verified that no code change is needed because the branch already satisfies the reviewer request. In that case, `public_comment` must explain the existing behavior specifically instead of saying only "no changes needed".
-   - Set it to false when your reply does not resolve the comment (e.g. partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
-   - If you omit this field, the system assumes true only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set it to true explicitly when the feedback is resolved.
-   - Plain MR comments cannot be marked resolved.
-18. Control whether GitLab should post a new normal MR comment for plain, non-resolvable MR comments:
-   - Set `post_plain_comment` to true only when a new public reply is necessary for a plain MR comment, and put the exact comment body in `public_comment`.
-   - If a plain MR comment needs no public reply, or if your response would only repeat that no further changes were needed, omit `post_plain_comment` or set it to false.
-19. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into `mr_description`, `mr_title`, `public_comment`, or any GitLab field.
+12. If the feedback cannot be resolved without additional human input (for example ambiguous requirements, out-of-scope requests, or missing information), report that clearly and identify the needed input.
+13. Keep the MR title stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
+14. Report only changes and metadata updates actually completed in this run; never imply a concern was fixed when the final branch does not fix it.
+15. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR metadata or GitLab comments.
 
 Proceed with addressing the feedback autonomously. Do not ask for any user input.
 "#,
@@ -4007,8 +3988,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         latest_mr.title,
         combined_context_content,
         latest_mr.target_branch,
-        feedback_scope_rules,
-        latest_mr.target_branch
+        feedback_scope_rules
     );
 
     // Follow-up poll: while the agent works on this MR's feedback, watch for
@@ -5967,7 +5947,7 @@ fn build_implementation_prompt(
 
     let common_requirements = get_common_requirements();
     let scope_rules = get_scope_rules(false);
-    let output_format = get_output_format();
+    let notes_rules = get_notes_rules();
 
     let prompt = format!(
         r#"SYSTEM: You are an autonomous coding agent.
@@ -6000,10 +5980,10 @@ INSTRUCTIONS:
 5. If non-test code exceeds ~500 lines or total exceeds ~1500 lines:
    - Evaluate if the feature can be split into smaller, independent pieces
    - If you are VERY SURE it CANNOT be split and MUST be implemented as one unit, proceed with implementation
-   - Otherwise, call `handoff` with `outcome: "needs_split"` and `reason: <explain the estimated line count and how to split into smaller issues>`
-6. If the issue is unclear or missing critical information that makes implementation impossible, call `handoff` with `outcome: "needs_clarification"` and `reason: <explain what information is needed and why>`
-7. If the issue requires large unrelated feature work, call `handoff` with `outcome: "needs_split"` and `reason: <explain how to split the issue>`
-8. If at any point you determine the issue simply cannot be implemented without additional human input that you cannot infer or assume (e.g. missing API credentials, undocumented external system dependencies, contradictory requirements), call `handoff` with `outcome: "needs_clarification"` and `reason: <explain precisely what input is needed and why you cannot proceed>`
+   - Otherwise, report that the issue needs splitting and explain the estimated line count and decomposition
+6. If the issue is unclear or missing critical information that makes implementation impossible, report that clarification is needed and explain what information is missing and why.
+7. If the issue requires large unrelated feature work, report that the issue needs splitting and explain the decomposition.
+8. If at any point you determine the issue simply cannot be implemented without additional human input that you cannot infer or assume (e.g. missing API credentials, undocumented external system dependencies, contradictory requirements), report that clarification is needed and explain precisely what input is required.
 IMPORTANT — When in doubt, REJECT:
 - If you are unsure how to implement the issue, REJECT it. Do not guess or produce speculative code.
 - If you believe the implementation would be huge or complex beyond what a single focused MR should contain, REJECT it.
@@ -6023,7 +6003,7 @@ Proceed with the implementation autonomously. Do not ask for any user input.
         context_content,
         common_requirements,
         scope_rules,
-        output_format
+        notes_rules
     );
 
     Ok(prompt)
@@ -6044,7 +6024,7 @@ fn build_continuation_prompt(
 
     let common_requirements = get_common_requirements();
     let scope_rules = get_scope_rules(true);
-    let output_format = get_output_format();
+    let notes_rules = get_notes_rules();
 
     let prompt = format!(
         r#"SYSTEM: You are an autonomous coding agent.
@@ -6081,10 +6061,10 @@ INSTRUCTIONS:
 6. If non-test code exceeds ~500 lines or total exceeds ~1500 lines:
    - Evaluate if the remaining work can be split into smaller, independent pieces
    - If you are VERY SURE it CANNOT be split and MUST be completed as one unit, proceed with implementation
-   - Otherwise, call `handoff` with `outcome: "needs_split"` and `reason: <explain the estimated line count and how to split into smaller issues>`
-7. If the issue is unclear or missing critical information that makes implementation impossible, call `handoff` with `outcome: "needs_clarification"` and `reason: <explain what information is needed and why>`
-8. If the issue requires large unrelated feature work, call `handoff` with `outcome: "needs_split"` and `reason: <explain how to split the issue>`
-9. If at any point you determine the remaining work simply cannot be completed without additional human input that you cannot infer or assume, call `handoff` with `outcome: "needs_clarification"` and `reason: <explain precisely what input is needed and why you cannot proceed>`
+   - Otherwise, report that the issue needs splitting and explain the estimated line count and decomposition
+7. If the issue is unclear or missing critical information that makes implementation impossible, report that clarification is needed and explain what information is missing and why.
+8. If the issue requires large unrelated feature work, report that the issue needs splitting and explain the decomposition.
+9. If at any point you determine the remaining work cannot be completed without additional human input that you cannot infer or assume, report that clarification is needed and explain precisely what input is required.
 IMPORTANT — When in doubt, REJECT:
 - If you are unsure how to implement the remaining work, REJECT it. Do not guess or produce speculative code.
 - If you believe the total implementation would be huge or complex beyond what a single focused MR should contain, REJECT it.
@@ -6105,7 +6085,7 @@ Proceed with continuing the implementation autonomously. Do not ask for any user
         context_content,
         common_requirements,
         scope_rules,
-        output_format
+        notes_rules
     );
 
     Ok(prompt)
@@ -6121,18 +6101,18 @@ fn get_common_requirements() -> &'static str {
 - If information is missing, document what's needed in your response (do not ask interactively)
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
 - Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed. PMO guidance appears as a comment starting with **PMO guidance for the worker agent:** — treat the body of that comment as authoritative worker instructions and follow it exactly.
-- Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules (see MANDATORY OUTPUT): not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments
+- Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules below: not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments
 
 NO WORKAROUNDS — STRICTLY PROHIBITED:
 - NEVER apply a workaround, hack, or shortcut to make code "work" without addressing the root cause.
 - The ONLY exception is an explicit instruction in a code comment or doc comment within the existing codebase that says to use a specific approach. In that case, follow the comment's instruction exactly.
-- If the correct fix is unclear or too large, REJECT the issue (call `handoff` with `outcome: "cannot_implement"`) rather than shipping a workaround.
+- If the correct fix is unclear or too large, reject the issue rather than shipping a workaround.
 
 RESOURCE AWARENESS — MANDATORY:
 - Before committing to an implementation approach, evaluate its resource footprint: memory, CPU, disk I/O, file descriptors, and goroutine/thread usage. An approach that has the potential to exhaust machine resources is UNACCEPTABLE, even if it produces correct output.
 - Specifically avoid: unbounded buffering (loading entire files/datasets into memory), O(n^2) or worse algorithms on large inputs, spawning unbounded goroutines/threads without a semaphore, holding large data in memory across iterations, redundant re-reads of large files, or creating temp files without cleanup.
-- If the correct, resource-safe implementation is too large for a single MR, REJECT via `handoff` with `outcome: "needs_split"` and explain the resource concern in `reason`.
-- If you are unsure whether your approach is resource-safe under production-scale inputs, REJECT via `handoff` with `outcome: "cannot_implement"` and explain the concern in `reason`. Do not ship code that might OOM, hang, or exhaust file descriptors on real data."#
+- If the correct, resource-safe implementation is too large for a single MR, report that the issue needs splitting and explain the resource concern.
+- If you are unsure whether your approach is resource-safe under production-scale inputs, report that it cannot be implemented safely and explain the concern. Do not ship code that might OOM, hang, or exhaust file descriptors on real data."#
 }
 
 fn get_evidence_bound_scope_bullets() -> &'static str {
@@ -6174,8 +6154,8 @@ fn get_scope_rules(is_continuation: bool) -> String {
 - If non-test code changes would be substantially larger than ~500 lines, or total changes larger than ~1500 lines:
   * First, carefully evaluate if the feature can be split into smaller, independent pieces
   * If you are VERY SURE the feature CANNOT be split and MUST be {} as one atomic unit, you may proceed
-  * Otherwise, call `handoff` with `outcome: "needs_split"` and `reason: <explain the estimated line count and how to split into smaller issues>`
-- If implementing the issue requires a large feature integration that is mainly unrelated to the task, call `handoff` with `outcome: "needs_split"` and `reason: <explain why the issue is too broad and how to split it>`"#,
+  * Otherwise, report that the issue needs splitting and explain the estimated line count and decomposition
+- If implementing the issue requires a large feature integration that is mainly unrelated to the task, report that the issue needs splitting and explain why it is too broad."#,
         get_evidence_bound_scope_bullets(),
         line_context,
         if is_continuation {
@@ -6186,26 +6166,8 @@ fn get_scope_rules(is_continuation: bool) -> String {
     )
 }
 
-fn get_output_format() -> &'static str {
-    r#"MANDATORY OUTPUT — call the `handoff` tool. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call `handoff` exactly once when you're done.
-
-Set `outcome` to the ONE branch that describes how this run ended, and send only that branch's fields. Sending another branch's fields is rejected and you will be asked to call the tool again.
-
-- `outcome: "implemented"` — you made the code changes. Potlatch commits, pushes, and opens the merge request. Fields:
-  - `mr_title` (string): Short title (max 8-10 words) stating the main feature or fix. Focus on WHAT, not HOW or HOW MUCH. No markdown, no **, no backticks.
-  - `mr_description` (string): Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections.
-  - `changes_summary` (string): A concise sentence summarizing the substance of the changes.
-- `outcome: "existing_mr"` — an already-open MR implements this issue, so no new MR should be created. Field: `existing_mr_iid` (integer, required). Potlatch tracks that MR as this issue's MR.
-- `outcome: "wait_dependency"` — the work is hard-blocked until another issue closes. Field: `depends_on_issue` (integer, required). Only use this when the dependency is real and your work genuinely cannot proceed. Potlatch parks this issue until the dependency closes, then resumes it automatically.
-- `outcome: "needs_split"` — the issue is too broad for one MR. Fields: `reason` (string, required) with the estimated line count and how to split it, and optional `public_comment`.
-- `outcome: "needs_clarification"` — information you cannot infer is missing. Fields: `reason` (string, required) stating exactly what input is needed and why, and optional `public_comment`.
-- `outcome: "cannot_implement"` — the issue cannot be implemented as specified for any other reason. Fields: `reason` (string, required), and optional `public_comment`.
-
-`public_comment` replaces `reason` as the text Potlatch posts on the issue; use it when the human-facing wording should differ from your internal explanation.
-
-Do NOT put public-comment text inside `mr_description` — the MR description must be plain documentation (goal, implementation, testing); reply text belongs in the `public_comment` field.
-
-NOTES.MD (agent-maintained in the repo — edit before you finish **only if** you earn real bullets):
+fn get_notes_rules() -> &'static str {
+    r#"NOTES.MD (agent-maintained in the repo — edit before you finish **only if** you earn real bullets):
 - Open or create notes.md at the repository root. Append **0–3** new "- " lines this run (often **0**). Each line is **one** short sentence capturing a **genuine surprise, near-mistake, or emotional friction** from the run — something you almost got wrong or that wasted time — expressed so a stranger learns the *habit of noticing*, not the *contents of this MR*.
 
 HARD REJECT (if a line violates any of these, delete it — do not append):
@@ -6223,7 +6185,7 @@ BAD STYLE (examples of rubbish — do not imitate):
 - In-repo code tours (paths, classes, long semicolon chains).
 - "Timeless" bullets that are really your MR summary: composable naming over literals, property vs field assumptions, stub heavy imports, or environment wiring — unless each line names a **non-obvious failure mode you personally hit** in **one** concrete clause (still without paths or symbol names).
 
-Stay concise; no secrets. That file is committed with your other changes. Never paste or quote any text from notes.md into `mr_title`, `mr_description`, `public_comment`, or anywhere on GitLab — those surfaces are for humans/reviewers only."#
+Stay concise; no secrets. That file is committed with your other changes. Never paste or quote any text from notes.md into MR metadata, issue comments, or merge request comments."#
 }
 
 fn extract_split_reason(blocked: &BlockedOutcome) -> String {
@@ -6350,6 +6312,16 @@ fn extract_mr_description(mr_description: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::core::agent::schema::conformance;
+
+    #[test]
+    fn worker_notes_rules_do_not_redeclare_the_structured_output_contract() {
+        let rules = get_notes_rules();
+
+        assert!(rules.contains("NOTES.MD"));
+        assert!(!rules.contains("handoff"));
+        assert!(!rules.contains("outcome"));
+        assert!(!rules.contains("output contract"));
+    }
 
     // -----------------------------------------------------------------
     // Session persistence: tolerant policy. Corrupt/unsupported session

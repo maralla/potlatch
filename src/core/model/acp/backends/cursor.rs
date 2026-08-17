@@ -7,7 +7,7 @@
 //! when the backend is the Cursor CLI.
 //!
 //! Implements [`AcpVendorExtension`] and [`AcpVendorState`] from
-//! [`super::vendor`]. The runtime creates a [`CursorExtension`] when the model
+//! [`super`]. The runtime creates a [`CursorExtension`] when the model
 //! URI vendor is `cursor`; all vendor-specific logic stays here.
 
 use std::sync::Arc;
@@ -19,13 +19,13 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use super::capabilities::{AskAnswer, AskChoice, AskQuestion, CapabilityProvider};
-use super::client::AcpClient;
-use super::types::{
+use super::super::capabilities::{AskAnswer, AskChoice, AskQuestion, CapabilityProvider};
+use super::super::client::AcpClient;
+use super::super::types::{
     InitializeResult, NewSessionResult, SessionModeStateBrief, mode_id_is_available,
     select_option_allows_value, session_mode_config_option,
 };
-use super::vendor::{AcpVendorExtension, AcpVendorState};
+use super::{AcpVendorExtension, AcpVendorState};
 
 // ---------------------------------------------------------------------------
 // Headless replies for cursor/* extension requests

@@ -87,7 +87,7 @@ impl StructuredOutput for ReviewerOutput {
     }
 
     fn tool_description() -> &'static str {
-        "Emit your review decision as structured JSON. This is the canonical output channel. Call this exactly once with the decision and the fields that decision allows. For approvals, keep `summary` to ONE LINE — do NOT write a multi-paragraph review narrative."
+        "The final merge-request review decision. Approval summaries must stay on one line."
     }
 
     fn schema() -> Schema {
@@ -1732,13 +1732,6 @@ FILE HYGIENE (STRICT — reject if violated):
 - Files must be placed in the correct directory according to the project's conventions. A test file must live in the designated test directory, configuration files in the config directory, etc. If a file is in the wrong location, request it be moved before approving.
 - Do NOT allow leftover artifacts: generated files that should be gitignored, editor config files, OS-specific metadata files (e.g. .DS_Store, Thumbs.db), or log files.
 - If unsure whether a file belongs, check the project structure and AGENTS.md for conventions.
-
-After your review, call the `review` tool exactly once with your decision. This tool call is the only output channel Potlatch reads — there is no text-based fallback.
-
-- `decision` (required): "approve" if the MR is good to merge, "request_changes" if changes are needed.
-- `summary` (for approve): ignored — the posted GitLab comment is always just 'LGTM'. You may leave this empty.
-- `feedback` (for request_changes): specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads.
-- `public_comment` (optional): human-facing GitLab comment text for explanations or recommendations that don't require code changes. Only final public comment text; no progress/status/tool logs.
 
 Proceed with the review autonomously. Do not ask for any user input.
 "#,

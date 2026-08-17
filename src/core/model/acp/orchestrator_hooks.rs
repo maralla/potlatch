@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use super::backends::AcpVendorState;
 use super::client::{AcpHooks, headless_agent_request_result};
-use super::vendor::AcpVendorState;
 use super::workspace_read::{read_text_file_under_workspace, slice_by_line_range};
 
 /// Accumulates `agent_message_chunk` text; auto-approves tool permissions.

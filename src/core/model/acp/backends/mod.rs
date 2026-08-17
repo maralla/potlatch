@@ -1,13 +1,15 @@
-//! Vendor extension abstraction for the ACP runtime.
+//! ACP backend abstraction and implementations.
 //!
 //! Vendors (e.g. Cursor CLI, potlatch harness) provide protocol extensions beyond
 //! the standard ACP spec. This module defines traits that the generic ACP
 //! runtime calls through at each lifecycle stage, so vendor-specific method names
 //! (e.g. `cursor/ask_question`, `session/inject`) never appear in generic code.
 //!
-//! Vendor selection lives in [`resolve_vendor_extension`]; the runtime calls it
-//! with the model URI and receives the right extension (or `None`). The
-//! implementations live in [`super::cursor`] and [`super::potlatch`].
+//! Vendor selection lives here; generic runtime code sees only the traits.
+
+pub mod potlatch;
+pub mod cursor;
+pub mod default;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -18,6 +20,38 @@ use serde_json::Value;
 use super::capabilities::CapabilityProvider;
 use super::client::AcpClient;
 use super::types::{NewSessionResult, SessionModeStateBrief};
+
+/// Backend-specific presentation and capture of a neutral structured-output
+/// contract. Backends that understand Potlatch's ACP extension receive real
+/// tools; every other ACP vendor gets a marker envelope generated from the
+/// same schema.
+pub(super) trait StructuredOutputBackend: Send + Sync {
+    /// Add this vendor's structured-output instructions to a task/repair
+    /// prompt. Tool-capable vendors leave the role prompt untouched.
+    fn prepare_prompt(&self, prompt: &str, tools: &[Value]) -> String;
+
+    /// Tool definitions to expose through `session/new`, if supported.
+    fn session_tools(&self, tools: &[Value]) -> Option<Vec<Value>>;
+
+    /// Recover structured values from the final response. Tool-capable
+    /// vendors return them through the protocol instead.
+    fn extract_outputs(&self, response: &str) -> Option<Value>;
+}
+
+/// Potlatch's harness implements the structured-output tool extension. Standard
+/// ACP vendors use the portable marker renderer.
+pub(super) fn resolve_structured_output_backend(
+    model_uri: Option<&str>,
+) -> Arc<dyn StructuredOutputBackend> {
+    let uses_tools = model_uri
+        .and_then(|uri| crate::core::config::uri::ModelUri::parse(uri).ok())
+        .is_some_and(|uri| uri.vendor == "potlatch");
+    if uses_tools {
+        Arc::new(potlatch::PotlatchStructuredOutputBackend)
+    } else {
+        Arc::new(default::DefaultBackend)
+    }
+}
 
 /// Per-session vendor state, stored on `StreamTextHooks`.
 ///
@@ -111,14 +145,47 @@ pub(super) fn resolve_vendor_extension(
     model_uri: Option<&str>,
     preferred_session_mode: Option<&'static str>,
 ) -> Option<Arc<dyn AcpVendorExtension>> {
-    if let Some(mut ext) = super::cursor::CursorExtension::new(model_uri) {
+    if let Some(mut ext) = cursor::CursorExtension::new(model_uri) {
         if let Some(mode) = preferred_session_mode {
             ext.set_preferred_session_mode(Some(mode));
         }
         return Some(Arc::new(ext));
     }
-    if let Some(ext) = super::potlatch::PotlatchExtension::new(model_uri) {
+    if let Some(ext) = potlatch::PotlatchExtension::new(model_uri) {
         return Some(Arc::new(ext));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn potlatch_uses_tools_and_other_vendors_use_markers() {
+        let tools = vec![json!({
+            "name": "result",
+            "description": "Result.",
+            "parameters": {"type": "object"}
+        })];
+
+        let potlatch = resolve_structured_output_backend(Some("acp://potlatch/test"));
+        assert_eq!(potlatch.session_tools(&tools), Some(tools.clone()));
+        assert_eq!(potlatch.prepare_prompt("Task.", &tools), "Task.");
+
+        for uri in [
+            None,
+            Some("acp://cursor/composer-2"),
+            Some("acp://other/model"),
+        ] {
+            let backend = resolve_structured_output_backend(uri);
+            assert_eq!(backend.session_tools(&tools), None);
+            assert!(
+                backend
+                    .prepare_prompt("Task.", &tools)
+                    .contains("BREEZE_STRUCTURED_OUTPUT_BEGIN")
+            );
+        }
+    }
 }
