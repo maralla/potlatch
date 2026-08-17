@@ -1061,11 +1061,19 @@ fn process_action_required_issue(
 }
 
 fn build_existing_issues_summary(current_iid: u64, all_issues: &[Issue]) -> String {
+    let mut issues: Vec<&Issue> = all_issues
+        .iter()
+        .filter(|issue| issue.iid != current_iid && issue.state == "opened")
+        .collect();
+    issues.sort_by(|a, b| {
+        a.priority()
+            .cmp(&b.priority())
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.iid.cmp(&a.iid))
+    });
+
     let mut lines = Vec::new();
-    for issue in all_issues {
-        if issue.iid == current_iid || issue.state != "opened" {
-            continue;
-        }
+    for issue in issues {
         let in_progress = issue.labels.contains(&"in-progress".to_string())
             || issue.labels.iter().any(|l| l.starts_with("claimed:"));
         let status = if in_progress { "IN-PROGRESS" } else { "OPEN" };
@@ -2260,6 +2268,36 @@ impl CapabilityProvider for GitLabIssueAskHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_issues_summary_puts_newest_first_within_priority() {
+        let issue = |iid, priority, created_at: &str, state: &str| Issue {
+            iid,
+            title: format!("Issue {iid}"),
+            description: String::new(),
+            labels: vec![format!("priority::{priority}")],
+            state: state.into(),
+            created_at: Some(created_at.into()),
+            updated_at: None,
+        };
+        let issues = vec![
+            issue(10, 1, "2026-01-01T00:00:00Z", "opened"),
+            issue(20, 1, "2026-02-01T00:00:00Z", "opened"),
+            issue(30, 2, "2026-03-01T00:00:00Z", "opened"),
+            issue(40, 1, "2026-04-01T00:00:00Z", "closed"),
+            issue(50, 1, "2026-05-01T00:00:00Z", "opened"),
+        ];
+
+        let summary = build_existing_issues_summary(50, &issues);
+        let newest_priority_one = summary.find("#20").unwrap();
+        let oldest_priority_one = summary.find("#10").unwrap();
+        let priority_two = summary.find("#30").unwrap();
+
+        assert!(newest_priority_one < oldest_priority_one);
+        assert!(oldest_priority_one < priority_two);
+        assert!(!summary.contains("#40"));
+        assert!(!summary.contains("#50"));
+    }
 
     #[test]
     fn build_split_prompt_documents_plan_tool_only() {
