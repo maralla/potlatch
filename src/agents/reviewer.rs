@@ -587,7 +587,7 @@ fn review_merge_request(
         } else {
             let approval_message = extract_approval_message(&agent_output);
             gitlab.add_resolved_mr_discussion(mr.iid, &approval_message)?;
-            gitlab.add_mr_label_with_transient_retries(mr.iid, REVIEWER_APPROVED_LABEL)?;
+            gitlab.add_mr_label_with_retries(mr.iid, REVIEWER_APPROVED_LABEL)?;
             return Ok(ReviewOutcome::ApprovedWithoutMerge);
         }
     } else if reviewer_requests_changes(&agent_output) {

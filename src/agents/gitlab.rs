@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use super::retry::with_transient_retries;
+use super::retry::with_backoff_retries;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -192,7 +192,7 @@ fn resolve_project_id(host: &str, project_path: &str) -> Result<u64> {
     // so a single transient blip (TLS timeout, 502, rate-limit) while N agents race
     // to resolve the same project id would kill agent startup nondeterministically.
     // Wrap it in the same transient-retry policy every other glab call uses.
-    let output = with_transient_retries(
+    let output = with_backoff_retries(
         &format!("resolve GitLab project id for {project_path} on {host}"),
         || {
             let output = Command::new("glab")
@@ -269,7 +269,7 @@ impl GitLabClient {
     }
 
     fn run_api(&self, endpoint: &str, extra_args: &[&str]) -> Result<std::process::Output> {
-        with_transient_retries(&format!("glab api GET {endpoint}"), || {
+        with_backoff_retries(&format!("glab api GET {endpoint}"), || {
             let output = self.run_api_once(endpoint, extra_args)?;
             if !output.status.success() {
                 anyhow::bail!(
@@ -402,7 +402,7 @@ impl GitLabClient {
     }
 
     pub fn list_issues(&self) -> Result<Vec<Issue>> {
-        with_transient_retries("listing open issues", || self.list_issues_pages())
+        with_backoff_retries("listing open issues", || self.list_issues_pages())
     }
 
     fn list_issues_pages(&self) -> Result<Vec<Issue>> {
@@ -690,7 +690,7 @@ impl GitLabClient {
     }
 
     fn fetch_discussions(&self, iid: u64) -> Result<Vec<serde_json::Value>> {
-        with_transient_retries(&format!("fetching MR !{iid} discussions"), || {
+        with_backoff_retries(&format!("fetching MR !{iid} discussions"), || {
             self.fetch_discussions_pages(iid)
         })
     }
@@ -986,11 +986,9 @@ impl GitLabClient {
         Ok(())
     }
 
-    /// Like [`Self::add_mr_label`], but on likely-transient failures (GitLab 5xx, rate limits, etc.)
-    /// sleeps with exponential backoff (capped) and retries until success. Returns `Err` only when
-    /// the error looks permanent (e.g. 401/403/404/400/422) so the caller can log and continue.
-    pub fn add_mr_label_with_transient_retries(&self, iid: u64, label: &str) -> Result<()> {
-        with_transient_retries(&format!("adding label {label:?} to MR !{iid}"), || {
+    /// Like [`Self::add_mr_label`], but retries indefinitely with capped exponential backoff.
+    pub fn add_mr_label_with_retries(&self, iid: u64, label: &str) -> Result<()> {
+        with_backoff_retries(&format!("adding label {label:?} to MR !{iid}"), || {
             self.add_mr_label(iid, label)
         })
     }

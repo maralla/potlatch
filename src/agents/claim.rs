@@ -128,7 +128,7 @@ pub fn try_claim_mr(
 
     debug!("{}: Attempting to claim MR !{}", agent_id, mr_iid);
 
-    gitlab.add_mr_label_with_transient_retries(mr_iid, &claim_label)?;
+    gitlab.add_mr_label_with_retries(mr_iid, &claim_label)?;
 
     let claim_result = (|| -> Result<bool> {
         if sleep(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
