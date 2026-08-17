@@ -77,15 +77,22 @@ pub fn run_periodic_scheduler<A: CoreAgent>(
                 }
             }
 
-            if let Err(e) = agent.run_periodic_task(task.id)
-                && !shutdown.load(Ordering::SeqCst)
-            {
-                tracing::error!(
-                    "{} periodic task {} failed: {}",
-                    agent.agent_id(),
-                    task.id,
-                    e
-                );
+            agent.runtime().mark_busy(task.id);
+            match agent.run_periodic_task(task.id) {
+                Ok(()) => agent.runtime().record_cycle_success(),
+                // A failure caused by shutdown itself isn't a real health
+                // signal — the scheduler is about to exit anyway — so only
+                // degrade and log when shutdown wasn't already requested.
+                Err(e) if !shutdown.load(Ordering::SeqCst) => {
+                    agent.runtime().record_cycle_failure(e.to_string());
+                    tracing::error!(
+                        "{} periodic task {} failed: {}",
+                        agent.agent_id(),
+                        task.id,
+                        e
+                    );
+                }
+                Err(_) => {}
             }
 
             if shutdown.load(Ordering::SeqCst) {
@@ -103,16 +110,34 @@ pub fn run_periodic_scheduler<A: CoreAgent>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
 
     use anyhow::{Result, anyhow};
 
     use super::*;
+    use crate::core::runtime::{AgentRuntime, HealthSnapshot, HealthState};
+
     struct SchedulerAgent {
         shutdown: Arc<AtomicBool>,
+        runtime: AgentRuntime,
         calls: Arc<AtomicUsize>,
         fail_first: bool,
+        /// Health snapshot observed at the start of each `run_periodic_task`
+        /// call, in call order.
+        observed_health: Arc<Mutex<Vec<HealthSnapshot>>>,
+    }
+
+    impl SchedulerAgent {
+        fn new(shutdown: Arc<AtomicBool>, calls: Arc<AtomicUsize>, fail_first: bool) -> Self {
+            Self {
+                runtime: AgentRuntime::new("scheduler-test-0", Arc::clone(&shutdown)),
+                shutdown,
+                calls,
+                fail_first,
+                observed_health: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     impl CoreAgent for SchedulerAgent {
@@ -122,15 +147,15 @@ mod tests {
             "scheduler-test"
         }
 
-        fn agent_id(&self) -> &str {
-            "scheduler-test-0"
-        }
-
-        fn shutdown(&self) -> &Arc<AtomicBool> {
-            &self.shutdown
+        fn runtime(&self) -> &AgentRuntime {
+            &self.runtime
         }
 
         fn run_periodic_task(&mut self, _task_id: &str) -> Result<()> {
+            self.observed_health
+                .lock()
+                .unwrap()
+                .push(self.runtime.health());
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call > 0 || !self.fail_first {
                 self.shutdown.store(true, Ordering::SeqCst);
@@ -172,11 +197,7 @@ mod tests {
     fn scheduler_does_not_run_tasks_after_shutdown() {
         let shutdown = Arc::new(AtomicBool::new(true));
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut agent = SchedulerAgent {
-            shutdown: Arc::clone(&shutdown),
-            calls: Arc::clone(&calls),
-            fail_first: false,
-        };
+        let mut agent = SchedulerAgent::new(Arc::clone(&shutdown), Arc::clone(&calls), false);
 
         run_periodic_scheduler(&mut agent, &[task(0)], &shutdown).unwrap();
 
@@ -187,11 +208,7 @@ mod tests {
     fn scheduler_continues_after_task_error_until_shutdown() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut agent = SchedulerAgent {
-            shutdown: Arc::clone(&shutdown),
-            calls: Arc::clone(&calls),
-            fail_first: true,
-        };
+        let mut agent = SchedulerAgent::new(Arc::clone(&shutdown), Arc::clone(&calls), true);
 
         run_periodic_scheduler(&mut agent, &[task(0)], &shutdown).unwrap();
 
@@ -202,14 +219,66 @@ mod tests {
     fn zero_jitter_runs_without_random_range_panic() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut agent = SchedulerAgent {
-            shutdown: Arc::clone(&shutdown),
-            calls: Arc::clone(&calls),
-            fail_first: false,
-        };
+        let mut agent = SchedulerAgent::new(Arc::clone(&shutdown), Arc::clone(&calls), false);
 
         run_periodic_scheduler(&mut agent, &[task(0)], &shutdown).unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn task_runs_with_health_marked_busy() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = SchedulerAgent::new(Arc::clone(&shutdown), Arc::clone(&calls), false);
+        let observed = Arc::clone(&agent.observed_health);
+
+        run_periodic_scheduler(&mut agent, &[task(0)], &shutdown).unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].state, HealthState::Busy("poll".to_string()));
+    }
+
+    #[test]
+    fn successful_cycle_resets_consecutive_failures_and_returns_to_idle() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = SchedulerAgent::new(Arc::clone(&shutdown), Arc::clone(&calls), false);
+        let runtime = agent.runtime.clone();
+
+        run_periodic_scheduler(&mut agent, &[task(0)], &shutdown).unwrap();
+
+        let health = runtime.health();
+        assert_eq!(health.state, HealthState::Idle);
+        assert_eq!(health.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn failed_cycle_is_recorded_as_degraded_before_a_later_success_resets_it() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = SchedulerAgent::new(Arc::clone(&shutdown), Arc::clone(&calls), true);
+        let observed = Arc::clone(&agent.observed_health);
+        let runtime = agent.runtime.clone();
+
+        run_periodic_scheduler(&mut agent, &[task(0)], &shutdown).unwrap();
+
+        // Snapshot taken at the start of the second call reflects the first
+        // call's recorded failure.
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[1].consecutive_failures, 1);
+        assert_eq!(
+            observed[1].last_error.as_deref(),
+            Some("expected cycle failure")
+        );
+
+        // The scheduler kept running the agent after the failure (this is
+        // not a restart) and the later success reset the failure counter.
+        let health = runtime.health();
+        assert_eq!(health.state, HealthState::Idle);
+        assert_eq!(health.consecutive_failures, 0);
+        assert_eq!(health.last_error.as_deref(), Some("expected cycle failure"));
     }
 }

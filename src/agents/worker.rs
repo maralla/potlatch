@@ -8,20 +8,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::{
     claim, issue_in_scope, strip_internal_markers, strip_public_comment_blocks,
     write_task_context_file,
 };
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{GitLabClient, Issue};
-use crate::agents::workspace::{GitLabAgentBootstrap, gitlab_banner};
+use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
+use crate::core::agent::schema::tagged;
 use crate::core::agent::{
-    AgentModel, CoreAgent, InvokeOptions, ModelPreferences, ObjectSchema, SchemaField,
-    StructuredOutput,
+    AgentModel, CoreAgent, InvokeOptions, ModelPreferences, ObjectSchema, OneOfSchema, Schema,
+    StructuredOutput, compat,
 };
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::periodic::PeriodicTaskSpec;
+use crate::core::runtime::AgentRuntime;
 
 const WORKING_ON_LABEL: &str = "in-progress";
 /// Root-level file updated by Potlatch after each successful worker run (impl or MR feedback).
@@ -36,155 +39,329 @@ const WORKER_REVIEW_ONLY_LABEL: &str = "review-only";
 /// ACP runtime message when `cancel_check` returns true.
 const WORKER_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
 
-fn deserialize_optional_iid<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let iid = value.as_u64().or_else(|| {
-        value
-            .as_str()?
-            .trim()
-            .trim_start_matches(['#', '!'])
-            .parse()
-            .ok()
-    });
-    Ok(iid.filter(|iid| *iid > 0))
-}
+/// The name of the structured-output tool both worker contracts use. An
+/// implementation run and a feedback run are different tasks with different
+/// outcomes, but from the model's side they are the same gesture: hand the
+/// run's result back to Potlatch.
+const HANDOFF_TOOL: &str = "handoff";
 
-fn deserialize_optional_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value.as_bool().or_else(|| {
-        value
-            .as_str()
-            .and_then(|value| value.trim().parse::<bool>().ok())
-    }))
-}
-
-/// The worker's typed structured-output contract. The model calls the
-/// `handoff` tool with these fields; core deserializes the captured JSON
-/// into this type (see [`AgentModel::complete_typed`]). Unlike the
-/// discriminated-union outputs of other roles, the worker's outcome is a
-/// grab-bag of independent signals (a dependency, a split/clarification
-/// request, an existing MR, or ordinary implementation metadata) that the
-/// caller inspects in priority order — so this stays a flat struct with
-/// every field optional, matching the original tool schema.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct WorkerOutput {
+/// Metadata for a merge request the worker actually produced. Every field is
+/// optional because the worker's fallbacks (issue title, placeholder
+/// description) are better defaults than forcing the model to invent text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImplementedMetadata {
     #[serde(default)]
     mr_title: Option<String>,
     #[serde(default)]
     mr_description: Option<String>,
     #[serde(default)]
     changes_summary: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_iid")]
-    depends_on_issue: Option<u64>,
+}
+
+/// Why the worker is handing the run back to a human instead of finishing it.
+/// The discriminator says which kind of blockage it is; `reason` carries the
+/// explanation, and `public_comment` overrides the text posted to GitLab.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlockedOutcome {
+    reason: String,
     #[serde(default)]
-    needs_split: Option<String>,
+    public_comment: Option<String>,
+}
+
+/// Everything a feedback run can report once it has addressed (or decided not
+/// to change anything for) the reviewer's comments.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedbackResolution {
     #[serde(default)]
-    needs_clarification: Option<String>,
+    mr_title: Option<String>,
     #[serde(default)]
-    cannot_implement: bool,
+    mr_description: Option<String>,
     #[serde(default)]
-    cannot_resolve: bool,
+    changes_summary: Option<String>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     public_comment: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    #[serde(default)]
     mark_discussions_resolved: Option<bool>,
     #[serde(default)]
     post_plain_comment: bool,
-    #[serde(default, deserialize_with = "deserialize_optional_iid")]
-    existing_mr_iid: Option<u64>,
 }
 
-impl StructuredOutput for WorkerOutput {
+/// The outcome of a worker *implementation* run, as a tagged union on
+/// `outcome`. The model calls the `handoff` tool; core validates the captured
+/// JSON against [`WorkerImplementationOutput::schema`] and deserializes it
+/// (see [`AgentModel::complete_typed`]). Because the outcomes are branches
+/// rather than independent flags, contradictory combinations — "I implemented
+/// it *and* it needs splitting", "here is an existing MR *and* a dependency"
+/// — cannot be expressed at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerImplementationOutput {
+    /// The work is done in the checked-out branch; here is its MR metadata.
+    Implemented(ImplementedMetadata),
+    /// An already-open MR implements this issue; adopt it instead of
+    /// creating a new one.
+    ExistingMr { existing_mr_iid: u64 },
+    /// The work is hard-blocked on another issue closing first.
+    WaitDependency { depends_on_issue: u64 },
+    /// The issue is too broad and must be split before it can be worked on.
+    NeedsSplit(BlockedOutcome),
+    /// The issue is missing information only a human can supply.
+    NeedsClarification(BlockedOutcome),
+    /// The issue cannot be implemented as specified, for some other reason.
+    CannotImplement(BlockedOutcome),
+}
+
+/// The outcome of a worker *MR feedback* run, as a tagged union on `outcome`.
+/// Same tool name as [`WorkerImplementationOutput`], different contract:
+/// a feedback run cannot request a split or declare a dependency, and only a
+/// feedback run controls discussion resolution and plain comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerFeedbackOutput {
+    /// The reviewer's feedback was handled (in code, in MR metadata, or by
+    /// explaining that the branch already satisfies it).
+    Addressed(FeedbackResolution),
+    /// The feedback cannot be resolved autonomously; abandon the MR.
+    CannotResolve(BlockedOutcome),
+}
+
+impl<'de> Deserialize<'de> for WorkerImplementationOutput {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (outcome, fields) = tagged::parts(deserializer, "outcome")?;
+        match outcome.as_str() {
+            "implemented" => tagged::branch(fields).map(Self::Implemented),
+            "existing_mr" => tagged::branch(fields).map(|wire: ExistingMrWire| Self::ExistingMr {
+                existing_mr_iid: wire.existing_mr_iid,
+            }),
+            "wait_dependency" => {
+                tagged::branch(fields).map(|wire: WaitDependencyWire| Self::WaitDependency {
+                    depends_on_issue: wire.depends_on_issue,
+                })
+            }
+            "needs_split" => tagged::branch(fields).map(Self::NeedsSplit),
+            "needs_clarification" => tagged::branch(fields).map(Self::NeedsClarification),
+            "cannot_implement" => tagged::branch(fields).map(Self::CannotImplement),
+            outcome => Err(serde::de::Error::unknown_variant(
+                outcome,
+                &[
+                    "implemented",
+                    "existing_mr",
+                    "wait_dependency",
+                    "needs_split",
+                    "needs_clarification",
+                    "cannot_implement",
+                ],
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerFeedbackOutput {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (outcome, fields) = tagged::parts(deserializer, "outcome")?;
+        match outcome.as_str() {
+            "addressed" => tagged::branch(fields).map(Self::Addressed),
+            "cannot_resolve" => tagged::branch(fields).map(Self::CannotResolve),
+            outcome => Err(serde::de::Error::unknown_variant(
+                outcome,
+                &["addressed", "cannot_resolve"],
+            )),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExistingMrWire {
+    existing_mr_iid: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitDependencyWire {
+    depends_on_issue: u64,
+}
+
+/// The MR metadata properties shared by the implementation contract's
+/// `implemented` branch and the feedback contract's `addressed` branch.
+fn mr_metadata_properties(schema: ObjectSchema) -> ObjectSchema {
+    schema
+        .property(
+            "mr_title",
+            Schema::string(
+                "Short MR title (max 8-10 words). Focus on WHAT, not HOW. No markdown. Omit to keep the current title.",
+            ),
+        )
+        .property(
+            "mr_description",
+            Schema::string(
+                "Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections.",
+            ),
+        )
+        .property(
+            "changes_summary",
+            Schema::string(
+                "A concise sentence summarizing the substance of the changes you made (used as the commit message).",
+            ),
+        )
+}
+
+/// The `reason` + `public_comment` pair every blocked branch carries.
+fn blocked_properties(schema: ObjectSchema, reason: &str) -> ObjectSchema {
+    schema
+        .required_property("reason", Schema::string(reason.to_string()))
+        .property(
+            "public_comment",
+            Schema::string(
+                "Human-facing GitLab comment text to post instead of `reason`. Omit to post `reason` as-is.",
+            ),
+        )
+}
+
+impl StructuredOutput for WorkerImplementationOutput {
     fn tool_name() -> &'static str {
-        "handoff"
+        HANDOFF_TOOL
     }
 
     fn tool_description() -> &'static str {
-        "Emit your implementation output as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this once when you're done (or when you need to signal a dependency/split/clarification). All fields are optional — include only the ones relevant to your outcome."
+        "Hand your implementation run back to Potlatch as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once, with `outcome` set to the one branch that describes how the run ended, and only that branch's fields."
     }
 
-    fn schema() -> ObjectSchema {
-        ObjectSchema::new()
-            .property(
-                "mr_title",
-                SchemaField::string(
-                    "Short MR title (max 8-10 words). Focus on WHAT, not HOW. No markdown.",
+    fn schema() -> Schema {
+        Schema::one_of(
+            OneOfSchema::new(
+                "outcome",
+                "How the implementation run ended. Pick exactly one and send only that outcome's fields.",
+            )
+            .variant(
+                "implemented",
+                "You made the code changes; Potlatch commits, pushes, and opens the merge request.",
+                mr_metadata_properties(ObjectSchema::new()),
+            )
+            .variant(
+                "existing_mr",
+                "You found an already-open merge request that implements this issue; Potlatch tracks it instead of opening a new one.",
+                ObjectSchema::new().required_property(
+                    "existing_mr_iid",
+                    Schema::integer("IID of the existing open merge request."),
                 ),
             )
-            .property(
-                "mr_description",
-                SchemaField::string(
-                    "Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections.",
+            .variant(
+                "wait_dependency",
+                "The work is hard-blocked until another issue closes; Potlatch parks this issue and resumes it automatically.",
+                ObjectSchema::new().required_property(
+                    "depends_on_issue",
+                    Schema::integer(
+                        "IID of the issue that must close before this work can proceed.",
+                    ),
                 ),
             )
-            .property(
-                "changes_summary",
-                SchemaField::string(
-                    "A concise sentence summarizing the substance of changes made (for commit messages).",
-                ),
-            )
-            .property(
-                "depends_on_issue",
-                SchemaField::integer(
-                    "IID of a dependency issue that must close before this work can proceed. Set when the issue is hard-blocked on another open issue.",
-                ),
-            )
-            .property(
+            .variant(
                 "needs_split",
-                SchemaField::string("Reason the issue needs splitting into smaller issues."),
+                "The issue is too broad for one merge request and must be split first.",
+                blocked_properties(
+                    ObjectSchema::new(),
+                    "The estimated line count and how to split the issue into smaller, focused issues.",
+                ),
             )
-            .property(
+            .variant(
                 "needs_clarification",
-                SchemaField::string("What information is needed from a human to proceed."),
+                "The issue is missing information you cannot infer; a human must answer before you can proceed.",
+                blocked_properties(
+                    ObjectSchema::new(),
+                    "Precisely what information is needed and why you cannot proceed without it.",
+                ),
             )
-            .property(
+            .variant(
                 "cannot_implement",
-                SchemaField::boolean(
-                    "Set to true when the issue cannot be implemented (too broad, unclear, blocked).",
+                "The issue cannot be implemented as specified for some other reason (contradictory requirements, no resource-safe approach).",
+                blocked_properties(
+                    ObjectSchema::new(),
+                    "Why the issue cannot be implemented as specified.",
                 ),
+            ),
+        )
+    }
+
+    /// Tolerated: an outcome spelled with different case or padding, and an
+    /// IID sent as `"#7"` / `"!12"` instead of a number.
+    fn normalize(value: &mut serde_json::Value) {
+        compat::normalize_tag(value, "outcome");
+        compat::normalize_iid(value, "existing_mr_iid");
+        compat::normalize_iid(value, "depends_on_issue");
+    }
+}
+
+impl StructuredOutput for WorkerFeedbackOutput {
+    fn tool_name() -> &'static str {
+        HANDOFF_TOOL
+    }
+
+    fn tool_description() -> &'static str {
+        "Hand your merge-request feedback run back to Potlatch as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once, with `outcome` set to the one branch that describes how the run ended, and only that branch's fields."
+    }
+
+    fn schema() -> Schema {
+        Schema::one_of(
+            OneOfSchema::new(
+                "outcome",
+                "How the feedback run ended. Pick exactly one and send only that outcome's fields.",
             )
-            .property(
+            .variant(
+                "addressed",
+                "You handled the reviewer feedback — in code, in merge request metadata, or by explaining that the branch already satisfies it.",
+                mr_metadata_properties(ObjectSchema::new())
+                    .property(
+                        "reason",
+                        Schema::string(
+                            "Why no code change was needed, when you resolved the feedback without touching the branch.",
+                        ),
+                    )
+                    .property(
+                        "public_comment",
+                        Schema::string(
+                            "The exact human-facing reply to post on the review threads. Only the final comment text — no progress updates, no command output.",
+                        ),
+                    )
+                    .property(
+                        "mark_discussions_resolved",
+                        Schema::boolean(
+                            "Whether Potlatch may mark the open review discussions resolved after posting your reply. Omit to let Potlatch infer it from whether the branch changed.",
+                        ),
+                    )
+                    .property(
+                        "post_plain_comment",
+                        Schema::boolean(
+                            "Whether to post a new plain (non-resolvable) merge request comment with your reply.",
+                        ),
+                    ),
+            )
+            .variant(
                 "cannot_resolve",
-                SchemaField::boolean(
-                    "Set to true when reviewer feedback cannot be resolved autonomously.",
+                "The feedback cannot be resolved autonomously; Potlatch abandons the merge request and reports back.",
+                blocked_properties(
+                    ObjectSchema::new(),
+                    "Why the feedback cannot be resolved and what human input is needed.",
                 ),
-            )
-            .property(
-                "reason",
-                SchemaField::string(
-                    "Explanation for cannot_implement, cannot_resolve, or no-code-changes.",
-                ),
-            )
-            .property(
-                "public_comment",
-                SchemaField::string(
-                    "Human-facing GitLab comment text (separate from MR description).",
-                ),
-            )
-            .property(
-                "mark_discussions_resolved",
-                SchemaField::boolean(
-                    "Whether to mark open review discussions as resolved after your reply.",
-                ),
-            )
-            .property(
-                "post_plain_comment",
-                SchemaField::boolean("Whether to post a new plain MR comment (non-resolvable)."),
-            )
-            .property(
-                "existing_mr_iid",
-                SchemaField::integer(
-                    "IID of an existing open MR that already implements this issue (discovered during work). Set this instead of creating a new MR when you find the issue is already implemented by an existing MR. The system will track it as this issue's MR.",
-                ),
-            )
+            ),
+        )
+    }
+
+    /// Tolerated: an outcome spelled with different case or padding, and the
+    /// comment-control booleans sent as `"true"`/`"false"` strings.
+    fn normalize(value: &mut serde_json::Value) {
+        compat::normalize_tag(value, "outcome");
+        compat::normalize_bool(value, "mark_discussions_resolved");
+        compat::normalize_bool(value, "post_plain_comment");
     }
 }
 
@@ -212,7 +389,7 @@ impl WorkerAgentSettings {
 }
 
 /// The single issue a worker is pinned to for its full lifecycle.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveIssue {
     issue_iid: u64,
     mr_iid: Option<u64>,
@@ -220,27 +397,53 @@ struct ActiveIssue {
     mr_created: bool,
 }
 
-struct AgentState {
-    project_name: String,
-    agent_id: String,
-    sessions_dir: String,
+/// A borrowing view over the [`GitLabAgentRuntime`] fields the worker cycle
+/// needs. Built fresh from `&GitLabAgentRuntime` at each use site rather
+/// than stored, so the worker never owns a second `GitRepo`/`GitLabClient`
+/// — and, since it is never stored alongside the runtime it borrows from,
+/// it can't become self-referential.
+struct AgentState<'a> {
+    project_name: &'a str,
+    agent_id: &'a str,
+    sessions_dir: &'a str,
 
-    git_repo: GitRepo,
-    glab: GitLabClient,
+    git_repo: &'a GitRepo,
+    glab: &'a GitLabClient,
 }
 
-impl AgentState {
+impl AgentState<'_> {
+    fn from_runtime(runtime: &GitLabAgentRuntime) -> AgentState<'_> {
+        AgentState {
+            project_name: &runtime.project_name,
+            agent_id: &runtime.agent_id,
+            sessions_dir: &runtime.sessions_dir,
+            git_repo: &runtime.git_repo,
+            glab: &runtime.gitlab,
+        }
+    }
+
     fn session_file_path(&self, issue_iid: u64) -> std::path::PathBuf {
         Path::new(&self.sessions_dir).join(format!("{}_issue_{}.json", &self.agent_id, issue_iid))
     }
 
-    fn session_store(&self, issue_iid: u64) -> crate::core::state::StateStore<SessionFile> {
-        crate::core::state::StateStore::new(self.session_file_path(issue_iid))
+    fn session_store(&self, issue_iid: u64) -> crate::agents::state::StateStore<SessionFile> {
+        crate::agents::state::StateStore::new(self.session_file_path(issue_iid))
     }
 
     fn load_session(&self, issue_iid: u64) -> Option<SessionFile> {
-        // Session corruption has historically been treated as a missing session.
-        self.session_store(issue_iid).load().ok().flatten()
+        // Session corruption has historically been treated as a missing
+        // session: tolerant, warn and fall back rather than failing the
+        // worker cycle over a persistence problem.
+        match self.session_store(issue_iid).load() {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(
+                    "{}: Failed to load session for issue #{}: {:#}",
+                    &self.agent_id, issue_iid, error
+                );
+                None
+            }
+        }
     }
 
     fn load_implementation_summary(&self, issue_number: u64) -> String {
@@ -266,7 +469,7 @@ impl AgentState {
         let session = SessionFile {
             issue_iid,
             mr_iid,
-            agent_id: Some(self.agent_id.clone()),
+            agent_id: Some(self.agent_id.to_string()),
             implementation_summary: None,
         };
 
@@ -280,7 +483,7 @@ impl AgentState {
         let session = SessionFile {
             issue_iid,
             mr_iid,
-            agent_id: Some(self.agent_id.clone()),
+            agent_id: Some(self.agent_id.to_string()),
             implementation_summary: Some(summary.to_string()),
         };
 
@@ -296,7 +499,7 @@ impl AgentState {
             &self.agent_id, issue_iid, WORKER_PENDING_LABEL
         );
 
-        let _ = claim::release_claim(&self.glab, issue_iid, &self.agent_id);
+        let _ = claim::release(self.glab, ClaimResource::Issue(issue_iid), self.agent_id);
         let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
         self.cleanup_session(issue_iid);
     }
@@ -322,7 +525,7 @@ impl AgentState {
         let _ = self.git_repo.checkout_remote_branch(&default_branch);
         let _ = self.git_repo.delete_local_branch(&branch);
 
-        let _ = claim::release_claim(&self.glab, issue_iid, &self.agent_id);
+        let _ = claim::release(self.glab, ClaimResource::Issue(issue_iid), self.agent_id);
         let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
         self.cleanup_session(issue_iid);
@@ -351,7 +554,7 @@ impl AgentState {
         let _ = self.git_repo.checkout_remote_branch(&default_branch);
         let _ = self.git_repo.delete_local_branch(&branch);
         self.git_repo.delete_remote_branch_best_effort(&branch);
-        let _ = claim::release_claim(&self.glab, issue_iid, &self.agent_id);
+        let _ = claim::release(self.glab, ClaimResource::Issue(issue_iid), self.agent_id);
         let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
         self.cleanup_session(issue_iid);
@@ -377,10 +580,8 @@ impl AgentState {
 }
 
 pub(crate) struct WorkerAgent {
-    state: AgentState,
-    model: AgentModel,
+    runtime: GitLabAgentRuntime,
     config: WorkerConfig,
-    scope_label: String,
     active: Option<ActiveIssue>,
 }
 
@@ -391,12 +592,8 @@ impl CoreAgent for WorkerAgent {
         "worker"
     }
 
-    fn agent_id(&self) -> &str {
-        &self.state.agent_id
-    }
-
-    fn shutdown(&self) -> &Arc<AtomicBool> {
-        self.model.shutdown()
+    fn runtime(&self) -> &AgentRuntime {
+        &self.runtime.core
     }
 
     fn banner(config: &Config, banner: &mut Banner) {
@@ -419,10 +616,11 @@ impl CoreAgent for WorkerAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "gitlab_poll" => {
-                let scope = crate::agents::scope_label_filter(&self.scope_label);
-                let model = &self.model;
+                let scope = crate::agents::scope_label_filter(&self.runtime.scope_label);
+                let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
-                worker_cycle(&self.state, model, &mut self.active, &shutdown, scope)
+                let state = AgentState::from_runtime(&self.runtime);
+                worker_cycle(&state, model, &mut self.active, &shutdown, scope)
             }
             _ => Ok(()),
         }
@@ -435,55 +633,43 @@ impl CoreAgent for WorkerAgent {
             .agent("worker")
             .context("[agent.worker] section required")?;
         let settings = WorkerAgentSettings::from_raw(&section.raw)?;
-        let runtime = GitLabAgentBootstrap::new(
-            &ctx,
-            "worker",
-            ModelPreferences {
-                structured_output_tools: Some(vec![WorkerOutput::tool_definition()]),
-                ..ModelPreferences::default()
-            },
-        )
-        .build()?;
-        let state = AgentState {
-            project_name: runtime.project_name,
-            agent_id: runtime.agent_id,
-            sessions_dir: runtime.sessions_dir,
-            git_repo: runtime.git_repo,
-            glab: runtime.gitlab,
-        };
+        let runtime =
+            GitLabAgentBootstrap::new(&ctx, "worker", ModelPreferences::default()).build()?;
         let config = WorkerConfig {
             poll_interval_secs: settings.poll_interval_secs,
         };
         let scope = crate::agents::scope_label_filter(&runtime.scope_label);
-        let mut active =
-            try_resume_session(&state, scope).or_else(|| find_claimed_issue(&state, scope));
-        active = clear_resumed_issue_if_ignored(&state, active, scope);
-        if let Some(ref a) = active {
-            if let Some(mr_iid) = a.mr_iid {
-                info!(
-                    "{}: Resumed issue #{} with MR !{}",
-                    &state.agent_id, a.issue_iid, mr_iid
-                );
-            } else {
-                info!(
-                    "{}: Resumed issue #{} (no MR yet)",
-                    &state.agent_id, a.issue_iid
-                );
+        let active = {
+            let state = AgentState::from_runtime(&runtime);
+            let mut active =
+                try_resume_session(&state, scope).or_else(|| find_claimed_issue(&state, scope));
+            active = clear_resumed_issue_if_ignored(&state, active, scope);
+            if let Some(ref a) = active {
+                if let Some(mr_iid) = a.mr_iid {
+                    info!(
+                        "{}: Resumed issue #{} with MR !{}",
+                        &state.agent_id, a.issue_iid, mr_iid
+                    );
+                } else {
+                    info!(
+                        "{}: Resumed issue #{} (no MR yet)",
+                        &state.agent_id, a.issue_iid
+                    );
+                }
             }
-        }
+            active
+        };
         Ok(Self {
-            state,
-            model: runtime.model,
+            runtime,
             config,
-            scope_label: runtime.scope_label,
             active,
         })
     }
 
     fn on_shutdown(&mut self) {
-        info!("{}: Shutting down, cleaning up...", self.state.agent_id);
-        self.state.cleanup_on_shutdown(&self.active);
-        info!("{}: Stopped", self.state.agent_id);
+        info!("{}: Shutting down, cleaning up...", self.runtime.agent_id);
+        AgentState::from_runtime(&self.runtime).cleanup_on_shutdown(&self.active);
+        info!("{}: Stopped", self.runtime.agent_id);
     }
 }
 
@@ -555,66 +741,1549 @@ fn clear_resumed_issue_if_ignored(
     Some(active_issue)
 }
 
-/// Returns `true` when the worker should keep watching the active MR issue.
-/// On release, clears `active` and returns `false` so the cycle can poll for new work.
-fn retain_active_mr_issue(
-    state: &AgentState,
-    active_issue: &ActiveIssue,
-    active: &mut Option<ActiveIssue>,
-    scope_label: Option<&str>,
-) -> bool {
-    let Some(mr_iid) = active_issue.mr_iid else {
-        return true;
-    };
+// ---------------------------------------------------------------------------
+// Worker routing port
+// ---------------------------------------------------------------------------
 
-    let issue = match state.glab.get_issue(active_issue.issue_iid) {
-        Ok(issue) => issue,
-        Err(e) => {
-            warn!(
-                "{}: Failed to verify active issue #{}: {}, releasing worker state",
-                &state.agent_id, active_issue.issue_iid, e
-            );
-            state.clear_resumed_issue_state(active_issue.issue_iid);
-            *active = None;
-            return false;
-        }
-    };
-
-    if issue.state != "opened" {
-        state.abandon_closed_issue(active_issue.issue_iid, Some(mr_iid));
-        *active = None;
-        return false;
-    }
-
-    if !issue_in_scope(&issue, scope_label) {
-        info!(
-            "{}: Issue #{} left scope label {:?}, releasing worker state",
-            &state.agent_id, active_issue.issue_iid, scope_label
-        );
-        state.clear_resumed_issue_state(active_issue.issue_iid);
-        *active = None;
-        return false;
-    }
-
-    if issue_has_worker_pending_label(&issue.labels) {
-        info!(
-            "{}: Issue #{} has `{}` — stopping MR watch (issue stays open)",
-            &state.agent_id, active_issue.issue_iid, WORKER_PENDING_LABEL
-        );
-        state.clear_resumed_issue_state(active_issue.issue_iid);
-        *active = None;
-        return false;
-    }
-
-    if issue_has_worker_review_only_label(&issue.labels) {
-        state.release_worker_hold_review_only(active_issue.issue_iid);
-        *active = None;
-        return false;
-    }
-
-    true
+/// Immutable snapshot of the issue fields worker decisions read. Role-local
+/// on purpose: the worker machine never holds a general GitLab object, and
+/// it cannot mutate what it observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssueObservation {
+    iid: u64,
+    title: String,
+    description: String,
+    state: String,
+    labels: Vec<String>,
 }
 
+impl IssueObservation {
+    fn from_issue(issue: &Issue) -> Self {
+        Self {
+            iid: issue.iid,
+            title: issue.title.clone(),
+            description: issue.description.clone(),
+            state: issue.state.clone(),
+            labels: issue.labels.clone(),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.state == "opened"
+    }
+
+    fn in_scope(&self, scope_label: Option<&str>) -> bool {
+        super::issue_labels_in_scope(&self.labels, scope_label)
+    }
+}
+
+/// The only thing routing needs to know about a merge request it is
+/// watching: whether it is still open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MrStatusObservation {
+    iid: u64,
+    state: String,
+}
+
+impl MrStatusObservation {
+    fn is_finished(&self) -> bool {
+        self.state == "merged" || self.state == "closed"
+    }
+
+    fn is_merged(&self) -> bool {
+        self.state == "merged"
+    }
+}
+
+/// One question the routing machine asks before it decides anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerQuery {
+    ShutdownRequested,
+    Issue {
+        issue_iid: u64,
+    },
+    MergeRequestStatus {
+        mr_iid: u64,
+    },
+    Issues,
+    /// The default branch, falling back to `main` — a read the worker never
+    /// fails a cycle over.
+    DefaultBranchOrMain,
+}
+
+/// The answer to one [`WorkerQuery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerFact {
+    ShutdownRequested(bool),
+    Issue(IssueObservation),
+    MergeRequestStatus(MrStatusObservation),
+    Issues(Vec<IssueObservation>),
+    DefaultBranchOrMain(String),
+}
+
+/// A single side effect the routing machine asks the port to perform.
+///
+/// Composite variants (`ClearIssueState`, `AbandonClosedIssue`,
+/// `ReleaseReviewOnlyHold`, `RunImplementation`, `RunFeedback`,
+/// `AdoptOrphanedSession`, `HandleNeedAiWorkerMr`, `ResolveCancelledIssue`)
+/// stand for one existing deep helper each: the helper stays the executor
+/// and keeps its own internal mutation order, while the decision to run it
+/// at this point in the cycle is the machine's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerAction {
+    ResetWorktree,
+    CheckoutBranch {
+        branch: String,
+    },
+    DeleteLocalBranch {
+        branch: String,
+    },
+    DeleteRemoteBranch {
+        branch: String,
+    },
+    ReleaseIssueClaim {
+        issue_iid: u64,
+    },
+    RemoveWorkingOnLabel {
+        issue_iid: u64,
+    },
+    RemoveIssueLabel {
+        issue_iid: u64,
+        label: String,
+    },
+    CleanupSession {
+        issue_iid: u64,
+    },
+    SaveSession {
+        issue_iid: u64,
+        mr_iid: u64,
+    },
+    CloseIssue {
+        issue_iid: u64,
+    },
+    AcquireIssueClaim {
+        issue_iid: u64,
+    },
+    /// Hand the just-won claim over to `active`/the session file: GitLab's
+    /// label stays in place across cycles and restarts.
+    PreserveIssueClaim {
+        issue_iid: u64,
+    },
+    /// Give the just-won claim straight back (shutdown landed).
+    ReleaseAcquiredClaim {
+        issue_iid: u64,
+    },
+    ClearIssueState {
+        issue_iid: u64,
+    },
+    ReleaseReviewOnlyHold {
+        issue_iid: u64,
+    },
+    AbandonClosedIssue {
+        issue_iid: u64,
+        mr_iid: Option<u64>,
+    },
+    AdoptOrphanedSession,
+    HandleNeedAiWorkerMr,
+    RunImplementation {
+        issue: Box<IssueObservation>,
+    },
+    RunFeedback {
+        mr_iid: u64,
+        linked_issue_iid: Option<u64>,
+        comments_only: bool,
+    },
+    ResolveCancelledIssue {
+        issue_iid: u64,
+    },
+    /// Re-read the issue to see whether the worker may keep tracking it,
+    /// releasing a `review-only` hold when it may not.
+    CheckIssueTrackable {
+        issue_iid: u64,
+    },
+}
+
+/// Result of a claim attempt, mirroring [`ClaimAcquireOutcome`] without the
+/// lease: the lease itself lives in the port, which owns claim effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssueClaimAttempt {
+    Won,
+    Lost,
+    Interrupted,
+}
+
+/// What the port reports after executing one [`WorkerAction`].
+enum WorkerOutcome {
+    Done,
+    Failed(anyhow::Error),
+    Claim(IssueClaimAttempt),
+    Adopted(Option<ActiveIssue>),
+    /// `true` when a labeled MR was handled this cycle.
+    HandledNeedAiWorkerMr(bool),
+    /// An implementation run: the in-flight issue as the run left it, plus
+    /// the error when the run failed. Both are needed, because the cleanup
+    /// the cycle performs after a failure depends on how far the run got.
+    Implementation {
+        current: ActiveIssue,
+        error: Option<anyhow::Error>,
+    },
+    /// A feedback run; `abandoned` is the old `Ok(true)`: the MR was closed
+    /// and the issue handed back.
+    Feedback {
+        abandoned: bool,
+    },
+    /// Whether an external cancel signal was handled as an intentional stop.
+    CancelHandled(bool),
+    Trackable(bool),
+}
+
+/// The narrow surface the worker's routing cycle needs. Object-safe and
+/// role-local: the worker's own observe/execute vocabulary rather than a
+/// general GitLab, git, session-store, or model interface.
+trait WorkerRoutingPort {
+    fn shutdown_requested(&self) -> bool;
+    fn issue(&self, issue_iid: u64) -> Result<IssueObservation>;
+    fn merge_request_status(&self, mr_iid: u64) -> Result<MrStatusObservation>;
+    fn issues(&self) -> Result<Vec<IssueObservation>>;
+    fn default_branch_or_main(&self) -> String;
+    fn execute(&mut self, action: &WorkerAction) -> WorkerOutcome;
+}
+
+/// One turn of the routing driver loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerStep {
+    Observe(WorkerQuery),
+    Act(WorkerAction),
+    Finish,
+}
+
+// ---------------------------------------------------------------------------
+// Pure routing decisions
+// ---------------------------------------------------------------------------
+
+/// Whether the worker still owns the issue it is pinned to, and how it lets
+/// go when it does not. Pure — no GitLab call — so the release rules and
+/// their precedence can be characterized without a live client. Shared by
+/// the MR-watch path and the no-MR re-attempt path, which release on
+/// exactly the same conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssueHold {
+    Keep,
+    AbandonClosed,
+    ClearState(ClearReason),
+    ReleaseReviewOnly,
+}
+
+/// Why the worker dropped its local state for an issue. Only the log
+/// differs between these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearReason {
+    OutOfScope,
+    Pending,
+}
+
+fn decide_issue_hold(issue: &IssueObservation, scope_label: Option<&str>) -> IssueHold {
+    if !issue.is_open() {
+        return IssueHold::AbandonClosed;
+    }
+    if !issue.in_scope(scope_label) {
+        return IssueHold::ClearState(ClearReason::OutOfScope);
+    }
+    if issue_has_worker_pending_label(&issue.labels) {
+        return IssueHold::ClearState(ClearReason::Pending);
+    }
+    if issue_has_worker_review_only_label(&issue.labels) {
+        return IssueHold::ReleaseReviewOnly;
+    }
+    IssueHold::Keep
+}
+
+/// What the poll does with one candidate issue. Pure: mirrors the filter
+/// chain in the polling loop, including that the dependency check runs
+/// before the claim check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateScreening {
+    Skip,
+    WaitingOnIssue(u64),
+    Claimable,
+    AlreadyClaimed,
+}
+
+fn screen_issue_candidate(
+    issue: &IssueObservation,
+    scope_label: Option<&str>,
+) -> CandidateScreening {
+    if should_skip_issue(issue) || !issue.in_scope(scope_label) {
+        return CandidateScreening::Skip;
+    }
+    if let Some(dep_issue_iid) = extract_waiting_on_issue_iid(&issue.labels) {
+        return CandidateScreening::WaitingOnIssue(dep_issue_iid);
+    }
+    if claim::is_claimed(&issue.labels) {
+        return CandidateScreening::AlreadyClaimed;
+    }
+    CandidateScreening::Claimable
+}
+
+/// Whether a dependency issue still parks the candidate. A dependency that
+/// GitLab no longer has (404) is treated as resolved: the label is dropped
+/// and the candidate proceeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyDecision {
+    Resolved,
+    StillWaiting,
+    Unknown,
+}
+
+fn decide_dependency(dependency: Result<&IssueObservation, &anyhow::Error>) -> DependencyDecision {
+    match dependency {
+        Ok(dep) if dep.state == "closed" => DependencyDecision::Resolved,
+        Ok(_) => DependencyDecision::StillWaiting,
+        Err(e) if e.to_string().contains("404") => DependencyDecision::Resolved,
+        Err(_) => DependencyDecision::Unknown,
+    }
+}
+
+/// The ordered worktree and GitLab writes that release an issue whose merge
+/// request finished. The order never changes; a merge additionally deletes
+/// the remote branch and closes the issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishedMrStep {
+    ObserveDefaultBranch,
+    ResetWorktree,
+    CheckoutDefaultBranch,
+    DeleteLocalBranch,
+    DeleteRemoteBranch,
+    ReleaseClaim,
+    RemoveWorkingOnLabel,
+    CleanupSession,
+    CloseIssue,
+}
+
+impl FinishedMrStep {
+    fn next(self, merged: bool) -> Option<Self> {
+        let next = match self {
+            Self::ObserveDefaultBranch => Self::ResetWorktree,
+            Self::ResetWorktree => Self::CheckoutDefaultBranch,
+            Self::CheckoutDefaultBranch => Self::DeleteLocalBranch,
+            Self::DeleteLocalBranch if merged => Self::DeleteRemoteBranch,
+            Self::DeleteLocalBranch | Self::DeleteRemoteBranch => Self::ReleaseClaim,
+            Self::ReleaseClaim => Self::RemoveWorkingOnLabel,
+            Self::RemoveWorkingOnLabel => Self::CleanupSession,
+            Self::CleanupSession if merged => Self::CloseIssue,
+            Self::CleanupSession | Self::CloseIssue => return None,
+        };
+        Some(next)
+    }
+}
+
+/// Which releases follow an implementation run that produced no merge
+/// request, or failed. The order of the steps never changes; the plan only
+/// says which of them apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanupPlan {
+    issue_iid: u64,
+    remove_working_label: bool,
+    cleanup_session: bool,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupStep {
+    ReleaseClaim,
+    RemoveWorkingOnLabel,
+    CleanupSession,
+    ObserveDefaultBranch,
+    ResetWorktree,
+    CheckoutDefaultBranch,
+    DeleteLocalBranch,
+}
+
+impl CleanupPlan {
+    fn first(&self) -> CleanupStep {
+        CleanupStep::ReleaseClaim
+    }
+
+    fn next(&self, after: CleanupStep) -> Option<CleanupStep> {
+        let mut step = after;
+        loop {
+            step = match step {
+                CleanupStep::ReleaseClaim => CleanupStep::RemoveWorkingOnLabel,
+                CleanupStep::RemoveWorkingOnLabel => CleanupStep::CleanupSession,
+                CleanupStep::CleanupSession => CleanupStep::ObserveDefaultBranch,
+                CleanupStep::ObserveDefaultBranch => CleanupStep::ResetWorktree,
+                CleanupStep::ResetWorktree => CleanupStep::CheckoutDefaultBranch,
+                CleanupStep::CheckoutDefaultBranch => CleanupStep::DeleteLocalBranch,
+                CleanupStep::DeleteLocalBranch => return None,
+            };
+            let applies = match step {
+                CleanupStep::RemoveWorkingOnLabel => self.remove_working_label,
+                CleanupStep::CleanupSession => self.cleanup_session,
+                CleanupStep::ObserveDefaultBranch
+                | CleanupStep::ResetWorktree
+                | CleanupStep::CheckoutDefaultBranch
+                | CleanupStep::DeleteLocalBranch => self.branch.is_some(),
+                CleanupStep::ReleaseClaim => true,
+            };
+            if applies {
+                return Some(step);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker routing state machine
+// ---------------------------------------------------------------------------
+
+/// Where the routing cycle is. Each variant names the single next
+/// observation, action, or pure transition, so
+/// [`WorkerRoutingMachine::next_step`] is a function of this plus what the
+/// machine already learned — never of the world.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerStage {
+    // The active issue's merge request.
+    ObserveActiveIssue,
+    ObserveActiveMr,
+    ClearIssueStateThen(u64),
+    AbandonClosedIssueThen(u64, Option<u64>),
+    ReleaseReviewOnlyHoldThen(u64),
+    ReleaseFinishedMr(FinishedMrStep),
+    RunActiveFeedback,
+    ReleaseClaimAfterAbandon,
+    CleanupSessionAfterAbandon,
+    ShutdownAfterFeedbackError(String),
+    ResolveCancelledActiveIssue(String),
+    // The active issue that never reached a merge request.
+    ObserveIssueBeforeReattempt,
+    ObserveIssueForReattempt,
+    RunReattemptImplementation,
+    CheckTrackableAfterReattempt,
+    ShutdownAfterImplementationError(String),
+    ResolveCancelledImplementation(String),
+    Cleanup(CleanupStep),
+    // Looking for new work.
+    ShutdownBeforePolling,
+    AdoptOrphanedSession,
+    HandleNeedAiWorkerMr,
+    ObserveIssues,
+    ShutdownAfterIssues,
+    NextCandidate,
+    ShutdownBeforeCandidate,
+    ScreenCandidate,
+    ObserveDependencyIssue(u64),
+    RemoveDependencyLabel(u64),
+    AcquireCandidateClaim,
+    ShutdownAfterCandidateClaim,
+    ReleaseCandidateClaimAtShutdown,
+    PreserveCandidateClaim,
+    SaveCandidatePreSession,
+    RunCandidateImplementation,
+    CheckTrackableAfterCandidate,
+    Finish,
+}
+
+/// What the machine does once the cleanup sequence it is running finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterCleanup {
+    LookForNewWork,
+    Finish,
+}
+
+/// Which of the two implementation paths is in flight. They release
+/// differently after a failed or fruitless run, and log differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplementationPhase {
+    /// The active issue never reached a merge request, so the worker is
+    /// implementing it again.
+    Reattempt,
+    /// A freshly claimed issue from the poll.
+    Candidate,
+}
+
+/// The worker's routing state. Plain data only — no GitLab client, no git
+/// repo, no lease — so every decision is a pure function of what the
+/// machine has observed.
+struct WorkerRoutingMachine<'a> {
+    agent_id: &'a str,
+    scope_label: Option<&'a str>,
+    stage: WorkerStage,
+    active: Option<ActiveIssue>,
+    /// The issue an implementation run is being performed for, as the run
+    /// left it.
+    current: Option<ActiveIssue>,
+    default_branch: String,
+    candidates: std::collections::VecDeque<IssueObservation>,
+    candidate: Option<IssueObservation>,
+    cleanup: Option<(CleanupPlan, AfterCleanup)>,
+    finished_mr_merged: bool,
+    implementation_phase: ImplementationPhase,
+}
+
+impl<'a> WorkerRoutingMachine<'a> {
+    fn new(agent_id: &'a str, scope_label: Option<&'a str>, active: Option<ActiveIssue>) -> Self {
+        let stage = Self::entry_stage(active.as_ref());
+        Self {
+            agent_id,
+            scope_label,
+            stage,
+            active,
+            current: None,
+            default_branch: String::new(),
+            candidates: std::collections::VecDeque::new(),
+            candidate: None,
+            cleanup: None,
+            finished_mr_merged: false,
+            implementation_phase: ImplementationPhase::Candidate,
+        }
+    }
+
+    /// Where a cycle starts: watching the active MR, re-attempting an
+    /// implementation that never produced one, or looking for new work.
+    fn entry_stage(active: Option<&ActiveIssue>) -> WorkerStage {
+        match active {
+            Some(a) if a.mr_iid.is_some() => WorkerStage::ObserveActiveIssue,
+            Some(a) if !a.mr_created => WorkerStage::ObserveIssueBeforeReattempt,
+            _ => WorkerStage::ShutdownBeforePolling,
+        }
+    }
+
+    fn active_issue(&self) -> &ActiveIssue {
+        self.active
+            .as_ref()
+            .expect("active stages run only while an issue is active")
+    }
+
+    fn active_iid(&self) -> u64 {
+        self.active_issue().issue_iid
+    }
+
+    fn candidate(&self) -> &IssueObservation {
+        self.candidate
+            .as_ref()
+            .expect("candidate stages run only after a candidate is picked")
+    }
+
+    /// Drop the active issue and continue to the new-work search, which is
+    /// what every release path in the active phases does.
+    fn release_active(&mut self) -> WorkerStage {
+        self.active = None;
+        WorkerStage::ShutdownBeforePolling
+    }
+
+    fn start_cleanup(&mut self, plan: CleanupPlan, after: AfterCleanup) -> WorkerStage {
+        let first = plan.first();
+        self.cleanup = Some((plan, after));
+        WorkerStage::Cleanup(first)
+    }
+
+    fn advance_cleanup(&mut self, after_step: CleanupStep) -> WorkerStage {
+        let (plan, after) = self
+            .cleanup
+            .as_ref()
+            .expect("cleanup stages run only while a plan is set");
+        match plan.next(after_step) {
+            Some(step) => WorkerStage::Cleanup(step),
+            None => {
+                let after = *after;
+                self.cleanup = None;
+                match after {
+                    AfterCleanup::LookForNewWork => WorkerStage::ShutdownBeforePolling,
+                    AfterCleanup::Finish => WorkerStage::Finish,
+                }
+            }
+        }
+    }
+
+    fn cleanup_plan(&self) -> &CleanupPlan {
+        &self
+            .cleanup
+            .as_ref()
+            .expect("cleanup stages run only while a plan is set")
+            .0
+    }
+
+    /// The single next thing to do. Pure: resolves the stages that need no
+    /// port interaction before handing back an observation or an action.
+    fn next_step(&mut self) -> WorkerStep {
+        loop {
+            match self.stage.clone() {
+                WorkerStage::ObserveActiveIssue | WorkerStage::ObserveIssueBeforeReattempt => {
+                    return WorkerStep::Observe(WorkerQuery::Issue {
+                        issue_iid: self.active_iid(),
+                    });
+                }
+                WorkerStage::ObserveIssueForReattempt => {
+                    return WorkerStep::Observe(WorkerQuery::Issue {
+                        issue_iid: self.active_iid(),
+                    });
+                }
+                WorkerStage::ObserveActiveMr => {
+                    let mr_iid = self
+                        .active_issue()
+                        .mr_iid
+                        .expect("the MR watch runs only for an active issue with an MR");
+                    return WorkerStep::Observe(WorkerQuery::MergeRequestStatus { mr_iid });
+                }
+                WorkerStage::ClearIssueStateThen(issue_iid) => {
+                    return WorkerStep::Act(WorkerAction::ClearIssueState { issue_iid });
+                }
+                WorkerStage::AbandonClosedIssueThen(issue_iid, mr_iid) => {
+                    return WorkerStep::Act(WorkerAction::AbandonClosedIssue { issue_iid, mr_iid });
+                }
+                WorkerStage::ReleaseReviewOnlyHoldThen(issue_iid) => {
+                    return WorkerStep::Act(WorkerAction::ReleaseReviewOnlyHold { issue_iid });
+                }
+                WorkerStage::ReleaseFinishedMr(step) => {
+                    return self.finished_mr_step(step);
+                }
+                WorkerStage::RunActiveFeedback => {
+                    let active = self.active_issue();
+                    return WorkerStep::Act(WorkerAction::RunFeedback {
+                        mr_iid: active
+                            .mr_iid
+                            .expect("the feedback run needs the active issue's MR"),
+                        linked_issue_iid: Some(active.issue_iid),
+                        comments_only: false,
+                    });
+                }
+                WorkerStage::ReleaseClaimAfterAbandon => {
+                    return WorkerStep::Act(WorkerAction::ReleaseIssueClaim {
+                        issue_iid: self.active_iid(),
+                    });
+                }
+                WorkerStage::CleanupSessionAfterAbandon => {
+                    return WorkerStep::Act(WorkerAction::CleanupSession {
+                        issue_iid: self.active_iid(),
+                    });
+                }
+                WorkerStage::ShutdownAfterFeedbackError(_)
+                | WorkerStage::ShutdownAfterImplementationError(_)
+                | WorkerStage::ShutdownBeforePolling
+                | WorkerStage::ShutdownAfterIssues
+                | WorkerStage::ShutdownBeforeCandidate
+                | WorkerStage::ShutdownAfterCandidateClaim => {
+                    return WorkerStep::Observe(WorkerQuery::ShutdownRequested);
+                }
+                WorkerStage::ResolveCancelledActiveIssue(_) => {
+                    return WorkerStep::Act(WorkerAction::ResolveCancelledIssue {
+                        issue_iid: self.active_iid(),
+                    });
+                }
+                WorkerStage::ResolveCancelledImplementation(_) => {
+                    return WorkerStep::Act(WorkerAction::ResolveCancelledIssue {
+                        issue_iid: self.implementation_iid(),
+                    });
+                }
+                WorkerStage::RunReattemptImplementation => {
+                    let issue = self
+                        .candidate
+                        .clone()
+                        .expect("the re-attempt runs against a freshly observed issue");
+                    self.implementation_phase = ImplementationPhase::Reattempt;
+                    return WorkerStep::Act(WorkerAction::RunImplementation {
+                        issue: Box::new(issue),
+                    });
+                }
+                WorkerStage::CheckTrackableAfterReattempt
+                | WorkerStage::CheckTrackableAfterCandidate => {
+                    return WorkerStep::Act(WorkerAction::CheckIssueTrackable {
+                        issue_iid: self.implementation_iid(),
+                    });
+                }
+                WorkerStage::Cleanup(step) => return self.cleanup_step(step),
+                WorkerStage::AdoptOrphanedSession => {
+                    return WorkerStep::Act(WorkerAction::AdoptOrphanedSession);
+                }
+                WorkerStage::HandleNeedAiWorkerMr => {
+                    return WorkerStep::Act(WorkerAction::HandleNeedAiWorkerMr);
+                }
+                WorkerStage::ObserveIssues => return WorkerStep::Observe(WorkerQuery::Issues),
+                WorkerStage::NextCandidate => match self.candidates.pop_front() {
+                    Some(issue) => {
+                        self.candidate = Some(issue);
+                        self.stage = WorkerStage::ShutdownBeforeCandidate;
+                    }
+                    None => self.stage = WorkerStage::Finish,
+                },
+                WorkerStage::ScreenCandidate => {
+                    let issue = self.candidate().clone();
+                    self.stage = match screen_issue_candidate(&issue, self.scope_label) {
+                        CandidateScreening::Skip => WorkerStage::NextCandidate,
+                        CandidateScreening::AlreadyClaimed => {
+                            debug!(
+                                "{}: Issue #{} already claimed, skipping",
+                                self.agent_id, issue.iid
+                            );
+                            WorkerStage::NextCandidate
+                        }
+                        CandidateScreening::WaitingOnIssue(dep) => {
+                            WorkerStage::ObserveDependencyIssue(dep)
+                        }
+                        CandidateScreening::Claimable => WorkerStage::AcquireCandidateClaim,
+                    };
+                }
+                WorkerStage::ObserveDependencyIssue(dep_issue_iid) => {
+                    return WorkerStep::Observe(WorkerQuery::Issue {
+                        issue_iid: dep_issue_iid,
+                    });
+                }
+                WorkerStage::RemoveDependencyLabel(dep_issue_iid) => {
+                    return WorkerStep::Act(WorkerAction::RemoveIssueLabel {
+                        issue_iid: self.candidate().iid,
+                        label: format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{dep_issue_iid}"),
+                    });
+                }
+                WorkerStage::AcquireCandidateClaim => {
+                    return WorkerStep::Act(WorkerAction::AcquireIssueClaim {
+                        issue_iid: self.candidate().iid,
+                    });
+                }
+                WorkerStage::ReleaseCandidateClaimAtShutdown => {
+                    return WorkerStep::Act(WorkerAction::ReleaseAcquiredClaim {
+                        issue_iid: self.candidate().iid,
+                    });
+                }
+                WorkerStage::PreserveCandidateClaim => {
+                    return WorkerStep::Act(WorkerAction::PreserveIssueClaim {
+                        issue_iid: self.candidate().iid,
+                    });
+                }
+                WorkerStage::SaveCandidatePreSession => {
+                    return WorkerStep::Act(WorkerAction::SaveSession {
+                        issue_iid: self.candidate().iid,
+                        mr_iid: 0,
+                    });
+                }
+                WorkerStage::RunCandidateImplementation => {
+                    let issue = self.candidate().clone();
+                    info!(
+                        "{}: Implementing issue #{}: {}",
+                        self.agent_id, issue.iid, issue.title
+                    );
+                    self.implementation_phase = ImplementationPhase::Candidate;
+                    return WorkerStep::Act(WorkerAction::RunImplementation {
+                        issue: Box::new(issue),
+                    });
+                }
+                WorkerStage::Finish => return WorkerStep::Finish,
+            }
+        }
+    }
+
+    /// The issue an implementation run is in flight for — the in-flight
+    /// `current` while it exists, otherwise the candidate it started from.
+    fn implementation_iid(&self) -> u64 {
+        self.current
+            .as_ref()
+            .map(|current| current.issue_iid)
+            .unwrap_or_else(|| self.candidate().iid)
+    }
+
+    fn finished_mr_step(&self, step: FinishedMrStep) -> WorkerStep {
+        let active = self.active_issue();
+        let issue_iid = active.issue_iid;
+        let branch = format!("issue-{issue_iid}");
+        match step {
+            FinishedMrStep::ObserveDefaultBranch => {
+                WorkerStep::Observe(WorkerQuery::DefaultBranchOrMain)
+            }
+            FinishedMrStep::ResetWorktree => WorkerStep::Act(WorkerAction::ResetWorktree),
+            FinishedMrStep::CheckoutDefaultBranch => {
+                WorkerStep::Act(WorkerAction::CheckoutBranch {
+                    branch: self.default_branch.clone(),
+                })
+            }
+            FinishedMrStep::DeleteLocalBranch => {
+                WorkerStep::Act(WorkerAction::DeleteLocalBranch { branch })
+            }
+            FinishedMrStep::DeleteRemoteBranch => {
+                WorkerStep::Act(WorkerAction::DeleteRemoteBranch { branch })
+            }
+            FinishedMrStep::ReleaseClaim => {
+                WorkerStep::Act(WorkerAction::ReleaseIssueClaim { issue_iid })
+            }
+            FinishedMrStep::RemoveWorkingOnLabel => {
+                WorkerStep::Act(WorkerAction::RemoveWorkingOnLabel { issue_iid })
+            }
+            FinishedMrStep::CleanupSession => {
+                WorkerStep::Act(WorkerAction::CleanupSession { issue_iid })
+            }
+            FinishedMrStep::CloseIssue => WorkerStep::Act(WorkerAction::CloseIssue { issue_iid }),
+        }
+    }
+
+    fn cleanup_step(&self, step: CleanupStep) -> WorkerStep {
+        let plan = self.cleanup_plan();
+        let issue_iid = plan.issue_iid;
+        match step {
+            CleanupStep::ReleaseClaim => {
+                WorkerStep::Act(WorkerAction::ReleaseIssueClaim { issue_iid })
+            }
+            CleanupStep::RemoveWorkingOnLabel => {
+                WorkerStep::Act(WorkerAction::RemoveWorkingOnLabel { issue_iid })
+            }
+            CleanupStep::CleanupSession => {
+                WorkerStep::Act(WorkerAction::CleanupSession { issue_iid })
+            }
+            CleanupStep::ObserveDefaultBranch => {
+                WorkerStep::Observe(WorkerQuery::DefaultBranchOrMain)
+            }
+            CleanupStep::ResetWorktree => WorkerStep::Act(WorkerAction::ResetWorktree),
+            CleanupStep::CheckoutDefaultBranch => WorkerStep::Act(WorkerAction::CheckoutBranch {
+                branch: self.default_branch.clone(),
+            }),
+            CleanupStep::DeleteLocalBranch => WorkerStep::Act(WorkerAction::DeleteLocalBranch {
+                branch: plan
+                    .branch
+                    .clone()
+                    .expect("branch cleanup steps run only when the plan has a branch"),
+            }),
+        }
+    }
+
+    /// Feed back the answer to the observation the machine just asked for.
+    /// `Err` here fails the cycle, exactly where the original code used `?`.
+    fn apply_fact(&mut self, fact: Result<WorkerFact>) -> Result<()> {
+        match (self.stage.clone(), fact) {
+            (WorkerStage::ObserveActiveIssue, observed) => {
+                self.stage = self.apply_active_issue_hold(observed, true)?;
+            }
+            (WorkerStage::ObserveIssueBeforeReattempt, observed) => {
+                let next = self.apply_active_issue_hold(observed, false)?;
+                self.stage = if matches!(next, WorkerStage::Finish) {
+                    // `Keep` for the no-MR path means: re-read the issue and
+                    // implement it again from scratch.
+                    let issue_iid = self.active_iid();
+                    info!(
+                        "{}: Active issue #{} has no MR, re-attempting implementation",
+                        self.agent_id, issue_iid
+                    );
+                    WorkerStage::ObserveIssueForReattempt
+                } else {
+                    next
+                };
+            }
+            (WorkerStage::ObserveIssueForReattempt, Ok(WorkerFact::Issue(issue))) => {
+                self.candidate = Some(issue);
+                self.current = None;
+                self.stage = WorkerStage::RunReattemptImplementation;
+            }
+            (WorkerStage::ObserveIssueForReattempt, Err(e)) => {
+                let issue_iid = self.active_iid();
+                warn!(
+                    "{}: Failed to fetch issue #{} for re-attempt: {}, releasing",
+                    self.agent_id, issue_iid, e
+                );
+                self.active = None;
+                self.stage = self.start_cleanup(
+                    CleanupPlan {
+                        issue_iid,
+                        remove_working_label: true,
+                        cleanup_session: true,
+                        branch: None,
+                    },
+                    AfterCleanup::LookForNewWork,
+                );
+            }
+            (WorkerStage::ObserveActiveMr, Ok(WorkerFact::MergeRequestStatus(mr))) => {
+                if mr.is_finished() {
+                    info!(
+                        "{}: MR !{} is {}, releasing issue #{}",
+                        self.agent_id,
+                        mr.iid,
+                        mr.state,
+                        self.active_iid()
+                    );
+                    self.finished_mr_merged = mr.is_merged();
+                    self.stage =
+                        WorkerStage::ReleaseFinishedMr(FinishedMrStep::ObserveDefaultBranch);
+                } else {
+                    self.stage = WorkerStage::RunActiveFeedback;
+                }
+            }
+            (WorkerStage::ObserveActiveMr, Err(e)) => {
+                let mr_iid = self.active_issue().mr_iid.unwrap_or(0);
+                warn!("{}: Failed to check MR !{}: {}", self.agent_id, mr_iid, e);
+                // The issue stays active, so the cycle ends here.
+                self.stage = WorkerStage::Finish;
+            }
+            (
+                WorkerStage::ReleaseFinishedMr(FinishedMrStep::ObserveDefaultBranch),
+                Ok(WorkerFact::DefaultBranchOrMain(branch)),
+            ) => {
+                self.default_branch = branch;
+                self.stage = self.advance_finished_mr(FinishedMrStep::ObserveDefaultBranch);
+            }
+            (
+                WorkerStage::Cleanup(CleanupStep::ObserveDefaultBranch),
+                Ok(WorkerFact::DefaultBranchOrMain(branch)),
+            ) => {
+                self.default_branch = branch;
+                self.stage = self.advance_cleanup(CleanupStep::ObserveDefaultBranch);
+            }
+            (
+                WorkerStage::ShutdownAfterFeedbackError(message),
+                Ok(WorkerFact::ShutdownRequested(stop)),
+            ) => {
+                if stop {
+                    self.stage = WorkerStage::Finish;
+                } else if message.contains(WORKER_AGENT_CANCELLED_MSG) {
+                    self.stage = WorkerStage::ResolveCancelledActiveIssue(message);
+                } else {
+                    error!(
+                        "{}: Failed to handle comments for MR !{}: {}",
+                        self.agent_id,
+                        self.active_issue().mr_iid.unwrap_or(0),
+                        message
+                    );
+                    // The issue is still active, so the cycle ends here.
+                    self.stage = WorkerStage::Finish;
+                }
+            }
+            (
+                WorkerStage::ShutdownAfterImplementationError(message),
+                Ok(WorkerFact::ShutdownRequested(stop)),
+            ) => {
+                self.stage = self.apply_implementation_error(&message, stop);
+            }
+            (WorkerStage::ShutdownBeforePolling, Ok(WorkerFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    WorkerStage::Finish
+                } else if self.active.is_none() {
+                    WorkerStage::AdoptOrphanedSession
+                } else {
+                    WorkerStage::HandleNeedAiWorkerMr
+                };
+            }
+            (WorkerStage::ObserveIssues, Ok(WorkerFact::Issues(issues))) => {
+                self.candidates = issues.into();
+                self.stage = WorkerStage::ShutdownAfterIssues;
+            }
+            (WorkerStage::ShutdownAfterIssues, Ok(WorkerFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    WorkerStage::Finish
+                } else {
+                    WorkerStage::NextCandidate
+                };
+            }
+            (WorkerStage::ShutdownBeforeCandidate, Ok(WorkerFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    WorkerStage::Finish
+                } else {
+                    WorkerStage::ScreenCandidate
+                };
+            }
+            (WorkerStage::ObserveDependencyIssue(dep_issue_iid), observed) => {
+                let candidate_iid = self.candidate().iid;
+                let as_ref = match &observed {
+                    Ok(WorkerFact::Issue(issue)) => Ok(issue),
+                    Ok(fact) => {
+                        anyhow::bail!("worker port answered a dependency observation with {fact:?}")
+                    }
+                    Err(e) => Err(e),
+                };
+                self.stage = match decide_dependency(as_ref) {
+                    DependencyDecision::Resolved => {
+                        match &observed {
+                            Ok(_) => info!(
+                                "{}: Issue #{} dependency issue #{} closed, resuming",
+                                self.agent_id, candidate_iid, dep_issue_iid
+                            ),
+                            Err(_) => info!(
+                                "{}: Issue #{} dependency issue #{} not found (deleted or never existed), dropping dependency label and resuming",
+                                self.agent_id, candidate_iid, dep_issue_iid
+                            ),
+                        }
+                        WorkerStage::RemoveDependencyLabel(dep_issue_iid)
+                    }
+                    DependencyDecision::StillWaiting => {
+                        debug!(
+                            "{}: Issue #{} waiting on issue #{} (not yet closed), skipping",
+                            self.agent_id, candidate_iid, dep_issue_iid
+                        );
+                        WorkerStage::NextCandidate
+                    }
+                    DependencyDecision::Unknown => {
+                        warn!(
+                            "{}: Issue #{} waiting on issue #{} — failed to check dependency state: {}, skipping this cycle",
+                            self.agent_id,
+                            candidate_iid,
+                            dep_issue_iid,
+                            observed.err().map(|e| e.to_string()).unwrap_or_default()
+                        );
+                        WorkerStage::NextCandidate
+                    }
+                };
+            }
+            (WorkerStage::ShutdownAfterCandidateClaim, Ok(WorkerFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    WorkerStage::ReleaseCandidateClaimAtShutdown
+                } else {
+                    WorkerStage::PreserveCandidateClaim
+                };
+            }
+            (stage, Ok(fact)) => {
+                anyhow::bail!("worker port answered {stage:?} with {fact:?}");
+            }
+            (_, Err(e)) => return Err(e),
+        }
+        Ok(())
+    }
+
+    /// Apply the shared release rules for the issue the worker is pinned
+    /// to. `Keep` maps to [`WorkerStage::Finish`] for the caller to
+    /// reinterpret, since the two active phases continue differently.
+    fn apply_active_issue_hold(
+        &mut self,
+        observed: Result<WorkerFact>,
+        watching_mr: bool,
+    ) -> Result<WorkerStage> {
+        let issue_iid = self.active_iid();
+        let mr_iid = self.active_issue().mr_iid;
+        let issue = match observed {
+            Ok(WorkerFact::Issue(issue)) => issue,
+            Ok(fact) => anyhow::bail!("worker port answered an issue observation with {fact:?}"),
+            Err(e) => {
+                if watching_mr {
+                    warn!(
+                        "{}: Failed to verify active issue #{}: {}, releasing worker state",
+                        self.agent_id, issue_iid, e
+                    );
+                } else {
+                    warn!(
+                        "{}: Failed to verify active issue #{}: {}, releasing",
+                        self.agent_id, issue_iid, e
+                    );
+                }
+                self.active = None;
+                return Ok(WorkerStage::ClearIssueStateThen(issue_iid));
+            }
+        };
+
+        Ok(match decide_issue_hold(&issue, self.scope_label) {
+            IssueHold::Keep => {
+                if watching_mr {
+                    WorkerStage::ObserveActiveMr
+                } else {
+                    WorkerStage::Finish
+                }
+            }
+            IssueHold::AbandonClosed => {
+                self.active = None;
+                WorkerStage::AbandonClosedIssueThen(
+                    issue_iid,
+                    if watching_mr { mr_iid } else { None },
+                )
+            }
+            IssueHold::ClearState(reason) => {
+                match reason {
+                    ClearReason::OutOfScope if watching_mr => info!(
+                        "{}: Issue #{} left scope label {:?}, releasing worker state",
+                        self.agent_id, issue_iid, self.scope_label
+                    ),
+                    ClearReason::OutOfScope => info!(
+                        "{}: Active issue #{} left scope label {:?}, releasing",
+                        self.agent_id, issue_iid, self.scope_label
+                    ),
+                    ClearReason::Pending if watching_mr => info!(
+                        "{}: Issue #{} has `{}` — stopping MR watch (issue stays open)",
+                        self.agent_id, issue_iid, WORKER_PENDING_LABEL
+                    ),
+                    ClearReason::Pending => info!(
+                        "{}: Active issue #{} has `{}` — yielding (issue stays open)",
+                        self.agent_id, issue_iid, WORKER_PENDING_LABEL
+                    ),
+                }
+                self.active = None;
+                WorkerStage::ClearIssueStateThen(issue_iid)
+            }
+            IssueHold::ReleaseReviewOnly => {
+                self.active = None;
+                WorkerStage::ReleaseReviewOnlyHoldThen(issue_iid)
+            }
+        })
+    }
+
+    fn advance_finished_mr(&mut self, after_step: FinishedMrStep) -> WorkerStage {
+        match after_step.next(self.finished_mr_merged) {
+            Some(step) => WorkerStage::ReleaseFinishedMr(step),
+            None => self.release_active(),
+        }
+    }
+
+    /// How a failed implementation run ends. Shutdown keeps the issue
+    /// active so the shutdown hook can persist it; an external cancel is
+    /// resolved by the cancel helper; anything else is logged and released.
+    fn apply_implementation_error(&mut self, message: &str, shutting_down: bool) -> WorkerStage {
+        if shutting_down {
+            // Keep the in-flight issue active so the shutdown hook can
+            // persist the claim and session for the next start.
+            self.active = self.current.clone();
+            return WorkerStage::Finish;
+        }
+        if message.contains(WORKER_AGENT_CANCELLED_MSG) {
+            return WorkerStage::ResolveCancelledImplementation(message.to_string());
+        }
+        self.release_after_failed_implementation(message)
+    }
+
+    fn release_after_failed_implementation(&mut self, message: &str) -> WorkerStage {
+        let current = self
+            .current
+            .clone()
+            .expect("an implementation run records its in-flight issue");
+        match self.implementation_phase {
+            ImplementationPhase::Reattempt => {
+                error!(
+                    "{}: Failed to re-process issue #{}: {}",
+                    self.agent_id, current.issue_iid, message
+                );
+                self.active = None;
+                self.start_cleanup(
+                    CleanupPlan {
+                        issue_iid: current.issue_iid,
+                        remove_working_label: true,
+                        cleanup_session: true,
+                        branch: current.branch_name.clone(),
+                    },
+                    AfterCleanup::Finish,
+                )
+            }
+            ImplementationPhase::Candidate => {
+                error!(
+                    "{}: Failed to process issue #{}: {}",
+                    self.agent_id, current.issue_iid, message
+                );
+                self.start_cleanup(
+                    CleanupPlan {
+                        issue_iid: current.issue_iid,
+                        remove_working_label: true,
+                        cleanup_session: false,
+                        branch: current.branch_name.clone(),
+                    },
+                    AfterCleanup::Finish,
+                )
+            }
+        }
+    }
+
+    /// Feed back the outcome of the action the machine just asked for.
+    fn apply_outcome(&mut self, outcome: WorkerOutcome) -> Result<()> {
+        match (self.stage.clone(), outcome) {
+            (
+                WorkerStage::ClearIssueStateThen(_)
+                | WorkerStage::AbandonClosedIssueThen(_, _)
+                | WorkerStage::ReleaseReviewOnlyHoldThen(_),
+                WorkerOutcome::Done,
+            ) => {
+                self.stage = WorkerStage::ShutdownBeforePolling;
+            }
+            (WorkerStage::ReleaseFinishedMr(step), WorkerOutcome::Done) => {
+                self.stage = self.advance_finished_mr(step);
+            }
+            (WorkerStage::RunActiveFeedback, WorkerOutcome::Feedback { abandoned }) => {
+                if abandoned {
+                    let active = self.active_issue();
+                    info!(
+                        "{}: Issue #{} abandoned, MR !{} closed",
+                        self.agent_id,
+                        active.issue_iid,
+                        active.mr_iid.unwrap_or(0)
+                    );
+                    self.stage = WorkerStage::ReleaseClaimAfterAbandon;
+                } else {
+                    // The issue stays active, so the cycle ends here.
+                    self.stage = WorkerStage::Finish;
+                }
+            }
+            (WorkerStage::RunActiveFeedback, WorkerOutcome::Failed(e)) => {
+                self.stage = WorkerStage::ShutdownAfterFeedbackError(format!("{e:#}"));
+            }
+            (WorkerStage::ReleaseClaimAfterAbandon, WorkerOutcome::Done) => {
+                self.stage = WorkerStage::CleanupSessionAfterAbandon;
+            }
+            (WorkerStage::CleanupSessionAfterAbandon, WorkerOutcome::Done) => {
+                self.stage = self.release_active();
+            }
+            (
+                WorkerStage::ResolveCancelledActiveIssue(message),
+                WorkerOutcome::CancelHandled(handled),
+            ) => {
+                if handled {
+                    self.stage = self.release_active_and_finish();
+                } else {
+                    error!(
+                        "{}: Failed to handle comments for MR !{}: {}",
+                        self.agent_id,
+                        self.active_issue().mr_iid.unwrap_or(0),
+                        message
+                    );
+                    self.stage = WorkerStage::Finish;
+                }
+            }
+            (
+                WorkerStage::ResolveCancelledImplementation(message),
+                WorkerOutcome::CancelHandled(handled),
+            ) => {
+                self.stage = if handled {
+                    self.active = None;
+                    WorkerStage::Finish
+                } else {
+                    self.release_after_failed_implementation(&message)
+                };
+            }
+            (
+                WorkerStage::RunReattemptImplementation | WorkerStage::RunCandidateImplementation,
+                WorkerOutcome::Implementation { current, error },
+            ) => {
+                let mr_created = current.mr_created;
+                self.current = Some(current);
+                self.stage = match error {
+                    Some(e) => WorkerStage::ShutdownAfterImplementationError(format!("{e:#}")),
+                    None if mr_created => match self.implementation_phase {
+                        ImplementationPhase::Reattempt => WorkerStage::CheckTrackableAfterReattempt,
+                        ImplementationPhase::Candidate => WorkerStage::CheckTrackableAfterCandidate,
+                    },
+                    None => {
+                        let issue_iid = self.implementation_iid();
+                        let cleanup_session =
+                            matches!(self.implementation_phase, ImplementationPhase::Reattempt);
+                        self.active = None;
+                        self.start_cleanup(
+                            CleanupPlan {
+                                issue_iid,
+                                remove_working_label: false,
+                                cleanup_session,
+                                branch: None,
+                            },
+                            AfterCleanup::Finish,
+                        )
+                    }
+                };
+            }
+            (
+                WorkerStage::CheckTrackableAfterReattempt
+                | WorkerStage::CheckTrackableAfterCandidate,
+                WorkerOutcome::Trackable(trackable),
+            ) => {
+                self.active = trackable.then(|| {
+                    self.current
+                        .clone()
+                        .expect("an implementation run records its in-flight issue")
+                });
+                self.stage = WorkerStage::Finish;
+            }
+            (WorkerStage::Cleanup(step), WorkerOutcome::Done) => {
+                self.stage = self.advance_cleanup(step);
+            }
+            (WorkerStage::AdoptOrphanedSession, WorkerOutcome::Adopted(adopted)) => {
+                self.stage = match adopted {
+                    Some(active) => {
+                        info!(
+                            "{}: Adopted orphaned issue #{} with MR !{}",
+                            self.agent_id,
+                            active.issue_iid,
+                            active.mr_iid.unwrap_or(0)
+                        );
+                        self.active = Some(active);
+                        WorkerStage::Finish
+                    }
+                    None => WorkerStage::HandleNeedAiWorkerMr,
+                };
+            }
+            (WorkerStage::HandleNeedAiWorkerMr, WorkerOutcome::HandledNeedAiWorkerMr(handled)) => {
+                self.stage = if handled {
+                    WorkerStage::Finish
+                } else {
+                    WorkerStage::ObserveIssues
+                };
+            }
+            (WorkerStage::RemoveDependencyLabel(_), WorkerOutcome::Done) => {
+                let candidate = self.candidate();
+                self.stage = if claim::is_claimed(&candidate.labels) {
+                    debug!(
+                        "{}: Issue #{} already claimed, skipping",
+                        self.agent_id, candidate.iid
+                    );
+                    WorkerStage::NextCandidate
+                } else {
+                    WorkerStage::AcquireCandidateClaim
+                };
+            }
+            (WorkerStage::AcquireCandidateClaim, WorkerOutcome::Claim(attempt)) => {
+                self.stage = match attempt {
+                    IssueClaimAttempt::Won => WorkerStage::ShutdownAfterCandidateClaim,
+                    IssueClaimAttempt::Lost => {
+                        info!(
+                            "{}: Failed to claim issue #{}, skipping",
+                            self.agent_id,
+                            self.candidate().iid
+                        );
+                        WorkerStage::NextCandidate
+                    }
+                    IssueClaimAttempt::Interrupted => WorkerStage::Finish,
+                };
+            }
+            (WorkerStage::ReleaseCandidateClaimAtShutdown, WorkerOutcome::Done) => {
+                self.stage = WorkerStage::Finish;
+            }
+            (WorkerStage::PreserveCandidateClaim, WorkerOutcome::Done) => {
+                self.stage = WorkerStage::SaveCandidatePreSession;
+            }
+            (WorkerStage::SaveCandidatePreSession, WorkerOutcome::Done) => {
+                self.stage = WorkerStage::RunCandidateImplementation;
+            }
+            // The reads and writes the cycle performed with `?` abort it.
+            (
+                WorkerStage::HandleNeedAiWorkerMr | WorkerStage::AcquireCandidateClaim,
+                WorkerOutcome::Failed(e),
+            ) => return Err(e),
+            (stage, _) => {
+                anyhow::bail!("worker port reported an unexpected outcome for {stage:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the active issue and end the cycle.
+    fn release_active_and_finish(&mut self) -> WorkerStage {
+        self.active = None;
+        WorkerStage::Finish
+    }
+}
+
+/// Ask the routing port one question.
+fn observe_worker(port: &dyn WorkerRoutingPort, query: &WorkerQuery) -> Result<WorkerFact> {
+    Ok(match query {
+        WorkerQuery::ShutdownRequested => WorkerFact::ShutdownRequested(port.shutdown_requested()),
+        WorkerQuery::Issue { issue_iid } => WorkerFact::Issue(port.issue(*issue_iid)?),
+        WorkerQuery::MergeRequestStatus { mr_iid } => {
+            WorkerFact::MergeRequestStatus(port.merge_request_status(*mr_iid)?)
+        }
+        WorkerQuery::Issues => WorkerFact::Issues(port.issues()?),
+        WorkerQuery::DefaultBranchOrMain => {
+            WorkerFact::DefaultBranchOrMain(port.default_branch_or_main())
+        }
+    })
+}
+
+/// Run the worker's routing machine to completion: observe, decide one
+/// step, execute it, feed the result back.
+fn drive_worker_routing(
+    machine: &mut WorkerRoutingMachine,
+    port: &mut dyn WorkerRoutingPort,
+) -> Result<()> {
+    loop {
+        match machine.next_step() {
+            WorkerStep::Observe(query) => {
+                let fact = observe_worker(port, &query);
+                machine.apply_fact(fact)?;
+            }
+            WorkerStep::Act(action) => {
+                let outcome = port.execute(&action);
+                machine.apply_outcome(outcome)?;
+            }
+            WorkerStep::Finish => return Ok(()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live worker routing port
+// ---------------------------------------------------------------------------
+
+/// The routing port backed by the real runtime: the worker's only place
+/// where a routing decision meets git, GitLab, the session store, or the
+/// model.
+struct LiveWorkerRoutingPort<'a> {
+    state: &'a AgentState<'a>,
+    model: &'a AgentModel,
+    shutdown: &'a AtomicBool,
+    scope_label: Option<&'a str>,
+    /// The claim won for the candidate currently being screened, until the
+    /// machine preserves or releases it.
+    candidate_lease: Option<ClaimLease>,
+}
+
+impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    fn issue(&self, issue_iid: u64) -> Result<IssueObservation> {
+        Ok(IssueObservation::from_issue(
+            &self.state.glab.get_issue(issue_iid)?,
+        ))
+    }
+
+    fn merge_request_status(&self, mr_iid: u64) -> Result<MrStatusObservation> {
+        let mr = self.state.glab.get_merge_request(mr_iid)?;
+        Ok(MrStatusObservation {
+            iid: mr.iid,
+            state: mr.state,
+        })
+    }
+
+    fn issues(&self) -> Result<Vec<IssueObservation>> {
+        Ok(self
+            .state
+            .glab
+            .list_issues()?
+            .iter()
+            .map(IssueObservation::from_issue)
+            .collect())
+    }
+
+    fn default_branch_or_main(&self) -> String {
+        self.state
+            .git_repo
+            .get_default_branch()
+            .unwrap_or("main".to_string())
+    }
+
+    fn execute(&mut self, action: &WorkerAction) -> WorkerOutcome {
+        let state = self.state;
+        match action {
+            WorkerAction::ResetWorktree => {
+                let _ = state.git_repo.reset_hard();
+                WorkerOutcome::Done
+            }
+            WorkerAction::CheckoutBranch { branch } => {
+                let _ = state.git_repo.checkout_remote_branch(branch);
+                WorkerOutcome::Done
+            }
+            WorkerAction::DeleteLocalBranch { branch } => {
+                let _ = state.git_repo.delete_local_branch(branch);
+                WorkerOutcome::Done
+            }
+            WorkerAction::DeleteRemoteBranch { branch } => {
+                state.git_repo.delete_remote_branch_best_effort(branch);
+                WorkerOutcome::Done
+            }
+            WorkerAction::ReleaseIssueClaim { issue_iid } => {
+                let _ =
+                    claim::release(state.glab, ClaimResource::Issue(*issue_iid), state.agent_id);
+                WorkerOutcome::Done
+            }
+            WorkerAction::RemoveWorkingOnLabel { issue_iid } => {
+                let _ = state.glab.remove_issue_label(*issue_iid, WORKING_ON_LABEL);
+                WorkerOutcome::Done
+            }
+            WorkerAction::RemoveIssueLabel { issue_iid, label } => {
+                let _ = state.glab.remove_issue_label(*issue_iid, label);
+                WorkerOutcome::Done
+            }
+            WorkerAction::CleanupSession { issue_iid } => {
+                state.cleanup_session(*issue_iid);
+                WorkerOutcome::Done
+            }
+            WorkerAction::SaveSession { issue_iid, mr_iid } => {
+                let _ = state.save_session(*issue_iid, *mr_iid);
+                WorkerOutcome::Done
+            }
+            WorkerAction::CloseIssue { issue_iid } => {
+                close_issue_best_effort(state.glab, *issue_iid);
+                WorkerOutcome::Done
+            }
+            WorkerAction::AcquireIssueClaim { issue_iid } => match claim::acquire(
+                state.glab,
+                ClaimResource::Issue(*issue_iid),
+                state.agent_id,
+                self.shutdown,
+            ) {
+                Ok(ClaimAcquireOutcome::Won(lease)) => {
+                    self.candidate_lease = Some(lease);
+                    WorkerOutcome::Claim(IssueClaimAttempt::Won)
+                }
+                Ok(ClaimAcquireOutcome::Lost) => WorkerOutcome::Claim(IssueClaimAttempt::Lost),
+                Ok(ClaimAcquireOutcome::Interrupted) => {
+                    WorkerOutcome::Claim(IssueClaimAttempt::Interrupted)
+                }
+                Err(e) => WorkerOutcome::Failed(e),
+            },
+            WorkerAction::PreserveIssueClaim { .. } => {
+                // Ownership is tracked by issue IID from here on (in
+                // `active` and the session file): GitLab's claim label is
+                // the source of truth across cycles and restarts.
+                if let Some(lease) = self.candidate_lease.take() {
+                    lease.preserve();
+                }
+                WorkerOutcome::Done
+            }
+            WorkerAction::ReleaseAcquiredClaim { .. } => {
+                if let Some(lease) = self.candidate_lease.take() {
+                    let _ = lease.release(state.glab);
+                }
+                WorkerOutcome::Done
+            }
+            WorkerAction::ClearIssueState { issue_iid } => {
+                state.clear_resumed_issue_state(*issue_iid);
+                WorkerOutcome::Done
+            }
+            WorkerAction::ReleaseReviewOnlyHold { issue_iid } => {
+                state.release_worker_hold_review_only(*issue_iid);
+                WorkerOutcome::Done
+            }
+            WorkerAction::AbandonClosedIssue { issue_iid, mr_iid } => {
+                state.abandon_closed_issue(*issue_iid, *mr_iid);
+                WorkerOutcome::Done
+            }
+            WorkerAction::AdoptOrphanedSession => WorkerOutcome::Adopted(
+                try_adopt_orphaned_session(state, self.shutdown, self.scope_label),
+            ),
+            WorkerAction::HandleNeedAiWorkerMr => {
+                match try_handle_need_ai_worker_mr(
+                    state,
+                    self.model,
+                    self.shutdown,
+                    self.scope_label,
+                ) {
+                    Ok(handled) => WorkerOutcome::HandledNeedAiWorkerMr(handled),
+                    Err(e) => WorkerOutcome::Failed(e),
+                }
+            }
+            WorkerAction::RunImplementation { issue } => {
+                let mut current = ActiveIssue {
+                    issue_iid: issue.iid,
+                    mr_iid: None,
+                    branch_name: None,
+                    mr_created: false,
+                };
+                let error =
+                    process_issue(state, self.model, issue, &mut current, self.scope_label).err();
+                WorkerOutcome::Implementation { current, error }
+            }
+            WorkerAction::RunFeedback {
+                mr_iid,
+                linked_issue_iid,
+                comments_only,
+            } => match handle_mr_comments(
+                state,
+                self.model,
+                *mr_iid,
+                *linked_issue_iid,
+                *comments_only,
+            ) {
+                Ok(abandoned) => WorkerOutcome::Feedback { abandoned },
+                Err(e) => WorkerOutcome::Failed(e),
+            },
+            WorkerAction::ResolveCancelledIssue { issue_iid } => {
+                let error = anyhow::anyhow!("{}", WORKER_AGENT_CANCELLED_MSG);
+                WorkerOutcome::CancelHandled(handle_worker_issue_processing_cancelled(
+                    state, *issue_iid, &error,
+                ))
+            }
+            WorkerAction::CheckIssueTrackable { issue_iid } => {
+                WorkerOutcome::Trackable(should_track_worker_issue(state, *issue_iid))
+            }
+        }
+    }
+}
+
+/// The worker's routing cycle: pick up where the last cycle left off, or
+/// find new work. Observes, decides one step, executes it, feeds the result
+/// back — see [`WorkerRoutingMachine`].
 fn worker_cycle(
     state: &AgentState,
     model: &AgentModel,
@@ -622,385 +2291,17 @@ fn worker_cycle(
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Result<()> {
-    // If we have an active issue with an MR, watch the MR unless it should be released.
-    if let Some(a) = active.clone()
-        && a.mr_iid.is_some()
-    {
-        let still_tracking = retain_active_mr_issue(state, &a, active, scope_label);
-        if still_tracking
-            && let Some(a) = &*active
-            && let Some(mr_iid) = a.mr_iid
-        {
-            match state.glab.get_merge_request(mr_iid) {
-                Ok(mr) => {
-                    if mr.state == "merged" || mr.state == "closed" {
-                        info!(
-                            "{}: MR !{} is {}, releasing issue #{}",
-                            &state.agent_id, mr_iid, mr.state, a.issue_iid
-                        );
-
-                        let branch = format!("issue-{}", a.issue_iid);
-                        let default_branch = state
-                            .git_repo
-                            .get_default_branch()
-                            .unwrap_or("main".to_string());
-
-                        let _ = state.git_repo.reset_hard();
-                        let _ = state.git_repo.checkout_remote_branch(&default_branch);
-                        let _ = state.git_repo.delete_local_branch(&branch);
-
-                        if mr.state == "merged" {
-                            state.git_repo.delete_remote_branch_best_effort(&branch);
-                        }
-
-                        let _ = claim::release_claim(&state.glab, a.issue_iid, &state.agent_id);
-                        let _ = state.glab.remove_issue_label(a.issue_iid, WORKING_ON_LABEL);
-
-                        state.cleanup_session(a.issue_iid);
-
-                        if mr.state == "merged" {
-                            close_issue_best_effort(&state.glab, a.issue_iid);
-                        }
-
-                        *active = None;
-                    } else {
-                        match handle_mr_comments(state, model, &mr, Some(a.issue_iid), false) {
-                            Ok(true) => {
-                                info!(
-                                    "{}: Issue #{} abandoned, MR !{} closed",
-                                    &state.agent_id, a.issue_iid, mr_iid
-                                );
-
-                                let _ =
-                                    claim::release_claim(&state.glab, a.issue_iid, &state.agent_id);
-
-                                state.cleanup_session(a.issue_iid);
-                                *active = None;
-                            }
-                            Err(e) => {
-                                if shutdown.load(Ordering::SeqCst) {
-                                    return Ok(());
-                                }
-                                if handle_worker_issue_processing_cancelled(state, a.issue_iid, &e)
-                                {
-                                    *active = None;
-                                    return Ok(());
-                                }
-
-                                error!(
-                                    "{}: Failed to handle comments for MR !{}: {}",
-                                    &state.agent_id, mr_iid, e
-                                );
-                            }
-                            Ok(false) => {}
-                        }
-
-                        if active.is_some() {
-                            return Ok(());
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("{}: Failed to check MR !{}: {}", &state.agent_id, mr_iid, e);
-                    if active.is_some() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-
-    // If we have an active issue without an MR, we were interrupted before
-    // creating the MR. Re-attempt implementation from scratch.
-    if let Some(ref a) = *active
-        && a.mr_iid.is_none()
-        && !a.mr_created
-    {
-        let issue_iid = a.issue_iid;
-
-        // Check if the issue was closed externally or left the scope label.
-        let mut released = false;
-        match state.glab.get_issue(issue_iid) {
-            Ok(issue) if issue.state != "opened" => {
-                state.abandon_closed_issue(issue_iid, None);
-                released = true;
-            }
-            Ok(issue) if !issue_in_scope(&issue, scope_label) => {
-                info!(
-                    "{}: Active issue #{} left scope label {:?}, releasing",
-                    &state.agent_id, issue_iid, scope_label
-                );
-                state.clear_resumed_issue_state(issue_iid);
-                released = true;
-            }
-            Ok(issue) if issue_has_worker_pending_label(&issue.labels) => {
-                info!(
-                    "{}: Active issue #{} has `{}` — yielding (issue stays open)",
-                    &state.agent_id, issue_iid, WORKER_PENDING_LABEL
-                );
-                state.clear_resumed_issue_state(issue_iid);
-                released = true;
-            }
-            Ok(issue) if issue_has_worker_review_only_label(&issue.labels) => {
-                state.release_worker_hold_review_only(issue_iid);
-                released = true;
-            }
-            Err(e) => {
-                warn!(
-                    "{}: Failed to verify active issue #{}: {}, releasing",
-                    &state.agent_id, issue_iid, e
-                );
-                state.clear_resumed_issue_state(issue_iid);
-                released = true;
-            }
-            Ok(_) => {}
-        }
-
-        if released {
-            *active = None;
-        } else {
-            info!(
-                "{}: Active issue #{} has no MR, re-attempting implementation",
-                &state.agent_id, issue_iid
-            );
-
-            match state.glab.get_issue(issue_iid) {
-                Ok(issue) => {
-                    let mut current = ActiveIssue {
-                        issue_iid,
-                        mr_iid: None,
-                        branch_name: None,
-                        mr_created: false,
-                    };
-
-                    match process_issue(state, model, &issue, &mut current, scope_label) {
-                        Ok(_) => {
-                            if current.mr_created {
-                                if should_track_worker_issue(state, issue_iid) {
-                                    *active = Some(current);
-                                } else {
-                                    *active = None;
-                                }
-                            } else {
-                                let _ =
-                                    claim::release_claim(&state.glab, issue_iid, &state.agent_id);
-                                state.cleanup_session(issue_iid);
-                                *active = None;
-                            }
-                        }
-                        Err(e) => {
-                            if shutdown.load(Ordering::SeqCst) {
-                                *active = Some(current);
-                                return Ok(());
-                            }
-                            if handle_worker_issue_processing_cancelled(state, issue_iid, &e) {
-                                *active = None;
-                                return Ok(());
-                            }
-                            error!(
-                                "{}: Failed to re-process issue #{}: {}",
-                                &state.agent_id, issue_iid, e
-                            );
-
-                            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
-                            let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-                            state.cleanup_session(issue_iid);
-                            *active = None;
-                            if let Some(ref branch) = current.branch_name {
-                                let default_branch = state
-                                    .git_repo
-                                    .get_default_branch()
-                                    .unwrap_or("main".to_string());
-                                let _ = state.git_repo.reset_hard();
-                                let _ = state.git_repo.checkout_remote_branch(&default_branch);
-                                let _ = state.git_repo.delete_local_branch(branch);
-                            }
-                        }
-                    }
-
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        "{}: Failed to fetch issue #{} for re-attempt: {}, releasing",
-                        &state.agent_id, issue_iid, e
-                    );
-
-                    let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
-                    let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-                    state.cleanup_session(issue_iid);
-                    *active = None;
-                }
-            }
-        }
-    }
-
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    // No active issue — try to pick up an orphaned session first
-    if active.is_none() {
-        *active = try_adopt_orphaned_session(state, shutdown, scope_label);
-        if let Some(a) = &*active {
-            info!(
-                "{}: Adopted orphaned issue #{} with MR !{}",
-                &state.agent_id,
-                a.issue_iid,
-                a.mr_iid.unwrap_or(0)
-            );
-            return Ok(());
-        }
-    }
-
-    // No orphaned sessions — poll for new issues
-    if try_handle_need_ai_worker_mr(state, model, shutdown, scope_label)? {
-        return Ok(());
-    }
-
-    // No labeled MR work — poll for new issues
-    let issues = state.glab.list_issues()?;
-
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    for issue in issues {
-        if shutdown.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-
-        if should_skip_issue(&issue) {
-            continue;
-        }
-
-        if !issue_in_scope(&issue, scope_label) {
-            continue;
-        }
-
-        // Check if this issue is parked waiting on a dependency issue.
-        if let Some(dep_issue_iid) = extract_waiting_on_issue_iid(&issue.labels) {
-            match state.glab.get_issue(dep_issue_iid) {
-                Ok(dep) if dep.state == "closed" => {
-                    // Dependency closed — strip the waiting label and proceed to claim.
-                    info!(
-                        "{}: Issue #{} dependency issue #{} closed, resuming",
-                        &state.agent_id, issue.iid, dep_issue_iid
-                    );
-                    let label = format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{dep_issue_iid}");
-                    let _ = state.glab.remove_issue_label(issue.iid, &label);
-                }
-                Ok(_) => {
-                    debug!(
-                        "{}: Issue #{} waiting on issue #{} (not yet closed), skipping",
-                        &state.agent_id, issue.iid, dep_issue_iid
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    // A 404 means the dependency issue was deleted or never
-                    // existed — drop the label and resume.
-                    if err_str.contains("404") {
-                        info!(
-                            "{}: Issue #{} dependency issue #{} not found (deleted or never existed), dropping dependency label and resuming",
-                            &state.agent_id, issue.iid, dep_issue_iid
-                        );
-                        let label = format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{dep_issue_iid}");
-                        let _ = state.glab.remove_issue_label(issue.iid, &label);
-                    } else {
-                        warn!(
-                            "{}: Issue #{} waiting on issue #{} — failed to check dependency state: {}, skipping this cycle",
-                            &state.agent_id, issue.iid, dep_issue_iid, err_str
-                        );
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if claim::is_claimed(&issue.labels) {
-            debug!(
-                "{}: Issue #{} already claimed, skipping",
-                &state.agent_id, issue.iid
-            );
-            continue;
-        }
-
-        if !claim::try_claim_issue(&state.glab, issue.iid, &state.agent_id, shutdown)? {
-            info!(
-                "{}: Failed to claim issue #{}, skipping",
-                &state.agent_id, issue.iid
-            );
-            continue;
-        }
-
-        if shutdown.load(Ordering::SeqCst) {
-            let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
-            return Ok(());
-        }
-
-        // Persist a pre-session immediately so that even a SIGKILL leaves
-        // a record of which issue this worker owns. mr_iid=0 means no MR yet.
-        let _ = state.save_session(issue.iid, 0);
-
-        info!(
-            "{}: Implementing issue #{}: {}",
-            &state.agent_id, issue.iid, issue.title
-        );
-
-        let mut current = ActiveIssue {
-            issue_iid: issue.iid,
-            mr_iid: None,
-            branch_name: None,
-            mr_created: false,
-        };
-
-        match process_issue(state, model, &issue, &mut current, scope_label) {
-            Ok(_) => {
-                if current.mr_created {
-                    if should_track_worker_issue(state, issue.iid) {
-                        *active = Some(current);
-                    }
-                } else {
-                    // Rejected or no MR — release claim
-                    let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
-                }
-            }
-            Err(e) => {
-                if shutdown.load(Ordering::SeqCst) {
-                    // Shutdown during processing — store as active for cleanup
-                    *active = Some(current);
-                    return Ok(());
-                }
-                if handle_worker_issue_processing_cancelled(state, issue.iid, &e) {
-                    *active = None;
-                    break;
-                }
-                error!(
-                    "{}: Failed to process issue #{}: {}",
-                    &state.agent_id, issue.iid, e
-                );
-                let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
-                let _ = state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
-
-                if let Some(ref branch) = current.branch_name {
-                    let default_branch = state
-                        .git_repo
-                        .get_default_branch()
-                        .unwrap_or("main".to_string());
-
-                    let _ = state.git_repo.reset_hard();
-                    let _ = state.git_repo.checkout_remote_branch(&default_branch);
-                    let _ = state.git_repo.delete_local_branch(branch);
-                }
-            }
-        }
-
-        break;
-    }
-
-    Ok(())
+    let mut machine = WorkerRoutingMachine::new(state.agent_id, scope_label, active.take());
+    let mut port = LiveWorkerRoutingPort {
+        state,
+        model,
+        shutdown,
+        scope_label,
+        candidate_lease: None,
+    };
+    let result = drive_worker_routing(&mut machine, &mut port);
+    *active = machine.active.take();
+    result
 }
 
 fn mr_has_label(mr: &crate::agents::gitlab::MergeRequest, label: &str) -> bool {
@@ -1039,11 +2340,18 @@ fn try_handle_need_ai_worker_mr(
         if unresolved.is_empty() {
             continue;
         }
-        if !claim::try_claim_mr(&state.glab, mr.iid, &state.agent_id, shutdown)? {
-            continue;
-        }
+        let lease = match claim::acquire(
+            state.glab,
+            ClaimResource::MergeRequest(mr.iid),
+            state.agent_id,
+            shutdown,
+        )? {
+            ClaimAcquireOutcome::Won(lease) => lease,
+            ClaimAcquireOutcome::Lost => continue,
+            ClaimAcquireOutcome::Interrupted => return Ok(false),
+        };
         if shutdown.load(Ordering::SeqCst) {
-            let _ = claim::release_mr_claim(&state.glab, mr.iid, &state.agent_id);
+            let _ = lease.release(state.glab);
             return Ok(false);
         }
         info!(
@@ -1053,15 +2361,15 @@ fn try_handle_need_ai_worker_mr(
             NEED_AI_WORKER_LABEL,
             unresolved.len()
         );
-        let result = handle_mr_comments(state, model, &mr, None, true);
-        let _ = claim::release_mr_claim(&state.glab, mr.iid, &state.agent_id);
+        let result = handle_mr_comments(state, model, mr.iid, None, true);
+        let _ = lease.release(state.glab);
         result?;
         return Ok(true);
     }
     Ok(false)
 }
 
-fn should_skip_issue(issue: &Issue) -> bool {
+fn should_skip_issue(issue: &IssueObservation) -> bool {
     if issue.title.starts_with("[Draft]") || issue.title.starts_with("Draft:") {
         return true;
     }
@@ -1096,7 +2404,7 @@ fn issue_has_worker_review_only_label(labels: &[String]) -> bool {
     labels.contains(&WORKER_REVIEW_ONLY_LABEL.to_string())
 }
 
-fn worker_should_cancel_issue_processing(issue: &Issue) -> bool {
+fn worker_should_cancel_issue_processing(issue: &IssueObservation) -> bool {
     issue.state != "opened"
         || issue_has_worker_review_only_label(&issue.labels)
         || issue_has_worker_pending_label(&issue.labels)
@@ -1107,9 +2415,9 @@ fn worker_issue_cancel_check(
     issue_iid: u64,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
     Arc::new(move || {
-        glab.get_issue(issue_iid)
-            .ok()
-            .is_some_and(|issue| worker_should_cancel_issue_processing(&issue))
+        glab.get_issue(issue_iid).ok().is_some_and(|issue| {
+            worker_should_cancel_issue_processing(&IssueObservation::from_issue(&issue))
+        })
     })
 }
 
@@ -1138,7 +2446,7 @@ fn handle_worker_issue_processing_cancelled(
             // Leave the issue open and the `pending` label in place; just drop
             // our claim and session so another worker can pick it up once a
             // human removes `pending`.
-            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+            let _ = claim::release(state.glab, ClaimResource::Issue(issue_iid), state.agent_id);
             let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
             state.cleanup_session(issue_iid);
             true
@@ -1156,7 +2464,7 @@ fn handle_worker_issue_processing_cancelled(
                 "{}: Stopped work on issue #{} after external cancel signal",
                 &state.agent_id, issue_iid
             );
-            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+            let _ = claim::release(state.glab, ClaimResource::Issue(issue_iid), state.agent_id);
             let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
             state.cleanup_session(issue_iid);
             true
@@ -1166,7 +2474,7 @@ fn handle_worker_issue_processing_cancelled(
                 "{}: Cancelled while working on issue #{} but failed to re-fetch issue: {}",
                 &state.agent_id, issue_iid, e
             );
-            let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+            let _ = claim::release(state.glab, ClaimResource::Issue(issue_iid), state.agent_id);
             state.cleanup_session(issue_iid);
             true
         }
@@ -1206,7 +2514,7 @@ fn close_issue_best_effort(gitlab: &GitLabClient, issue_iid: u64) {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosesLinkedMr {
     Open(u64),
     Merged,
@@ -1276,335 +2584,1150 @@ fn has_worker_skip_label(labels: &[String]) -> bool {
     labels.contains(&WORKING_ON_LABEL.to_string()) || has_worker_resume_abandon_label(labels)
 }
 
-fn has_worker_claim(labels: &[String], agent_id: &str) -> bool {
-    labels.contains(&claim::claim_label(agent_id))
+// ---------------------------------------------------------------------------
+// Implementation progression port
+// ---------------------------------------------------------------------------
+
+/// One question the implementation progression asks before it decides
+/// anything. Reads only — every write is an [`ImplAction`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplQuery {
+    /// The merge request linked to the issue by a `Closes #` keyword.
+    ClosesLinkedMr,
+    /// An open merge request on the issue's own branch.
+    OpenMrForIssue,
+    /// The default branch; a read the run cannot proceed without.
+    DefaultBranch,
+    /// The default branch, falling back to `main` — used by the release
+    /// paths, which never fail the run over it.
+    DefaultBranchOrMain,
+    RemoteBranchExists,
+    DiffAgainstDefault,
+    StagedChanges,
+    /// The state of a merge request the model claims already implements the
+    /// issue; `None` when it could not be fetched at all.
+    MergeRequestState {
+        mr_iid: u64,
+    },
+    DependencyClosed {
+        issue_iid: u64,
+    },
+    IssueComments,
 }
 
-fn process_issue(
-    state: &AgentState,
-    model: &AgentModel,
-    issue: &Issue,
-    current: &mut ActiveIssue,
-    scope_label: Option<&str>,
-) -> Result<Option<u64>> {
-    if stop_worker_issue_if_review_only(state, issue.iid) {
-        return Ok(None);
+/// The answer to one [`ImplQuery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplFact {
+    ClosesLinkedMr(Option<ClosesLinkedMr>),
+    OpenMrForIssue(Option<u64>),
+    DefaultBranch(String),
+    DefaultBranchOrMain(String),
+    RemoteBranchExists(bool),
+    DiffAgainstDefault(bool),
+    StagedChanges(bool),
+    MergeRequestState(Option<String>),
+    DependencyClosed(bool),
+    IssueComments(String),
+}
+
+/// One side effect in the implementation progression: the workspace
+/// preparation, the model invocation, and every GitLab write are all
+/// actions the machine asks for one at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplAction {
+    /// Release the issue if a human asked for review-only in the meantime.
+    StopIfReviewOnly,
+    AddWorkingOnLabel,
+    /// The same label write, where the original code failed the run on it.
+    RequireWorkingOnLabel,
+    RemoveWorkingOnLabel,
+    AddIssueLabel {
+        label: String,
+    },
+    AddIssueComment {
+        body: String,
+    },
+    ReleaseIssueClaim,
+    CleanupSession,
+    CloseIssue,
+    SaveSession {
+        mr_iid: u64,
+    },
+    RequireSaveSession {
+        mr_iid: u64,
+    },
+    RequireSaveSessionWithSummary {
+        mr_iid: u64,
+        summary: String,
+    },
+    FetchRemote,
+    ResetWorktree,
+    CheckoutBranch {
+        branch: String,
+    },
+    /// The same checkout on a release path, where a failure is tolerated.
+    CheckoutBranchBestEffort {
+        branch: String,
+    },
+    DeleteLocalBranch {
+        branch: String,
+    },
+    DeleteRemoteBranch {
+        branch: String,
+    },
+    CreateBranchFrom {
+        branch: String,
+        base: String,
+    },
+    MergeBaseIntoBranch {
+        base: String,
+    },
+    /// Workspace preparation for the model: render the prompt and write the
+    /// task context file next to the session.
+    BuildPrompt {
+        continuation: bool,
+        comments: String,
+    },
+    InvokeImplementationModel {
+        prompt: String,
+    },
+    StageAll,
+    Commit {
+        message: String,
+    },
+    PushBranch {
+        branch: String,
+    },
+    CreateMergeRequest {
+        branch: String,
+        base: String,
+        title: String,
+        description: String,
+    },
+    AddMrScopeLabel {
+        mr_iid: u64,
+    },
+    HandIssueBackToHumans {
+        branch: String,
+        reason: String,
+    },
+}
+
+/// How one model invocation ended.
+enum ImplModelResult {
+    Output(Box<WorkerImplementationOutput>),
+    /// An external cancel that the cancel helper resolved as an
+    /// intentional stop.
+    Cancelled,
+}
+
+/// What the port reports after executing one [`ImplAction`].
+enum ImplOutcome {
+    Done,
+    Failed(anyhow::Error),
+    /// [`ImplAction::StopIfReviewOnly`]: whether the run must stop.
+    Stopped(bool),
+    /// [`ImplAction::MergeBaseIntoBranch`]: whether the merge was clean.
+    Merged(bool),
+    Prompt(String),
+    Model(ImplModelResult),
+    MergeRequestCreated(u64),
+}
+
+/// The narrow surface one implementation run needs: the worktree, the
+/// issue's merge requests, the session store, and the model. Object-safe
+/// and role-local.
+trait ImplementationPort {
+    fn closes_linked_mr(&self) -> Option<ClosesLinkedMr>;
+    fn open_mr_for_issue(&self) -> Option<u64>;
+    fn default_branch(&self) -> Result<String>;
+    fn default_branch_or_main(&self) -> String;
+    fn remote_branch_exists(&self, branch: &str) -> Result<bool>;
+    fn has_diff_against(&self, base: &str) -> Result<bool>;
+    fn has_staged_changes(&self) -> Result<bool>;
+    fn merge_request_state(&self, mr_iid: u64) -> Option<String>;
+    fn dependency_closed(&self, issue_iid: u64) -> bool;
+    fn issue_comments(&self) -> String;
+    fn execute(&mut self, action: &ImplAction) -> ImplOutcome;
+}
+
+/// One turn of the implementation driver loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplStep {
+    Observe(ImplQuery),
+    Act(ImplAction),
+    Finish,
+}
+
+/// Where an implementation run is. The variants spell out the fixed order:
+/// adopt an existing merge request if there is one, then prepare the
+/// worktree, then invoke the model, then commit, push, and open the MR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplStage {
+    StopBeforeDiscovery,
+    ObserveClosesLinkedMr,
+    LabelClosesMr(u64),
+    SaveClosesMrSession(u64),
+    CloseIssueForMergedMr,
+    CleanupSessionForMergedMr,
+    ObserveOpenMrForIssue,
+    LabelOpenMr(u64),
+    SaveOpenMrSession(u64),
+    ObserveDefaultBranch,
+    FetchRemote,
+    ResetBeforePreparation,
+    ObserveRemoteBranch,
+    CheckoutExistingBranch,
+    ObserveBranchDiff,
+    ResetStaleBranch,
+    CheckoutDefaultAfterStale,
+    DeleteLocalStaleBranch,
+    DeleteRemoteStaleBranch,
+    CreateBranchAfterStale,
+    MergeDefaultIntoBranch,
+    ResetConflictedBranch,
+    CheckoutDefaultAfterConflict,
+    DeleteLocalConflictedBranch,
+    CreateBranchAfterConflict,
+    CreateBranch,
+    StopAfterPreparation,
+    RequireWorkingOnLabel,
+    ObserveIssueComments,
+    BuildPrompt,
+    InvokeModel,
+    ObserveExistingMrState(u64),
+    ResetForExistingMr(u64),
+    ObserveDefaultForExistingMr(u64),
+    CheckoutDefaultForExistingMr(u64),
+    DeleteLocalBranchForExistingMr(u64),
+    SaveExistingMrSession(u64),
+    LabelExistingMr(u64),
+    HandBackToHumans(String),
+    ObserveDependencyState(u64),
+    ParkLabelDependency(u64),
+    ParkRemoveWorkingOnLabel(u64),
+    ParkComment(u64),
+    ParkReleaseClaim(u64),
+    ParkCleanupSession(u64),
+    ParkObserveDefaultBranch(u64),
+    ParkResetWorktree(u64),
+    ParkCheckoutDefault(u64),
+    ParkDeleteLocalBranch(u64),
+    StageAll,
+    ObserveStagedChanges,
+    CommitChanges,
+    ObserveDiffBeforePush,
+    PushBranch,
+    CreateMergeRequest,
+    AddScopeLabel(u64),
+    SaveSessionWithSummary(u64),
+    Finish,
+}
+
+/// The state of one implementation run. Plain data: no git repo, no GitLab
+/// client, no model, so every transition is a pure function of what the
+/// machine already observed.
+struct ImplementationMachine<'a> {
+    agent_id: &'a str,
+    scope_label: Option<&'a str>,
+    issue: IssueObservation,
+    stage: ImplStage,
+    branch_name: String,
+    default_branch: String,
+    branch_existed: bool,
+    metadata: ImplementedMetadata,
+    /// The rendered issue comments, held only between the observation that
+    /// read them and the prompt build that consumes them.
+    comments: String,
+    prompt: String,
+    /// The merge request this run ends up tracking, if any — the old
+    /// `Ok(Some(mr_iid))`.
+    tracked_mr: Option<u64>,
+    /// Mirrors the `current` the cycle cleans up from: the branch the run
+    /// left behind and whether it produced a merge request.
+    left_branch: Option<String>,
+    mr_created: bool,
+}
+
+impl<'a> ImplementationMachine<'a> {
+    fn new(agent_id: &'a str, scope_label: Option<&'a str>, issue: IssueObservation) -> Self {
+        let branch_name = format!("issue-{}", issue.iid);
+        Self {
+            agent_id,
+            scope_label,
+            issue,
+            stage: ImplStage::StopBeforeDiscovery,
+            branch_name,
+            default_branch: String::new(),
+            branch_existed: false,
+            metadata: ImplementedMetadata::default(),
+            comments: String::new(),
+            prompt: String::new(),
+            tracked_mr: None,
+            left_branch: None,
+            mr_created: false,
+        }
     }
 
-    match closes_keyword_mr_status(&state.glab, issue.iid) {
-        Some(ClosesLinkedMr::Open(mr_iid)) => {
-            info!(
-                "Issue #{} has open MR !{} (linked via Closes #{}), tracking it",
-                issue.iid, mr_iid, issue.iid
-            );
-
-            current.mr_iid = Some(mr_iid);
-            current.mr_created = true;
-
-            let _ = state.glab.add_issue_label(issue.iid, WORKING_ON_LABEL);
-            let _ = state.save_session(issue.iid, mr_iid);
-
-            return Ok(Some(mr_iid));
-        }
-        Some(ClosesLinkedMr::Merged) => {
-            info!(
-                "Issue #{}: merged MR already references it via Closes #; closing issue",
-                issue.iid
-            );
-            close_issue_best_effort(&state.glab, issue.iid);
-            state.cleanup_session(issue.iid);
-            return Ok(None);
-        }
-        None => {}
+    fn mr_title(&self) -> String {
+        extract_mr_title(self.metadata.mr_title.as_deref(), &self.issue.title)
     }
 
-    // Open MR on branch issue-<n> (no Closes # link required)
-    if let Some(mr_iid) = find_open_mr_for_issue(&state.glab, issue.iid) {
-        info!(
-            "Issue #{} already has open MR !{}, tracking it",
-            issue.iid, mr_iid
-        );
-
-        current.mr_iid = Some(mr_iid);
-        current.mr_created = true;
-        let _ = state.glab.add_issue_label(issue.iid, WORKING_ON_LABEL);
-        state.save_session(issue.iid, mr_iid)?;
-        return Ok(Some(mr_iid));
-    }
-
-    let default_branch = state.git_repo.get_default_branch()?;
-    state.git_repo.fetch()?;
-    let _ = state.git_repo.reset_hard();
-
-    let branch_name = format!("issue-{}", issue.iid);
-
-    let branch_existed = if state.git_repo.remote_branch_exists(&branch_name)? {
-        info!(
-            "Branch {} already exists on remote, checking if it's stale",
-            branch_name
-        );
-        state.git_repo.checkout_remote_branch(&branch_name)?;
-
-        // Check if the branch has any diff against the target — if not, it's
-        // stale (content already merged). Delete and start fresh.
-        if !state.git_repo.has_diff_against(&default_branch)? {
-            warn!(
-                "Branch {} has no diff against {}, discarding stale branch",
-                branch_name, default_branch
-            );
-
-            let _ = state.git_repo.reset_hard();
-            state.git_repo.checkout_remote_branch(&default_branch)?;
-            let _ = state.git_repo.delete_local_branch(&branch_name);
-            let _ = state.git_repo.delete_remote_branch(&branch_name);
-
-            state
-                .git_repo
-                .create_branch_from(&branch_name, &default_branch)?;
-
-            false
-        } else if !state.git_repo.try_merge(&default_branch)? {
-            warn!(
-                "Branch {} has conflicts with {}, creating fresh branch instead",
-                branch_name, default_branch
-            );
-
-            let _ = state.git_repo.reset_hard();
-            state.git_repo.checkout_remote_branch(&default_branch)?;
-            let _ = state.git_repo.delete_local_branch(&branch_name);
-            state
-                .git_repo
-                .create_branch_from(&branch_name, &default_branch)?;
-
-            false
-        } else {
-            true
-        }
-    } else {
-        state
-            .git_repo
-            .create_branch_from(&branch_name, &default_branch)?;
-        false
-    };
-
-    current.branch_name = Some(branch_name.clone());
-
-    if stop_worker_issue_if_review_only(state, issue.iid) {
-        return Ok(None);
-    }
-
-    state.glab.add_issue_label(issue.iid, WORKING_ON_LABEL)?;
-
-    let gl_comments = format_issue_comments_for_worker_context(&state.glab, issue.iid);
-
-    let prompt = if branch_existed {
-        build_continuation_prompt(state, issue, &gl_comments)?
-    } else {
-        build_implementation_prompt(state, issue, &gl_comments)?
-    };
-
-    let agent_output = match model.complete_typed::<WorkerOutput>(
-        &prompt,
-        &InvokeOptions {
-            cancel_check: Some(worker_issue_cancel_check(state.glab.clone(), issue.iid)),
-            follow_up_poll: None,
-            activity_label: Some(format!(
-                "{} implementing issue #{}",
-                &state.agent_id, issue.iid
-            )),
-        },
-    ) {
-        Ok(output) => output,
-        Err(e) if handle_worker_issue_processing_cancelled(state, issue.iid, &e) => {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-    info!(
-        "{}: Worker agent finished issue #{}",
-        &state.agent_id, issue.iid
-    );
-
-    // The model found an existing open MR that already implements this issue.
-    // Track it in worker state instead of creating a new MR.
-    if let Some(mr_iid) = extract_existing_mr_iid(&agent_output.output) {
-        if let Ok(mr) = state.glab.get_merge_request(mr_iid) {
-            if mr.state == "opened" {
-                info!(
-                    "Issue #{}: model identified existing MR !{} as the implementation; tracking it",
-                    issue.iid, mr_iid
-                );
-                // Clean up the worker-created branch (if any).
-                let _ = state.git_repo.reset_hard();
-                let default_branch = state
-                    .git_repo
-                    .get_default_branch()
-                    .unwrap_or_else(|_| "main".to_string());
-                let _ = state.git_repo.checkout_remote_branch(&default_branch);
-                let _ = state.git_repo.delete_local_branch(&branch_name);
-                // Track the existing MR in worker state.
-                current.mr_iid = Some(mr_iid);
-                current.mr_created = true;
-                state.save_session(issue.iid, mr_iid)?;
-                let _ = state.glab.add_issue_label(issue.iid, WORKING_ON_LABEL);
-                return Ok(Some(mr_iid));
+    /// The single next thing to do; resolves the stages that need no port
+    /// interaction on the way.
+    fn next_step(&mut self) -> ImplStep {
+        match self.stage.clone() {
+            ImplStage::StopBeforeDiscovery | ImplStage::StopAfterPreparation => {
+                ImplStep::Act(ImplAction::StopIfReviewOnly)
             }
-            warn!(
-                "Issue #{}: model identified MR !{} but it is not open (state={}); proceeding with new MR",
-                issue.iid, mr_iid, mr.state
-            );
-        } else {
-            warn!(
-                "Issue #{}: model identified MR !{} but it could not be fetched; proceeding with new MR",
-                issue.iid, mr_iid
-            );
-        }
-    }
-
-    if output_signals_cannot_implement(&agent_output.output) {
-        let reason = if output_needs_split(&agent_output.output) {
-            warn!("Issue #{} is too broad, needs splitting", issue.iid);
-            let split_reason = extract_split_reason(&agent_output.output);
-            format!(
-                "This issue needs to be split into smaller, focused issues:\n\n{}",
-                split_reason
-            )
-        } else {
-            warn!("Issue #{} needs clarification", issue.iid);
-            extract_clarification(&agent_output.output)
-        };
-        state.glab.add_issue_comment(issue.iid, &reason)?;
-
-        // If the branch already had an open MR, close it
-        if let Some(mr_iid) = find_open_mr_for_issue(&state.glab, issue.iid) {
-            state.glab.add_mr_comment(
-                mr_iid,
-                &format!(
-                    "Closing this MR — the issue cannot be implemented:\n\n{}",
-                    reason
-                ),
-            )?;
-            let _ = state.glab.close_mr(mr_iid);
-        }
-
-        // Reset git to a clean state — keep remote branch for potential retry
-        let default_branch = state
-            .git_repo
-            .get_default_branch()
-            .unwrap_or("main".to_string());
-        let _ = state.git_repo.reset_hard();
-        let _ = state.git_repo.checkout_remote_branch(&default_branch);
-        let _ = state.git_repo.delete_local_branch(&branch_name);
-
-        state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL)?;
-        state
-            .glab
-            .add_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
-        current.branch_name = None;
-        info!(
-            "Issue #{} requires user action, labeled with '{}'",
-            issue.iid, ACTION_REQUIRED_LABEL
-        );
-        return Ok(None);
-    }
-
-    // If the agent declared a dependency on another issue that is not yet
-    // closed, park this issue: label it `waiting-on-issue:#N`, remove
-    // `in-progress`, release the claim, and reset git state. No MR is
-    // created — the work can't proceed until the dependency closes. When
-    // the dependency issue closes, the worker resume-path strips the label
-    // and the issue becomes claimable again.
-    if let Some(dep_issue_iid) = extract_depends_on_issue(&agent_output.output) {
-        let dep_closed = state
-            .glab
-            .get_issue(dep_issue_iid)
-            .map(|dep| dep.state == "closed")
-            .unwrap_or(false);
-        if !dep_closed {
-            let label = waiting_on_issue_label(dep_issue_iid);
-            let _ = state.glab.add_issue_label(issue.iid, &label);
-            let _ = state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
-            let _ = state.glab.add_issue_comment(
-                issue.iid,
-                &format!(
+            ImplStage::ObserveClosesLinkedMr => ImplStep::Observe(ImplQuery::ClosesLinkedMr),
+            ImplStage::LabelClosesMr(_) | ImplStage::LabelOpenMr(_) => {
+                ImplStep::Act(ImplAction::AddWorkingOnLabel)
+            }
+            ImplStage::SaveClosesMrSession(mr_iid) => {
+                ImplStep::Act(ImplAction::SaveSession { mr_iid })
+            }
+            ImplStage::CloseIssueForMergedMr => ImplStep::Act(ImplAction::CloseIssue),
+            ImplStage::CleanupSessionForMergedMr | ImplStage::ParkCleanupSession(_) => {
+                ImplStep::Act(ImplAction::CleanupSession)
+            }
+            ImplStage::ObserveOpenMrForIssue => ImplStep::Observe(ImplQuery::OpenMrForIssue),
+            ImplStage::SaveOpenMrSession(mr_iid) | ImplStage::SaveExistingMrSession(mr_iid) => {
+                ImplStep::Act(ImplAction::RequireSaveSession { mr_iid })
+            }
+            ImplStage::ObserveDefaultBranch => ImplStep::Observe(ImplQuery::DefaultBranch),
+            ImplStage::FetchRemote => ImplStep::Act(ImplAction::FetchRemote),
+            ImplStage::ResetBeforePreparation
+            | ImplStage::ResetStaleBranch
+            | ImplStage::ResetConflictedBranch
+            | ImplStage::ResetForExistingMr(_)
+            | ImplStage::ParkResetWorktree(_) => ImplStep::Act(ImplAction::ResetWorktree),
+            ImplStage::ObserveRemoteBranch => ImplStep::Observe(ImplQuery::RemoteBranchExists),
+            ImplStage::CheckoutExistingBranch => ImplStep::Act(ImplAction::CheckoutBranch {
+                branch: self.branch_name.clone(),
+            }),
+            ImplStage::ObserveBranchDiff | ImplStage::ObserveDiffBeforePush => {
+                ImplStep::Observe(ImplQuery::DiffAgainstDefault)
+            }
+            ImplStage::CheckoutDefaultAfterStale | ImplStage::CheckoutDefaultAfterConflict => {
+                ImplStep::Act(ImplAction::CheckoutBranch {
+                    branch: self.default_branch.clone(),
+                })
+            }
+            ImplStage::CheckoutDefaultForExistingMr(_) | ImplStage::ParkCheckoutDefault(_) => {
+                ImplStep::Act(ImplAction::CheckoutBranchBestEffort {
+                    branch: self.default_branch.clone(),
+                })
+            }
+            ImplStage::DeleteLocalStaleBranch
+            | ImplStage::DeleteLocalConflictedBranch
+            | ImplStage::DeleteLocalBranchForExistingMr(_)
+            | ImplStage::ParkDeleteLocalBranch(_) => ImplStep::Act(ImplAction::DeleteLocalBranch {
+                branch: self.branch_name.clone(),
+            }),
+            ImplStage::DeleteRemoteStaleBranch => ImplStep::Act(ImplAction::DeleteRemoteBranch {
+                branch: self.branch_name.clone(),
+            }),
+            ImplStage::CreateBranchAfterStale
+            | ImplStage::CreateBranchAfterConflict
+            | ImplStage::CreateBranch => ImplStep::Act(ImplAction::CreateBranchFrom {
+                branch: self.branch_name.clone(),
+                base: self.default_branch.clone(),
+            }),
+            ImplStage::MergeDefaultIntoBranch => ImplStep::Act(ImplAction::MergeBaseIntoBranch {
+                base: self.default_branch.clone(),
+            }),
+            ImplStage::RequireWorkingOnLabel => ImplStep::Act(ImplAction::RequireWorkingOnLabel),
+            ImplStage::ObserveIssueComments => ImplStep::Observe(ImplQuery::IssueComments),
+            ImplStage::BuildPrompt => ImplStep::Act(ImplAction::BuildPrompt {
+                continuation: self.branch_existed,
+                comments: self.comments.clone(),
+            }),
+            ImplStage::InvokeModel => ImplStep::Act(ImplAction::InvokeImplementationModel {
+                prompt: self.prompt.clone(),
+            }),
+            ImplStage::ObserveExistingMrState(mr_iid) => {
+                ImplStep::Observe(ImplQuery::MergeRequestState { mr_iid })
+            }
+            ImplStage::ObserveDefaultForExistingMr(_) | ImplStage::ParkObserveDefaultBranch(_) => {
+                ImplStep::Observe(ImplQuery::DefaultBranchOrMain)
+            }
+            ImplStage::LabelExistingMr(_) => ImplStep::Act(ImplAction::AddWorkingOnLabel),
+            ImplStage::HandBackToHumans(reason) => {
+                ImplStep::Act(ImplAction::HandIssueBackToHumans {
+                    branch: self.branch_name.clone(),
+                    reason,
+                })
+            }
+            ImplStage::ObserveDependencyState(issue_iid) => {
+                ImplStep::Observe(ImplQuery::DependencyClosed { issue_iid })
+            }
+            ImplStage::ParkLabelDependency(dep_issue_iid) => {
+                ImplStep::Act(ImplAction::AddIssueLabel {
+                    label: waiting_on_issue_label(dep_issue_iid),
+                })
+            }
+            ImplStage::ParkRemoveWorkingOnLabel(_) => {
+                ImplStep::Act(ImplAction::RemoveWorkingOnLabel)
+            }
+            ImplStage::ParkComment(dep_issue_iid) => ImplStep::Act(ImplAction::AddIssueComment {
+                body: format!(
                     "Implementation cannot proceed until issue #{} is closed. \
                      Parking this issue until the dependency resolves.",
                     dep_issue_iid
                 ),
-            );
-            let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
-            state.cleanup_session(issue.iid);
-
-            // Reset git to a clean state — keep the remote branch for resume.
-            let default_branch = state
-                .git_repo
-                .get_default_branch()
-                .unwrap_or("main".to_string());
-            let _ = state.git_repo.reset_hard();
-            let _ = state.git_repo.checkout_remote_branch(&default_branch);
-            let _ = state.git_repo.delete_local_branch(&branch_name);
-
-            info!(
-                "{}: Issue #{} parked waiting on issue #{} (dependency open), released claim",
-                &state.agent_id, issue.iid, dep_issue_iid
-            );
-            current.mr_created = false;
-            current.branch_name = None;
-            return Ok(None);
+            }),
+            ImplStage::ParkReleaseClaim(_) => ImplStep::Act(ImplAction::ReleaseIssueClaim),
+            ImplStage::StageAll => ImplStep::Act(ImplAction::StageAll),
+            ImplStage::ObserveStagedChanges => ImplStep::Observe(ImplQuery::StagedChanges),
+            ImplStage::CommitChanges => ImplStep::Act(ImplAction::Commit {
+                message: build_commit_message(&self.mr_title(), self.issue.iid),
+            }),
+            ImplStage::PushBranch => ImplStep::Act(ImplAction::PushBranch {
+                branch: self.branch_name.clone(),
+            }),
+            ImplStage::CreateMergeRequest => ImplStep::Act(ImplAction::CreateMergeRequest {
+                branch: self.branch_name.clone(),
+                base: self.default_branch.clone(),
+                title: self.mr_title(),
+                description: format!(
+                    "Closes #{}\n\n{}",
+                    self.issue.iid,
+                    extract_mr_description(self.metadata.mr_description.as_deref())
+                ),
+            }),
+            ImplStage::AddScopeLabel(mr_iid) => {
+                ImplStep::Act(ImplAction::AddMrScopeLabel { mr_iid })
+            }
+            ImplStage::SaveSessionWithSummary(mr_iid) => {
+                ImplStep::Act(ImplAction::RequireSaveSessionWithSummary {
+                    mr_iid,
+                    summary: extract_mr_description(self.metadata.mr_description.as_deref()),
+                })
+            }
+            ImplStage::Finish => ImplStep::Finish,
         }
     }
 
-    // The agent may have already committed changes itself (it has full shell
-    // access). Stage+commit any remaining uncommitted work, then check whether
-    // the branch diverges from the base at all.
-    state.git_repo.add_all()?;
-
-    let mr_title = extract_mr_title(&agent_output.output, &issue.title);
-
-    if state.git_repo.has_staged_changes()? {
-        let commit_message = build_commit_message(&mr_title, issue.iid);
-        state.git_repo.commit(&commit_message)?;
+    fn apply_fact(&mut self, fact: Result<ImplFact>) -> Result<()> {
+        match (self.stage.clone(), fact?) {
+            (ImplStage::ObserveClosesLinkedMr, ImplFact::ClosesLinkedMr(linked)) => {
+                self.stage = match linked {
+                    Some(ClosesLinkedMr::Open(mr_iid)) => {
+                        info!(
+                            "Issue #{} has open MR !{} (linked via Closes #{}), tracking it",
+                            self.issue.iid, mr_iid, self.issue.iid
+                        );
+                        self.tracked_mr = Some(mr_iid);
+                        self.mr_created = true;
+                        ImplStage::LabelClosesMr(mr_iid)
+                    }
+                    Some(ClosesLinkedMr::Merged) => {
+                        info!(
+                            "Issue #{}: merged MR already references it via Closes #; closing issue",
+                            self.issue.iid
+                        );
+                        ImplStage::CloseIssueForMergedMr
+                    }
+                    None => ImplStage::ObserveOpenMrForIssue,
+                };
+            }
+            (ImplStage::ObserveOpenMrForIssue, ImplFact::OpenMrForIssue(found)) => {
+                self.stage = match found {
+                    Some(mr_iid) => {
+                        info!(
+                            "Issue #{} already has open MR !{}, tracking it",
+                            self.issue.iid, mr_iid
+                        );
+                        self.tracked_mr = Some(mr_iid);
+                        self.mr_created = true;
+                        ImplStage::LabelOpenMr(mr_iid)
+                    }
+                    None => ImplStage::ObserveDefaultBranch,
+                };
+            }
+            (ImplStage::ObserveDefaultBranch, ImplFact::DefaultBranch(branch)) => {
+                self.default_branch = branch;
+                self.stage = ImplStage::FetchRemote;
+            }
+            (ImplStage::ObserveRemoteBranch, ImplFact::RemoteBranchExists(exists)) => {
+                self.stage = if exists {
+                    info!(
+                        "Branch {} already exists on remote, checking if it's stale",
+                        self.branch_name
+                    );
+                    ImplStage::CheckoutExistingBranch
+                } else {
+                    ImplStage::CreateBranch
+                };
+            }
+            (ImplStage::ObserveBranchDiff, ImplFact::DiffAgainstDefault(has_diff)) => {
+                self.stage = if has_diff {
+                    ImplStage::MergeDefaultIntoBranch
+                } else {
+                    warn!(
+                        "Branch {} has no diff against {}, discarding stale branch",
+                        self.branch_name, self.default_branch
+                    );
+                    ImplStage::ResetStaleBranch
+                };
+            }
+            (ImplStage::ObserveIssueComments, ImplFact::IssueComments(comments)) => {
+                self.comments = comments;
+                self.stage = ImplStage::BuildPrompt;
+            }
+            (ImplStage::ObserveExistingMrState(mr_iid), ImplFact::MergeRequestState(state)) => {
+                self.stage = match state.as_deref() {
+                    Some("opened") => {
+                        info!(
+                            "Issue #{}: model identified existing MR !{} as the implementation; tracking it",
+                            self.issue.iid, mr_iid
+                        );
+                        ImplStage::ResetForExistingMr(mr_iid)
+                    }
+                    Some(other) => {
+                        warn!(
+                            "Issue #{}: model identified MR !{} but it is not open (state={}); proceeding with new MR",
+                            self.issue.iid, mr_iid, other
+                        );
+                        ImplStage::StageAll
+                    }
+                    None => {
+                        warn!(
+                            "Issue #{}: model identified MR !{} but it could not be fetched; proceeding with new MR",
+                            self.issue.iid, mr_iid
+                        );
+                        ImplStage::StageAll
+                    }
+                };
+            }
+            (
+                ImplStage::ObserveDefaultForExistingMr(mr_iid),
+                ImplFact::DefaultBranchOrMain(branch),
+            ) => {
+                self.default_branch = branch;
+                self.stage = ImplStage::CheckoutDefaultForExistingMr(mr_iid);
+            }
+            (ImplStage::ParkObserveDefaultBranch(dep), ImplFact::DefaultBranchOrMain(branch)) => {
+                self.default_branch = branch;
+                self.stage = ImplStage::ParkResetWorktree(dep);
+            }
+            (ImplStage::ObserveDependencyState(dep), ImplFact::DependencyClosed(closed)) => {
+                self.stage = if closed {
+                    ImplStage::StageAll
+                } else {
+                    ImplStage::ParkLabelDependency(dep)
+                };
+            }
+            (ImplStage::ObserveStagedChanges, ImplFact::StagedChanges(staged)) => {
+                self.stage = if staged {
+                    ImplStage::CommitChanges
+                } else {
+                    ImplStage::ObserveDiffBeforePush
+                };
+            }
+            (ImplStage::ObserveDiffBeforePush, ImplFact::DiffAgainstDefault(has_diff)) => {
+                if !has_diff {
+                    warn!(
+                        "Issue #{}: agent produced no code changes, retrying",
+                        self.issue.iid
+                    );
+                    anyhow::bail!("{}", no_code_changes_retry_error_message(self.issue.iid));
+                }
+                self.stage = ImplStage::PushBranch;
+            }
+            (stage, fact) => {
+                anyhow::bail!("implementation port answered {stage:?} with {fact:?}");
+            }
+        }
+        Ok(())
     }
 
-    if !state.git_repo.has_diff_against(&default_branch)? {
-        warn!(
-            "Issue #{}: agent produced no code changes, retrying",
-            issue.iid
-        );
-        anyhow::bail!("{}", no_code_changes_retry_error_message(issue.iid));
+    fn apply_outcome(&mut self, outcome: ImplOutcome) -> Result<()> {
+        match (self.stage.clone(), outcome) {
+            (ImplStage::StopBeforeDiscovery, ImplOutcome::Stopped(stop)) => {
+                self.stage = if stop {
+                    ImplStage::Finish
+                } else {
+                    ImplStage::ObserveClosesLinkedMr
+                };
+            }
+            (ImplStage::StopAfterPreparation, ImplOutcome::Stopped(stop)) => {
+                self.stage = if stop {
+                    ImplStage::Finish
+                } else {
+                    ImplStage::RequireWorkingOnLabel
+                };
+            }
+            (ImplStage::LabelClosesMr(mr_iid), ImplOutcome::Done) => {
+                self.stage = ImplStage::SaveClosesMrSession(mr_iid);
+            }
+            (ImplStage::SaveClosesMrSession(_), ImplOutcome::Done) => {
+                self.stage = ImplStage::Finish;
+            }
+            (ImplStage::CloseIssueForMergedMr, ImplOutcome::Done) => {
+                self.stage = ImplStage::CleanupSessionForMergedMr;
+            }
+            (ImplStage::CleanupSessionForMergedMr, ImplOutcome::Done) => {
+                self.stage = ImplStage::Finish;
+            }
+            (ImplStage::LabelOpenMr(mr_iid), ImplOutcome::Done) => {
+                self.stage = ImplStage::SaveOpenMrSession(mr_iid);
+            }
+            (ImplStage::SaveOpenMrSession(_), ImplOutcome::Done) => {
+                self.stage = ImplStage::Finish;
+            }
+            (ImplStage::FetchRemote, ImplOutcome::Done) => {
+                self.stage = ImplStage::ResetBeforePreparation;
+            }
+            (ImplStage::ResetBeforePreparation, ImplOutcome::Done) => {
+                self.stage = ImplStage::ObserveRemoteBranch;
+            }
+            (ImplStage::CheckoutExistingBranch, ImplOutcome::Done) => {
+                self.stage = ImplStage::ObserveBranchDiff;
+            }
+            (ImplStage::ResetStaleBranch, ImplOutcome::Done) => {
+                self.stage = ImplStage::CheckoutDefaultAfterStale;
+            }
+            (ImplStage::CheckoutDefaultAfterStale, ImplOutcome::Done) => {
+                self.stage = ImplStage::DeleteLocalStaleBranch;
+            }
+            (ImplStage::DeleteLocalStaleBranch, ImplOutcome::Done) => {
+                self.stage = ImplStage::DeleteRemoteStaleBranch;
+            }
+            (ImplStage::DeleteRemoteStaleBranch, ImplOutcome::Done) => {
+                self.stage = ImplStage::CreateBranchAfterStale;
+            }
+            (ImplStage::MergeDefaultIntoBranch, ImplOutcome::Merged(clean)) => {
+                self.stage = if clean {
+                    self.branch_existed = true;
+                    self.enter_preparation_done()
+                } else {
+                    warn!(
+                        "Branch {} has conflicts with {}, creating fresh branch instead",
+                        self.branch_name, self.default_branch
+                    );
+                    ImplStage::ResetConflictedBranch
+                };
+            }
+            (ImplStage::ResetConflictedBranch, ImplOutcome::Done) => {
+                self.stage = ImplStage::CheckoutDefaultAfterConflict;
+            }
+            (ImplStage::CheckoutDefaultAfterConflict, ImplOutcome::Done) => {
+                self.stage = ImplStage::DeleteLocalConflictedBranch;
+            }
+            (ImplStage::DeleteLocalConflictedBranch, ImplOutcome::Done) => {
+                self.stage = ImplStage::CreateBranchAfterConflict;
+            }
+            (
+                ImplStage::CreateBranchAfterStale
+                | ImplStage::CreateBranchAfterConflict
+                | ImplStage::CreateBranch,
+                ImplOutcome::Done,
+            ) => {
+                self.branch_existed = false;
+                self.stage = self.enter_preparation_done();
+            }
+            (ImplStage::RequireWorkingOnLabel, ImplOutcome::Done) => {
+                self.stage = ImplStage::ObserveIssueComments;
+            }
+            (ImplStage::BuildPrompt, ImplOutcome::Prompt(prompt)) => {
+                self.prompt = prompt;
+                self.stage = ImplStage::InvokeModel;
+            }
+            (ImplStage::InvokeModel, ImplOutcome::Model(result)) => {
+                self.stage = match result {
+                    ImplModelResult::Cancelled => ImplStage::Finish,
+                    ImplModelResult::Output(output) => {
+                        info!(
+                            "{}: Worker agent finished issue #{}",
+                            self.agent_id, self.issue.iid
+                        );
+                        self.classify_model_output(&output)
+                    }
+                };
+            }
+            (ImplStage::ResetForExistingMr(mr_iid), ImplOutcome::Done) => {
+                self.stage = ImplStage::ObserveDefaultForExistingMr(mr_iid);
+            }
+            (ImplStage::CheckoutDefaultForExistingMr(mr_iid), ImplOutcome::Done) => {
+                self.stage = ImplStage::DeleteLocalBranchForExistingMr(mr_iid);
+            }
+            (ImplStage::DeleteLocalBranchForExistingMr(mr_iid), ImplOutcome::Done) => {
+                self.tracked_mr = Some(mr_iid);
+                self.mr_created = true;
+                self.stage = ImplStage::SaveExistingMrSession(mr_iid);
+            }
+            (ImplStage::SaveExistingMrSession(mr_iid), ImplOutcome::Done) => {
+                self.stage = ImplStage::LabelExistingMr(mr_iid);
+            }
+            (ImplStage::LabelExistingMr(_), ImplOutcome::Done) => {
+                self.stage = ImplStage::Finish;
+            }
+            (ImplStage::HandBackToHumans(_), ImplOutcome::Done) => {
+                self.left_branch = None;
+                self.stage = ImplStage::Finish;
+            }
+            (ImplStage::ParkLabelDependency(dep), ImplOutcome::Done) => {
+                self.stage = ImplStage::ParkRemoveWorkingOnLabel(dep);
+            }
+            (ImplStage::ParkRemoveWorkingOnLabel(dep), ImplOutcome::Done) => {
+                self.stage = ImplStage::ParkComment(dep);
+            }
+            (ImplStage::ParkComment(dep), ImplOutcome::Done) => {
+                self.stage = ImplStage::ParkReleaseClaim(dep);
+            }
+            (ImplStage::ParkReleaseClaim(dep), ImplOutcome::Done) => {
+                self.stage = ImplStage::ParkCleanupSession(dep);
+            }
+            (ImplStage::ParkCleanupSession(dep), ImplOutcome::Done) => {
+                self.stage = ImplStage::ParkObserveDefaultBranch(dep);
+            }
+            (ImplStage::ParkResetWorktree(dep), ImplOutcome::Done) => {
+                self.stage = ImplStage::ParkCheckoutDefault(dep);
+            }
+            (ImplStage::ParkCheckoutDefault(dep), ImplOutcome::Done) => {
+                self.stage = ImplStage::ParkDeleteLocalBranch(dep);
+            }
+            (ImplStage::ParkDeleteLocalBranch(dep), ImplOutcome::Done) => {
+                info!(
+                    "{}: Issue #{} parked waiting on issue #{} (dependency open), released claim",
+                    self.agent_id, self.issue.iid, dep
+                );
+                self.mr_created = false;
+                self.left_branch = None;
+                self.stage = ImplStage::Finish;
+            }
+            (ImplStage::StageAll, ImplOutcome::Done) => {
+                self.stage = ImplStage::ObserveStagedChanges;
+            }
+            (ImplStage::CommitChanges, ImplOutcome::Done) => {
+                self.stage = ImplStage::ObserveDiffBeforePush;
+            }
+            (ImplStage::PushBranch, ImplOutcome::Done) => {
+                self.stage = ImplStage::CreateMergeRequest;
+            }
+            (ImplStage::CreateMergeRequest, ImplOutcome::MergeRequestCreated(mr_iid)) => {
+                self.tracked_mr = Some(mr_iid);
+                self.mr_created = true;
+                info!("Created MR !{} for issue #{}", mr_iid, self.issue.iid);
+                self.stage = if self.scope_label.is_some() {
+                    ImplStage::AddScopeLabel(mr_iid)
+                } else {
+                    ImplStage::SaveSessionWithSummary(mr_iid)
+                };
+            }
+            (ImplStage::AddScopeLabel(mr_iid), ImplOutcome::Done) => {
+                self.stage = ImplStage::SaveSessionWithSummary(mr_iid);
+            }
+            (ImplStage::SaveSessionWithSummary(_), ImplOutcome::Done) => {
+                self.stage = ImplStage::Finish;
+            }
+            (_, ImplOutcome::Failed(e)) => return Err(e),
+            (stage, _) => {
+                anyhow::bail!("implementation port reported an unexpected outcome for {stage:?}");
+            }
+        }
+        Ok(())
     }
 
-    state.git_repo.push(&branch_name)?;
-    let mr_description = format!(
-        "Closes #{}\n\n{}",
-        issue.iid,
-        extract_mr_description(&agent_output.output)
+    /// The branch is ready: record it as the branch this run may have to
+    /// clean up, then re-check the review-only hold.
+    fn enter_preparation_done(&mut self) -> ImplStage {
+        self.left_branch = Some(self.branch_name.clone());
+        ImplStage::StopAfterPreparation
+    }
+
+    /// Which of the handoff branches the run took. The branches that
+    /// resolve the issue on their own end the run; the rest fall through to
+    /// the ordinary commit/push/open-MR path.
+    fn classify_model_output(&mut self, output: &WorkerImplementationOutput) -> ImplStage {
+        match output {
+            WorkerImplementationOutput::Implemented(metadata) => {
+                self.metadata = metadata.clone();
+                ImplStage::StageAll
+            }
+            WorkerImplementationOutput::ExistingMr { existing_mr_iid } => {
+                ImplStage::ObserveExistingMrState(*existing_mr_iid)
+            }
+            WorkerImplementationOutput::NeedsSplit(blocked) => {
+                warn!("Issue #{} is too broad, needs splitting", self.issue.iid);
+                ImplStage::HandBackToHumans(format!(
+                    "This issue needs to be split into smaller, focused issues:\n\n{}",
+                    extract_split_reason(blocked)
+                ))
+            }
+            WorkerImplementationOutput::NeedsClarification(blocked) => {
+                warn!("Issue #{} needs clarification", self.issue.iid);
+                ImplStage::HandBackToHumans(extract_clarification(blocked))
+            }
+            WorkerImplementationOutput::CannotImplement(blocked) => {
+                warn!("Issue #{} cannot be implemented", self.issue.iid);
+                ImplStage::HandBackToHumans(extract_cannot_implement_reason(blocked))
+            }
+            WorkerImplementationOutput::WaitDependency { depends_on_issue } => {
+                ImplStage::ObserveDependencyState(*depends_on_issue)
+            }
+        }
+    }
+}
+
+/// Ask the implementation port one question.
+fn observe_implementation(
+    port: &dyn ImplementationPort,
+    query: &ImplQuery,
+    machine: &ImplementationMachine,
+) -> Result<ImplFact> {
+    Ok(match query {
+        ImplQuery::ClosesLinkedMr => ImplFact::ClosesLinkedMr(port.closes_linked_mr()),
+        ImplQuery::OpenMrForIssue => ImplFact::OpenMrForIssue(port.open_mr_for_issue()),
+        ImplQuery::DefaultBranch => ImplFact::DefaultBranch(port.default_branch()?),
+        ImplQuery::DefaultBranchOrMain => {
+            ImplFact::DefaultBranchOrMain(port.default_branch_or_main())
+        }
+        ImplQuery::RemoteBranchExists => {
+            ImplFact::RemoteBranchExists(port.remote_branch_exists(&machine.branch_name)?)
+        }
+        ImplQuery::DiffAgainstDefault => {
+            ImplFact::DiffAgainstDefault(port.has_diff_against(&machine.default_branch)?)
+        }
+        ImplQuery::StagedChanges => ImplFact::StagedChanges(port.has_staged_changes()?),
+        ImplQuery::MergeRequestState { mr_iid } => {
+            ImplFact::MergeRequestState(port.merge_request_state(*mr_iid))
+        }
+        ImplQuery::DependencyClosed { issue_iid } => {
+            ImplFact::DependencyClosed(port.dependency_closed(*issue_iid))
+        }
+        ImplQuery::IssueComments => ImplFact::IssueComments(port.issue_comments()),
+    })
+}
+
+/// Run one implementation to completion: observe, decide one step, execute
+/// it, feed the result back.
+fn drive_implementation(
+    machine: &mut ImplementationMachine,
+    port: &mut dyn ImplementationPort,
+) -> Result<()> {
+    loop {
+        match machine.next_step() {
+            ImplStep::Observe(query) => {
+                let fact = observe_implementation(port, &query, machine);
+                machine.apply_fact(fact)?;
+            }
+            ImplStep::Act(action) => {
+                let outcome = port.execute(&action);
+                machine.apply_outcome(outcome)?;
+            }
+            ImplStep::Finish => return Ok(()),
+        }
+    }
+}
+
+/// The implementation progression backed by the real runtime.
+struct LiveImplementationPort<'a> {
+    state: &'a AgentState<'a>,
+    model: &'a AgentModel,
+    issue: &'a IssueObservation,
+    scope_label: Option<&'a str>,
+}
+
+impl ImplementationPort for LiveImplementationPort<'_> {
+    fn closes_linked_mr(&self) -> Option<ClosesLinkedMr> {
+        closes_keyword_mr_status(self.state.glab, self.issue.iid)
+    }
+
+    fn open_mr_for_issue(&self) -> Option<u64> {
+        find_open_mr_for_issue(self.state.glab, self.issue.iid)
+    }
+
+    fn default_branch(&self) -> Result<String> {
+        self.state.git_repo.get_default_branch()
+    }
+
+    fn default_branch_or_main(&self) -> String {
+        self.state
+            .git_repo
+            .get_default_branch()
+            .unwrap_or_else(|_| "main".to_string())
+    }
+
+    fn remote_branch_exists(&self, branch: &str) -> Result<bool> {
+        self.state.git_repo.remote_branch_exists(branch)
+    }
+
+    fn has_diff_against(&self, base: &str) -> Result<bool> {
+        self.state.git_repo.has_diff_against(base)
+    }
+
+    fn has_staged_changes(&self) -> Result<bool> {
+        self.state.git_repo.has_staged_changes()
+    }
+
+    fn merge_request_state(&self, mr_iid: u64) -> Option<String> {
+        self.state
+            .glab
+            .get_merge_request(mr_iid)
+            .ok()
+            .map(|mr| mr.state)
+    }
+
+    fn dependency_closed(&self, issue_iid: u64) -> bool {
+        self.state
+            .glab
+            .get_issue(issue_iid)
+            .map(|dep| dep.state == "closed")
+            .unwrap_or(false)
+    }
+
+    fn issue_comments(&self) -> String {
+        format_issue_comments_for_worker_context(self.state.glab, self.issue.iid)
+    }
+
+    fn execute(&mut self, action: &ImplAction) -> ImplOutcome {
+        let state = self.state;
+        let issue_iid = self.issue.iid;
+        match action {
+            ImplAction::StopIfReviewOnly => {
+                ImplOutcome::Stopped(stop_worker_issue_if_review_only(state, issue_iid))
+            }
+            ImplAction::AddWorkingOnLabel => {
+                let _ = state.glab.add_issue_label(issue_iid, WORKING_ON_LABEL);
+                ImplOutcome::Done
+            }
+            ImplAction::RequireWorkingOnLabel => {
+                match state.glab.add_issue_label(issue_iid, WORKING_ON_LABEL) {
+                    Ok(()) => ImplOutcome::Done,
+                    Err(e) => ImplOutcome::Failed(e),
+                }
+            }
+            ImplAction::RemoveWorkingOnLabel => {
+                let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+                ImplOutcome::Done
+            }
+            ImplAction::AddIssueLabel { label } => {
+                let _ = state.glab.add_issue_label(issue_iid, label);
+                ImplOutcome::Done
+            }
+            ImplAction::AddIssueComment { body } => {
+                let _ = state.glab.add_issue_comment(issue_iid, body);
+                ImplOutcome::Done
+            }
+            ImplAction::ReleaseIssueClaim => {
+                let _ = claim::release(state.glab, ClaimResource::Issue(issue_iid), state.agent_id);
+                ImplOutcome::Done
+            }
+            ImplAction::CleanupSession => {
+                state.cleanup_session(issue_iid);
+                ImplOutcome::Done
+            }
+            ImplAction::CloseIssue => {
+                close_issue_best_effort(state.glab, issue_iid);
+                ImplOutcome::Done
+            }
+            ImplAction::SaveSession { mr_iid } => {
+                let _ = state.save_session(issue_iid, *mr_iid);
+                ImplOutcome::Done
+            }
+            ImplAction::RequireSaveSession { mr_iid } => {
+                match state.save_session(issue_iid, *mr_iid) {
+                    Ok(()) => ImplOutcome::Done,
+                    Err(e) => ImplOutcome::Failed(e),
+                }
+            }
+            ImplAction::RequireSaveSessionWithSummary { mr_iid, summary } => {
+                match state.save_session_with_summary(issue_iid, *mr_iid, summary) {
+                    Ok(()) => ImplOutcome::Done,
+                    Err(e) => ImplOutcome::Failed(e),
+                }
+            }
+            ImplAction::FetchRemote => match state.git_repo.fetch() {
+                Ok(()) => ImplOutcome::Done,
+                Err(e) => ImplOutcome::Failed(e),
+            },
+            ImplAction::ResetWorktree => {
+                let _ = state.git_repo.reset_hard();
+                ImplOutcome::Done
+            }
+            ImplAction::CheckoutBranch { branch } => {
+                match state.git_repo.checkout_remote_branch(branch) {
+                    Ok(()) => ImplOutcome::Done,
+                    Err(e) => ImplOutcome::Failed(e),
+                }
+            }
+            ImplAction::CheckoutBranchBestEffort { branch } => {
+                let _ = state.git_repo.checkout_remote_branch(branch);
+                ImplOutcome::Done
+            }
+            ImplAction::DeleteLocalBranch { branch } => {
+                let _ = state.git_repo.delete_local_branch(branch);
+                ImplOutcome::Done
+            }
+            ImplAction::DeleteRemoteBranch { branch } => {
+                let _ = state.git_repo.delete_remote_branch(branch);
+                ImplOutcome::Done
+            }
+            ImplAction::CreateBranchFrom { branch, base } => {
+                match state.git_repo.create_branch_from(branch, base) {
+                    Ok(()) => ImplOutcome::Done,
+                    Err(e) => ImplOutcome::Failed(e),
+                }
+            }
+            ImplAction::MergeBaseIntoBranch { base } => match state.git_repo.try_merge(base) {
+                Ok(clean) => ImplOutcome::Merged(clean),
+                Err(e) => ImplOutcome::Failed(e),
+            },
+            ImplAction::BuildPrompt {
+                continuation,
+                comments,
+            } => {
+                let built = if *continuation {
+                    build_continuation_prompt(state, self.issue, comments)
+                } else {
+                    build_implementation_prompt(state, self.issue, comments)
+                };
+                match built {
+                    Ok(prompt) => ImplOutcome::Prompt(prompt),
+                    Err(e) => ImplOutcome::Failed(e),
+                }
+            }
+            ImplAction::InvokeImplementationModel { prompt } => {
+                match self.model.complete_typed::<WorkerImplementationOutput>(
+                    prompt,
+                    &InvokeOptions {
+                        cancel_check: Some(worker_issue_cancel_check(
+                            state.glab.clone(),
+                            issue_iid,
+                        )),
+                        follow_up_poll: None,
+                        activity_label: Some(format!(
+                            "{} implementing issue #{}",
+                            state.agent_id, issue_iid
+                        )),
+                    },
+                ) {
+                    Ok(completion) => {
+                        ImplOutcome::Model(ImplModelResult::Output(Box::new(completion.output)))
+                    }
+                    Err(e) if handle_worker_issue_processing_cancelled(state, issue_iid, &e) => {
+                        ImplOutcome::Model(ImplModelResult::Cancelled)
+                    }
+                    Err(e) => ImplOutcome::Failed(e),
+                }
+            }
+            ImplAction::StageAll => match state.git_repo.add_all() {
+                Ok(()) => ImplOutcome::Done,
+                Err(e) => ImplOutcome::Failed(e),
+            },
+            ImplAction::Commit { message } => match state.git_repo.commit(message) {
+                Ok(()) => ImplOutcome::Done,
+                Err(e) => ImplOutcome::Failed(e),
+            },
+            ImplAction::PushBranch { branch } => match state.git_repo.push(branch) {
+                Ok(()) => ImplOutcome::Done,
+                Err(e) => ImplOutcome::Failed(e),
+            },
+            ImplAction::CreateMergeRequest {
+                branch,
+                base,
+                title,
+                description,
+            } => match state
+                .glab
+                .create_merge_request(branch, base, title, description)
+            {
+                Ok(mr_iid) => ImplOutcome::MergeRequestCreated(mr_iid),
+                Err(e) => ImplOutcome::Failed(e),
+            },
+            ImplAction::AddMrScopeLabel { mr_iid } => {
+                if let Some(label) = self.scope_label
+                    && let Err(e) = state.glab.add_mr_label_with_retries(*mr_iid, label)
+                {
+                    warn!(
+                        "{}: Failed to add scope label {:?} to MR !{} (permanent error): {}",
+                        state.agent_id, label, mr_iid, e
+                    );
+                }
+                ImplOutcome::Done
+            }
+            ImplAction::HandIssueBackToHumans { branch, reason } => {
+                match hand_issue_back_to_humans(state, issue_iid, branch, reason) {
+                    Ok(()) => ImplOutcome::Done,
+                    Err(e) => ImplOutcome::Failed(e),
+                }
+            }
+        }
+    }
+}
+
+/// Implement one issue: adopt an existing merge request if the issue
+/// already has one, otherwise prepare the branch, invoke the model, and
+/// turn what it produced into a merge request. Observes, decides one step,
+/// executes it, feeds the result back — see [`ImplementationMachine`].
+///
+/// `current` is updated as the run progresses, because the cycle's cleanup
+/// after a failure depends on how far the run got.
+fn process_issue(
+    state: &AgentState,
+    model: &AgentModel,
+    issue: &IssueObservation,
+    current: &mut ActiveIssue,
+    scope_label: Option<&str>,
+) -> Result<Option<u64>> {
+    let mut machine = ImplementationMachine::new(state.agent_id, scope_label, issue.clone());
+    let mut port = LiveImplementationPort {
+        state,
+        model,
+        issue,
+        scope_label,
+    };
+    let result = drive_implementation(&mut machine, &mut port);
+    current.mr_iid = machine.tracked_mr;
+    current.mr_created = machine.mr_created;
+    current.branch_name = machine.left_branch.clone();
+    result.map(|()| machine.tracked_mr)
+}
+
+/// Post `reason` on the issue, close any MR the branch already had, reset the
+/// worktree, and swap `in-progress` for `action-required` so a human picks the
+/// issue up. Shared by the three implementation outcomes that hand the issue
+/// back instead of producing a merge request.
+fn hand_issue_back_to_humans(
+    state: &AgentState,
+    issue_iid: u64,
+    branch_name: &str,
+    reason: &str,
+) -> Result<()> {
+    state.glab.add_issue_comment(issue_iid, reason)?;
+
+    if let Some(mr_iid) = find_open_mr_for_issue(state.glab, issue_iid) {
+        state.glab.add_mr_comment(
+            mr_iid,
+            &format!(
+                "Closing this MR — the issue cannot be implemented:\n\n{}",
+                reason
+            ),
+        )?;
+        let _ = state.glab.close_mr(mr_iid);
+    }
+
+    // Reset git to a clean state — keep remote branch for potential retry.
+    let default_branch = state
+        .git_repo
+        .get_default_branch()
+        .unwrap_or("main".to_string());
+    let _ = state.git_repo.reset_hard();
+    let _ = state.git_repo.checkout_remote_branch(&default_branch);
+    let _ = state.git_repo.delete_local_branch(branch_name);
+
+    state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL)?;
+    state
+        .glab
+        .add_issue_label(issue_iid, ACTION_REQUIRED_LABEL)?;
+    info!(
+        "Issue #{} requires user action, labeled with '{}'",
+        issue_iid, ACTION_REQUIRED_LABEL
     );
-
-    let mr_iid = state.glab.create_merge_request(
-        &branch_name,
-        &default_branch,
-        &mr_title,
-        &mr_description,
-    )?;
-    current.mr_iid = Some(mr_iid);
-    current.mr_created = true;
-
-    info!("Created MR !{} for issue #{}", mr_iid, issue.iid);
-
-    if let Some(lbl) = scope_label
-        && let Err(e) = state.glab.add_mr_label_with_retries(mr_iid, lbl)
-    {
-        warn!(
-            "{}: Failed to add scope label {:?} to MR !{} (permanent error): {}",
-            &state.agent_id, lbl, mr_iid, e
-        );
-    }
-
-    let impl_summary = extract_mr_description(&agent_output.output);
-    state.save_session_with_summary(issue.iid, mr_iid, &impl_summary)?;
-
-    Ok(Some(mr_iid))
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1636,16 +3759,55 @@ fn collect_new_follow_ups(
     new_msgs
 }
 
+/// A pending MR title/description write, computed purely from the agent's
+/// output and the MR's current metadata.
+struct MrMetadataUpdate {
+    title: String,
+    description: String,
+}
+
+/// Decide whether the agent's feedback-run output changes the MR title
+/// and/or description, and if so what the resulting metadata should be.
+/// Mirrors the update gate in [`handle_mr_comments`] exactly: an update is
+/// only planned when the agent's title differs from the current title, or
+/// its description is neither the default placeholder nor identical to the
+/// current description. Pure — no GitLab call — so this metadata-update
+/// decision can be characterized without a live client.
+fn plan_mr_metadata_update(
+    current_title: &str,
+    current_description: &str,
+    resolution: &FeedbackResolution,
+) -> Option<MrMetadataUpdate> {
+    let new_title = extract_explicit_mr_title(resolution.mr_title.as_deref());
+    let new_desc = extract_mr_description(resolution.mr_description.as_deref());
+    let title_changed = new_title.as_deref().is_some_and(|t| t != current_title);
+    let desc_changed = new_desc != "Implementation completed." && new_desc != current_description;
+    if !title_changed && !desc_changed {
+        return None;
+    }
+    let title = if title_changed {
+        new_title.unwrap_or_else(|| current_title.to_string())
+    } else {
+        current_title.to_string()
+    };
+    let description = if desc_changed {
+        new_desc
+    } else {
+        current_description.to_string()
+    };
+    Some(MrMetadataUpdate { title, description })
+}
+
 /// Returns `Ok(true)` if the agent decided the issue cannot be resolved and
 /// the MR was closed + issue rejected.
 fn handle_mr_comments(
     state: &AgentState,
     model: &AgentModel,
-    mr: &crate::agents::gitlab::MergeRequest,
+    mr_iid: u64,
     linked_issue_iid: Option<u64>,
     comments_only_mode: bool,
 ) -> Result<bool> {
-    let latest_mr = state.glab.get_merge_request(mr.iid)?;
+    let latest_mr = state.glab.get_merge_request(mr_iid)?;
     let unresolved_ids = state.glab.get_unresolved_discussion_ids(latest_mr.iid)?;
     let all_comments = state.glab.get_mr_comments(latest_mr.iid)?;
     let plain_comments: Vec<_> = all_comments
@@ -1710,12 +3872,8 @@ fn handle_mr_comments(
 
     // Build a diff snapshot from the latest source/target state before we merge
     // target into source locally for conflict handling.
-    let diff_context_content = build_mr_diff_context(
-        &state.project_name,
-        &latest_mr,
-        &state.git_repo,
-        &state.glab,
-    );
+    let diff_context_content =
+        build_mr_diff_context(state.project_name, &latest_mr, state.git_repo, state.glab);
 
     // Merge the latest target branch so the worker has up-to-date upstream code.
     let local_merge_clean = state.git_repo.merge_no_abort(&latest_mr.target_branch)?;
@@ -1730,7 +3888,7 @@ fn handle_mr_comments(
         &latest_mr,
         requires_conflict_resolution,
         local_merge_clean,
-        &state.git_repo,
+        state.git_repo,
     )?;
 
     let issue_number = linked_issue_iid
@@ -1741,7 +3899,7 @@ fn handle_mr_comments(
         return Ok(false);
     }
     let issue_context = issue_number
-        .map(|n| load_issue_context(&state.glab, n))
+        .map(|n| load_issue_context(state.glab, n))
         .transpose()?
         .unwrap_or_else(|| "No linked issue context available for this MR.".to_string());
     let implementation_summary = issue_number
@@ -1754,7 +3912,7 @@ fn handle_mr_comments(
 
     let combined_context_content =
         build_combined_mr_feedback_context(CombinedMrFeedbackContextInput {
-            project_name: &state.project_name,
+            project_name: state.project_name,
             mr: &latest_mr,
             issue_context: &issue_context,
             implementation_summary: &implementation_summary,
@@ -1767,7 +3925,7 @@ fn handle_mr_comments(
     // Write the context to disk for archival/debugging, but inject the content
     // directly into the prompt so the model doesn't waste turns reading it back.
     let _combined_context_path = write_task_context_file(
-        &state.sessions_dir,
+        state.sessions_dir,
         &format!(
             "{}-mr-feedback-and-diff-{}.md",
             &state.agent_id, latest_mr.iid
@@ -1814,28 +3972,33 @@ INSTRUCTIONS:
 8. Make the necessary code changes to address all unresolved threaded feedback and any actionable plain MR comments
 9. If the reviewer asked you to delete, rename, or move files, make those file changes.
 10. Ensure changes align with both the original requirements and reviewer feedback
-11. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
+11. MANDATORY OUTPUT — call the `handoff` tool exactly once when you are done, with `outcome` set to the ONE branch that describes how this run ended, and only that branch's fields:
+   - `outcome: "addressed"` — you handled the feedback (in code, in MR metadata, or by explaining the branch already satisfies it). Optional fields: `mr_title`, `mr_description`, `changes_summary`, `reason`, `public_comment`, `mark_discussions_resolved`, `post_plain_comment`.
+   - `outcome: "cannot_resolve"` — the feedback cannot be resolved autonomously. Required field: `reason`. Optional: `public_comment`.
+   Sending another branch's fields is rejected and you will be asked to call the tool again.
+12. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
    a) Adjust your implementation to reduce changed lines — simplify, remove unnecessary changes, trim scope
-   b) If you cannot reasonably reduce the size, set `cannot_resolve` to true in the `handoff` tool so the issue is rejected and the problem is reported back
+   b) If you cannot reasonably reduce the size, call `handoff` with `outcome: "cannot_resolve"` so the issue is rejected and the problem is reported back
    Do NOT try to split the issue yourself — that is handled by the PMO agent, not you.
-12. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), set `cannot_resolve` to true and put the concise explanation and needed input in `reason`.
-13. If the reviewer asked you to fix the MR title or description, include updated versions in your `handoff` tool call (`mr_title` and `mr_description` fields). Do NOT change the title just because you made another follow-up commit; keep it stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
-14. After addressing feedback, put a concise sentence summarizing the substance of the changes in the `changes_summary` field. This will be used as the git commit message, so it must convey the main idea of what changed.
+13. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), call `handoff` with `outcome: "cannot_resolve"` and put the concise explanation and needed input in `reason`.
+14. If the reviewer asked you to fix the MR title or description, include updated versions in your `handoff` tool call (`mr_title` and `mr_description` fields). Do NOT change the title just because you made another follow-up commit; keep it stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
+15. After addressing feedback, put a concise sentence summarizing the substance of the changes in the `changes_summary` field. This will be used as the git commit message, so it must convey the main idea of what changed.
    The summary must reflect the actual source/MR metadata changes you made in this run. Do not mention a reviewer concern as fixed unless the final diff or MR metadata actually changed to address it.
-15. Put any human-facing GitLab comment/reply text in the `public_comment` field of the `handoff` tool. Include only the final comment text to post publicly; no progress updates or tool/log output.
+   If you resolved the feedback without touching the branch, explain why no code change was needed in `reason` instead.
+16. Put any human-facing GitLab comment/reply text in the `public_comment` field of the `handoff` tool. Include only the final comment text to post publicly; no progress updates or tool/log output.
    Keep this public reply concise. Do NOT include a `Validation:` section, test/lint command lists, passed/failed command output, or unrelated repository backlog notes.
    The public reply must exactly match the committed changes from this run. Mention only feedback items you actually resolved in code or MR metadata. If you did not change code/metadata for an item, set `mark_discussions_resolved` to false instead of implying it was fixed.
-16. Control whether GitLab should mark open review discussions as resolved after your reply:
+17. Control whether GitLab should mark open review discussions as resolved after your reply:
    - Set `mark_discussions_resolved` to true only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
    - For merge-conflict feedback: use true only after you committed and pushed a branch that merges cleanly with `origin/{}` with no conflict markers left. If conflicts remain, use false.
    - True is also correct when you verified that no code change is needed because the branch already satisfies the reviewer request. In that case, `public_comment` must explain the existing behavior specifically instead of saying only "no changes needed".
    - Set it to false when your reply does not resolve the comment (e.g. partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
    - If you omit this field, the system assumes true only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set it to true explicitly when the feedback is resolved.
    - Plain MR comments cannot be marked resolved.
-17. Control whether GitLab should post a new normal MR comment for plain, non-resolvable MR comments:
+18. Control whether GitLab should post a new normal MR comment for plain, non-resolvable MR comments:
    - Set `post_plain_comment` to true only when a new public reply is necessary for a plain MR comment, and put the exact comment body in `public_comment`.
    - If a plain MR comment needs no public reply, or if your response would only repeat that no further changes were needed, omit `post_plain_comment` or set it to false.
-18. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into `mr_description`, `mr_title`, `public_comment`, or any GitLab field.
+19. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into `mr_description`, `mr_title`, `public_comment`, or any GitLab field.
 
 Proceed with addressing the feedback autonomously. Do not ask for any user input.
 "#,
@@ -1868,7 +4031,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
             "{}: Worker agent addressing MR !{} feedback for issue #{}",
             &state.agent_id, latest_mr.iid, issue_iid
         );
-        let output = match model.complete_typed::<WorkerOutput>(
+        let output = match model.complete_typed::<WorkerFeedbackOutput>(
             &prompt,
             &InvokeOptions {
                 cancel_check: Some(worker_issue_cancel_check(state.glab.clone(), issue_iid)),
@@ -1895,7 +4058,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
             "{}: Worker agent addressing MR !{} feedback",
             &state.agent_id, latest_mr.iid
         );
-        let output = model.complete_typed::<WorkerOutput>(
+        let output = model.complete_typed::<WorkerFeedbackOutput>(
             &prompt,
             &InvokeOptions {
                 cancel_check: None,
@@ -1913,270 +4076,911 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         output
     };
 
-    if output_signals_cannot_resolve(&agent_output.output) {
-        let reason = extract_cannot_resolve_reason(&agent_output.output);
-        warn!(
-            "MR !{} cannot be resolved autonomously: {}",
-            latest_mr.iid, reason
-        );
-
-        if let Some(issue_number) = issue_number {
-            abandon_mr(state, &latest_mr, issue_number, &reason)?;
-        } else {
-            state.glab.add_mr_comment(
-                latest_mr.iid,
-                &format!(
-                    "Cannot resolve this MR feedback autonomously:\n\n{}",
-                    reason
-                ),
-            )?;
-            let _ = state.glab.close_mr(latest_mr.iid);
-        }
-
-        return Ok(true);
-    }
-
-    // If the agent provided an updated mr_title / mr_description that differs
-    // from the current MR metadata (e.g. the reviewer asked for a better
-    // title), update the MR. Only write when something actually changed.
-    let new_title = extract_explicit_mr_title(&agent_output.output);
-    let new_desc = extract_mr_description(&agent_output.output);
-    let title_changed = new_title.as_deref().is_some_and(|t| t != latest_mr.title);
-    let desc_changed = new_desc != "Implementation completed." && new_desc != latest_mr.description;
-    if title_changed || desc_changed {
-        let title = if title_changed {
-            new_title.as_deref().unwrap_or(&latest_mr.title)
-        } else {
-            &latest_mr.title
-        };
-
-        let desc = if desc_changed {
-            &new_desc
-        } else {
-            &latest_mr.description
-        };
-
-        if let Err(e) = state
-            .glab
-            .update_mr_title_description(latest_mr.iid, title, desc)
-        {
-            warn!("Failed to update MR !{} metadata: {}", latest_mr.iid, e);
-        } else {
-            info!(
-                "Updated MR !{} title/description from agent feedback",
-                latest_mr.iid
-            );
-        }
-    }
-
-    // Detect all changes the agent made: working tree, staged, or committed
-    // (even if the agent disobeyed and ran git commit/push itself).
-    state.git_repo.fetch_branches(&[
-        latest_mr.target_branch.as_str(),
-        latest_mr.source_branch.as_str(),
-    ])?;
-    let mut has_new_changes = state.git_repo.has_changes_since(&pre_agent_sha)?;
-
-    if state.git_repo.is_merge_in_progress()? {
-        if state.git_repo.stage_resolved_unmerged_paths()? {
-            info!(
-                "MR !{}: staged merge-conflict files with no remaining conflict markers",
-                latest_mr.iid
-            );
-        }
-        state.git_repo.add_all()?;
-        has_new_changes = state.git_repo.has_changes_since(&pre_agent_sha)?;
-    } else if has_new_changes {
-        state.git_repo.add_all()?;
-        let summary_for_commit = extract_changes_summary(&agent_output.output);
-        if state.git_repo.has_staged_changes()? {
-            let commit_msg = build_commit_message(&summary_for_commit, issue_number.unwrap_or(0));
-            state.git_repo.commit(&commit_msg)?;
-        }
-    }
-
-    let merge_commit_msg = build_commit_message(
-        &format!(
-            "Merge origin/{} into {}",
-            latest_mr.target_branch, latest_mr.source_branch
-        ),
-        issue_number.unwrap_or(0),
-    );
-    if state.git_repo.complete_merge_if_ready(&merge_commit_msg)? {
-        has_new_changes = true;
-        info!(
-            "MR !{}: concluded in-progress merge with origin/{}",
-            latest_mr.iid, latest_mr.target_branch
-        );
-    }
-
-    let mut conflicts_unresolved = state.git_repo.merge_conflicts_present()?;
-    if requires_conflict_resolution {
-        state.git_repo.fetch_branches(&[
-            latest_mr.target_branch.as_str(),
-            latest_mr.source_branch.as_str(),
-        ])?;
-        if !state
-            .git_repo
-            .verify_up_to_date_with_target(&latest_mr.target_branch)?
-        {
-            conflicts_unresolved = true;
+    let resolution = match &agent_output.output {
+        WorkerFeedbackOutput::Addressed(resolution) => resolution.clone(),
+        WorkerFeedbackOutput::CannotResolve(blocked) => {
+            let reason = extract_cannot_resolve_reason(blocked);
             warn!(
-                "MR !{}: branch still does not merge cleanly with origin/{} (fetched latest target and source)",
-                latest_mr.iid, latest_mr.target_branch
+                "MR !{} cannot be resolved autonomously: {}",
+                latest_mr.iid, reason
             );
-        } else if state.git_repo.has_changes_since(&pre_agent_sha)? {
-            has_new_changes = true;
-            state.git_repo.add_all()?;
-            if state.git_repo.has_staged_changes()? {
-                state.git_repo.commit(&merge_commit_msg)?;
+
+            if let Some(issue_number) = issue_number {
+                abandon_mr(state, &latest_mr, issue_number, &reason)?;
+            } else {
+                state.glab.add_mr_comment(
+                    latest_mr.iid,
+                    &format!(
+                        "Cannot resolve this MR feedback autonomously:\n\n{}",
+                        reason
+                    ),
+                )?;
+                let _ = state.glab.close_mr(latest_mr.iid);
+            }
+
+            return Ok(true);
+        }
+    };
+
+    // From here the run is a driven progression: metadata, then
+    // commit/push, then the conflict recheck, then the GitLab replies. The
+    // decisions live in `FeedbackMachine`; the writes live in the port.
+    let mut machine = FeedbackMachine::new(FeedbackTailInput {
+        mr_iid: latest_mr.iid,
+        source_branch: latest_mr.source_branch.clone(),
+        target_branch: latest_mr.target_branch.clone(),
+        pre_agent_sha,
+        requires_conflict_resolution,
+        unresolved_ids,
+        plain_comments_present: !plain_comments.is_empty(),
+        issue_iid: issue_number,
+        surface_before: MrSurfaceObservation::from_mr(&latest_mr),
+        resolution,
+    });
+    let mut port = LiveFeedbackTailPort {
+        git_repo: state.git_repo,
+        glab: state.glab,
+        mr_iid: latest_mr.iid,
+        source_branch: latest_mr.source_branch.clone(),
+        target_branch: latest_mr.target_branch.clone(),
+    };
+    drive_feedback(&mut machine, &mut port)?;
+
+    Ok(false)
+}
+
+/// One GitLab write in the feedback-reply tail of [`handle_mr_comments`],
+/// in the exact order [`plan_feedback_reply_steps`] emits them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeedbackReplyStep {
+    Reply { discussion_id: String },
+    Resolve { discussion_id: String },
+    PostPlainComment,
+}
+
+/// Decide the ordered sequence of discussion replies, discussion resolves,
+/// and the plain-comment reply that [`handle_mr_comments`] performs after
+/// pushing feedback changes. Pure — takes only the already-computed gating
+/// booleans — so the reply-before-resolve ordering and the plain-comment
+/// gating can be locked down without a live GitLab client.
+///
+/// Mirrors current behavior exactly: each unresolved discussion gets a
+/// reply immediately followed by a resolve (only when `resolve_discussions`
+/// is true), in `ids_to_resolve` order; the plain-comment reply, if any, is
+/// always emitted last. Nothing is emitted when there is no reply body.
+fn plan_feedback_reply_steps(
+    ids_to_resolve: &[String],
+    reply_body_present: bool,
+    resolve_discussions: bool,
+    plain_comments_present: bool,
+    should_post_plain_comment: bool,
+) -> Vec<FeedbackReplyStep> {
+    let mut steps = Vec::new();
+    if reply_body_present {
+        for discussion_id in ids_to_resolve {
+            steps.push(FeedbackReplyStep::Reply {
+                discussion_id: discussion_id.clone(),
+            });
+            if resolve_discussions {
+                steps.push(FeedbackReplyStep::Resolve {
+                    discussion_id: discussion_id.clone(),
+                });
+            }
+        }
+        if plain_comments_present && should_post_plain_comment {
+            steps.push(FeedbackReplyStep::PostPlainComment);
+        }
+    }
+    steps
+}
+
+// ---------------------------------------------------------------------------
+// Feedback progression port
+// ---------------------------------------------------------------------------
+
+/// The MR fields the feedback progression compares before and after the
+/// model run: a metadata-only edit must not imply that feedback was
+/// addressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MrSurfaceObservation {
+    title: String,
+    description: String,
+    labels: Option<Vec<String>>,
+    has_conflicts: bool,
+}
+
+impl MrSurfaceObservation {
+    fn from_mr(mr: &crate::agents::gitlab::MergeRequest) -> Self {
+        Self {
+            title: mr.title.clone(),
+            description: mr.description.clone(),
+            labels: mr.labels.clone(),
+            has_conflicts: mr.has_conflicts,
+        }
+    }
+
+    /// True when title, description, or labels differ (e.g. metadata edit,
+    /// label added or removed).
+    fn differs_from(&self, other: &Self) -> bool {
+        self.title.trim() != other.title.trim()
+            || self.description.trim() != other.description.trim()
+            || self.labels != other.labels
+    }
+}
+
+/// Everything the pre-model half of a feedback run already learned, as one
+/// immutable snapshot the progression decides from.
+#[derive(Debug, Clone)]
+struct FeedbackTailInput {
+    mr_iid: u64,
+    source_branch: String,
+    target_branch: String,
+    pre_agent_sha: String,
+    requires_conflict_resolution: bool,
+    /// The discussions that were unresolved before the model ran; empty
+    /// when the run was triggered by conflicts alone.
+    unresolved_ids: Vec<String>,
+    plain_comments_present: bool,
+    issue_iid: Option<u64>,
+    surface_before: MrSurfaceObservation,
+    resolution: FeedbackResolution,
+}
+
+impl FeedbackTailInput {
+    fn commit_message(&self) -> String {
+        build_commit_message(
+            &extract_changes_summary(self.resolution.changes_summary.as_deref()),
+            self.issue_iid.unwrap_or(0),
+        )
+    }
+
+    fn merge_commit_message(&self) -> String {
+        build_commit_message(
+            &format!(
+                "Merge origin/{} into {}",
+                self.target_branch, self.source_branch
+            ),
+            self.issue_iid.unwrap_or(0),
+        )
+    }
+}
+
+/// One question the feedback progression asks about the worktree, the
+/// branch, or the merge request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeedbackQuery {
+    ChangesSinceModelRun,
+    MergeInProgress,
+    MergeConflictsPresent,
+    StagedChanges,
+    UpToDateWithTarget,
+    DiffHighlights,
+    MergeRequestSurface,
+    OriginHead,
+    UnresolvedDiscussionIds,
+}
+
+/// The answer to one [`FeedbackQuery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeedbackFact {
+    ChangesSinceModelRun(bool),
+    MergeInProgress(bool),
+    MergeConflictsPresent(bool),
+    StagedChanges(bool),
+    UpToDateWithTarget(bool),
+    DiffHighlights(Option<String>),
+    MergeRequestSurface(MrSurfaceObservation),
+    OriginHead(String),
+    UnresolvedDiscussionIds(Vec<String>),
+}
+
+/// One side effect in the feedback progression. Everything from the
+/// metadata write to the last GitLab reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeedbackAction {
+    UpdateMrMetadata { title: String, description: String },
+    FetchBranches,
+    StageResolvedConflicts,
+    StageAll,
+    Commit { message: String },
+    CompleteMergeIfReady { message: String },
+    PushSourceBranch,
+    ReplyToDiscussion { discussion_id: String, body: String },
+    ResolveDiscussion { discussion_id: String },
+    PostPlainComment { body: String },
+}
+
+/// What the port reports after executing one [`FeedbackAction`].
+enum FeedbackOutcome {
+    Done,
+    Failed(anyhow::Error),
+    /// [`FeedbackAction::StageResolvedConflicts`]: whether anything was
+    /// staged.
+    Staged(bool),
+    /// [`FeedbackAction::CompleteMergeIfReady`]: whether the in-progress
+    /// merge was concluded.
+    MergeCompleted(bool),
+}
+
+/// The narrow surface the feedback progression needs: the worktree, the
+/// branch tips, and the MR's discussions. Object-safe and role-local.
+trait FeedbackTailPort {
+    fn has_changes_since(&self, base_ref: &str) -> Result<bool>;
+    fn merge_in_progress(&self) -> Result<bool>;
+    fn merge_conflicts_present(&self) -> Result<bool>;
+    fn has_staged_changes(&self) -> Result<bool>;
+    fn up_to_date_with_target(&self, target_branch: &str) -> Result<bool>;
+    /// Best effort: no highlights is a valid answer, never a failed run.
+    fn diff_highlights(&self, base_ref: &str) -> Option<String>;
+    fn merge_request_surface(&self, mr_iid: u64) -> Result<MrSurfaceObservation>;
+    /// Best effort: falls back to the pre-run SHA when the tip cannot be
+    /// read.
+    fn origin_head(&self, source_branch: &str) -> Option<String>;
+    /// Best effort: an unreadable list is treated as empty.
+    fn unresolved_discussion_ids(&self, mr_iid: u64) -> Vec<String>;
+    fn execute(&mut self, action: &FeedbackAction) -> FeedbackOutcome;
+}
+
+/// One turn of the feedback driver loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeedbackStep {
+    Observe(FeedbackQuery),
+    Act(FeedbackAction),
+    Finish,
+}
+
+/// Where the feedback progression is. The stage names spell out the
+/// required order: metadata, then commit/push, then the conflict recheck,
+/// then the GitLab replies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeedbackStage {
+    UpdateMetadata,
+    FetchAfterModelRun,
+    ObserveChangesAfterModelRun,
+    ObserveMergeInProgress,
+    StageResolvedConflicts,
+    StageAllForMerge,
+    ObserveChangesAfterStaging,
+    StageAllForCommit,
+    ObserveStagedForCommit,
+    CommitChanges,
+    CompleteMerge,
+    ObserveConflictsAfterMerge,
+    FetchForConflictRecheck,
+    ObserveUpToDateWithTarget,
+    ObserveChangesAfterRecheck,
+    StageAllForMergeCommit,
+    ObserveStagedForMergeCommit,
+    CommitMergeResolution,
+    ObserveConflictsBeforeReplies,
+    ObserveDiffHighlights,
+    PushChanges,
+    ObserveMergeRequestSurface,
+    ObserveOriginHead,
+    ObserveUnresolvedIds,
+    Reply(usize),
+    Finish,
+}
+
+/// The state of one feedback progression. Plain data: no git repo, no
+/// GitLab client, no model.
+struct FeedbackMachine {
+    input: FeedbackTailInput,
+    stage: FeedbackStage,
+    has_new_changes: bool,
+    conflicts_unresolved: bool,
+    diff_highlights: Option<String>,
+    branch_tip_changed: bool,
+    surface_changed: bool,
+    ids_to_resolve: Vec<String>,
+    reply_body: Option<String>,
+    reply_steps: Vec<FeedbackReplyStep>,
+}
+
+impl FeedbackMachine {
+    fn new(input: FeedbackTailInput) -> Self {
+        Self {
+            input,
+            stage: FeedbackStage::UpdateMetadata,
+            has_new_changes: false,
+            conflicts_unresolved: false,
+            diff_highlights: None,
+            branch_tip_changed: false,
+            surface_changed: false,
+            ids_to_resolve: Vec::new(),
+            reply_body: None,
+            reply_steps: Vec::new(),
+        }
+    }
+
+    /// The single next thing to do; resolves the stages that need no port
+    /// interaction on the way.
+    fn next_step(&mut self) -> FeedbackStep {
+        loop {
+            match self.stage.clone() {
+                FeedbackStage::UpdateMetadata => {
+                    match plan_mr_metadata_update(
+                        &self.input.surface_before.title,
+                        &self.input.surface_before.description,
+                        &self.input.resolution,
+                    ) {
+                        Some(update) => {
+                            return FeedbackStep::Act(FeedbackAction::UpdateMrMetadata {
+                                title: update.title,
+                                description: update.description,
+                            });
+                        }
+                        None => self.stage = FeedbackStage::FetchAfterModelRun,
+                    }
+                }
+                FeedbackStage::FetchAfterModelRun | FeedbackStage::FetchForConflictRecheck => {
+                    return FeedbackStep::Act(FeedbackAction::FetchBranches);
+                }
+                FeedbackStage::ObserveChangesAfterModelRun
+                | FeedbackStage::ObserveChangesAfterStaging
+                | FeedbackStage::ObserveChangesAfterRecheck => {
+                    return FeedbackStep::Observe(FeedbackQuery::ChangesSinceModelRun);
+                }
+                FeedbackStage::ObserveMergeInProgress => {
+                    return FeedbackStep::Observe(FeedbackQuery::MergeInProgress);
+                }
+                FeedbackStage::StageResolvedConflicts => {
+                    return FeedbackStep::Act(FeedbackAction::StageResolvedConflicts);
+                }
+                FeedbackStage::StageAllForMerge
+                | FeedbackStage::StageAllForCommit
+                | FeedbackStage::StageAllForMergeCommit => {
+                    return FeedbackStep::Act(FeedbackAction::StageAll);
+                }
+                FeedbackStage::ObserveStagedForCommit
+                | FeedbackStage::ObserveStagedForMergeCommit => {
+                    return FeedbackStep::Observe(FeedbackQuery::StagedChanges);
+                }
+                FeedbackStage::CommitChanges => {
+                    return FeedbackStep::Act(FeedbackAction::Commit {
+                        message: self.input.commit_message(),
+                    });
+                }
+                FeedbackStage::CommitMergeResolution => {
+                    return FeedbackStep::Act(FeedbackAction::Commit {
+                        message: self.input.merge_commit_message(),
+                    });
+                }
+                FeedbackStage::CompleteMerge => {
+                    return FeedbackStep::Act(FeedbackAction::CompleteMergeIfReady {
+                        message: self.input.merge_commit_message(),
+                    });
+                }
+                FeedbackStage::ObserveConflictsAfterMerge
+                | FeedbackStage::ObserveConflictsBeforeReplies => {
+                    return FeedbackStep::Observe(FeedbackQuery::MergeConflictsPresent);
+                }
+                FeedbackStage::ObserveUpToDateWithTarget => {
+                    return FeedbackStep::Observe(FeedbackQuery::UpToDateWithTarget);
+                }
+                FeedbackStage::ObserveDiffHighlights => {
+                    return FeedbackStep::Observe(FeedbackQuery::DiffHighlights);
+                }
+                FeedbackStage::PushChanges => {
+                    return FeedbackStep::Act(FeedbackAction::PushSourceBranch);
+                }
+                FeedbackStage::ObserveMergeRequestSurface => {
+                    return FeedbackStep::Observe(FeedbackQuery::MergeRequestSurface);
+                }
+                FeedbackStage::ObserveOriginHead => {
+                    return FeedbackStep::Observe(FeedbackQuery::OriginHead);
+                }
+                FeedbackStage::ObserveUnresolvedIds => {
+                    return FeedbackStep::Observe(FeedbackQuery::UnresolvedDiscussionIds);
+                }
+                FeedbackStage::Reply(index) => match self.reply_steps.get(index).cloned() {
+                    None => self.stage = FeedbackStage::Finish,
+                    Some(step) => {
+                        self.stage = FeedbackStage::Reply(index + 1);
+                        let body = self
+                            .reply_body
+                            .clone()
+                            .expect("reply steps are only planned with a reply body");
+                        return FeedbackStep::Act(match step {
+                            FeedbackReplyStep::Reply { discussion_id } => {
+                                FeedbackAction::ReplyToDiscussion {
+                                    discussion_id,
+                                    body,
+                                }
+                            }
+                            FeedbackReplyStep::Resolve { discussion_id } => {
+                                FeedbackAction::ResolveDiscussion { discussion_id }
+                            }
+                            FeedbackReplyStep::PostPlainComment => {
+                                FeedbackAction::PostPlainComment { body }
+                            }
+                        });
+                    }
+                },
+                FeedbackStage::Finish => return FeedbackStep::Finish,
             }
         }
     }
 
-    if !conflicts_unresolved {
-        conflicts_unresolved = state.git_repo.merge_conflicts_present()?;
+    fn apply_fact(&mut self, fact: Result<FeedbackFact>) -> Result<()> {
+        match (self.stage.clone(), fact?) {
+            (
+                FeedbackStage::ObserveChangesAfterModelRun,
+                FeedbackFact::ChangesSinceModelRun(changed),
+            ) => {
+                self.has_new_changes = changed;
+                self.stage = FeedbackStage::ObserveMergeInProgress;
+            }
+            (FeedbackStage::ObserveMergeInProgress, FeedbackFact::MergeInProgress(in_progress)) => {
+                self.stage = if in_progress {
+                    FeedbackStage::StageResolvedConflicts
+                } else if self.has_new_changes {
+                    FeedbackStage::StageAllForCommit
+                } else {
+                    FeedbackStage::CompleteMerge
+                };
+            }
+            (
+                FeedbackStage::ObserveChangesAfterStaging,
+                FeedbackFact::ChangesSinceModelRun(changed),
+            ) => {
+                self.has_new_changes = changed;
+                self.stage = FeedbackStage::CompleteMerge;
+            }
+            (FeedbackStage::ObserveStagedForCommit, FeedbackFact::StagedChanges(staged)) => {
+                self.stage = if staged {
+                    FeedbackStage::CommitChanges
+                } else {
+                    FeedbackStage::CompleteMerge
+                };
+            }
+            (
+                FeedbackStage::ObserveConflictsAfterMerge,
+                FeedbackFact::MergeConflictsPresent(present),
+            ) => {
+                self.conflicts_unresolved = present;
+                self.stage = if self.input.requires_conflict_resolution {
+                    FeedbackStage::FetchForConflictRecheck
+                } else {
+                    self.after_conflict_recheck()
+                };
+            }
+            (FeedbackStage::ObserveUpToDateWithTarget, FeedbackFact::UpToDateWithTarget(ok)) => {
+                self.stage = if ok {
+                    FeedbackStage::ObserveChangesAfterRecheck
+                } else {
+                    self.conflicts_unresolved = true;
+                    warn!(
+                        "MR !{}: branch still does not merge cleanly with origin/{} (fetched latest target and source)",
+                        self.input.mr_iid, self.input.target_branch
+                    );
+                    self.after_conflict_recheck()
+                };
+            }
+            (
+                FeedbackStage::ObserveChangesAfterRecheck,
+                FeedbackFact::ChangesSinceModelRun(changed),
+            ) => {
+                self.stage = if changed {
+                    self.has_new_changes = true;
+                    FeedbackStage::StageAllForMergeCommit
+                } else {
+                    self.after_conflict_recheck()
+                };
+            }
+            (FeedbackStage::ObserveStagedForMergeCommit, FeedbackFact::StagedChanges(staged)) => {
+                self.stage = if staged {
+                    FeedbackStage::CommitMergeResolution
+                } else {
+                    self.after_conflict_recheck()
+                };
+            }
+            (
+                FeedbackStage::ObserveConflictsBeforeReplies,
+                FeedbackFact::MergeConflictsPresent(present),
+            ) => {
+                self.conflicts_unresolved = present;
+                self.stage = self.after_conflicts_known();
+            }
+            (FeedbackStage::ObserveDiffHighlights, FeedbackFact::DiffHighlights(highlights)) => {
+                self.diff_highlights = highlights;
+                self.stage = self.after_diff_highlights();
+            }
+            (
+                FeedbackStage::ObserveMergeRequestSurface,
+                FeedbackFact::MergeRequestSurface(surface),
+            ) => {
+                if surface.has_conflicts {
+                    self.conflicts_unresolved = true;
+                    warn!(
+                        "MR !{}: GitLab still reports merge conflicts after worker run",
+                        self.input.mr_iid
+                    );
+                }
+                self.surface_changed = self.input.surface_before.differs_from(&surface);
+                self.stage = FeedbackStage::ObserveOriginHead;
+            }
+            (FeedbackStage::ObserveOriginHead, FeedbackFact::OriginHead(head)) => {
+                self.branch_tip_changed = head.trim() != self.input.pre_agent_sha.trim();
+                if self.surface_changed && !self.implicit_resolve_discussions() {
+                    info!(
+                        "MR !{} metadata changed without branch updates; discussions will remain open unless explicitly requested",
+                        self.input.mr_iid
+                    );
+                }
+                self.stage = if self.input.unresolved_ids.is_empty() {
+                    FeedbackStage::ObserveUnresolvedIds
+                } else {
+                    self.ids_to_resolve = self.input.unresolved_ids.clone();
+                    self.plan_replies()?
+                };
+            }
+            (FeedbackStage::ObserveUnresolvedIds, FeedbackFact::UnresolvedDiscussionIds(ids)) => {
+                self.ids_to_resolve = ids;
+                self.stage = self.plan_replies()?;
+            }
+            (stage, fact) => {
+                anyhow::bail!("feedback port answered {stage:?} with {fact:?}");
+            }
+        }
+        Ok(())
     }
 
-    let diff_highlights = if has_new_changes {
-        build_diff_highlights_since(&state.git_repo, &pre_agent_sha)
-    } else {
-        None
-    };
-
-    if has_new_changes && conflicts_unresolved {
-        warn!(
-            "MR !{}: not pushing — merge conflicts with origin/{} are still unresolved",
-            latest_mr.iid, latest_mr.target_branch
-        );
-    } else if has_new_changes {
-        state.git_repo.push(&latest_mr.source_branch)?;
-        info!(
-            "Pushed changes addressing feedback for MR !{}",
-            latest_mr.iid
-        );
-    } else {
-        info!(
-            "Agent processed comments for MR !{} but made no code changes",
-            latest_mr.iid
-        );
+    fn apply_outcome(&mut self, outcome: FeedbackOutcome) -> Result<()> {
+        match (self.stage.clone(), outcome) {
+            // The metadata write is best effort; the port logs its failure.
+            (FeedbackStage::UpdateMetadata, FeedbackOutcome::Done) => {
+                self.stage = FeedbackStage::FetchAfterModelRun;
+            }
+            (FeedbackStage::FetchAfterModelRun, FeedbackOutcome::Done) => {
+                self.stage = FeedbackStage::ObserveChangesAfterModelRun;
+            }
+            (FeedbackStage::StageResolvedConflicts, FeedbackOutcome::Staged(staged)) => {
+                if staged {
+                    info!(
+                        "MR !{}: staged merge-conflict files with no remaining conflict markers",
+                        self.input.mr_iid
+                    );
+                }
+                self.stage = FeedbackStage::StageAllForMerge;
+            }
+            (FeedbackStage::StageAllForMerge, FeedbackOutcome::Done) => {
+                self.stage = FeedbackStage::ObserveChangesAfterStaging;
+            }
+            (FeedbackStage::StageAllForCommit, FeedbackOutcome::Done) => {
+                self.stage = FeedbackStage::ObserveStagedForCommit;
+            }
+            (FeedbackStage::CommitChanges, FeedbackOutcome::Done) => {
+                self.stage = FeedbackStage::CompleteMerge;
+            }
+            (FeedbackStage::CompleteMerge, FeedbackOutcome::MergeCompleted(completed)) => {
+                if completed {
+                    self.has_new_changes = true;
+                    info!(
+                        "MR !{}: concluded in-progress merge with origin/{}",
+                        self.input.mr_iid, self.input.target_branch
+                    );
+                }
+                self.stage = FeedbackStage::ObserveConflictsAfterMerge;
+            }
+            (FeedbackStage::FetchForConflictRecheck, FeedbackOutcome::Done) => {
+                self.stage = FeedbackStage::ObserveUpToDateWithTarget;
+            }
+            (FeedbackStage::StageAllForMergeCommit, FeedbackOutcome::Done) => {
+                self.stage = FeedbackStage::ObserveStagedForMergeCommit;
+            }
+            (FeedbackStage::CommitMergeResolution, FeedbackOutcome::Done) => {
+                self.stage = self.after_conflict_recheck();
+            }
+            (FeedbackStage::PushChanges, FeedbackOutcome::Done) => {
+                info!(
+                    "Pushed changes addressing feedback for MR !{}",
+                    self.input.mr_iid
+                );
+                self.stage = FeedbackStage::ObserveMergeRequestSurface;
+            }
+            // Every GitLab reply, resolve, and plain comment is best
+            // effort; the port logs what it could not post.
+            (FeedbackStage::Reply(_), FeedbackOutcome::Done) => {}
+            (_, FeedbackOutcome::Failed(e)) => return Err(e),
+            (stage, _) => {
+                anyhow::bail!("feedback port reported an unexpected outcome for {stage:?}");
+            }
+        }
+        Ok(())
     }
 
-    let mr_now = state.glab.get_merge_request(latest_mr.iid)?;
-    if mr_now.has_conflicts {
-        conflicts_unresolved = true;
-        warn!(
-            "MR !{}: GitLab still reports merge conflicts after worker run",
-            latest_mr.iid
-        );
-    }
-    let mr_gitlab_surface_changed = merge_request_surface_changed(&latest_mr, &mr_now);
-
-    // Only auto-resolve when the branch tip actually changed. MR metadata-only
-    // changes (title/description/labels) can happen without addressing feedback.
-    let post_origin_head = state
-        .git_repo
-        .rev_parse(&format!("origin/{}", latest_mr.source_branch))
-        .unwrap_or_else(|_| pre_agent_sha.clone());
-    let branch_tip_changed = post_origin_head.trim() != pre_agent_sha.trim();
-    let implicit_resolve_discussions = has_new_changes || branch_tip_changed;
-    if mr_gitlab_surface_changed && !implicit_resolve_discussions {
-        info!(
-            "MR !{} metadata changed without branch updates; discussions will remain open unless explicitly requested",
-            latest_mr.iid
-        );
-    }
-
-    // Re-fetch unresolved discussions — the original list may have been empty
-    // if we were triggered by has_conflicts alone. After pushing, resolve all
-    // remaining open discussions (including conflict comments).
-    let ids_to_resolve = if unresolved_ids.is_empty() {
-        state
-            .glab
-            .get_unresolved_discussion_ids(latest_mr.iid)
-            .unwrap_or_default()
-    } else {
-        unresolved_ids
-    };
-
-    let should_post_plain_comment = should_post_plain_comment(&agent_output.output);
-    let needs_reply_body =
-        !ids_to_resolve.is_empty() || (!plain_comments.is_empty() && should_post_plain_comment);
-
-    if requires_conflict_resolution && conflicts_unresolved {
-        info!(
-            "MR !{}: merge conflicts with origin/{} remain; skipping GitLab replies until the branch merges cleanly",
-            latest_mr.iid, latest_mr.target_branch
-        );
-        return Ok(false);
-    }
-
-    let reply_body = if needs_reply_body {
-        let reply_raw = if let Some(block) = extract_worker_public_comment(&agent_output.output) {
-            block
-        } else if let Some(reply) = build_feedback_resolution_reply(
-            &agent_output.output,
-            has_new_changes,
-            diff_highlights.as_deref(),
-        ) {
-            reply
+    /// Where the progression goes once the conflict recheck is done: one
+    /// more conflict probe unless conflicts are already known to remain.
+    fn after_conflict_recheck(&self) -> FeedbackStage {
+        if self.conflicts_unresolved {
+            self.after_conflicts_known()
         } else {
-            return Err(anyhow::anyhow!(
-                "worker produced no source changes and no feedback reply for MR !{}",
-                latest_mr.iid
-            ));
-        };
-        Some(strip_worker_reply_boilerplate(&reply_raw))
-    } else {
-        None
-    };
-    let resolve_discussions = feedback_discussions_may_be_resolved(
-        &agent_output.output,
-        implicit_resolve_discussions,
-        conflicts_unresolved,
-    );
-    if conflicts_unresolved && parse_mark_discussions_resolved(&agent_output.output) == Some(true) {
-        warn!(
-            "MR !{}: ignoring agent request to mark discussions resolved while merge conflicts remain",
-            latest_mr.iid
-        );
-    }
-    if !resolve_discussions && !ids_to_resolve.is_empty() {
-        info!(
-            "MR !{}: posting feedback replies without resolving discussions (no mark_discussions_resolved signal and no implicit resolving actions)",
-            latest_mr.iid
-        );
-    }
-
-    for discussion_id in &ids_to_resolve {
-        let Some(reply_body) = reply_body.as_deref() else {
-            continue;
-        };
-        if let Err(e) = state
-            .glab
-            .reply_to_discussion(latest_mr.iid, discussion_id, reply_body)
-        {
-            warn!("Failed to reply to discussion {}: {}", discussion_id, e);
-        }
-        if resolve_discussions
-            && let Err(e) = state.glab.resolve_discussion(latest_mr.iid, discussion_id)
-        {
-            warn!("Failed to resolve discussion {}: {}", discussion_id, e);
+            FeedbackStage::ObserveConflictsBeforeReplies
         }
     }
 
-    if !plain_comments.is_empty()
-        && should_post_plain_comment
-        && let Some(reply_body) = reply_body.as_deref()
-        && let Err(e) = state.glab.add_mr_comment(latest_mr.iid, reply_body)
-    {
-        warn!(
-            "Failed to post MR !{} reply for plain comments: {}",
-            latest_mr.iid, e
-        );
+    fn after_conflicts_known(&self) -> FeedbackStage {
+        if self.has_new_changes {
+            FeedbackStage::ObserveDiffHighlights
+        } else {
+            self.after_diff_highlights()
+        }
     }
 
-    Ok(false)
+    /// The push decision: conflicts hold the branch back, no changes means
+    /// nothing to push.
+    fn after_diff_highlights(&self) -> FeedbackStage {
+        if self.has_new_changes && self.conflicts_unresolved {
+            warn!(
+                "MR !{}: not pushing — merge conflicts with origin/{} are still unresolved",
+                self.input.mr_iid, self.input.target_branch
+            );
+            FeedbackStage::ObserveMergeRequestSurface
+        } else if self.has_new_changes {
+            FeedbackStage::PushChanges
+        } else {
+            info!(
+                "Agent processed comments for MR !{} but made no code changes",
+                self.input.mr_iid
+            );
+            FeedbackStage::ObserveMergeRequestSurface
+        }
+    }
+
+    fn implicit_resolve_discussions(&self) -> bool {
+        self.has_new_changes || self.branch_tip_changed
+    }
+
+    /// Decide the reply body and the ordered GitLab writes. Fails the run
+    /// when the worker produced neither changes nor an explanation, which
+    /// is what the pre-machine code did.
+    fn plan_replies(&mut self) -> Result<FeedbackStage> {
+        let should_post_plain_comment = self.input.resolution.post_plain_comment;
+        let needs_reply_body = !self.ids_to_resolve.is_empty()
+            || (self.input.plain_comments_present && should_post_plain_comment);
+
+        if self.input.requires_conflict_resolution && self.conflicts_unresolved {
+            info!(
+                "MR !{}: merge conflicts with origin/{} remain; skipping GitLab replies until the branch merges cleanly",
+                self.input.mr_iid, self.input.target_branch
+            );
+            return Ok(FeedbackStage::Finish);
+        }
+
+        self.reply_body = if needs_reply_body {
+            let reply_raw = if let Some(block) =
+                extract_worker_public_comment(self.input.resolution.public_comment.as_deref())
+            {
+                block
+            } else if let Some(reply) = build_feedback_resolution_reply(
+                &self.input.resolution,
+                self.has_new_changes,
+                self.diff_highlights.as_deref(),
+            ) {
+                reply
+            } else {
+                return Err(anyhow::anyhow!(
+                    "worker produced no source changes and no feedback reply for MR !{}",
+                    self.input.mr_iid
+                ));
+            };
+            Some(strip_worker_reply_boilerplate(&reply_raw))
+        } else {
+            None
+        };
+
+        let resolve_discussions = feedback_discussions_may_be_resolved(
+            &self.input.resolution,
+            self.implicit_resolve_discussions(),
+            self.conflicts_unresolved,
+        );
+        if self.conflicts_unresolved
+            && self.input.resolution.mark_discussions_resolved == Some(true)
+        {
+            warn!(
+                "MR !{}: ignoring agent request to mark discussions resolved while merge conflicts remain",
+                self.input.mr_iid
+            );
+        }
+        if !resolve_discussions && !self.ids_to_resolve.is_empty() {
+            info!(
+                "MR !{}: posting feedback replies without resolving discussions (no mark_discussions_resolved signal and no implicit resolving actions)",
+                self.input.mr_iid
+            );
+        }
+
+        self.reply_steps = plan_feedback_reply_steps(
+            &self.ids_to_resolve,
+            self.reply_body.is_some(),
+            resolve_discussions,
+            self.input.plain_comments_present,
+            should_post_plain_comment,
+        );
+        Ok(FeedbackStage::Reply(0))
+    }
+}
+
+/// Ask the feedback port one question.
+fn observe_feedback(
+    port: &dyn FeedbackTailPort,
+    query: &FeedbackQuery,
+    input: &FeedbackTailInput,
+) -> Result<FeedbackFact> {
+    Ok(match query {
+        FeedbackQuery::ChangesSinceModelRun => {
+            FeedbackFact::ChangesSinceModelRun(port.has_changes_since(&input.pre_agent_sha)?)
+        }
+        FeedbackQuery::MergeInProgress => FeedbackFact::MergeInProgress(port.merge_in_progress()?),
+        FeedbackQuery::MergeConflictsPresent => {
+            FeedbackFact::MergeConflictsPresent(port.merge_conflicts_present()?)
+        }
+        FeedbackQuery::StagedChanges => FeedbackFact::StagedChanges(port.has_staged_changes()?),
+        FeedbackQuery::UpToDateWithTarget => {
+            FeedbackFact::UpToDateWithTarget(port.up_to_date_with_target(&input.target_branch)?)
+        }
+        FeedbackQuery::DiffHighlights => {
+            FeedbackFact::DiffHighlights(port.diff_highlights(&input.pre_agent_sha))
+        }
+        FeedbackQuery::MergeRequestSurface => {
+            FeedbackFact::MergeRequestSurface(port.merge_request_surface(input.mr_iid)?)
+        }
+        FeedbackQuery::OriginHead => FeedbackFact::OriginHead(
+            port.origin_head(&input.source_branch)
+                .unwrap_or_else(|| input.pre_agent_sha.clone()),
+        ),
+        FeedbackQuery::UnresolvedDiscussionIds => {
+            FeedbackFact::UnresolvedDiscussionIds(port.unresolved_discussion_ids(input.mr_iid))
+        }
+    })
+}
+
+/// Run the feedback progression to completion: observe, decide one step,
+/// execute it, feed the result back.
+fn drive_feedback(machine: &mut FeedbackMachine, port: &mut dyn FeedbackTailPort) -> Result<()> {
+    loop {
+        match machine.next_step() {
+            FeedbackStep::Observe(query) => {
+                let fact = observe_feedback(port, &query, &machine.input);
+                machine.apply_fact(fact)?;
+            }
+            FeedbackStep::Act(action) => {
+                let outcome = port.execute(&action);
+                machine.apply_outcome(outcome)?;
+            }
+            FeedbackStep::Finish => return Ok(()),
+        }
+    }
+}
+
+/// The feedback progression backed by the real worktree and GitLab client.
+struct LiveFeedbackTailPort<'a> {
+    git_repo: &'a GitRepo,
+    glab: &'a GitLabClient,
+    mr_iid: u64,
+    source_branch: String,
+    target_branch: String,
+}
+
+impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
+    fn has_changes_since(&self, base_ref: &str) -> Result<bool> {
+        self.git_repo.has_changes_since(base_ref)
+    }
+
+    fn merge_in_progress(&self) -> Result<bool> {
+        self.git_repo.is_merge_in_progress()
+    }
+
+    fn merge_conflicts_present(&self) -> Result<bool> {
+        self.git_repo.merge_conflicts_present()
+    }
+
+    fn has_staged_changes(&self) -> Result<bool> {
+        self.git_repo.has_staged_changes()
+    }
+
+    fn up_to_date_with_target(&self, target_branch: &str) -> Result<bool> {
+        self.git_repo.verify_up_to_date_with_target(target_branch)
+    }
+
+    fn diff_highlights(&self, base_ref: &str) -> Option<String> {
+        build_diff_highlights_since(self.git_repo, base_ref)
+    }
+
+    fn merge_request_surface(&self, mr_iid: u64) -> Result<MrSurfaceObservation> {
+        Ok(MrSurfaceObservation::from_mr(
+            &self.glab.get_merge_request(mr_iid)?,
+        ))
+    }
+
+    fn origin_head(&self, source_branch: &str) -> Option<String> {
+        self.git_repo
+            .rev_parse(&format!("origin/{source_branch}"))
+            .ok()
+    }
+
+    fn unresolved_discussion_ids(&self, mr_iid: u64) -> Vec<String> {
+        self.glab
+            .get_unresolved_discussion_ids(mr_iid)
+            .unwrap_or_default()
+    }
+
+    fn execute(&mut self, action: &FeedbackAction) -> FeedbackOutcome {
+        match action {
+            FeedbackAction::UpdateMrMetadata { title, description } => {
+                if let Err(e) =
+                    self.glab
+                        .update_mr_title_description(self.mr_iid, title, description)
+                {
+                    warn!("Failed to update MR !{} metadata: {}", self.mr_iid, e);
+                } else {
+                    info!(
+                        "Updated MR !{} title/description from agent feedback",
+                        self.mr_iid
+                    );
+                }
+                FeedbackOutcome::Done
+            }
+            FeedbackAction::FetchBranches => match self
+                .git_repo
+                .fetch_branches(&[self.target_branch.as_str(), self.source_branch.as_str()])
+            {
+                Ok(()) => FeedbackOutcome::Done,
+                Err(e) => FeedbackOutcome::Failed(e),
+            },
+            FeedbackAction::StageResolvedConflicts => {
+                match self.git_repo.stage_resolved_unmerged_paths() {
+                    Ok(staged) => FeedbackOutcome::Staged(staged),
+                    Err(e) => FeedbackOutcome::Failed(e),
+                }
+            }
+            FeedbackAction::StageAll => match self.git_repo.add_all() {
+                Ok(()) => FeedbackOutcome::Done,
+                Err(e) => FeedbackOutcome::Failed(e),
+            },
+            FeedbackAction::Commit { message } => match self.git_repo.commit(message) {
+                Ok(()) => FeedbackOutcome::Done,
+                Err(e) => FeedbackOutcome::Failed(e),
+            },
+            FeedbackAction::CompleteMergeIfReady { message } => {
+                match self.git_repo.complete_merge_if_ready(message) {
+                    Ok(completed) => FeedbackOutcome::MergeCompleted(completed),
+                    Err(e) => FeedbackOutcome::Failed(e),
+                }
+            }
+            FeedbackAction::PushSourceBranch => match self.git_repo.push(&self.source_branch) {
+                Ok(()) => FeedbackOutcome::Done,
+                Err(e) => FeedbackOutcome::Failed(e),
+            },
+            FeedbackAction::ReplyToDiscussion {
+                discussion_id,
+                body,
+            } => {
+                if let Err(e) = self
+                    .glab
+                    .reply_to_discussion(self.mr_iid, discussion_id, body)
+                {
+                    warn!("Failed to reply to discussion {}: {}", discussion_id, e);
+                }
+                FeedbackOutcome::Done
+            }
+            FeedbackAction::ResolveDiscussion { discussion_id } => {
+                if let Err(e) = self.glab.resolve_discussion(self.mr_iid, discussion_id) {
+                    warn!("Failed to resolve discussion {}: {}", discussion_id, e);
+                }
+                FeedbackOutcome::Done
+            }
+            FeedbackAction::PostPlainComment { body } => {
+                if let Err(e) = self.glab.add_mr_comment(self.mr_iid, body) {
+                    warn!(
+                        "Failed to post MR !{} reply for plain comments: {}",
+                        self.mr_iid, e
+                    );
+                }
+                FeedbackOutcome::Done
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2199,7 +5003,7 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
     let claim_label = format!("claimed:{}", &state.agent_id);
     let issue_prefix = format!("{}_issue_", &state.agent_id);
 
-    let entries = match fs::read_dir(&state.sessions_dir) {
+    let entries = match fs::read_dir(state.sessions_dir) {
         Ok(e) => e,
         Err(e) => {
             warn!("Failed to read sessions directory: {}", e);
@@ -2232,7 +5036,7 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
 
         // Fast path: session file records which agent owned it
         if let Some(ref stored_id) = session.agent_id {
-            if stored_id == &state.agent_id {
+            if stored_id == state.agent_id {
                 let issue = match state.glab.get_issue(issue_iid) {
                     Ok(i) => i,
                     Err(e) => {
@@ -2250,14 +5054,24 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                     continue;
                 }
 
-                if !has_worker_claim(&issue.labels, &state.agent_id) {
+                // Restart recovery only ever trusts a lease reconstructed
+                // from labels just fetched live from GitLab above — never
+                // the session file's own bookkeeping.
+                let Some(lease) = ClaimLease::recover(
+                    ClaimResource::Issue(issue_iid),
+                    state.agent_id,
+                    &issue.labels,
+                ) else {
                     info!(
                         "{}: Session for issue #{} has no matching claim label, discarding stale session",
                         &state.agent_id, issue_iid
                     );
                     state.cleanup_session(issue_iid);
                     continue;
-                }
+                };
+                // Tracked by IID in `ActiveIssue` from here on, like every
+                // other long-lived worker claim.
+                lease.preserve();
 
                 if !issue_in_scope(&issue, scope_label) {
                     continue;
@@ -2273,11 +5087,15 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                     continue;
                 }
 
-                match resolve_tracked_mr_for_worker_issue(&state.glab, issue_iid, session.mr_iid) {
+                match resolve_tracked_mr_for_worker_issue(state.glab, issue_iid, session.mr_iid) {
                     ResolvedTrackedMr::MergedCloseIssue => {
-                        close_issue_best_effort(&state.glab, issue_iid);
+                        close_issue_best_effort(state.glab, issue_iid);
 
-                        let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                        let _ = claim::release(
+                            state.glab,
+                            ClaimResource::Issue(issue_iid),
+                            state.agent_id,
+                        );
                         let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
                         state.cleanup_session(issue_iid);
@@ -2334,11 +5152,15 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                     continue;
                 }
 
-                match resolve_tracked_mr_for_worker_issue(&state.glab, issue_iid, session.mr_iid) {
+                match resolve_tracked_mr_for_worker_issue(state.glab, issue_iid, session.mr_iid) {
                     ResolvedTrackedMr::MergedCloseIssue => {
-                        close_issue_best_effort(&state.glab, issue_iid);
+                        close_issue_best_effort(state.glab, issue_iid);
 
-                        let _ = claim::release_claim(&state.glab, issue_iid, &state.agent_id);
+                        let _ = claim::release(
+                            state.glab,
+                            ClaimResource::Issue(issue_iid),
+                            state.agent_id,
+                        );
                         let _ = &state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
                         state.cleanup_session(issue_iid);
@@ -2431,11 +5253,11 @@ fn find_claimed_issue(state: &AgentState, scope_label: Option<&str>) -> Option<A
             continue;
         }
 
-        match resolve_tracked_mr_for_worker_issue(&state.glab, issue.iid, 0) {
+        match resolve_tracked_mr_for_worker_issue(state.glab, issue.iid, 0) {
             ResolvedTrackedMr::MergedCloseIssue => {
-                close_issue_best_effort(&state.glab, issue.iid);
+                close_issue_best_effort(state.glab, issue.iid);
 
-                let _ = claim::release_claim(&state.glab, issue.iid, &state.agent_id);
+                let _ = claim::release(state.glab, ClaimResource::Issue(issue.iid), state.agent_id);
                 let _ = state.glab.remove_issue_label(issue.iid, WORKING_ON_LABEL);
 
                 state.cleanup_session(issue.iid);
@@ -2479,7 +5301,7 @@ fn try_adopt_orphaned_session(
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Option<ActiveIssue> {
-    let entries = fs::read_dir(&state.sessions_dir).ok()?;
+    let entries = fs::read_dir(state.sessions_dir).ok()?;
 
     let issue_prefix = format!("{}_issue_", &state.agent_id);
 
@@ -2558,15 +5380,20 @@ fn try_adopt_orphaned_session(
             (Some(session.mr_iid), true)
         } else {
             // No MR yet — check if one was created in the meantime
-            match find_open_mr_for_issue(&state.glab, issue_iid) {
+            match find_open_mr_for_issue(state.glab, issue_iid) {
                 Some(mr) => (Some(mr), true),
                 None => (None, false),
             }
         };
 
         // Try to claim this issue
-        match claim::try_claim_issue(&state.glab, issue_iid, &state.agent_id, shutdown) {
-            Ok(true) => {
+        match claim::acquire(
+            state.glab,
+            ClaimResource::Issue(issue_iid),
+            state.agent_id,
+            shutdown,
+        ) {
+            Ok(ClaimAcquireOutcome::Won(lease)) => {
                 info!(
                     "{}: Adopted orphaned issue #{} (MR: {})",
                     &state.agent_id,
@@ -2574,6 +5401,9 @@ fn try_adopt_orphaned_session(
                     mr_iid.map_or("none".to_string(), |id| format!("!{}", id))
                 );
 
+                // Tracked by IID in `ActiveIssue` from here on, the same as
+                // every other long-lived worker claim.
+                lease.preserve();
                 return Some(ActiveIssue {
                     issue_iid,
                     mr_iid,
@@ -2679,32 +5509,25 @@ fn abandon_mr(
     Ok(())
 }
 
-fn output_signals_cannot_implement(agent_output: &WorkerOutput) -> bool {
-    agent_output.cannot_implement
-}
-
-fn output_signals_cannot_resolve(agent_output: &WorkerOutput) -> bool {
-    agent_output.cannot_resolve
-}
-
-fn output_needs_split(agent_output: &WorkerOutput) -> bool {
-    agent_output
-        .needs_split
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty())
-}
-
-fn extract_cannot_resolve_reason(agent_output: &WorkerOutput) -> String {
-    if let Some(block) = extract_worker_public_comment(agent_output) {
+/// The text to post for a blocked outcome: the model's `public_comment` if it
+/// wrote one, otherwise its `reason`, otherwise `default_text` (the schema
+/// requires `reason`, but not that it be non-blank).
+fn blocked_outcome_text(blocked: &BlockedOutcome, default_text: &str) -> String {
+    if let Some(block) = extract_worker_public_comment(blocked.public_comment.as_deref()) {
         return block;
     }
-    if let Some(reason) = &agent_output.reason {
-        let trimmed = reason.trim();
-        if !trimmed.is_empty() {
-            return strip_internal_markers(trimmed);
-        }
+    let trimmed = blocked.reason.trim();
+    if !trimmed.is_empty() {
+        return strip_internal_markers(trimmed);
     }
-    "The implementation cannot proceed without additional human input.".to_string()
+    default_text.to_string()
+}
+
+fn extract_cannot_resolve_reason(blocked: &BlockedOutcome) -> String {
+    blocked_outcome_text(
+        blocked,
+        "The implementation cannot proceed without additional human input.",
+    )
 }
 
 fn build_commit_message(title: &str, issue_iid: u64) -> String {
@@ -2722,8 +5545,8 @@ fn build_commit_message(title: &str, issue_iid: u64) -> String {
     }
 }
 
-fn extract_changes_summary(agent_output: &WorkerOutput) -> String {
-    if let Some(s) = agent_output.changes_summary.as_deref() {
+fn extract_changes_summary(changes_summary: Option<&str>) -> String {
+    if let Some(s) = changes_summary {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             return strip_markdown_formatting(trimmed);
@@ -2779,40 +5602,23 @@ fn strip_worker_reply_boilerplate(text: &str) -> String {
     }
 }
 
-fn parse_mark_discussions_resolved(agent_output: &WorkerOutput) -> Option<bool> {
-    agent_output.mark_discussions_resolved
-}
-
-fn should_post_plain_comment(agent_output: &WorkerOutput) -> bool {
-    agent_output.post_plain_comment
-}
-
 /// Whether to call GitLab `resolve` on discussions after posting the worker reply.
 fn should_resolve_mr_feedback_discussions(
-    agent_output: &WorkerOutput,
+    resolution: &FeedbackResolution,
     implicit_from_actions: bool,
 ) -> bool {
-    parse_mark_discussions_resolved(agent_output).unwrap_or(implicit_from_actions)
-}
-
-/// True when MR title, description, or labels differ between two GitLab snapshots (e.g. metadata
-/// edit, label added/removed).
-fn merge_request_surface_changed(
-    before: &crate::agents::gitlab::MergeRequest,
-    after: &crate::agents::gitlab::MergeRequest,
-) -> bool {
-    before.title.trim() != after.title.trim()
-        || before.description.trim() != after.description.trim()
-        || before.labels != after.labels
+    resolution
+        .mark_discussions_resolved
+        .unwrap_or(implicit_from_actions)
 }
 
 fn build_feedback_resolution_reply(
-    agent_output: &WorkerOutput,
+    resolution: &FeedbackResolution,
     has_new_changes: bool,
     diff_highlights: Option<&str>,
 ) -> Option<String> {
     if has_new_changes {
-        let summary = extract_changes_summary(agent_output);
+        let summary = extract_changes_summary(resolution.changes_summary.as_deref());
         if let Some(diff) = diff_highlights
             && !diff.trim().is_empty()
         {
@@ -2823,7 +5629,7 @@ fn build_feedback_resolution_reply(
         }
         return Some(format!("Addressed feedback:\n\n{}", summary));
     }
-    extract_no_change_resolution_reason(agent_output)
+    extract_no_change_resolution_reason(resolution)
         .map(|reason| format!("Resolved without code changes:\n\n{}", reason))
 }
 
@@ -3091,33 +5897,26 @@ fn build_merge_conflict_status_section(
 }
 
 fn feedback_discussions_may_be_resolved(
-    agent_output: &WorkerOutput,
+    resolution: &FeedbackResolution,
     implicit_from_actions: bool,
     conflicts_unresolved: bool,
 ) -> bool {
     if conflicts_unresolved {
         return false;
     }
-    should_resolve_mr_feedback_discussions(agent_output, implicit_from_actions)
+    should_resolve_mr_feedback_discussions(resolution, implicit_from_actions)
 }
 
 /// The reason to post for a "resolved without code changes" reply: the
 /// `reason` field if the model explained itself, otherwise `changes_summary`
 /// (the model sometimes describes a no-op resolution there instead).
-fn extract_no_change_resolution_reason(agent_output: &WorkerOutput) -> Option<String> {
-    if let Some(reason) = &agent_output.reason {
-        let trimmed = reason.trim();
-        if !trimmed.is_empty() {
-            return Some(strip_markdown_formatting(&strip_internal_markers(trimmed)));
-        }
-    }
-    if let Some(s) = &agent_output.changes_summary {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return Some(strip_markdown_formatting(&strip_internal_markers(trimmed)));
-        }
-    }
-    None
+fn extract_no_change_resolution_reason(resolution: &FeedbackResolution) -> Option<String> {
+    [&resolution.reason, &resolution.changes_summary]
+        .into_iter()
+        .flatten()
+        .map(|text| text.trim())
+        .find(|text| !text.is_empty())
+        .map(|text| strip_markdown_formatting(&strip_internal_markers(text)))
 }
 
 // ---------------------------------------------------------------------------
@@ -3146,7 +5945,7 @@ fn format_issue_comments_for_worker_context(gitlab: &GitLabClient, issue_iid: u6
     }
 }
 
-fn worker_issue_context_markdown(issue: &Issue, gitlab_comments_text: &str) -> String {
+fn worker_issue_context_markdown(issue: &IssueObservation, gitlab_comments_text: &str) -> String {
     format!(
         "# Issue Context\n\nIssue: #{} {}\n\n## Description\n{}\n\n## GitLab issue comments\n\n{}\n",
         issue.iid, issue.title, issue.description, gitlab_comments_text
@@ -3155,13 +5954,13 @@ fn worker_issue_context_markdown(issue: &Issue, gitlab_comments_text: &str) -> S
 
 fn build_implementation_prompt(
     state: &AgentState,
-    issue: &Issue,
+    issue: &IssueObservation,
     gitlab_comments_text: &str,
 ) -> Result<String> {
     let context_content = worker_issue_context_markdown(issue, gitlab_comments_text);
     // Write to disk for archival, but inject content into the prompt.
     let _context_path = write_task_context_file(
-        &state.sessions_dir,
+        state.sessions_dir,
         &format!("{}-issue-{}.md", state.agent_id, issue.iid),
         &context_content,
     )?;
@@ -3201,10 +6000,10 @@ INSTRUCTIONS:
 5. If non-test code exceeds ~500 lines or total exceeds ~1500 lines:
    - Evaluate if the feature can be split into smaller, independent pieces
    - If you are VERY SURE it CANNOT be split and MUST be implemented as one unit, proceed with implementation
-   - Otherwise, call `handoff` with `cannot_implement: true` and `needs_split: <explain the estimated line count and how to split into smaller issues>`
-6. If the issue is unclear or missing critical information that makes implementation impossible, call `handoff` with `cannot_implement: true` and `needs_clarification: <explain what information is needed and why>`
-7. If the issue requires large unrelated feature work, call `handoff` with `cannot_implement: true` and `needs_split: <explain how to split the issue>`
-8. If at any point you determine the issue simply cannot be implemented without additional human input that you cannot infer or assume (e.g. missing API credentials, undocumented external system dependencies, contradictory requirements), call `handoff` with `cannot_implement: true` and `needs_clarification: <explain precisely what input is needed and why you cannot proceed>`
+   - Otherwise, call `handoff` with `outcome: "needs_split"` and `reason: <explain the estimated line count and how to split into smaller issues>`
+6. If the issue is unclear or missing critical information that makes implementation impossible, call `handoff` with `outcome: "needs_clarification"` and `reason: <explain what information is needed and why>`
+7. If the issue requires large unrelated feature work, call `handoff` with `outcome: "needs_split"` and `reason: <explain how to split the issue>`
+8. If at any point you determine the issue simply cannot be implemented without additional human input that you cannot infer or assume (e.g. missing API credentials, undocumented external system dependencies, contradictory requirements), call `handoff` with `outcome: "needs_clarification"` and `reason: <explain precisely what input is needed and why you cannot proceed>`
 IMPORTANT — When in doubt, REJECT:
 - If you are unsure how to implement the issue, REJECT it. Do not guess or produce speculative code.
 - If you believe the implementation would be huge or complex beyond what a single focused MR should contain, REJECT it.
@@ -3232,13 +6031,13 @@ Proceed with the implementation autonomously. Do not ask for any user input.
 
 fn build_continuation_prompt(
     state: &AgentState,
-    issue: &Issue,
+    issue: &IssueObservation,
     gitlab_comments_text: &str,
 ) -> Result<String> {
     let context_content = worker_issue_context_markdown(issue, gitlab_comments_text);
     // Write to disk for archival, but inject content into the prompt.
     let _context_path = write_task_context_file(
-        &state.sessions_dir,
+        state.sessions_dir,
         &format!("{}-issue-{}.md", &state.agent_id, issue.iid),
         &context_content,
     )?;
@@ -3282,10 +6081,10 @@ INSTRUCTIONS:
 6. If non-test code exceeds ~500 lines or total exceeds ~1500 lines:
    - Evaluate if the remaining work can be split into smaller, independent pieces
    - If you are VERY SURE it CANNOT be split and MUST be completed as one unit, proceed with implementation
-   - Otherwise, call `handoff` with `cannot_implement: true` and `needs_split: <explain the estimated line count and how to split into smaller issues>`
-7. If the issue is unclear or missing critical information that makes implementation impossible, call `handoff` with `cannot_implement: true` and `needs_clarification: <explain what information is needed and why>`
-8. If the issue requires large unrelated feature work, call `handoff` with `cannot_implement: true` and `needs_split: <explain how to split the issue>`
-9. If at any point you determine the remaining work simply cannot be completed without additional human input that you cannot infer or assume, call `handoff` with `cannot_implement: true` and `needs_clarification: <explain precisely what input is needed and why you cannot proceed>`
+   - Otherwise, call `handoff` with `outcome: "needs_split"` and `reason: <explain the estimated line count and how to split into smaller issues>`
+7. If the issue is unclear or missing critical information that makes implementation impossible, call `handoff` with `outcome: "needs_clarification"` and `reason: <explain what information is needed and why>`
+8. If the issue requires large unrelated feature work, call `handoff` with `outcome: "needs_split"` and `reason: <explain how to split the issue>`
+9. If at any point you determine the remaining work simply cannot be completed without additional human input that you cannot infer or assume, call `handoff` with `outcome: "needs_clarification"` and `reason: <explain precisely what input is needed and why you cannot proceed>`
 IMPORTANT — When in doubt, REJECT:
 - If you are unsure how to implement the remaining work, REJECT it. Do not guess or produce speculative code.
 - If you believe the total implementation would be huge or complex beyond what a single focused MR should contain, REJECT it.
@@ -3327,13 +6126,13 @@ fn get_common_requirements() -> &'static str {
 NO WORKAROUNDS — STRICTLY PROHIBITED:
 - NEVER apply a workaround, hack, or shortcut to make code "work" without addressing the root cause.
 - The ONLY exception is an explicit instruction in a code comment or doc comment within the existing codebase that says to use a specific approach. In that case, follow the comment's instruction exactly.
-- If the correct fix is unclear or too large, REJECT the issue (call `handoff` with `cannot_implement: true`) rather than shipping a workaround.
+- If the correct fix is unclear or too large, REJECT the issue (call `handoff` with `outcome: "cannot_implement"`) rather than shipping a workaround.
 
 RESOURCE AWARENESS — MANDATORY:
 - Before committing to an implementation approach, evaluate its resource footprint: memory, CPU, disk I/O, file descriptors, and goroutine/thread usage. An approach that has the potential to exhaust machine resources is UNACCEPTABLE, even if it produces correct output.
 - Specifically avoid: unbounded buffering (loading entire files/datasets into memory), O(n^2) or worse algorithms on large inputs, spawning unbounded goroutines/threads without a semaphore, holding large data in memory across iterations, redundant re-reads of large files, or creating temp files without cleanup.
-- If the correct, resource-safe implementation is too large for a single MR, REJECT via `handoff` with `needs_split` and explain the resource concern.
-- If you are unsure whether your approach is resource-safe under production-scale inputs, REJECT via `handoff` with `cannot_implement: true` and explain the concern. Do not ship code that might OOM, hang, or exhaust file descriptors on real data."#
+- If the correct, resource-safe implementation is too large for a single MR, REJECT via `handoff` with `outcome: "needs_split"` and explain the resource concern in `reason`.
+- If you are unsure whether your approach is resource-safe under production-scale inputs, REJECT via `handoff` with `outcome: "cannot_implement"` and explain the concern in `reason`. Do not ship code that might OOM, hang, or exhaust file descriptors on real data."#
 }
 
 fn get_evidence_bound_scope_bullets() -> &'static str {
@@ -3375,8 +6174,8 @@ fn get_scope_rules(is_continuation: bool) -> String {
 - If non-test code changes would be substantially larger than ~500 lines, or total changes larger than ~1500 lines:
   * First, carefully evaluate if the feature can be split into smaller, independent pieces
   * If you are VERY SURE the feature CANNOT be split and MUST be {} as one atomic unit, you may proceed
-  * Otherwise, call `handoff` with `cannot_implement: true` and `needs_split: <explain the estimated line count and how to split into smaller issues>`
-- If implementing the issue requires a large feature integration that is mainly unrelated to the task, call `handoff` with `cannot_implement: true` and `needs_split: <explain why the issue is too broad and how to split it>`"#,
+  * Otherwise, call `handoff` with `outcome: "needs_split"` and `reason: <explain the estimated line count and how to split into smaller issues>`
+- If implementing the issue requires a large feature integration that is mainly unrelated to the task, call `handoff` with `outcome: "needs_split"` and `reason: <explain why the issue is too broad and how to split it>`"#,
         get_evidence_bound_scope_bullets(),
         line_context,
         if is_continuation {
@@ -3388,25 +6187,21 @@ fn get_scope_rules(is_continuation: bool) -> String {
 }
 
 fn get_output_format() -> &'static str {
-    r#"MANDATORY OUTPUT — call the `handoff` tool with your output fields. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call `handoff` exactly once when you're done.
+    r#"MANDATORY OUTPUT — call the `handoff` tool. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call `handoff` exactly once when you're done.
 
-Call `handoff` with the fields relevant to your outcome:
+Set `outcome` to the ONE branch that describes how this run ended, and send only that branch's fields. Sending another branch's fields is rejected and you will be asked to call the tool again.
 
-- `mr_title` (string): Short title (max 8-10 words) stating the main feature or fix. Focus on WHAT, not HOW or HOW MUCH. No markdown, no **, no backticks.
-- `mr_description` (string): Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections.
-- `changes_summary` (string): A concise sentence summarizing the substance of changes made.
-- `depends_on_issue` (integer): IID of a dependency issue that must close before this work can proceed. Only set when the dependency is real — your work cannot proceed until the other issue is closed. The system will park this issue until the dependency closes, then resume it automatically.
-- `needs_split` (string): Reason the issue needs splitting into smaller issues.
-- `needs_clarification` (string): What information is needed from a human to proceed.
-- `cannot_implement` (boolean): Set to true when the issue cannot be implemented.
-- `cannot_resolve` (boolean): Set to true when reviewer feedback cannot be resolved autonomously.
-- `reason` (string): Explanation for cannot_implement, cannot_resolve, or no-code-changes.
-- `public_comment` (string): Human-facing GitLab comment text (separate from MR description).
-- `mark_discussions_resolved` (boolean): Whether to mark open review discussions as resolved.
-- `post_plain_comment` (boolean): Whether to post a new plain MR comment.
-- `existing_mr_iid` (integer): IID of an existing open MR that already implements this issue. Set this when you discover the issue is already implemented by an existing MR, instead of creating a new MR. The system will track it as this issue's MR.
+- `outcome: "implemented"` — you made the code changes. Potlatch commits, pushes, and opens the merge request. Fields:
+  - `mr_title` (string): Short title (max 8-10 words) stating the main feature or fix. Focus on WHAT, not HOW or HOW MUCH. No markdown, no **, no backticks.
+  - `mr_description` (string): Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections.
+  - `changes_summary` (string): A concise sentence summarizing the substance of the changes.
+- `outcome: "existing_mr"` — an already-open MR implements this issue, so no new MR should be created. Field: `existing_mr_iid` (integer, required). Potlatch tracks that MR as this issue's MR.
+- `outcome: "wait_dependency"` — the work is hard-blocked until another issue closes. Field: `depends_on_issue` (integer, required). Only use this when the dependency is real and your work genuinely cannot proceed. Potlatch parks this issue until the dependency closes, then resumes it automatically.
+- `outcome: "needs_split"` — the issue is too broad for one MR. Fields: `reason` (string, required) with the estimated line count and how to split it, and optional `public_comment`.
+- `outcome: "needs_clarification"` — information you cannot infer is missing. Fields: `reason` (string, required) stating exactly what input is needed and why, and optional `public_comment`.
+- `outcome: "cannot_implement"` — the issue cannot be implemented as specified for any other reason. Fields: `reason` (string, required), and optional `public_comment`.
 
-All fields are optional — include only the ones relevant to your outcome.
+`public_comment` replaces `reason` as the text Potlatch posts on the issue; use it when the human-facing wording should differ from your internal explanation.
 
 Do NOT put public-comment text inside `mr_description` — the MR description must be plain documentation (goal, implementation, testing); reply text belongs in the `public_comment` field.
 
@@ -3431,54 +6226,36 @@ BAD STYLE (examples of rubbish — do not imitate):
 Stay concise; no secrets. That file is committed with your other changes. Never paste or quote any text from notes.md into `mr_title`, `mr_description`, `public_comment`, or anywhere on GitLab — those surfaces are for humans/reviewers only."#
 }
 
-fn extract_split_reason(agent_output: &WorkerOutput) -> String {
-    if let Some(block) = extract_worker_public_comment(agent_output) {
-        return block;
-    }
-    if let Some(reason) = &agent_output.needs_split {
-        let trimmed = reason.trim();
-        if !trimmed.is_empty() {
-            return strip_internal_markers(trimmed);
-        }
-    }
-    "This issue is too broad and requires large unrelated feature work. Please split it into smaller, focused issues with detailed descriptions.".to_string()
+fn extract_split_reason(blocked: &BlockedOutcome) -> String {
+    blocked_outcome_text(
+        blocked,
+        "This issue is too broad and requires large unrelated feature work. Please split it into smaller, focused issues with detailed descriptions.",
+    )
 }
 
-fn extract_clarification(agent_output: &WorkerOutput) -> String {
-    if let Some(block) = extract_worker_public_comment(agent_output) {
-        return block;
-    }
-    if let Some(clarification) = &agent_output.needs_clarification {
-        let trimmed = clarification.trim();
-        if !trimmed.is_empty() {
-            return strip_internal_markers(trimmed);
-        }
-    }
-    "This issue needs clarification. Please provide more details.".to_string()
+fn extract_clarification(blocked: &BlockedOutcome) -> String {
+    blocked_outcome_text(
+        blocked,
+        "This issue needs clarification. Please provide more details.",
+    )
 }
 
-/// Extract the worker's public comment text from the `handoff` tool's
+fn extract_cannot_implement_reason(blocked: &BlockedOutcome) -> String {
+    blocked_outcome_text(
+        blocked,
+        "This issue cannot be implemented as specified. Please provide more details.",
+    )
+}
+
+/// Clean the worker's public comment text from a `handoff` branch's
 /// `public_comment` field. Stray internal markers are stripped as
 /// defense-in-depth before this text reaches a GitLab surface.
-fn extract_worker_public_comment(agent_output: &WorkerOutput) -> Option<String> {
-    let s = agent_output.public_comment.as_deref()?.trim();
+fn extract_worker_public_comment(public_comment: Option<&str>) -> Option<String> {
+    let s = public_comment?.trim();
     if s.is_empty() {
         return None;
     }
     Some(strip_internal_markers(s))
-}
-
-/// Extract a dependency issue IID from the `handoff` tool's
-/// `depends_on_issue` field. `0` (and negative/absent values) mean "no
-/// dependency".
-fn extract_depends_on_issue(agent_output: &WorkerOutput) -> Option<u64> {
-    agent_output.depends_on_issue.filter(|n| *n > 0)
-}
-
-/// Extract `existing_mr_iid` from the `handoff` tool output.
-/// Returns `Some(iid)` only when the field is a positive integer.
-fn extract_existing_mr_iid(agent_output: &WorkerOutput) -> Option<u64> {
-    agent_output.existing_mr_iid.filter(|n| *n > 0)
 }
 
 /// Prefix for labels that park an issue until a dependency issue is closed.
@@ -3503,8 +6280,8 @@ fn extract_waiting_on_issue_iid(labels: &[String]) -> Option<u64> {
 /// didn't provide one. The issue title is always meaningful and specific to
 /// the work, so it's a far better default than a placeholder that produces
 /// a stream of indistinguishable MRs.
-fn extract_mr_title(agent_output: &WorkerOutput, issue_title: &str) -> String {
-    if let Some(s) = agent_output.mr_title.as_deref() {
+fn extract_mr_title(mr_title: Option<&str>, issue_title: &str) -> String {
+    if let Some(s) = mr_title {
         let cleaned = strip_markdown_formatting(s.trim());
         if !cleaned.is_empty() {
             return cleaned;
@@ -3521,9 +6298,8 @@ fn extract_mr_title(agent_output: &WorkerOutput, issue_title: &str) -> String {
 /// [`extract_mr_title`], this does NOT fall back to the issue title — a
 /// metadata update should only overwrite the title when the agent explicitly
 /// said to.
-fn extract_explicit_mr_title(agent_output: &WorkerOutput) -> Option<String> {
-    let s = agent_output.mr_title.as_deref()?;
-    let cleaned = strip_markdown_formatting(s.trim());
+fn extract_explicit_mr_title(mr_title: Option<&str>) -> Option<String> {
+    let cleaned = strip_markdown_formatting(mr_title?.trim());
     if cleaned.is_empty() {
         None
     } else {
@@ -3560,8 +6336,8 @@ fn sanitize_mr_description_text(s: &str) -> String {
 
 /// Extract the MR description the agent emitted via the `handoff` tool's
 /// `mr_description` field, falling back to a generic placeholder when absent.
-fn extract_mr_description(agent_output: &WorkerOutput) -> String {
-    if let Some(s) = agent_output.mr_description.as_deref() {
+fn extract_mr_description(mr_description: Option<&str>) -> String {
+    if let Some(s) = mr_description {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             return sanitize_mr_description_text(trimmed);
@@ -3573,35 +6349,583 @@ fn extract_mr_description(agent_output: &WorkerOutput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agent::schema::conformance;
 
-    #[test]
-    fn worker_output_tool_definition_has_no_required_fields() {
-        let tool = WorkerOutput::tool_definition();
-        assert_eq!(tool.name, "handoff");
-        assert!(tool.parameters.required.is_empty());
-        assert_eq!(tool.parameters.properties.len(), 13);
+    // -----------------------------------------------------------------
+    // Session persistence: tolerant policy. Corrupt/unsupported session
+    // files have historically been treated as "no session" rather than
+    // failing the worker cycle; `GitRepo::new`/`GitLabClient::for_test` are
+    // file/network-free constructors so this exercises the real
+    // `AgentState` session methods without touching git or GitLab.
+    // -----------------------------------------------------------------
+
+    /// Owns the resources a test [`AgentState`] borrows from, standing in
+    /// for the [`GitLabAgentRuntime`] fields the worker cycle needs.
+    struct TestRuntime {
+        project_name: String,
+        agent_id: String,
+        sessions_dir: String,
+        git_repo: GitRepo,
+        glab: GitLabClient,
+    }
+
+    fn test_runtime(sessions_dir: &str, agent_id: &str) -> TestRuntime {
+        TestRuntime {
+            project_name: "test-project".to_string(),
+            agent_id: agent_id.to_string(),
+            sessions_dir: sessions_dir.to_string(),
+            git_repo: GitRepo::new(
+                std::env::temp_dir().to_string_lossy().into_owned(),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            glab: GitLabClient::for_test("/tmp/unused-repo"),
+        }
+    }
+
+    fn test_agent_state(rt: &TestRuntime) -> AgentState<'_> {
+        AgentState {
+            project_name: &rt.project_name,
+            agent_id: &rt.agent_id,
+            sessions_dir: &rt.sessions_dir,
+            git_repo: &rt.git_repo,
+            glab: &rt.glab,
+        }
+    }
+
+    fn worker_session_test_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "potlatch-worker-session-{name}-{}",
+            std::process::id()
+        ))
     }
 
     #[test]
-    fn worker_output_deserializes_empty_object() {
-        let output: WorkerOutput = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(!output.cannot_implement);
-        assert!(!output.cannot_resolve);
-        assert!(output.mr_title.is_none());
-        assert!(output.depends_on_issue.is_none());
+    fn load_session_returns_none_when_no_file_exists_yet() {
+        let dir = worker_session_test_dir("missing");
+        let rt = test_runtime(&dir.to_string_lossy(), "worker-0");
+        let state = test_agent_state(&rt);
+        assert!(state.load_session(1).is_none());
     }
 
     #[test]
-    fn worker_output_tolerates_string_ids_and_booleans() {
-        let output: WorkerOutput = serde_json::from_value(serde_json::json!({
-            "depends_on_issue": "#7",
-            "existing_mr_iid": "!12",
-            "mark_discussions_resolved": "true"
-        }))
+    fn save_then_load_session_round_trips_through_the_v1_envelope() {
+        let dir = worker_session_test_dir("roundtrip");
+        fs::create_dir_all(&dir).unwrap();
+        let rt = test_runtime(&dir.to_string_lossy(), "worker-1");
+        let state = test_agent_state(&rt);
+
+        state.save_session(42, 7).unwrap();
+        let session = state.load_session(42).unwrap();
+        assert_eq!(session.issue_iid, 42);
+        assert_eq!(session.mr_iid, 7);
+        assert_eq!(session.agent_id.as_deref(), Some("worker-1"));
+
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.session_file_path(42)).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 1);
+        assert_eq!(on_disk["state"]["issue_iid"], 42);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_reads_the_legacy_unversioned_format_and_migrates_it() {
+        let dir = worker_session_test_dir("legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let rt = test_runtime(&dir.to_string_lossy(), "worker-2");
+        let state = test_agent_state(&rt);
+        let path = state.session_file_path(9);
+
+        // The bare pre-envelope payload written by older builds.
+        fs::write(
+            &path,
+            serde_json::to_vec(&SessionFile {
+                issue_iid: 9,
+                mr_iid: 3,
+                agent_id: Some("worker-2".to_string()),
+                implementation_summary: Some("done".to_string()),
+            })
+            .unwrap(),
+        )
         .unwrap();
-        assert_eq!(output.depends_on_issue, Some(7));
-        assert_eq!(output.existing_mr_iid, Some(12));
-        assert_eq!(output.mark_discussions_resolved, Some(true));
+
+        let session = state.load_session(9).unwrap();
+        assert_eq!(session.mr_iid, 3);
+        assert_eq!(session.implementation_summary.as_deref(), Some("done"));
+
+        // Transparently migrated to the v1 envelope on disk.
+        let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_tolerates_corrupt_files_by_warning_and_returning_none() {
+        let dir = worker_session_test_dir("corrupt");
+        fs::create_dir_all(&dir).unwrap();
+        let rt = test_runtime(&dir.to_string_lossy(), "worker-3");
+        let state = test_agent_state(&rt);
+        let path = state.session_file_path(5);
+        fs::write(&path, b"not json").unwrap();
+
+        assert!(state.load_session(5).is_none());
+        // Quarantined beside the original rather than deleted outright.
+        assert!(!path.exists());
+        let quarantined: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("quarantined"))
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_tolerates_an_unsupported_envelope_version() {
+        let dir = worker_session_test_dir("unsupported-version");
+        fs::create_dir_all(&dir).unwrap();
+        let rt = test_runtime(&dir.to_string_lossy(), "worker-4");
+        let state = test_agent_state(&rt);
+        let path = state.session_file_path(6);
+        fs::write(&path, br#"{"version":7,"state":{}}"#).unwrap();
+
+        assert!(state.load_session(6).is_none());
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // `handle_mr_comments` characterization: metadata-update decision.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn plan_mr_metadata_update_is_none_when_nothing_changed() {
+        let output = FeedbackResolution {
+            mr_title: Some("Same title".to_string()),
+            mr_description: Some("Same description".to_string()),
+            ..Default::default()
+        };
+        assert!(plan_mr_metadata_update("Same title", "Same description", &output).is_none());
+    }
+
+    #[test]
+    fn plan_mr_metadata_update_is_none_for_default_placeholder_description() {
+        // "Implementation completed." is the extractor's fallback default,
+        // not an agent-authored description, so it must never trigger a write.
+        let output = FeedbackResolution::default();
+        assert!(plan_mr_metadata_update("Title", "Old description", &output).is_none());
+    }
+
+    #[test]
+    fn plan_mr_metadata_update_changes_title_only_keeps_current_description() {
+        let output = FeedbackResolution {
+            mr_title: Some("New title".to_string()),
+            ..Default::default()
+        };
+        let update = plan_mr_metadata_update("Old title", "Old description", &output).unwrap();
+        assert_eq!(update.title, "New title");
+        assert_eq!(update.description, "Old description");
+    }
+
+    #[test]
+    fn plan_mr_metadata_update_changes_description_only_keeps_current_title() {
+        let output = FeedbackResolution {
+            mr_description: Some("New description".to_string()),
+            ..Default::default()
+        };
+        let update = plan_mr_metadata_update("Old title", "Old description", &output).unwrap();
+        assert_eq!(update.title, "Old title");
+        assert_eq!(update.description, "New description");
+    }
+
+    #[test]
+    fn plan_mr_metadata_update_changes_both_when_both_differ() {
+        let output = FeedbackResolution {
+            mr_title: Some("New title".to_string()),
+            mr_description: Some("New description".to_string()),
+            ..Default::default()
+        };
+        let update = plan_mr_metadata_update("Old title", "Old description", &output).unwrap();
+        assert_eq!(update.title, "New title");
+        assert_eq!(update.description, "New description");
+    }
+
+    // -----------------------------------------------------------------
+    // `handle_mr_comments` characterization: reply/resolve/plain-comment
+    // ordering tail.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn plan_feedback_reply_steps_is_empty_without_a_reply_body() {
+        let steps = plan_feedback_reply_steps(
+            &["d1".to_string()],
+            false, // no reply body
+            true,
+            true,
+            true,
+        );
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn plan_feedback_reply_steps_replies_before_resolving_each_discussion() {
+        let ids = vec!["d1".to_string(), "d2".to_string()];
+        let steps = plan_feedback_reply_steps(&ids, true, true, false, false);
+        assert_eq!(
+            steps,
+            vec![
+                FeedbackReplyStep::Reply {
+                    discussion_id: "d1".to_string()
+                },
+                FeedbackReplyStep::Resolve {
+                    discussion_id: "d1".to_string()
+                },
+                FeedbackReplyStep::Reply {
+                    discussion_id: "d2".to_string()
+                },
+                FeedbackReplyStep::Resolve {
+                    discussion_id: "d2".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_feedback_reply_steps_replies_without_resolving_when_not_permitted() {
+        let ids = vec!["d1".to_string()];
+        let steps = plan_feedback_reply_steps(&ids, true, false, false, false);
+        assert_eq!(
+            steps,
+            vec![FeedbackReplyStep::Reply {
+                discussion_id: "d1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_feedback_reply_steps_appends_plain_comment_last() {
+        let ids = vec!["d1".to_string()];
+        let steps = plan_feedback_reply_steps(&ids, true, true, true, true);
+        assert_eq!(
+            steps,
+            vec![
+                FeedbackReplyStep::Reply {
+                    discussion_id: "d1".to_string()
+                },
+                FeedbackReplyStep::Resolve {
+                    discussion_id: "d1".to_string()
+                },
+                FeedbackReplyStep::PostPlainComment,
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_feedback_reply_steps_plain_comment_only_when_no_discussions() {
+        let steps = plan_feedback_reply_steps(&[], true, true, true, true);
+        assert_eq!(steps, vec![FeedbackReplyStep::PostPlainComment]);
+    }
+
+    #[test]
+    fn plan_feedback_reply_steps_omits_plain_comment_when_not_requested() {
+        let steps = plan_feedback_reply_steps(&[], true, true, true, false);
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn plan_feedback_reply_steps_omits_plain_comment_when_none_present() {
+        let steps = plan_feedback_reply_steps(&[], true, true, false, true);
+        assert!(steps.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Git-mutation ordering used by `handle_mr_comments`: commit only when
+    // something is staged, push only once committed, and a real `rev_parse`
+    // comparison detects whether the remote branch tip moved. Exercised
+    // against a real temporary git repository and a real local bare
+    // "origin" remote — no fakes, no network.
+    // -----------------------------------------------------------------
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    struct TestRepoPair {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for TestRepoPair {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Sets up a bare "origin" plus a clone with an initial commit on `main`,
+    /// mirroring the fetch/checkout preconditions `handle_mr_comments` relies
+    /// on before it decides whether to commit and push.
+    fn setup_origin_and_clone(name: &str) -> (TestRepoPair, GitRepo) {
+        let base = std::env::temp_dir().join(format!(
+            "potlatch-worker-git-{name}-{}-{}",
+            std::process::id(),
+            name.len()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let origin = base.join("origin.git");
+        let clone = base.join("clone");
+
+        run_git(
+            &base,
+            &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
+        );
+        run_git(
+            &base,
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        run_git(&clone, &["config", "user.email", "test@example.com"]);
+        run_git(&clone, &["config", "user.name", "test"]);
+        fs::write(clone.join("file.txt"), "base\n").unwrap();
+        run_git(&clone, &["add", "file.txt"]);
+        run_git(&clone, &["commit", "-m", "base"]);
+        run_git(&clone, &["push", "-u", "origin", "main"]);
+
+        let repo = GitRepo::new(
+            clone.to_string_lossy().into_owned(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        (TestRepoPair { dir: base }, repo)
+    }
+
+    #[test]
+    fn commit_is_skipped_when_nothing_is_staged() {
+        let (_guard, repo) = setup_origin_and_clone("no-staged-changes");
+        // No working-tree edits were made, matching `has_new_changes == false`.
+        repo.add_all().unwrap();
+        assert!(!repo.has_staged_changes().unwrap());
+    }
+
+    #[test]
+    fn commit_then_push_advances_the_remote_branch_tip() {
+        let (_guard, repo) = setup_origin_and_clone("commit-then-push");
+        let pre_sha = repo.rev_parse("origin/main").unwrap();
+
+        fs::write(
+            std::path::Path::new(&repo.path).join("file.txt"),
+            "changed\n",
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        assert!(
+            repo.has_staged_changes().unwrap(),
+            "edit must be staged before commit is attempted"
+        );
+        repo.commit("feedback: address review comments").unwrap();
+        repo.push("main").unwrap();
+
+        repo.fetch_branches(&["main"]).unwrap();
+        let post_sha = repo
+            .rev_parse("origin/main")
+            .unwrap_or_else(|_| pre_sha.clone());
+        assert_ne!(
+            pre_sha.trim(),
+            post_sha.trim(),
+            "branch tip must advance only after a real commit was pushed"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The two `handoff` contracts. An implementation run and a feedback
+    // run share the tool name but not the schema, and each branch of
+    // either union carries only its own fields — so the combinations the
+    // old flat struct allowed ("implemented *and* needs splitting") are
+    // now unrepresentable rather than merely unhandled.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn worker_contracts_pass_the_shared_conformance_suite() {
+        conformance::assert_contract::<WorkerImplementationOutput>();
+        conformance::assert_contract::<WorkerFeedbackOutput>();
+    }
+
+    #[test]
+    fn both_worker_contracts_are_handed_off_through_the_same_tool() {
+        assert_eq!(
+            WorkerImplementationOutput::tool_definition().name,
+            HANDOFF_TOOL
+        );
+        assert_eq!(WorkerFeedbackOutput::tool_definition().name, HANDOFF_TOOL);
+    }
+
+    #[test]
+    fn implementation_output_accepts_implemented_metadata() {
+        let output = conformance::assert_accepts::<WorkerImplementationOutput>(serde_json::json!({
+            "outcome": "implemented",
+            "mr_title": "Add feature",
+            "mr_description": "## Goal\nDo it",
+            "changes_summary": "Added the feature"
+        }));
+        assert_eq!(
+            output,
+            WorkerImplementationOutput::Implemented(ImplementedMetadata {
+                mr_title: Some("Add feature".to_string()),
+                mr_description: Some("## Goal\nDo it".to_string()),
+                changes_summary: Some("Added the feature".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn implementation_output_requires_an_outcome() {
+        let error = conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+            "mr_title": "Add feature"
+        }));
+        assert!(
+            error.starts_with("$.outcome: required discriminator is missing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn implementation_output_rejects_contradictory_branch_fields() {
+        let error = conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+            "outcome": "implemented",
+            "mr_title": "Add feature",
+            "depends_on_issue": 7
+        }));
+        assert!(
+            error.starts_with("$.depends_on_issue: unexpected property"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn implementation_output_tolerates_prefixed_string_iids() {
+        assert_eq!(
+            conformance::assert_accepts::<WorkerImplementationOutput>(serde_json::json!({
+                "outcome": "existing_mr",
+                "existing_mr_iid": "!12"
+            })),
+            WorkerImplementationOutput::ExistingMr {
+                existing_mr_iid: 12
+            }
+        );
+        assert_eq!(
+            conformance::assert_accepts::<WorkerImplementationOutput>(serde_json::json!({
+                "outcome": "wait_dependency",
+                "depends_on_issue": "#7"
+            })),
+            WorkerImplementationOutput::WaitDependency {
+                depends_on_issue: 7
+            }
+        );
+    }
+
+    #[test]
+    fn implementation_output_treats_a_zero_iid_as_no_iid() {
+        // Normalization drops it, so the branch's own required rule is what
+        // reports the problem — "0" never reaches the GitLab calls.
+        assert_eq!(
+            conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+                "outcome": "wait_dependency",
+                "depends_on_issue": 0
+            })),
+            "$.depends_on_issue: required property is missing"
+        );
+    }
+
+    #[test]
+    fn implementation_output_requires_a_reason_on_every_blocked_branch() {
+        for outcome in ["needs_split", "needs_clarification", "cannot_implement"] {
+            assert_eq!(
+                conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+                    "outcome": outcome
+                })),
+                "$.reason: required property is missing",
+                "{outcome}"
+            );
+        }
+    }
+
+    #[test]
+    fn implementation_output_normalizes_outcome_case_and_padding() {
+        assert_eq!(
+            conformance::assert_accepts::<WorkerImplementationOutput>(serde_json::json!({
+                "outcome": " Needs_Split ",
+                "reason": "too large"
+            })),
+            WorkerImplementationOutput::NeedsSplit(BlockedOutcome {
+                reason: "too large".to_string(),
+                public_comment: None,
+            })
+        );
+    }
+
+    #[test]
+    fn feedback_output_accepts_an_addressed_run() {
+        assert_eq!(
+            conformance::assert_accepts::<WorkerFeedbackOutput>(serde_json::json!({
+                "outcome": "addressed",
+                "changes_summary": "Fixed the null check",
+                "public_comment": "Done.",
+                "mark_discussions_resolved": true,
+                "post_plain_comment": false
+            })),
+            WorkerFeedbackOutput::Addressed(FeedbackResolution {
+                changes_summary: Some("Fixed the null check".to_string()),
+                public_comment: Some("Done.".to_string()),
+                mark_discussions_resolved: Some(true),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn feedback_output_tolerates_stringified_comment_controls() {
+        let output = conformance::assert_accepts::<WorkerFeedbackOutput>(serde_json::json!({
+            "outcome": "addressed",
+            "mark_discussions_resolved": "true",
+            "post_plain_comment": "False"
+        }));
+        let WorkerFeedbackOutput::Addressed(resolution) = output else {
+            panic!("expected an addressed outcome");
+        };
+        assert_eq!(resolution.mark_discussions_resolved, Some(true));
+        assert!(!resolution.post_plain_comment);
+    }
+
+    #[test]
+    fn feedback_output_requires_a_reason_to_give_up() {
+        assert_eq!(
+            conformance::assert_rejects::<WorkerFeedbackOutput>(serde_json::json!({
+                "outcome": "cannot_resolve"
+            })),
+            "$.reason: required property is missing"
+        );
+    }
+
+    #[test]
+    fn feedback_output_rejects_implementation_only_outcomes() {
+        let error = conformance::assert_rejects::<WorkerFeedbackOutput>(serde_json::json!({
+            "outcome": "needs_split",
+            "reason": "too large"
+        }));
+        assert_eq!(
+            error,
+            "$.outcome: expected one of [\"addressed\", \"cannot_resolve\"], got \"needs_split\""
+        );
     }
 
     #[test]
@@ -3621,160 +6945,91 @@ mod tests {
         assert!(format!("{error:#}").contains("Failed to parse agent settings"));
     }
 
-    #[test]
-    fn worker_output_deserializes_full_payload() {
-        let output: WorkerOutput = serde_json::from_value(serde_json::json!({
-            "mr_title": "Add feature",
-            "mr_description": "## Goal\nDo it",
-            "changes_summary": "Added the feature",
-            "depends_on_issue": 7,
-            "needs_split": "too large",
-            "needs_clarification": "what auth scheme?",
-            "cannot_implement": true,
-            "cannot_resolve": false,
-            "reason": "blocked",
-            "public_comment": "Thanks!",
-            "mark_discussions_resolved": true,
-            "post_plain_comment": true,
-            "existing_mr_iid": 9
-        }))
-        .unwrap();
-        assert_eq!(output.mr_title, Some("Add feature".to_string()));
-        assert_eq!(output.depends_on_issue, Some(7));
-        assert!(output.cannot_implement);
-        assert!(!output.cannot_resolve);
-        assert_eq!(output.existing_mr_iid, Some(9));
-        assert_eq!(output.mark_discussions_resolved, Some(true));
-        assert!(output.post_plain_comment);
-    }
-
-    #[test]
-    fn worker_output_rejects_wrong_type_for_boolean_field() {
-        let err = serde_json::from_value::<WorkerOutput>(serde_json::json!({
-            "cannot_implement": "yes"
-        }))
-        .unwrap_err();
-        assert!(err.to_string().contains("cannot_implement") || err.is_data());
-    }
-
-    #[test]
-    fn output_signals_cannot_implement_reads_typed_flag() {
-        let out = WorkerOutput {
-            cannot_implement: true,
-            ..Default::default()
-        };
-        assert!(output_signals_cannot_implement(&out));
-        assert!(!output_signals_cannot_implement(&WorkerOutput::default()));
-    }
-
-    #[test]
-    fn output_signals_cannot_resolve_reads_typed_flag() {
-        let out = WorkerOutput {
-            cannot_resolve: true,
-            ..Default::default()
-        };
-        assert!(output_signals_cannot_resolve(&out));
-        assert!(!output_signals_cannot_resolve(&WorkerOutput::default()));
-    }
-
-    #[test]
-    fn output_needs_split_true_only_when_reason_non_empty() {
-        assert!(!output_needs_split(&WorkerOutput::default()));
-        assert!(!output_needs_split(&WorkerOutput {
-            needs_split: Some("   ".to_string()),
-            ..Default::default()
-        }));
-        assert!(output_needs_split(&WorkerOutput {
-            needs_split: Some("too large".to_string()),
-            ..Default::default()
-        }));
+    /// A blocked branch payload with the given reason and no public comment.
+    fn blocked(reason: &str) -> BlockedOutcome {
+        BlockedOutcome {
+            reason: reason.to_string(),
+            public_comment: None,
+        }
     }
 
     #[test]
     fn extract_cannot_resolve_reason_prefers_public_comment_then_reason_then_default() {
-        let with_comment = WorkerOutput {
-            public_comment: Some("Explained to the reviewer.".to_string()),
-            reason: Some("internal reason".to_string()),
-            ..Default::default()
-        };
         assert_eq!(
-            extract_cannot_resolve_reason(&with_comment),
+            extract_cannot_resolve_reason(&BlockedOutcome {
+                reason: "internal reason".to_string(),
+                public_comment: Some("Explained to the reviewer.".to_string()),
+            }),
             "Explained to the reviewer."
         );
-
-        let with_reason_only = WorkerOutput {
-            reason: Some("Missing credentials.".to_string()),
-            ..Default::default()
-        };
         assert_eq!(
-            extract_cannot_resolve_reason(&with_reason_only),
+            extract_cannot_resolve_reason(&blocked("Missing credentials.")),
             "Missing credentials."
         );
-
         assert_eq!(
-            extract_cannot_resolve_reason(&WorkerOutput::default()),
+            extract_cannot_resolve_reason(&blocked("   ")),
             "The implementation cannot proceed without additional human input."
         );
     }
 
     #[test]
-    fn extract_split_reason_prefers_public_comment_then_needs_split_then_default() {
-        let out = WorkerOutput {
-            needs_split: Some("split reason".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(extract_split_reason(&out), "split reason");
-        assert!(extract_split_reason(&WorkerOutput::default()).contains("too broad"));
+    fn extract_split_reason_prefers_public_comment_then_reason_then_default() {
+        assert_eq!(
+            extract_split_reason(&blocked("split reason")),
+            "split reason"
+        );
+        assert_eq!(
+            extract_split_reason(&BlockedOutcome {
+                reason: "split reason".to_string(),
+                public_comment: Some("Splitting this up, here is why.".to_string()),
+            }),
+            "Splitting this up, here is why."
+        );
+        assert!(extract_split_reason(&blocked("")).contains("too broad"));
     }
 
     #[test]
-    fn extract_clarification_prefers_public_comment_then_needs_clarification_then_default() {
-        let out = WorkerOutput {
-            needs_clarification: Some("what auth scheme?".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(extract_clarification(&out), "what auth scheme?");
-        assert!(extract_clarification(&WorkerOutput::default()).contains("clarification"));
+    fn extract_clarification_prefers_public_comment_then_reason_then_default() {
+        assert_eq!(
+            extract_clarification(&blocked("what auth scheme?")),
+            "what auth scheme?"
+        );
+        assert!(extract_clarification(&blocked("")).contains("clarification"));
+    }
+
+    #[test]
+    fn extract_cannot_implement_reason_falls_back_to_its_own_default() {
+        assert_eq!(
+            extract_cannot_implement_reason(&blocked("contradictory requirements")),
+            "contradictory requirements"
+        );
+        assert!(extract_cannot_implement_reason(&blocked("")).contains("cannot be implemented"));
     }
 
     #[test]
     fn extract_worker_public_comment_strips_stray_internal_markers() {
-        let out = WorkerOutput {
-            public_comment: Some(
-                "PUBLIC_COMMENT_BEGIN\nHidden.\nPUBLIC_COMMENT_END\nVisible.".to_string(),
-            ),
-            ..Default::default()
-        };
-        let comment = extract_worker_public_comment(&out).unwrap();
+        let comment = extract_worker_public_comment(Some(
+            "PUBLIC_COMMENT_BEGIN\nHidden.\nPUBLIC_COMMENT_END\nVisible.",
+        ))
+        .unwrap();
         assert!(!comment.contains("PUBLIC_COMMENT_BEGIN"));
         assert!(comment.contains("Visible."));
     }
 
     #[test]
     fn extract_worker_public_comment_returns_none_when_absent_or_blank() {
-        assert_eq!(
-            extract_worker_public_comment(&WorkerOutput::default()),
-            None
-        );
-        assert_eq!(
-            extract_worker_public_comment(&WorkerOutput {
-                public_comment: Some("   ".to_string()),
-                ..Default::default()
-            }),
-            None
-        );
+        assert_eq!(extract_worker_public_comment(None), None);
+        assert_eq!(extract_worker_public_comment(Some("   ")), None);
     }
 
     #[test]
     fn worker_issue_context_includes_comments_section() {
-        let issue = Issue {
+        let issue = IssueObservation {
             iid: 7,
             title: "Add feature".to_string(),
             description: "Do the thing".to_string(),
             labels: vec![],
             state: "opened".to_string(),
-            created_at: None,
-            updated_at: None,
         };
         let md = worker_issue_context_markdown(&issue, "- alice: hi");
         assert!(md.contains("## GitLab issue comments"));
@@ -3785,14 +7040,12 @@ mod tests {
 
     #[test]
     fn test_should_skip_issue() {
-        let mut issue = Issue {
+        let mut issue = IssueObservation {
             iid: 1,
             title: "[Draft] Test issue".to_string(),
             description: "Test".to_string(),
             labels: vec![],
             state: "opened".to_string(),
-            created_at: None,
-            updated_at: None,
         };
         assert!(should_skip_issue(&issue));
 
@@ -3848,14 +7101,12 @@ mod tests {
 
     #[test]
     fn worker_should_cancel_issue_processing_for_review_only_closed_or_pending() {
-        let mut issue = Issue {
+        let mut issue = IssueObservation {
             iid: 9,
             title: "Test".into(),
             description: String::new(),
             state: "opened".into(),
             labels: vec![WORKER_REVIEW_ONLY_LABEL.to_string()],
-            created_at: None,
-            updated_at: None,
         };
         assert!(worker_should_cancel_issue_processing(&issue));
 
@@ -3935,32 +7186,36 @@ mod tests {
     }
 
     #[test]
-    fn worker_session_requires_its_live_claim_label() {
-        assert!(has_worker_claim(
+    fn worker_session_resume_requires_its_live_claim_label() {
+        let resource = ClaimResource::Issue(4);
+        let recovered = ClaimLease::recover(
+            resource,
+            "worker-4",
             &["claimed:worker-4".to_string(), WORKING_ON_LABEL.to_string()],
-            "worker-4"
-        ));
-        assert!(!has_worker_claim(
-            &["claimed:worker-3".to_string(), WORKING_ON_LABEL.to_string()],
-            "worker-4"
-        ));
-        assert!(!has_worker_claim(&[], "worker-4"));
+        );
+        assert!(recovered.is_some());
+        recovered.unwrap().preserve();
+
+        assert!(
+            ClaimLease::recover(
+                resource,
+                "worker-4",
+                &["claimed:worker-3".to_string(), WORKING_ON_LABEL.to_string()],
+            )
+            .is_none()
+        );
+        assert!(ClaimLease::recover(resource, "worker-4", &[]).is_none());
     }
 
     #[test]
     fn extract_explicit_mr_title_returns_none_when_field_absent() {
-        let output = WorkerOutput::default();
-        assert_eq!(extract_explicit_mr_title(&output), None);
+        assert_eq!(extract_explicit_mr_title(None), None);
     }
 
     #[test]
     fn extract_explicit_mr_title_reads_handoff_structured_field() {
-        let output = WorkerOutput {
-            mr_title: Some("Add comment chunk truncation docs".to_string()),
-            ..Default::default()
-        };
         assert_eq!(
-            extract_explicit_mr_title(&output),
+            extract_explicit_mr_title(Some("Add comment chunk truncation docs")),
             Some("Add comment chunk truncation docs".into())
         );
     }
@@ -3969,16 +7224,15 @@ mod tests {
     fn extract_mr_title_falls_back_to_issue_title_when_absent() {
         // When the agent doesn't set mr_title, the MR title falls back to
         // the issue title — never a generic placeholder.
-        let output = WorkerOutput::default();
         assert_eq!(
-            extract_mr_title(&output, "Add login rate limiting"),
+            extract_mr_title(None, "Add login rate limiting"),
             "Add login rate limiting"
         );
     }
 
     #[test]
     fn test_build_feedback_resolution_reply_includes_reason_without_code_changes() {
-        let output = WorkerOutput {
+        let output = FeedbackResolution {
             reason: Some("Existing validation already covered this case.".to_string()),
             ..Default::default()
         };
@@ -3993,7 +7247,7 @@ mod tests {
 
     #[test]
     fn test_build_feedback_resolution_reply_uses_changes_summary_when_changes_exist() {
-        let output = WorkerOutput {
+        let output = FeedbackResolution {
             changes_summary: Some("Add missing null check in parser.".to_string()),
             ..Default::default()
         };
@@ -4005,7 +7259,7 @@ mod tests {
 
     #[test]
     fn test_build_feedback_resolution_reply_includes_diff_highlights() {
-        let output = WorkerOutput {
+        let output = FeedbackResolution {
             changes_summary: Some("Tighten input validation.".to_string()),
             ..Default::default()
         };
@@ -4018,13 +7272,13 @@ mod tests {
 
     #[test]
     fn build_feedback_resolution_reply_requires_reason_without_code_changes() {
-        let output = WorkerOutput::default();
+        let output = FeedbackResolution::default();
         assert_eq!(build_feedback_resolution_reply(&output, false, None), None);
     }
 
     #[test]
     fn feedback_discussions_may_be_resolved_blocks_while_conflicts_remain() {
-        let out = WorkerOutput {
+        let out = FeedbackResolution {
             mark_discussions_resolved: Some(true),
             ..Default::default()
         };
@@ -4103,19 +7357,19 @@ mod tests {
 
     #[test]
     fn should_resolve_mr_feedback_discussions_defaults_follow_implicit_actions() {
-        let out = WorkerOutput::default();
+        let out = FeedbackResolution::default();
         assert!(!should_resolve_mr_feedback_discussions(&out, false));
         assert!(should_resolve_mr_feedback_discussions(&out, true));
     }
 
     #[test]
     fn mark_discussions_resolved_reads_structured_field() {
-        let out_no = WorkerOutput {
+        let out_no = FeedbackResolution {
             mark_discussions_resolved: Some(false),
             ..Default::default()
         };
         assert!(!should_resolve_mr_feedback_discussions(&out_no, true));
-        let out_yes = WorkerOutput {
+        let out_yes = FeedbackResolution {
             mark_discussions_resolved: Some(true),
             ..Default::default()
         };
@@ -4124,36 +7378,31 @@ mod tests {
 
     #[test]
     fn plain_comment_posting_requires_explicit_field() {
-        let out_default = WorkerOutput {
+        // A public comment on its own never posts a plain MR comment; the
+        // model has to ask for it.
+        let default = FeedbackResolution {
             public_comment: Some("No further changes were needed.".to_string()),
             ..Default::default()
         };
-        assert!(!should_post_plain_comment(&out_default));
+        assert!(!default.post_plain_comment);
 
-        let out_no = WorkerOutput {
-            post_plain_comment: false,
-            public_comment: Some("No further changes were needed.".to_string()),
-            ..Default::default()
-        };
-        assert!(!should_post_plain_comment(&out_no));
-
-        let out_yes = WorkerOutput {
+        let requested = FeedbackResolution {
             post_plain_comment: true,
             public_comment: Some("Posted by request.".to_string()),
             ..Default::default()
         };
-        assert!(should_post_plain_comment(&out_yes));
+        assert!(requested.post_plain_comment);
     }
 
     #[test]
     fn no_change_reply_requires_explicit_resolve_field() {
-        let out = WorkerOutput {
+        let out = FeedbackResolution {
             public_comment: Some("No new code changes were needed in this run.".to_string()),
             ..Default::default()
         };
         assert!(!should_resolve_mr_feedback_discussions(&out, false));
 
-        let explicit = WorkerOutput {
+        let explicit = FeedbackResolution {
             mark_discussions_resolved: Some(true),
             public_comment: Some("No new code changes were needed in this run.".to_string()),
             ..Default::default()
@@ -4163,10 +7412,10 @@ mod tests {
 
     #[test]
     fn no_change_reply_text_requires_structured_reason_field() {
-        let out = WorkerOutput::default();
+        let out = FeedbackResolution::default();
         assert_eq!(build_feedback_resolution_reply(&out, false, None), None);
 
-        let explicit = WorkerOutput {
+        let explicit = FeedbackResolution {
             reason: Some(
                 "No new code changes were needed in this run. The branch already satisfies the requested behavior."
                     .to_string(),
@@ -4181,13 +7430,13 @@ mod tests {
 
     #[test]
     fn extract_no_change_resolution_reason_returns_none_when_absent() {
-        let out = WorkerOutput::default();
+        let out = FeedbackResolution::default();
         assert_eq!(extract_no_change_resolution_reason(&out), None);
     }
 
     #[test]
     fn extract_no_change_resolution_reason_prefers_reason_over_changes_summary() {
-        let out = WorkerOutput {
+        let out = FeedbackResolution {
             reason: Some(
                 "Property deletion already removes stored data on schema update.".to_string(),
             ),
@@ -4202,7 +7451,7 @@ mod tests {
 
     #[test]
     fn extract_no_change_resolution_reason_falls_back_to_changes_summary() {
-        let out = WorkerOutput {
+        let out = FeedbackResolution {
             changes_summary: Some("Resolved via metadata update only.".to_string()),
             ..Default::default()
         };
@@ -4226,25 +7475,21 @@ mod tests {
             labels: Some(vec!["a".into()]),
             has_conflicts: false,
         };
+        let before = MrSurfaceObservation::from_mr(&a);
         let mut b = a.clone();
-        assert!(!merge_request_surface_changed(&a, &b));
+        assert!(!before.differs_from(&MrSurfaceObservation::from_mr(&b)));
         b.title = "New".into();
-        assert!(merge_request_surface_changed(&a, &b));
+        assert!(before.differs_from(&MrSurfaceObservation::from_mr(&b)));
         b.title = "Old".into();
         b.labels = Some(vec!["a".into(), "b".into()]);
-        assert!(merge_request_surface_changed(&a, &b));
+        assert!(before.differs_from(&MrSurfaceObservation::from_mr(&b)));
     }
 
     #[test]
     fn extract_mr_description_strips_control_marker_lines() {
-        let output = WorkerOutput {
-            mr_description: Some(
-                "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\nPOST_PLAIN_COMMENT: yes\n## Testing\ncargo test"
-                    .to_string(),
-            ),
-            ..Default::default()
-        };
-        let desc = extract_mr_description(&output);
+        let desc = extract_mr_description(Some(
+            "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\nPOST_PLAIN_COMMENT: yes\n## Testing\ncargo test",
+        ));
         assert!(!desc.contains("CHANGES_SUMMARY:"), "{desc}");
         assert!(!desc.contains("MARK_DISCUSSIONS_RESOLVED:"), "{desc}");
         assert!(!desc.contains("POST_PLAIN_COMMENT:"), "{desc}");
@@ -4254,14 +7499,9 @@ mod tests {
 
     #[test]
     fn extract_mr_description_strips_public_comment_blocks() {
-        let output = WorkerOutput {
-            mr_description: Some(
-                "## Goal\npytest coverage.\nPUBLIC_COMMENT_BEGIN\nThanks for the review.\nPUBLIC_COMMENT_END\n## Testing\nuv run pytest"
-                    .to_string(),
-            ),
-            ..Default::default()
-        };
-        let desc = extract_mr_description(&output);
+        let desc = extract_mr_description(Some(
+            "## Goal\npytest coverage.\nPUBLIC_COMMENT_BEGIN\nThanks for the review.\nPUBLIC_COMMENT_END\n## Testing\nuv run pytest",
+        ));
         assert!(!desc.contains("PUBLIC_COMMENT_BEGIN"), "{desc}");
         assert!(!desc.contains("Thanks for the review"), "{desc}");
         assert!(desc.contains("## Goal"), "{desc}");
@@ -4270,45 +7510,19 @@ mod tests {
 
     #[test]
     fn extract_mr_description_defaults_when_field_absent() {
-        let output = WorkerOutput::default();
-        assert_eq!(extract_mr_description(&output), "Implementation completed.");
+        assert_eq!(extract_mr_description(None), "Implementation completed.");
     }
 
     #[test]
     fn extract_mr_title_reads_structured_field() {
-        let output = WorkerOutput {
-            mr_title: Some("Stable title".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(extract_mr_title(&output, "Issue title"), "Stable title");
         assert_eq!(
-            extract_explicit_mr_title(&output),
+            extract_mr_title(Some("Stable title"), "Issue title"),
+            "Stable title"
+        );
+        assert_eq!(
+            extract_explicit_mr_title(Some("Stable title")),
             Some("Stable title".into())
         );
-    }
-
-    #[test]
-    fn extract_depends_on_issue_reads_structured_field() {
-        let out = WorkerOutput {
-            depends_on_issue: Some(42),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(42));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_returns_none_when_absent() {
-        let out = WorkerOutput::default();
-        assert_eq!(extract_depends_on_issue(&out), None);
-    }
-
-    #[test]
-    fn extract_depends_on_issue_returns_none_for_zero() {
-        let out = WorkerOutput {
-            depends_on_issue: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), None);
     }
 
     #[test]
@@ -4393,35 +7607,2310 @@ mod tests {
     }
 
     #[test]
-    fn extract_existing_mr_iid_reads_structured_field() {
-        let handoff = WorkerOutput {
-            existing_mr_iid: Some(42),
-            ..Default::default()
-        };
-        assert_eq!(extract_existing_mr_iid(&handoff), Some(42));
+    fn an_existing_mr_is_only_adopted_from_its_own_branch() {
+        // Adoption is a whole outcome now, so the IID cannot ride along on an
+        // ordinary implementation handoff and quietly redirect the run.
+        assert_eq!(
+            conformance::assert_accepts::<WorkerImplementationOutput>(serde_json::json!({
+                "outcome": "existing_mr",
+                "existing_mr_iid": 42
+            })),
+            WorkerImplementationOutput::ExistingMr {
+                existing_mr_iid: 42
+            }
+        );
+        let error = conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+            "outcome": "implemented",
+            "mr_title": "Fix bug",
+            "existing_mr_iid": 42
+        }));
+        assert!(
+            error.starts_with("$.existing_mr_iid: unexpected property"),
+            "{error}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Routing driver traces against a recording fake port. The machine is
+    // plain data, so a whole cycle can be characterized as an ordered
+    // list of observations and actions — including the failure paths,
+    // which are the ones that are hardest to reach against live GitLab.
+    // -----------------------------------------------------------------
+
+    const ROUTING_AGENT: &str = "worker-1";
+
+    fn issue_observation(iid: u64, labels: &[&str]) -> IssueObservation {
+        IssueObservation {
+            iid,
+            title: format!("Cap the retry backoff for issue {iid}"),
+            description: "## Goal\nCap the backoff.".to_string(),
+            state: "opened".to_string(),
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+        }
+    }
+
+    /// What one scripted implementation run does: whether it produced an
+    /// MR, which branch it left behind, and how it ended.
+    #[derive(Clone)]
+    struct ImplementationScript {
+        mr_created: bool,
+        mr_iid: Option<u64>,
+        branch_name: Option<String>,
+        error: Option<String>,
+    }
+
+    impl ImplementationScript {
+        fn succeeded(mr_iid: u64) -> Self {
+            Self {
+                mr_created: true,
+                mr_iid: Some(mr_iid),
+                branch_name: Some(format!("issue-{mr_iid}")),
+                error: None,
+            }
+        }
+
+        fn no_mr() -> Self {
+            Self {
+                mr_created: false,
+                mr_iid: None,
+                branch_name: None,
+                error: None,
+            }
+        }
+
+        fn failed(branch: Option<&str>, message: &str) -> Self {
+            Self {
+                mr_created: false,
+                mr_iid: None,
+                branch_name: branch.map(str::to_string),
+                error: Some(message.to_string()),
+            }
+        }
+    }
+
+    /// A recording routing port. The world is scripted per observation
+    /// kind; failures are injected by naming the exact query or action
+    /// that should fail, so each test reads as "this world, then this
+    /// trace".
+    struct FakeWorkerPort {
+        trace: std::cell::RefCell<Vec<WorkerStep>>,
+        shutdown_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
+        issues: Vec<IssueObservation>,
+        known_issues: Vec<IssueObservation>,
+        mr_states: Vec<(u64, String)>,
+        default_branch: String,
+        claim_attempts: std::cell::RefCell<std::collections::VecDeque<IssueClaimAttempt>>,
+        adopted: Option<ActiveIssue>,
+        handled_labeled_mr: bool,
+        implementation: std::cell::RefCell<std::collections::VecDeque<ImplementationScript>>,
+        feedback_abandoned: bool,
+        feedback_error: Option<String>,
+        cancel_handled: bool,
+        trackable: bool,
+        failing_queries: Vec<WorkerQuery>,
+        failing_actions: Vec<WorkerAction>,
+    }
+
+    impl FakeWorkerPort {
+        fn new() -> Self {
+            Self {
+                trace: std::cell::RefCell::new(Vec::new()),
+                shutdown_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                issues: Vec::new(),
+                known_issues: Vec::new(),
+                mr_states: Vec::new(),
+                default_branch: "main".to_string(),
+                claim_attempts: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                adopted: None,
+                handled_labeled_mr: false,
+                implementation: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                feedback_abandoned: false,
+                feedback_error: None,
+                cancel_handled: false,
+                trackable: true,
+                failing_queries: Vec::new(),
+                failing_actions: Vec::new(),
+            }
+        }
+
+        /// The issues the poll lists; they are answerable by IID too.
+        fn listing(mut self, issues: &[IssueObservation]) -> Self {
+            self.issues = issues.to_vec();
+            self.known_issues.extend(issues.iter().cloned());
+            self
+        }
+
+        fn knowing(mut self, issues: &[IssueObservation]) -> Self {
+            self.known_issues.extend(issues.iter().cloned());
+            self
+        }
+
+        fn with_mr_state(mut self, mr_iid: u64, state: &str) -> Self {
+            self.mr_states.push((mr_iid, state.to_string()));
+            self
+        }
+
+        fn with_shutdown_answers(self, answers: &[bool]) -> Self {
+            self.shutdown_answers.borrow_mut().extend(answers);
+            self
+        }
+
+        fn with_claim_attempts(self, attempts: &[IssueClaimAttempt]) -> Self {
+            self.claim_attempts.borrow_mut().extend(attempts);
+            self
+        }
+
+        fn implementing(self, scripts: &[ImplementationScript]) -> Self {
+            self.implementation
+                .borrow_mut()
+                .extend(scripts.iter().cloned());
+            self
+        }
+
+        fn adopting(mut self, active: ActiveIssue) -> Self {
+            self.adopted = Some(active);
+            self
+        }
+
+        fn handling_labeled_mr(mut self) -> Self {
+            self.handled_labeled_mr = true;
+            self
+        }
+
+        fn abandoning_feedback(mut self) -> Self {
+            self.feedback_abandoned = true;
+            self
+        }
+
+        fn failing_feedback(mut self, message: &str) -> Self {
+            self.feedback_error = Some(message.to_string());
+            self
+        }
+
+        fn handling_cancel(mut self) -> Self {
+            self.cancel_handled = true;
+            self
+        }
+
+        fn untrackable(mut self) -> Self {
+            self.trackable = false;
+            self
+        }
+
+        fn failing_query(mut self, query: WorkerQuery) -> Self {
+            self.failing_queries.push(query);
+            self
+        }
+
+        fn failing_action(mut self, action: WorkerAction) -> Self {
+            self.failing_actions.push(action);
+            self
+        }
+
+        fn record(&self, step: WorkerStep) {
+            self.trace.borrow_mut().push(step);
+        }
+
+        fn observe(&self, query: WorkerQuery) -> Result<()> {
+            self.record(WorkerStep::Observe(query.clone()));
+            if self.failing_queries.contains(&query) {
+                anyhow::bail!("injected failure observing {query:?}");
+            }
+            Ok(())
+        }
+    }
+
+    impl WorkerRoutingPort for FakeWorkerPort {
+        fn shutdown_requested(&self) -> bool {
+            self.record(WorkerStep::Observe(WorkerQuery::ShutdownRequested));
+            self.shutdown_answers
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(false)
+        }
+
+        fn issue(&self, issue_iid: u64) -> Result<IssueObservation> {
+            self.observe(WorkerQuery::Issue { issue_iid })?;
+            self.known_issues
+                .iter()
+                .find(|issue| issue.iid == issue_iid)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("404 Issue Not Found: #{issue_iid}"))
+        }
+
+        fn merge_request_status(&self, mr_iid: u64) -> Result<MrStatusObservation> {
+            self.observe(WorkerQuery::MergeRequestStatus { mr_iid })?;
+            let state = self
+                .mr_states
+                .iter()
+                .find(|(iid, _)| *iid == mr_iid)
+                .map(|(_, state)| state.clone())
+                .unwrap_or_else(|| "opened".to_string());
+            Ok(MrStatusObservation { iid: mr_iid, state })
+        }
+
+        fn issues(&self) -> Result<Vec<IssueObservation>> {
+            self.observe(WorkerQuery::Issues)?;
+            Ok(self.issues.clone())
+        }
+
+        fn default_branch_or_main(&self) -> String {
+            self.record(WorkerStep::Observe(WorkerQuery::DefaultBranchOrMain));
+            self.default_branch.clone()
+        }
+
+        fn execute(&mut self, action: &WorkerAction) -> WorkerOutcome {
+            self.record(WorkerStep::Act(action.clone()));
+            if self.failing_actions.contains(action) {
+                return WorkerOutcome::Failed(anyhow::anyhow!(
+                    "injected failure executing {action:?}"
+                ));
+            }
+            match action {
+                WorkerAction::AcquireIssueClaim { .. } => WorkerOutcome::Claim(
+                    self.claim_attempts
+                        .borrow_mut()
+                        .pop_front()
+                        .unwrap_or(IssueClaimAttempt::Won),
+                ),
+                WorkerAction::AdoptOrphanedSession => WorkerOutcome::Adopted(self.adopted.clone()),
+                WorkerAction::HandleNeedAiWorkerMr => {
+                    WorkerOutcome::HandledNeedAiWorkerMr(self.handled_labeled_mr)
+                }
+                WorkerAction::RunImplementation { issue } => {
+                    let script = self
+                        .implementation
+                        .borrow_mut()
+                        .pop_front()
+                        .unwrap_or_else(ImplementationScript::no_mr);
+                    WorkerOutcome::Implementation {
+                        current: ActiveIssue {
+                            issue_iid: issue.iid,
+                            mr_iid: script.mr_iid,
+                            branch_name: script.branch_name.clone(),
+                            mr_created: script.mr_created,
+                        },
+                        error: script.error.as_ref().map(|e| anyhow::anyhow!("{e}")),
+                    }
+                }
+                WorkerAction::RunFeedback { .. } => match &self.feedback_error {
+                    Some(message) => WorkerOutcome::Failed(anyhow::anyhow!("{message}")),
+                    None => WorkerOutcome::Feedback {
+                        abandoned: self.feedback_abandoned,
+                    },
+                },
+                WorkerAction::ResolveCancelledIssue { .. } => {
+                    WorkerOutcome::CancelHandled(self.cancel_handled)
+                }
+                WorkerAction::CheckIssueTrackable { .. } => {
+                    WorkerOutcome::Trackable(self.trackable)
+                }
+                _ => WorkerOutcome::Done,
+            }
+        }
+    }
+
+    struct FakeWorkerRun {
+        result: Result<()>,
+        trace: Vec<WorkerStep>,
+        active: Option<ActiveIssue>,
+    }
+
+    fn run_worker_routing(port: &mut FakeWorkerPort, active: Option<ActiveIssue>) -> FakeWorkerRun {
+        let mut machine = WorkerRoutingMachine::new(ROUTING_AGENT, None, active);
+        let result = drive_worker_routing(&mut machine, port);
+        FakeWorkerRun {
+            result,
+            trace: port.trace.borrow().clone(),
+            active: machine.active.take(),
+        }
+    }
+
+    fn w_observe(query: WorkerQuery) -> WorkerStep {
+        WorkerStep::Observe(query)
+    }
+
+    fn w_act(action: WorkerAction) -> WorkerStep {
+        WorkerStep::Act(action)
+    }
+
+    fn w_shutdown() -> WorkerStep {
+        w_observe(WorkerQuery::ShutdownRequested)
+    }
+
+    fn active_with_mr(issue_iid: u64, mr_iid: u64) -> ActiveIssue {
+        ActiveIssue {
+            issue_iid,
+            mr_iid: Some(mr_iid),
+            branch_name: Some(format!("issue-{issue_iid}")),
+            mr_created: true,
+        }
+    }
+
+    fn active_without_mr(issue_iid: u64) -> ActiveIssue {
+        ActiveIssue {
+            issue_iid,
+            mr_iid: None,
+            branch_name: None,
+            mr_created: false,
+        }
+    }
+
+    /// The steps a cycle with no active issue performs before it looks at
+    /// any candidate.
+    fn polling_steps() -> Vec<WorkerStep> {
+        vec![
+            w_shutdown(),
+            w_act(WorkerAction::AdoptOrphanedSession),
+            w_act(WorkerAction::HandleNeedAiWorkerMr),
+            w_observe(WorkerQuery::Issues),
+            w_shutdown(),
+        ]
     }
 
     #[test]
-    fn extract_existing_mr_iid_returns_none_when_absent() {
-        let handoff = WorkerOutput {
-            mr_title: Some("Fix bug".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(extract_existing_mr_iid(&handoff), None);
+    fn worker_cycle_claims_a_candidate_then_implements_and_tracks_it_in_order() {
+        let candidate = issue_observation(7, &[]);
+        let mut port = FakeWorkerPort::new()
+            .listing(std::slice::from_ref(&candidate))
+            .implementing(&[ImplementationScript::succeeded(7)]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        let mut expected = polling_steps();
+        expected.extend([
+            w_shutdown(),
+            w_act(WorkerAction::AcquireIssueClaim { issue_iid: 7 }),
+            w_shutdown(),
+            w_act(WorkerAction::PreserveIssueClaim { issue_iid: 7 }),
+            w_act(WorkerAction::SaveSession {
+                issue_iid: 7,
+                mr_iid: 0,
+            }),
+            w_act(WorkerAction::RunImplementation {
+                issue: Box::new(candidate),
+            }),
+            w_act(WorkerAction::CheckIssueTrackable { issue_iid: 7 }),
+        ]);
+        assert_eq!(run.trace, expected);
+        assert_eq!(run.active, Some(active_with_mr(7, 7)));
     }
 
     #[test]
-    fn extract_existing_mr_iid_returns_none_for_zero_or_negative() {
-        let handoff = WorkerOutput {
-            existing_mr_iid: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(extract_existing_mr_iid(&handoff), None);
+    fn worker_cycle_releases_only_the_claim_when_the_run_produced_no_merge_request() {
+        let candidate = issue_observation(7, &[]);
+        let mut port = FakeWorkerPort::new()
+            .listing(&[candidate])
+            .implementing(&[ImplementationScript::no_mr()]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace.last(),
+            Some(&w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }))
+        );
+        assert!(run.active.is_none());
     }
 
     #[test]
-    fn extract_existing_mr_iid_returns_none_when_default() {
-        let handoff = WorkerOutput::default();
-        assert_eq!(extract_existing_mr_iid(&handoff), None);
+    fn worker_cycle_cleans_the_branch_up_after_a_failed_candidate_run() {
+        let candidate = issue_observation(7, &[]);
+        let mut port = FakeWorkerPort::new()
+            .listing(&[candidate])
+            .implementing(&[ImplementationScript::failed(Some("issue-7"), "boom")]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        // A failed candidate run keeps the session file (only the
+        // re-attempt path drops it) and cleans the worktree last.
+        assert_eq!(
+            &run.trace[run.trace.len() - 7..],
+            &[
+                w_shutdown(),
+                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
+                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
+                w_observe(WorkerQuery::DefaultBranchOrMain),
+                w_act(WorkerAction::ResetWorktree),
+                w_act(WorkerAction::CheckoutBranch {
+                    branch: "main".to_string(),
+                }),
+                w_act(WorkerAction::DeleteLocalBranch {
+                    branch: "issue-7".to_string(),
+                }),
+            ]
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_keeps_the_issue_active_when_shutdown_lands_mid_implementation() {
+        let candidate = issue_observation(7, &[]);
+        let mut port = FakeWorkerPort::new()
+            .listing(&[candidate])
+            .implementing(&[ImplementationScript::failed(Some("issue-7"), "interrupted")])
+            .with_shutdown_answers(&[false, false, false, false, true]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        assert_eq!(run.trace.last(), Some(&w_shutdown()));
+        // The shutdown hook needs the in-flight issue to persist the claim.
+        assert_eq!(
+            run.active,
+            Some(ActiveIssue {
+                issue_iid: 7,
+                mr_iid: None,
+                branch_name: Some("issue-7".to_string()),
+                mr_created: false,
+            })
+        );
+    }
+
+    #[test]
+    fn worker_cycle_resolves_an_externally_cancelled_candidate_run_without_cleanup() {
+        let candidate = issue_observation(7, &[]);
+        let mut port = FakeWorkerPort::new()
+            .listing(&[candidate])
+            .implementing(&[ImplementationScript::failed(
+                Some("issue-7"),
+                WORKER_AGENT_CANCELLED_MSG,
+            )])
+            .handling_cancel();
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace.last(),
+            Some(&w_act(WorkerAction::ResolveCancelledIssue { issue_iid: 7 }))
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_falls_back_to_cleanup_when_a_cancel_turns_out_to_be_a_real_failure() {
+        let candidate = issue_observation(7, &[]);
+        let mut port = FakeWorkerPort::new().listing(&[candidate]).implementing(&[
+            ImplementationScript::failed(None, WORKER_AGENT_CANCELLED_MSG),
+        ]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            &run.trace[run.trace.len() - 3..],
+            &[
+                w_act(WorkerAction::ResolveCancelledIssue { issue_iid: 7 }),
+                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
+                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_cycle_gives_a_won_claim_straight_back_when_shutdown_lands() {
+        let candidate = issue_observation(7, &[]);
+        let mut port = FakeWorkerPort::new()
+            .listing(&[candidate])
+            .with_shutdown_answers(&[false, false, false, true]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            &run.trace[run.trace.len() - 2..],
+            &[
+                w_shutdown(),
+                w_act(WorkerAction::ReleaseAcquiredClaim { issue_iid: 7 }),
+            ]
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_moves_on_when_a_candidate_claim_is_lost_and_stops_when_interrupted() {
+        let mut lost = FakeWorkerPort::new()
+            .listing(&[issue_observation(7, &[]), issue_observation(9, &[])])
+            .with_claim_attempts(&[IssueClaimAttempt::Lost, IssueClaimAttempt::Won])
+            .implementing(&[ImplementationScript::succeeded(9)]);
+        let run = run_worker_routing(&mut lost, None);
+        assert!(run.result.is_ok());
+        assert_eq!(run.active, Some(active_with_mr(9, 9)));
+
+        let mut interrupted = FakeWorkerPort::new()
+            .listing(&[issue_observation(7, &[]), issue_observation(9, &[])])
+            .with_claim_attempts(&[IssueClaimAttempt::Interrupted]);
+        let run = run_worker_routing(&mut interrupted, None);
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace.last(),
+            Some(&w_act(WorkerAction::AcquireIssueClaim { issue_iid: 7 }))
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_skips_candidates_that_are_out_of_reach_without_touching_gitlab() {
+        let mut port = FakeWorkerPort::new().listing(&[
+            issue_observation(1, &[WORKING_ON_LABEL]),
+            issue_observation(2, &[&format!("claimed:{}", "worker-2")]),
+            issue_observation(3, &[ACTION_REQUIRED_LABEL]),
+        ]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        // Screening is pure, so the whole poll is the listing steps plus
+        // one shutdown check per candidate.
+        let mut expected = polling_steps();
+        expected.extend([w_shutdown(), w_shutdown(), w_shutdown()]);
+        assert_eq!(run.trace, expected);
+    }
+
+    #[test]
+    fn worker_cycle_drops_a_resolved_dependency_label_before_claiming() {
+        let candidate = issue_observation(7, &[&waiting_on_issue_label(4)]);
+        let mut closed_dependency = issue_observation(4, &[]);
+        closed_dependency.state = "closed".to_string();
+        let mut port = FakeWorkerPort::new()
+            .listing(&[candidate])
+            .knowing(&[closed_dependency])
+            .implementing(&[ImplementationScript::succeeded(7)]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        let mut expected = polling_steps();
+        expected.extend([
+            w_shutdown(),
+            w_observe(WorkerQuery::Issue { issue_iid: 4 }),
+            w_act(WorkerAction::RemoveIssueLabel {
+                issue_iid: 7,
+                label: waiting_on_issue_label(4),
+            }),
+            w_act(WorkerAction::AcquireIssueClaim { issue_iid: 7 }),
+            w_shutdown(),
+            w_act(WorkerAction::PreserveIssueClaim { issue_iid: 7 }),
+            w_act(WorkerAction::SaveSession {
+                issue_iid: 7,
+                mr_iid: 0,
+            }),
+            w_act(WorkerAction::RunImplementation {
+                issue: Box::new(issue_observation(7, &[&waiting_on_issue_label(4)])),
+            }),
+            w_act(WorkerAction::CheckIssueTrackable { issue_iid: 7 }),
+        ]);
+        assert_eq!(run.trace, expected);
+    }
+
+    #[test]
+    fn worker_cycle_leaves_a_candidate_parked_while_its_dependency_is_open() {
+        let candidate = issue_observation(7, &[&waiting_on_issue_label(4)]);
+        let mut port = FakeWorkerPort::new()
+            .listing(&[candidate])
+            .knowing(&[issue_observation(4, &[])]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        let mut expected = polling_steps();
+        expected.extend([w_shutdown(), w_observe(WorkerQuery::Issue { issue_iid: 4 })]);
+        assert_eq!(run.trace, expected);
+    }
+
+    #[test]
+    fn worker_cycle_treats_a_missing_dependency_as_resolved_but_an_unreadable_one_as_parked() {
+        let candidate = issue_observation(7, &[&waiting_on_issue_label(4)]);
+        let mut missing = FakeWorkerPort::new().listing(std::slice::from_ref(&candidate));
+        let run = run_worker_routing(&mut missing, None);
+        assert!(run.result.is_ok());
+        assert!(run.trace.contains(&w_act(WorkerAction::RemoveIssueLabel {
+            issue_iid: 7,
+            label: waiting_on_issue_label(4),
+        })));
+
+        let mut unreadable = FakeWorkerPort::new()
+            .listing(&[candidate])
+            .knowing(&[issue_observation(4, &[])])
+            .failing_query(WorkerQuery::Issue { issue_iid: 4 });
+        let run = run_worker_routing(&mut unreadable, None);
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace.last(),
+            Some(&w_observe(WorkerQuery::Issue { issue_iid: 4 }))
+        );
+    }
+
+    #[test]
+    fn worker_cycle_stops_at_an_adopted_orphan_and_at_a_handled_labeled_mr() {
+        let mut adopting = FakeWorkerPort::new().adopting(active_with_mr(7, 12));
+        let run = run_worker_routing(&mut adopting, None);
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace,
+            vec![w_shutdown(), w_act(WorkerAction::AdoptOrphanedSession)]
+        );
+        assert_eq!(run.active, Some(active_with_mr(7, 12)));
+
+        let mut labeled = FakeWorkerPort::new().handling_labeled_mr();
+        let run = run_worker_routing(&mut labeled, None);
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace,
+            vec![
+                w_shutdown(),
+                w_act(WorkerAction::AdoptOrphanedSession),
+                w_act(WorkerAction::HandleNeedAiWorkerMr),
+            ]
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_fails_the_cycle_when_a_required_read_or_write_fails() {
+        let mut listing = FakeWorkerPort::new().failing_query(WorkerQuery::Issues);
+        assert!(run_worker_routing(&mut listing, None).result.is_err());
+
+        let mut labeled_mr =
+            FakeWorkerPort::new().failing_action(WorkerAction::HandleNeedAiWorkerMr);
+        assert!(run_worker_routing(&mut labeled_mr, None).result.is_err());
+
+        let mut claiming = FakeWorkerPort::new()
+            .listing(&[issue_observation(7, &[])])
+            .failing_action(WorkerAction::AcquireIssueClaim { issue_iid: 7 });
+        assert!(run_worker_routing(&mut claiming, None).result.is_err());
+    }
+
+    #[test]
+    fn worker_cycle_ends_the_release_of_a_merged_mr_by_closing_the_issue() {
+        let mut port = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .with_mr_state(12, "merged")
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace,
+            vec![
+                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
+                w_observe(WorkerQuery::MergeRequestStatus { mr_iid: 12 }),
+                w_observe(WorkerQuery::DefaultBranchOrMain),
+                w_act(WorkerAction::ResetWorktree),
+                w_act(WorkerAction::CheckoutBranch {
+                    branch: "main".to_string(),
+                }),
+                w_act(WorkerAction::DeleteLocalBranch {
+                    branch: "issue-7".to_string(),
+                }),
+                w_act(WorkerAction::DeleteRemoteBranch {
+                    branch: "issue-7".to_string(),
+                }),
+                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
+                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
+                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
+                w_act(WorkerAction::CloseIssue { issue_iid: 7 }),
+                w_shutdown(),
+            ]
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_keeps_the_remote_branch_and_the_issue_when_the_mr_was_closed() {
+        let mut port = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .with_mr_state(12, "closed")
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
+
+        assert!(run.result.is_ok());
+        assert!(
+            !run.trace.contains(&w_act(WorkerAction::DeleteRemoteBranch {
+                branch: "issue-7".to_string(),
+            }))
+        );
+        assert!(
+            !run.trace
+                .contains(&w_act(WorkerAction::CloseIssue { issue_iid: 7 }))
+        );
+        assert_eq!(
+            &run.trace[run.trace.len() - 2..],
+            &[
+                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
+                w_shutdown()
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_cycle_runs_feedback_for_an_open_mr_and_keeps_the_issue_active() {
+        let mut port = FakeWorkerPort::new().knowing(&[issue_observation(7, &[WORKING_ON_LABEL])]);
+        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace,
+            vec![
+                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
+                w_observe(WorkerQuery::MergeRequestStatus { mr_iid: 12 }),
+                w_act(WorkerAction::RunFeedback {
+                    mr_iid: 12,
+                    linked_issue_iid: Some(7),
+                    comments_only: false,
+                }),
+            ]
+        );
+        assert_eq!(run.active, Some(active_with_mr(7, 12)));
+    }
+
+    #[test]
+    fn worker_cycle_releases_the_issue_when_feedback_abandoned_the_merge_request() {
+        let mut port = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .abandoning_feedback()
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            &run.trace[run.trace.len() - 3..],
+            &[
+                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
+                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
+                w_shutdown(),
+            ]
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_handles_a_failed_feedback_run_by_shutdown_cancel_or_logging() {
+        // Shutdown: keep the issue active and stop.
+        let mut shutting_down = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .failing_feedback("boom")
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut shutting_down, Some(active_with_mr(7, 12)));
+        assert!(run.result.is_ok());
+        assert_eq!(run.trace.last(), Some(&w_shutdown()));
+        assert_eq!(run.active, Some(active_with_mr(7, 12)));
+
+        // An external cancel is resolved and releases the issue.
+        let mut cancelled = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .failing_feedback(WORKER_AGENT_CANCELLED_MSG)
+            .handling_cancel();
+        let run = run_worker_routing(&mut cancelled, Some(active_with_mr(7, 12)));
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace.last(),
+            Some(&w_act(WorkerAction::ResolveCancelledIssue { issue_iid: 7 }))
+        );
+        assert!(run.active.is_none());
+
+        // Anything else is logged; the issue stays active for the next cycle.
+        let mut failed = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .failing_feedback("boom");
+        let run = run_worker_routing(&mut failed, Some(active_with_mr(7, 12)));
+        assert!(run.result.is_ok());
+        assert_eq!(run.trace.last(), Some(&w_shutdown()));
+        assert_eq!(run.active, Some(active_with_mr(7, 12)));
+    }
+
+    #[test]
+    fn worker_cycle_ends_the_mr_watch_when_the_mr_cannot_be_read() {
+        let mut port = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .failing_query(WorkerQuery::MergeRequestStatus { mr_iid: 12 });
+        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace.last(),
+            Some(&w_observe(WorkerQuery::MergeRequestStatus { mr_iid: 12 }))
+        );
+        assert_eq!(run.active, Some(active_with_mr(7, 12)));
+    }
+
+    #[test]
+    fn worker_cycle_releases_a_watched_issue_that_left_the_worker_behind() {
+        // Closed externally.
+        let mut closed_issue = issue_observation(7, &[WORKING_ON_LABEL]);
+        closed_issue.state = "closed".to_string();
+        let mut closed = FakeWorkerPort::new()
+            .knowing(&[closed_issue])
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut closed, Some(active_with_mr(7, 12)));
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace,
+            vec![
+                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
+                w_act(WorkerAction::AbandonClosedIssue {
+                    issue_iid: 7,
+                    mr_iid: Some(12),
+                }),
+                w_shutdown(),
+            ]
+        );
+        assert!(run.active.is_none());
+
+        // A human parked it with the pending label.
+        let mut pending = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKER_PENDING_LABEL])])
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut pending, Some(active_with_mr(7, 12)));
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace[1],
+            w_act(WorkerAction::ClearIssueState { issue_iid: 7 })
+        );
+        assert!(run.active.is_none());
+
+        // A human asked for review-only.
+        let mut review_only = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKER_REVIEW_ONLY_LABEL])])
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut review_only, Some(active_with_mr(7, 12)));
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace[1],
+            w_act(WorkerAction::ReleaseReviewOnlyHold { issue_iid: 7 })
+        );
+        assert!(run.active.is_none());
+
+        // The issue itself could not be read.
+        let mut unreadable = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .failing_query(WorkerQuery::Issue { issue_iid: 7 })
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut unreadable, Some(active_with_mr(7, 12)));
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace[1],
+            w_act(WorkerAction::ClearIssueState { issue_iid: 7 })
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_re_attempts_an_active_issue_that_never_reached_an_mr() {
+        let mut port = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .implementing(&[ImplementationScript::succeeded(7)]);
+        let run = run_worker_routing(&mut port, Some(active_without_mr(7)));
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.trace,
+            vec![
+                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
+                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
+                w_act(WorkerAction::RunImplementation {
+                    issue: Box::new(issue_observation(7, &[WORKING_ON_LABEL])),
+                }),
+                w_act(WorkerAction::CheckIssueTrackable { issue_iid: 7 }),
+            ]
+        );
+        assert_eq!(run.active, Some(active_with_mr(7, 7)));
+    }
+
+    #[test]
+    fn worker_cycle_drops_the_issue_when_a_re_attempt_is_not_trackable() {
+        let mut port = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .implementing(&[ImplementationScript::succeeded(7)])
+            .untrackable();
+        let run = run_worker_routing(&mut port, Some(active_without_mr(7)));
+
+        assert!(run.result.is_ok());
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_drops_the_session_after_a_failed_re_attempt() {
+        let mut port = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .implementing(&[ImplementationScript::failed(Some("issue-7"), "boom")]);
+        let run = run_worker_routing(&mut port, Some(active_without_mr(7)));
+
+        assert!(run.result.is_ok());
+        assert_eq!(
+            &run.trace[run.trace.len() - 8..],
+            &[
+                w_shutdown(),
+                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
+                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
+                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
+                w_observe(WorkerQuery::DefaultBranchOrMain),
+                w_act(WorkerAction::ResetWorktree),
+                w_act(WorkerAction::CheckoutBranch {
+                    branch: "main".to_string(),
+                }),
+                w_act(WorkerAction::DeleteLocalBranch {
+                    branch: "issue-7".to_string(),
+                }),
+            ]
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_releases_a_re_attempt_whose_issue_disappeared_then_looks_for_new_work() {
+        let mut port = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .failing_query(WorkerQuery::Issue { issue_iid: 7 })
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut port, Some(active_without_mr(7)));
+
+        assert!(run.result.is_ok());
+        // The first read is the hold check, which releases through
+        // `ClearIssueState` rather than the fetch-failure cleanup.
+        assert_eq!(
+            run.trace,
+            vec![
+                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
+                w_act(WorkerAction::ClearIssueState { issue_iid: 7 }),
+                w_shutdown(),
+            ]
+        );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_cleans_up_when_the_re_attempt_read_fails_after_the_hold_check() {
+        struct FailSecondIssueRead {
+            inner: FakeWorkerPort,
+            reads: std::cell::Cell<usize>,
+        }
+
+        impl WorkerRoutingPort for FailSecondIssueRead {
+            fn shutdown_requested(&self) -> bool {
+                self.inner.shutdown_requested()
+            }
+
+            fn issue(&self, issue_iid: u64) -> Result<IssueObservation> {
+                let read = self.reads.get();
+                self.reads.set(read + 1);
+                let observed = self.inner.issue(issue_iid)?;
+                if read == 0 {
+                    Ok(observed)
+                } else {
+                    anyhow::bail!("injected failure on the re-attempt read")
+                }
+            }
+
+            fn merge_request_status(&self, mr_iid: u64) -> Result<MrStatusObservation> {
+                self.inner.merge_request_status(mr_iid)
+            }
+
+            fn issues(&self) -> Result<Vec<IssueObservation>> {
+                self.inner.issues()
+            }
+
+            fn default_branch_or_main(&self) -> String {
+                self.inner.default_branch_or_main()
+            }
+
+            fn execute(&mut self, action: &WorkerAction) -> WorkerOutcome {
+                self.inner.execute(action)
+            }
+        }
+
+        let mut port = FailSecondIssueRead {
+            inner: FakeWorkerPort::new()
+                .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+                .with_shutdown_answers(&[true]),
+            reads: std::cell::Cell::new(0),
+        };
+        let mut machine =
+            WorkerRoutingMachine::new(ROUTING_AGENT, None, Some(active_without_mr(7)));
+        let result = drive_worker_routing(&mut machine, &mut port);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            port.inner.trace.borrow().clone(),
+            vec![
+                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
+                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
+                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
+                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
+                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
+                w_shutdown(),
+            ]
+        );
+        assert!(machine.active.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Implementation progression traces. Workspace preparation and the
+    // model invocation are actions, so a whole implementation run — down
+    // to which branch of the handoff union it took — is an ordered trace.
+    // -----------------------------------------------------------------
+
+    /// A recording implementation port. Answers are scripted per query;
+    /// failures are injected by naming the query or action that fails.
+    struct FakeImplPort {
+        trace: std::cell::RefCell<Vec<ImplStep>>,
+        closes_linked: Option<ClosesLinkedMr>,
+        open_mr: Option<u64>,
+        default_branch: String,
+        remote_branch_exists: bool,
+        diff_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
+        staged: bool,
+        merge_clean: bool,
+        existing_mr_state: Option<String>,
+        dependency_closed: bool,
+        model_cancelled: bool,
+        model_output: WorkerImplementationOutput,
+        created_mr_iid: u64,
+        stop_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
+        failing_queries: Vec<ImplQuery>,
+        failing_actions: Vec<ImplAction>,
+    }
+
+    impl FakeImplPort {
+        fn new() -> Self {
+            Self {
+                trace: std::cell::RefCell::new(Vec::new()),
+                closes_linked: None,
+                open_mr: None,
+                default_branch: "main".to_string(),
+                remote_branch_exists: false,
+                diff_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                staged: true,
+                merge_clean: true,
+                existing_mr_state: Some("opened".to_string()),
+                dependency_closed: false,
+                model_cancelled: false,
+                model_output: WorkerImplementationOutput::Implemented(ImplementedMetadata {
+                    mr_title: Some("Cap the retry backoff".to_string()),
+                    mr_description: Some("Capped the backoff at 30s.".to_string()),
+                    changes_summary: None,
+                }),
+                created_mr_iid: 12,
+                stop_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                failing_queries: Vec::new(),
+                failing_actions: Vec::new(),
+            }
+        }
+
+        fn with_closes_linked(mut self, linked: ClosesLinkedMr) -> Self {
+            self.closes_linked = Some(linked);
+            self
+        }
+
+        fn with_open_mr(mut self, mr_iid: u64) -> Self {
+            self.open_mr = Some(mr_iid);
+            self
+        }
+
+        fn with_remote_branch(mut self) -> Self {
+            self.remote_branch_exists = true;
+            self
+        }
+
+        fn with_diff_answers(self, answers: &[bool]) -> Self {
+            self.diff_answers.borrow_mut().extend(answers);
+            self
+        }
+
+        fn nothing_staged(mut self) -> Self {
+            self.staged = false;
+            self
+        }
+
+        fn conflicting_merge(mut self) -> Self {
+            self.merge_clean = false;
+            self
+        }
+
+        fn deciding(mut self, output: WorkerImplementationOutput) -> Self {
+            self.model_output = output;
+            self
+        }
+
+        fn cancelling_model(mut self) -> Self {
+            self.model_cancelled = true;
+            self
+        }
+
+        fn with_existing_mr_state(mut self, state: Option<&str>) -> Self {
+            self.existing_mr_state = state.map(str::to_string);
+            self
+        }
+
+        fn with_closed_dependency(mut self) -> Self {
+            self.dependency_closed = true;
+            self
+        }
+
+        fn stopping_at(self, answers: &[bool]) -> Self {
+            self.stop_answers.borrow_mut().extend(answers);
+            self
+        }
+
+        fn failing_query(mut self, query: ImplQuery) -> Self {
+            self.failing_queries.push(query);
+            self
+        }
+
+        fn failing_action(mut self, action: ImplAction) -> Self {
+            self.failing_actions.push(action);
+            self
+        }
+
+        fn record(&self, step: ImplStep) {
+            self.trace.borrow_mut().push(step);
+        }
+
+        fn observe(&self, query: ImplQuery) -> Result<()> {
+            self.record(ImplStep::Observe(query.clone()));
+            if self.failing_queries.contains(&query) {
+                anyhow::bail!("injected failure observing {query:?}");
+            }
+            Ok(())
+        }
+    }
+
+    impl ImplementationPort for FakeImplPort {
+        fn closes_linked_mr(&self) -> Option<ClosesLinkedMr> {
+            self.record(ImplStep::Observe(ImplQuery::ClosesLinkedMr));
+            self.closes_linked
+        }
+
+        fn open_mr_for_issue(&self) -> Option<u64> {
+            self.record(ImplStep::Observe(ImplQuery::OpenMrForIssue));
+            self.open_mr
+        }
+
+        fn default_branch(&self) -> Result<String> {
+            self.observe(ImplQuery::DefaultBranch)?;
+            Ok(self.default_branch.clone())
+        }
+
+        fn default_branch_or_main(&self) -> String {
+            self.record(ImplStep::Observe(ImplQuery::DefaultBranchOrMain));
+            self.default_branch.clone()
+        }
+
+        fn remote_branch_exists(&self, _branch: &str) -> Result<bool> {
+            self.observe(ImplQuery::RemoteBranchExists)?;
+            Ok(self.remote_branch_exists)
+        }
+
+        fn has_diff_against(&self, _base: &str) -> Result<bool> {
+            self.observe(ImplQuery::DiffAgainstDefault)?;
+            Ok(self.diff_answers.borrow_mut().pop_front().unwrap_or(true))
+        }
+
+        fn has_staged_changes(&self) -> Result<bool> {
+            self.observe(ImplQuery::StagedChanges)?;
+            Ok(self.staged)
+        }
+
+        fn merge_request_state(&self, mr_iid: u64) -> Option<String> {
+            self.record(ImplStep::Observe(ImplQuery::MergeRequestState { mr_iid }));
+            self.existing_mr_state.clone()
+        }
+
+        fn dependency_closed(&self, issue_iid: u64) -> bool {
+            self.record(ImplStep::Observe(ImplQuery::DependencyClosed { issue_iid }));
+            self.dependency_closed
+        }
+
+        fn issue_comments(&self) -> String {
+            self.record(ImplStep::Observe(ImplQuery::IssueComments));
+            "- alice: please cap it".to_string()
+        }
+
+        fn execute(&mut self, action: &ImplAction) -> ImplOutcome {
+            self.record(ImplStep::Act(action.clone()));
+            if self.failing_actions.contains(action) {
+                return ImplOutcome::Failed(anyhow::anyhow!(
+                    "injected failure executing {action:?}"
+                ));
+            }
+            match action {
+                ImplAction::StopIfReviewOnly => ImplOutcome::Stopped(
+                    self.stop_answers.borrow_mut().pop_front().unwrap_or(false),
+                ),
+                ImplAction::MergeBaseIntoBranch { .. } => ImplOutcome::Merged(self.merge_clean),
+                ImplAction::BuildPrompt { continuation, .. } => {
+                    ImplOutcome::Prompt(format!("prompt(continuation={continuation})"))
+                }
+                ImplAction::InvokeImplementationModel { .. } => {
+                    ImplOutcome::Model(if self.model_cancelled {
+                        ImplModelResult::Cancelled
+                    } else {
+                        ImplModelResult::Output(Box::new(self.model_output.clone()))
+                    })
+                }
+                ImplAction::CreateMergeRequest { .. } => {
+                    ImplOutcome::MergeRequestCreated(self.created_mr_iid)
+                }
+                _ => ImplOutcome::Done,
+            }
+        }
+    }
+
+    struct FakeImplRun {
+        result: Result<Option<u64>>,
+        trace: Vec<ImplStep>,
+        mr_created: bool,
+        branch: Option<String>,
+    }
+
+    fn run_implementation(port: &mut FakeImplPort, scope_label: Option<&str>) -> FakeImplRun {
+        let mut machine =
+            ImplementationMachine::new(ROUTING_AGENT, scope_label, issue_observation(7, &[]));
+        let result = drive_implementation(&mut machine, port);
+        FakeImplRun {
+            result: result.map(|()| machine.tracked_mr),
+            trace: port.trace.borrow().clone(),
+            mr_created: machine.mr_created,
+            branch: machine.left_branch.clone(),
+        }
+    }
+
+    fn i_observe(query: ImplQuery) -> ImplStep {
+        ImplStep::Observe(query)
+    }
+
+    fn i_act(action: ImplAction) -> ImplStep {
+        ImplStep::Act(action)
+    }
+
+    /// The steps that take a fresh issue from discovery to the model's
+    /// answer, for an issue whose branch does not exist yet.
+    fn steps_up_to_model(continuation: bool) -> Vec<ImplStep> {
+        vec![
+            i_act(ImplAction::StopIfReviewOnly),
+            i_observe(ImplQuery::ClosesLinkedMr),
+            i_observe(ImplQuery::OpenMrForIssue),
+            i_observe(ImplQuery::DefaultBranch),
+            i_act(ImplAction::FetchRemote),
+            i_act(ImplAction::ResetWorktree),
+            i_observe(ImplQuery::RemoteBranchExists),
+            i_act(ImplAction::CreateBranchFrom {
+                branch: "issue-7".to_string(),
+                base: "main".to_string(),
+            }),
+            i_act(ImplAction::StopIfReviewOnly),
+            i_act(ImplAction::RequireWorkingOnLabel),
+            i_observe(ImplQuery::IssueComments),
+            i_act(ImplAction::BuildPrompt {
+                continuation,
+                comments: "- alice: please cap it".to_string(),
+            }),
+            i_act(ImplAction::InvokeImplementationModel {
+                prompt: format!("prompt(continuation={continuation})"),
+            }),
+        ]
+    }
+
+    #[test]
+    fn implementation_prepares_the_branch_invokes_the_model_then_opens_the_merge_request() {
+        let mut port = FakeImplPort::new();
+        let run = run_implementation(&mut port, Some("team:core"));
+
+        assert_eq!(run.result.unwrap(), Some(12));
+        let mut expected = steps_up_to_model(false);
+        expected.extend([
+            i_act(ImplAction::StageAll),
+            i_observe(ImplQuery::StagedChanges),
+            i_act(ImplAction::Commit {
+                message: build_commit_message("Cap the retry backoff", 7),
+            }),
+            i_observe(ImplQuery::DiffAgainstDefault),
+            i_act(ImplAction::PushBranch {
+                branch: "issue-7".to_string(),
+            }),
+            i_act(ImplAction::CreateMergeRequest {
+                branch: "issue-7".to_string(),
+                base: "main".to_string(),
+                title: "Cap the retry backoff".to_string(),
+                description: "Closes #7\n\nCapped the backoff at 30s.".to_string(),
+            }),
+            i_act(ImplAction::AddMrScopeLabel { mr_iid: 12 }),
+            i_act(ImplAction::RequireSaveSessionWithSummary {
+                mr_iid: 12,
+                summary: "Capped the backoff at 30s.".to_string(),
+            }),
+        ]);
+        assert_eq!(run.trace, expected);
+        assert!(run.mr_created);
+        assert_eq!(run.branch, Some("issue-7".to_string()));
+    }
+
+    #[test]
+    fn implementation_skips_the_scope_label_when_the_worker_has_no_scope() {
+        let mut port = FakeImplPort::new();
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(12));
+        assert!(
+            !run.trace
+                .iter()
+                .any(|step| matches!(step, ImplStep::Act(ImplAction::AddMrScopeLabel { .. })))
+        );
+    }
+
+    #[test]
+    fn implementation_adopts_a_merge_request_linked_by_a_closes_keyword() {
+        let mut port = FakeImplPort::new().with_closes_linked(ClosesLinkedMr::Open(9));
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(9));
+        assert_eq!(
+            run.trace,
+            vec![
+                i_act(ImplAction::StopIfReviewOnly),
+                i_observe(ImplQuery::ClosesLinkedMr),
+                i_act(ImplAction::AddWorkingOnLabel),
+                i_act(ImplAction::SaveSession { mr_iid: 9 }),
+            ]
+        );
+        assert!(run.mr_created);
+        assert!(run.branch.is_none());
+    }
+
+    #[test]
+    fn implementation_closes_an_issue_a_merged_merge_request_already_covered() {
+        let mut port = FakeImplPort::new().with_closes_linked(ClosesLinkedMr::Merged);
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(
+            run.trace,
+            vec![
+                i_act(ImplAction::StopIfReviewOnly),
+                i_observe(ImplQuery::ClosesLinkedMr),
+                i_act(ImplAction::CloseIssue),
+                i_act(ImplAction::CleanupSession),
+            ]
+        );
+        assert!(!run.mr_created);
+    }
+
+    #[test]
+    fn implementation_adopts_an_open_merge_request_on_the_issue_branch() {
+        let mut port = FakeImplPort::new().with_open_mr(9);
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(9));
+        assert_eq!(
+            run.trace,
+            vec![
+                i_act(ImplAction::StopIfReviewOnly),
+                i_observe(ImplQuery::ClosesLinkedMr),
+                i_observe(ImplQuery::OpenMrForIssue),
+                i_act(ImplAction::AddWorkingOnLabel),
+                i_act(ImplAction::RequireSaveSession { mr_iid: 9 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn implementation_continues_an_existing_branch_that_merges_cleanly() {
+        let mut port = FakeImplPort::new().with_remote_branch();
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(12));
+        assert_eq!(
+            &run.trace[6..10],
+            &[
+                i_observe(ImplQuery::RemoteBranchExists),
+                i_act(ImplAction::CheckoutBranch {
+                    branch: "issue-7".to_string(),
+                }),
+                i_observe(ImplQuery::DiffAgainstDefault),
+                i_act(ImplAction::MergeBaseIntoBranch {
+                    base: "main".to_string(),
+                }),
+            ]
+        );
+        // A branch that already has work gets the continuation prompt.
+        assert!(run.trace.contains(&i_act(ImplAction::BuildPrompt {
+            continuation: true,
+            comments: "- alice: please cap it".to_string(),
+        })));
+    }
+
+    #[test]
+    fn implementation_discards_a_stale_branch_and_starts_over() {
+        let mut port = FakeImplPort::new()
+            .with_remote_branch()
+            .with_diff_answers(&[false, true]);
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(12));
+        assert_eq!(
+            &run.trace[8..14],
+            &[
+                i_observe(ImplQuery::DiffAgainstDefault),
+                i_act(ImplAction::ResetWorktree),
+                i_act(ImplAction::CheckoutBranch {
+                    branch: "main".to_string(),
+                }),
+                i_act(ImplAction::DeleteLocalBranch {
+                    branch: "issue-7".to_string(),
+                }),
+                i_act(ImplAction::DeleteRemoteBranch {
+                    branch: "issue-7".to_string(),
+                }),
+                i_act(ImplAction::CreateBranchFrom {
+                    branch: "issue-7".to_string(),
+                    base: "main".to_string(),
+                }),
+            ]
+        );
+        assert!(run.trace.contains(&i_act(ImplAction::BuildPrompt {
+            continuation: false,
+            comments: "- alice: please cap it".to_string(),
+        })));
+    }
+
+    #[test]
+    fn implementation_recreates_a_branch_that_conflicts_with_the_default_branch() {
+        let mut port = FakeImplPort::new().with_remote_branch().conflicting_merge();
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(12));
+        assert_eq!(
+            &run.trace[9..14],
+            &[
+                i_act(ImplAction::MergeBaseIntoBranch {
+                    base: "main".to_string(),
+                }),
+                i_act(ImplAction::ResetWorktree),
+                i_act(ImplAction::CheckoutBranch {
+                    branch: "main".to_string(),
+                }),
+                i_act(ImplAction::DeleteLocalBranch {
+                    branch: "issue-7".to_string(),
+                }),
+                i_act(ImplAction::CreateBranchFrom {
+                    branch: "issue-7".to_string(),
+                    base: "main".to_string(),
+                }),
+            ]
+        );
+        // The recreated branch is fresh, so no remote branch is deleted.
+        assert!(
+            !run.trace
+                .iter()
+                .any(|step| matches!(step, ImplStep::Act(ImplAction::DeleteRemoteBranch { .. })))
+        );
+    }
+
+    #[test]
+    fn implementation_stops_when_a_human_asks_for_review_only() {
+        let mut before = FakeImplPort::new().stopping_at(&[true]);
+        let run = run_implementation(&mut before, None);
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(run.trace, vec![i_act(ImplAction::StopIfReviewOnly)]);
+        assert!(run.branch.is_none());
+
+        let mut after_prep = FakeImplPort::new().stopping_at(&[false, true]);
+        let run = run_implementation(&mut after_prep, None);
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(run.trace.last(), Some(&i_act(ImplAction::StopIfReviewOnly)));
+        // The branch was already created, so the cycle has to clean it up.
+        assert_eq!(run.branch, Some("issue-7".to_string()));
+    }
+
+    #[test]
+    fn implementation_ends_quietly_when_the_model_run_was_cancelled() {
+        let mut port = FakeImplPort::new().cancelling_model();
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(run.trace, steps_up_to_model(false));
+        assert!(!run.mr_created);
+    }
+
+    #[test]
+    fn implementation_hands_the_issue_back_and_forgets_the_branch_when_blocked() {
+        for output in [
+            WorkerImplementationOutput::NeedsSplit(BlockedOutcome {
+                reason: "Two features in one issue".to_string(),
+                public_comment: None,
+            }),
+            WorkerImplementationOutput::NeedsClarification(BlockedOutcome {
+                reason: "Which backoff cap?".to_string(),
+                public_comment: None,
+            }),
+            WorkerImplementationOutput::CannotImplement(BlockedOutcome {
+                reason: "The API does not exist".to_string(),
+                public_comment: None,
+            }),
+        ] {
+            let mut port = FakeImplPort::new().deciding(output);
+            let run = run_implementation(&mut port, None);
+
+            assert_eq!(run.result.unwrap(), None);
+            assert!(matches!(
+                run.trace.last(),
+                Some(ImplStep::Act(ImplAction::HandIssueBackToHumans { .. }))
+            ));
+            // The hand-back already reset the worktree, so the cycle must
+            // not delete the branch a second time.
+            assert!(run.branch.is_none());
+            assert!(!run.mr_created);
+        }
+    }
+
+    #[test]
+    fn implementation_parks_an_issue_whose_dependency_is_still_open() {
+        let mut port = FakeImplPort::new().deciding(WorkerImplementationOutput::WaitDependency {
+            depends_on_issue: 4,
+        });
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), None);
+        let tail = &run.trace[run.trace.len() - 10..];
+        assert_eq!(
+            tail,
+            &[
+                i_observe(ImplQuery::DependencyClosed { issue_iid: 4 }),
+                i_act(ImplAction::AddIssueLabel {
+                    label: waiting_on_issue_label(4),
+                }),
+                i_act(ImplAction::RemoveWorkingOnLabel),
+                i_act(ImplAction::AddIssueComment {
+                    body: "Implementation cannot proceed until issue #4 is closed. \
+                         Parking this issue until the dependency resolves."
+                        .to_string(),
+                }),
+                i_act(ImplAction::ReleaseIssueClaim),
+                i_act(ImplAction::CleanupSession),
+                i_observe(ImplQuery::DefaultBranchOrMain),
+                i_act(ImplAction::ResetWorktree),
+                i_act(ImplAction::CheckoutBranchBestEffort {
+                    branch: "main".to_string(),
+                }),
+                i_act(ImplAction::DeleteLocalBranch {
+                    branch: "issue-7".to_string(),
+                }),
+            ]
+        );
+        assert!(run.branch.is_none());
+        assert!(!run.mr_created);
+    }
+
+    #[test]
+    fn implementation_proceeds_normally_when_the_declared_dependency_is_already_closed() {
+        let mut port = FakeImplPort::new()
+            .deciding(WorkerImplementationOutput::WaitDependency {
+                depends_on_issue: 4,
+            })
+            .with_closed_dependency();
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(12));
+        // No MR metadata came back with a dependency handoff, so the title
+        // falls back to the issue title.
+        assert!(run.trace.contains(&i_act(ImplAction::CreateMergeRequest {
+            branch: "issue-7".to_string(),
+            base: "main".to_string(),
+            title: "Cap the retry backoff for issue 7".to_string(),
+            description: "Closes #7\n\nImplementation completed.".to_string(),
+        })));
+    }
+
+    #[test]
+    fn implementation_adopts_the_merge_request_the_model_pointed_at() {
+        let mut port = FakeImplPort::new()
+            .deciding(WorkerImplementationOutput::ExistingMr { existing_mr_iid: 9 });
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(9));
+        assert_eq!(
+            &run.trace[run.trace.len() - 7..],
+            &[
+                i_observe(ImplQuery::MergeRequestState { mr_iid: 9 }),
+                i_act(ImplAction::ResetWorktree),
+                i_observe(ImplQuery::DefaultBranchOrMain),
+                i_act(ImplAction::CheckoutBranchBestEffort {
+                    branch: "main".to_string(),
+                }),
+                i_act(ImplAction::DeleteLocalBranch {
+                    branch: "issue-7".to_string(),
+                }),
+                i_act(ImplAction::RequireSaveSession { mr_iid: 9 }),
+                i_act(ImplAction::AddWorkingOnLabel),
+            ]
+        );
+        assert!(run.mr_created);
+    }
+
+    #[test]
+    fn implementation_opens_its_own_merge_request_when_the_pointed_at_one_is_unusable() {
+        for state in [Some("merged"), None] {
+            let mut port = FakeImplPort::new()
+                .deciding(WorkerImplementationOutput::ExistingMr { existing_mr_iid: 9 })
+                .with_existing_mr_state(state);
+            let run = run_implementation(&mut port, None);
+
+            assert_eq!(run.result.unwrap(), Some(12));
+            assert!(run.trace.contains(&i_act(ImplAction::PushBranch {
+                branch: "issue-7".to_string(),
+            })));
+        }
+    }
+
+    #[test]
+    fn implementation_skips_the_commit_when_the_agent_committed_its_own_work() {
+        let mut port = FakeImplPort::new().nothing_staged();
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(12));
+        assert!(
+            !run.trace
+                .iter()
+                .any(|step| matches!(step, ImplStep::Act(ImplAction::Commit { .. })))
+        );
+    }
+
+    #[test]
+    fn implementation_fails_the_run_when_the_agent_produced_no_code_changes() {
+        let mut port = FakeImplPort::new().with_diff_answers(&[false]);
+        let run = run_implementation(&mut port, None);
+
+        let error = run
+            .result
+            .expect_err("a run without code changes must be retried");
+        assert!(error.to_string().contains("no code changes"), "{error}");
+        // The branch is still recorded, so the cycle cleans it up.
+        assert_eq!(run.branch, Some("issue-7".to_string()));
+    }
+
+    #[test]
+    fn implementation_fails_the_run_when_a_required_step_fails() {
+        let mut branching = FakeImplPort::new().failing_action(ImplAction::CreateBranchFrom {
+            branch: "issue-7".to_string(),
+            base: "main".to_string(),
+        });
+        let run = run_implementation(&mut branching, None);
+        assert!(run.result.is_err());
+        // The branch was never created, so there is nothing to clean up.
+        assert!(run.branch.is_none());
+
+        let mut pushing = FakeImplPort::new().failing_action(ImplAction::PushBranch {
+            branch: "issue-7".to_string(),
+        });
+        let run = run_implementation(&mut pushing, None);
+        assert!(run.result.is_err());
+        assert_eq!(run.branch, Some("issue-7".to_string()));
+
+        let mut labeling = FakeImplPort::new().failing_action(ImplAction::RequireWorkingOnLabel);
+        assert!(run_implementation(&mut labeling, None).result.is_err());
+
+        let mut reading = FakeImplPort::new().failing_query(ImplQuery::DefaultBranch);
+        assert!(run_implementation(&mut reading, None).result.is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Feedback progression traces. The order the worker performs the
+    // post-model writes in is load-bearing (metadata, then commit/push,
+    // then the conflict recheck, then reply before resolve), so it is
+    // characterized end to end against a recording port.
+    // -----------------------------------------------------------------
+
+    fn feedback_surface(title: &str, has_conflicts: bool) -> MrSurfaceObservation {
+        MrSurfaceObservation {
+            title: title.to_string(),
+            description: "Closes #7".to_string(),
+            labels: Some(vec!["ai".to_string()]),
+            has_conflicts,
+        }
+    }
+
+    fn feedback_input(
+        unresolved_ids: &[&str],
+        resolution: FeedbackResolution,
+    ) -> FeedbackTailInput {
+        FeedbackTailInput {
+            mr_iid: 12,
+            source_branch: "issue-7".to_string(),
+            target_branch: "main".to_string(),
+            pre_agent_sha: "sha-before".to_string(),
+            requires_conflict_resolution: false,
+            unresolved_ids: unresolved_ids.iter().map(|id| id.to_string()).collect(),
+            plain_comments_present: false,
+            issue_iid: Some(7),
+            surface_before: feedback_surface("Cap the retry backoff", false),
+            resolution,
+        }
+    }
+
+    fn addressed(summary: &str) -> FeedbackResolution {
+        FeedbackResolution {
+            changes_summary: Some(summary.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// A recording feedback port. Every answer is scripted; failures are
+    /// injected by naming the query or action that should fail.
+    struct FakeFeedbackPort {
+        trace: std::cell::RefCell<Vec<FeedbackStep>>,
+        changes_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
+        conflict_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
+        staged_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
+        merge_in_progress: bool,
+        staged_conflicts: bool,
+        merge_completed: bool,
+        up_to_date: bool,
+        highlights: Option<String>,
+        surface_after: MrSurfaceObservation,
+        origin_head: Option<String>,
+        refetched_ids: Vec<String>,
+        failing_queries: Vec<FeedbackQuery>,
+        failing_actions: Vec<FeedbackAction>,
+    }
+
+    impl FakeFeedbackPort {
+        fn new() -> Self {
+            Self {
+                trace: std::cell::RefCell::new(Vec::new()),
+                changes_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                conflict_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                staged_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                merge_in_progress: false,
+                staged_conflicts: false,
+                merge_completed: false,
+                up_to_date: true,
+                highlights: Some("- src/lib.rs\n- 1 file changed".to_string()),
+                surface_after: feedback_surface("Cap the retry backoff", false),
+                origin_head: None,
+                refetched_ids: Vec::new(),
+                failing_queries: Vec::new(),
+                failing_actions: Vec::new(),
+            }
+        }
+
+        fn with_changes(self, answers: &[bool]) -> Self {
+            self.changes_answers.borrow_mut().extend(answers);
+            self
+        }
+
+        fn with_conflicts(self, answers: &[bool]) -> Self {
+            self.conflict_answers.borrow_mut().extend(answers);
+            self
+        }
+
+        fn with_staged(self, answers: &[bool]) -> Self {
+            self.staged_answers.borrow_mut().extend(answers);
+            self
+        }
+
+        fn merging(mut self, staged_conflicts: bool) -> Self {
+            self.merge_in_progress = true;
+            self.staged_conflicts = staged_conflicts;
+            self
+        }
+
+        fn completing_merge(mut self) -> Self {
+            self.merge_completed = true;
+            self
+        }
+
+        fn behind_target(mut self) -> Self {
+            self.up_to_date = false;
+            self
+        }
+
+        fn with_surface_after(mut self, surface: MrSurfaceObservation) -> Self {
+            self.surface_after = surface;
+            self
+        }
+
+        fn with_origin_head(mut self, head: &str) -> Self {
+            self.origin_head = Some(head.to_string());
+            self
+        }
+
+        fn refetching_ids(mut self, ids: &[&str]) -> Self {
+            self.refetched_ids = ids.iter().map(|id| id.to_string()).collect();
+            self
+        }
+
+        fn failing_query(mut self, query: FeedbackQuery) -> Self {
+            self.failing_queries.push(query);
+            self
+        }
+
+        fn failing_action(mut self, action: FeedbackAction) -> Self {
+            self.failing_actions.push(action);
+            self
+        }
+
+        fn record(&self, step: FeedbackStep) {
+            self.trace.borrow_mut().push(step);
+        }
+
+        fn observe(&self, query: FeedbackQuery) -> Result<()> {
+            self.record(FeedbackStep::Observe(query.clone()));
+            if self.failing_queries.contains(&query) {
+                anyhow::bail!("injected failure observing {query:?}");
+            }
+            Ok(())
+        }
+
+        fn next(
+            queue: &std::cell::RefCell<std::collections::VecDeque<bool>>,
+            fallback: bool,
+        ) -> bool {
+            queue.borrow_mut().pop_front().unwrap_or(fallback)
+        }
+    }
+
+    impl FeedbackTailPort for FakeFeedbackPort {
+        fn has_changes_since(&self, _base_ref: &str) -> Result<bool> {
+            self.observe(FeedbackQuery::ChangesSinceModelRun)?;
+            Ok(Self::next(&self.changes_answers, false))
+        }
+
+        fn merge_in_progress(&self) -> Result<bool> {
+            self.observe(FeedbackQuery::MergeInProgress)?;
+            Ok(self.merge_in_progress)
+        }
+
+        fn merge_conflicts_present(&self) -> Result<bool> {
+            self.observe(FeedbackQuery::MergeConflictsPresent)?;
+            Ok(Self::next(&self.conflict_answers, false))
+        }
+
+        fn has_staged_changes(&self) -> Result<bool> {
+            self.observe(FeedbackQuery::StagedChanges)?;
+            Ok(Self::next(&self.staged_answers, true))
+        }
+
+        fn up_to_date_with_target(&self, _target_branch: &str) -> Result<bool> {
+            self.observe(FeedbackQuery::UpToDateWithTarget)?;
+            Ok(self.up_to_date)
+        }
+
+        fn diff_highlights(&self, _base_ref: &str) -> Option<String> {
+            self.record(FeedbackStep::Observe(FeedbackQuery::DiffHighlights));
+            self.highlights.clone()
+        }
+
+        fn merge_request_surface(&self, _mr_iid: u64) -> Result<MrSurfaceObservation> {
+            self.observe(FeedbackQuery::MergeRequestSurface)?;
+            Ok(self.surface_after.clone())
+        }
+
+        fn origin_head(&self, _source_branch: &str) -> Option<String> {
+            self.record(FeedbackStep::Observe(FeedbackQuery::OriginHead));
+            self.origin_head.clone()
+        }
+
+        fn unresolved_discussion_ids(&self, _mr_iid: u64) -> Vec<String> {
+            self.record(FeedbackStep::Observe(
+                FeedbackQuery::UnresolvedDiscussionIds,
+            ));
+            self.refetched_ids.clone()
+        }
+
+        fn execute(&mut self, action: &FeedbackAction) -> FeedbackOutcome {
+            self.record(FeedbackStep::Act(action.clone()));
+            if self.failing_actions.contains(action) {
+                return FeedbackOutcome::Failed(anyhow::anyhow!(
+                    "injected failure executing {action:?}"
+                ));
+            }
+            match action {
+                FeedbackAction::StageResolvedConflicts => {
+                    FeedbackOutcome::Staged(self.staged_conflicts)
+                }
+                FeedbackAction::CompleteMergeIfReady { .. } => {
+                    FeedbackOutcome::MergeCompleted(self.merge_completed)
+                }
+                _ => FeedbackOutcome::Done,
+            }
+        }
+    }
+
+    fn run_feedback(
+        port: &mut FakeFeedbackPort,
+        input: FeedbackTailInput,
+    ) -> (Result<()>, Vec<FeedbackStep>) {
+        let mut machine = FeedbackMachine::new(input);
+        let result = drive_feedback(&mut machine, port);
+        (result, port.trace.borrow().clone())
+    }
+
+    fn f_observe(query: FeedbackQuery) -> FeedbackStep {
+        FeedbackStep::Observe(query)
+    }
+
+    fn f_act(action: FeedbackAction) -> FeedbackStep {
+        FeedbackStep::Act(action)
+    }
+
+    #[test]
+    fn feedback_commits_pushes_then_replies_and_resolves_each_discussion_in_order() {
+        let mut port = FakeFeedbackPort::new()
+            .with_changes(&[true])
+            .with_origin_head("sha-after");
+        let (result, trace) = run_feedback(
+            &mut port,
+            feedback_input(&["d1", "d2"], addressed("Capped the backoff")),
+        );
+
+        assert!(result.is_ok());
+        // `strip_worker_reply_boilerplate` trims the prefix and the diff
+        // block back off the generated reply before it is posted.
+        let body = "Capped the backoff";
+        assert_eq!(
+            trace,
+            vec![
+                f_act(FeedbackAction::FetchBranches),
+                f_observe(FeedbackQuery::ChangesSinceModelRun),
+                f_observe(FeedbackQuery::MergeInProgress),
+                f_act(FeedbackAction::StageAll),
+                f_observe(FeedbackQuery::StagedChanges),
+                f_act(FeedbackAction::Commit {
+                    message: build_commit_message("Capped the backoff", 7),
+                }),
+                f_act(FeedbackAction::CompleteMergeIfReady {
+                    message: build_commit_message("Merge origin/main into issue-7", 7),
+                }),
+                f_observe(FeedbackQuery::MergeConflictsPresent),
+                f_observe(FeedbackQuery::MergeConflictsPresent),
+                f_observe(FeedbackQuery::DiffHighlights),
+                f_act(FeedbackAction::PushSourceBranch),
+                f_observe(FeedbackQuery::MergeRequestSurface),
+                f_observe(FeedbackQuery::OriginHead),
+                f_act(FeedbackAction::ReplyToDiscussion {
+                    discussion_id: "d1".to_string(),
+                    body: body.to_string(),
+                }),
+                f_act(FeedbackAction::ResolveDiscussion {
+                    discussion_id: "d1".to_string(),
+                }),
+                f_act(FeedbackAction::ReplyToDiscussion {
+                    discussion_id: "d2".to_string(),
+                    body: body.to_string(),
+                }),
+                f_act(FeedbackAction::ResolveDiscussion {
+                    discussion_id: "d2".to_string(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_updates_mr_metadata_before_it_touches_the_branch() {
+        let resolution = FeedbackResolution {
+            mr_title: Some("Cap the retry backoff at 30s".to_string()),
+            changes_summary: Some("Capped the backoff".to_string()),
+            ..Default::default()
+        };
+        let mut port = FakeFeedbackPort::new().with_changes(&[true]);
+        let (result, trace) = run_feedback(&mut port, feedback_input(&["d1"], resolution));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            &trace[..2],
+            &[
+                f_act(FeedbackAction::UpdateMrMetadata {
+                    title: "Cap the retry backoff at 30s".to_string(),
+                    description: "Closes #7".to_string(),
+                }),
+                f_act(FeedbackAction::FetchBranches),
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_stages_a_conflict_resolution_before_it_looks_for_changes_again() {
+        let mut port = FakeFeedbackPort::new()
+            .merging(true)
+            .with_changes(&[false, true])
+            .completing_merge()
+            .with_origin_head("sha-after");
+        let (result, trace) = run_feedback(
+            &mut port,
+            feedback_input(&["d1"], addressed("Resolved conflicts")),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            &trace[..7],
+            &[
+                f_act(FeedbackAction::FetchBranches),
+                f_observe(FeedbackQuery::ChangesSinceModelRun),
+                f_observe(FeedbackQuery::MergeInProgress),
+                f_act(FeedbackAction::StageResolvedConflicts),
+                f_act(FeedbackAction::StageAll),
+                f_observe(FeedbackQuery::ChangesSinceModelRun),
+                f_act(FeedbackAction::CompleteMergeIfReady {
+                    message: build_commit_message("Merge origin/main into issue-7", 7),
+                }),
+            ]
+        );
+        assert!(trace.contains(&f_act(FeedbackAction::PushSourceBranch)));
+    }
+
+    #[test]
+    fn feedback_pushes_nothing_and_posts_nothing_while_conflicts_remain() {
+        let mut input = feedback_input(&["d1"], addressed("Tried to resolve conflicts"));
+        input.requires_conflict_resolution = true;
+        let mut port = FakeFeedbackPort::new()
+            .with_changes(&[true])
+            .behind_target();
+        let (result, trace) = run_feedback(&mut port, input);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            trace,
+            vec![
+                f_act(FeedbackAction::FetchBranches),
+                f_observe(FeedbackQuery::ChangesSinceModelRun),
+                f_observe(FeedbackQuery::MergeInProgress),
+                f_act(FeedbackAction::StageAll),
+                f_observe(FeedbackQuery::StagedChanges),
+                f_act(FeedbackAction::Commit {
+                    message: build_commit_message("Tried to resolve conflicts", 7),
+                }),
+                f_act(FeedbackAction::CompleteMergeIfReady {
+                    message: build_commit_message("Merge origin/main into issue-7", 7),
+                }),
+                f_observe(FeedbackQuery::MergeConflictsPresent),
+                f_act(FeedbackAction::FetchBranches),
+                f_observe(FeedbackQuery::UpToDateWithTarget),
+                f_observe(FeedbackQuery::DiffHighlights),
+                f_observe(FeedbackQuery::MergeRequestSurface),
+                f_observe(FeedbackQuery::OriginHead),
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_treats_gitlab_reported_conflicts_as_unresolved_after_the_run() {
+        let mut input = feedback_input(&["d1"], addressed("Capped the backoff"));
+        input.requires_conflict_resolution = true;
+        let mut port = FakeFeedbackPort::new()
+            .with_changes(&[true, false])
+            .with_surface_after(feedback_surface("Cap the retry backoff", true));
+        let (result, trace) = run_feedback(&mut port, input);
+
+        assert!(result.is_ok());
+        // GitLab's own conflict flag is read after the push, so the replies
+        // are skipped even though the local worktree looked clean.
+        assert!(trace.contains(&f_act(FeedbackAction::PushSourceBranch)));
+        assert_eq!(trace.last(), Some(&f_observe(FeedbackQuery::OriginHead)));
+    }
+
+    #[test]
+    fn feedback_refetches_discussions_when_the_run_was_triggered_by_conflicts_alone() {
+        let mut port = FakeFeedbackPort::new()
+            .with_changes(&[true])
+            .with_origin_head("sha-after")
+            .refetching_ids(&["conflict-thread"]);
+        let (result, trace) =
+            run_feedback(&mut port, feedback_input(&[], addressed("Merged main")));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            &trace[trace.len() - 3..],
+            &[
+                f_observe(FeedbackQuery::UnresolvedDiscussionIds),
+                f_act(FeedbackAction::ReplyToDiscussion {
+                    discussion_id: "conflict-thread".to_string(),
+                    body: "Merged main".to_string(),
+                }),
+                f_act(FeedbackAction::ResolveDiscussion {
+                    discussion_id: "conflict-thread".to_string(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_without_branch_changes_replies_without_resolving() {
+        let resolution = FeedbackResolution {
+            reason: Some("The branch already handles this case".to_string()),
+            ..Default::default()
+        };
+        let mut port = FakeFeedbackPort::new()
+            .with_surface_after(feedback_surface("Cap the retry backoff at 30s", false));
+        let (result, trace) = run_feedback(&mut port, feedback_input(&["d1"], resolution));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            trace,
+            vec![
+                f_act(FeedbackAction::FetchBranches),
+                f_observe(FeedbackQuery::ChangesSinceModelRun),
+                f_observe(FeedbackQuery::MergeInProgress),
+                f_act(FeedbackAction::CompleteMergeIfReady {
+                    message: build_commit_message("Merge origin/main into issue-7", 7),
+                }),
+                f_observe(FeedbackQuery::MergeConflictsPresent),
+                f_observe(FeedbackQuery::MergeConflictsPresent),
+                f_observe(FeedbackQuery::MergeRequestSurface),
+                f_observe(FeedbackQuery::OriginHead),
+                f_act(FeedbackAction::ReplyToDiscussion {
+                    discussion_id: "d1".to_string(),
+                    body: "The branch already handles this case".to_string(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_resolves_without_branch_changes_when_the_agent_says_so_explicitly() {
+        let resolution = FeedbackResolution {
+            reason: Some("Already handled".to_string()),
+            mark_discussions_resolved: Some(true),
+            ..Default::default()
+        };
+        let mut port = FakeFeedbackPort::new();
+        let (result, trace) = run_feedback(&mut port, feedback_input(&["d1"], resolution));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            trace.last(),
+            Some(&f_act(FeedbackAction::ResolveDiscussion {
+                discussion_id: "d1".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn feedback_posts_the_plain_comment_reply_last() {
+        let resolution = FeedbackResolution {
+            changes_summary: Some("Capped the backoff".to_string()),
+            post_plain_comment: true,
+            ..Default::default()
+        };
+        let mut input = feedback_input(&["d1"], resolution);
+        input.plain_comments_present = true;
+        let mut port = FakeFeedbackPort::new()
+            .with_changes(&[true])
+            .with_origin_head("sha-after");
+        let (result, trace) = run_feedback(&mut port, input);
+
+        assert!(result.is_ok());
+        let body = "Capped the backoff";
+        assert_eq!(
+            &trace[trace.len() - 3..],
+            &[
+                f_act(FeedbackAction::ReplyToDiscussion {
+                    discussion_id: "d1".to_string(),
+                    body: body.to_string(),
+                }),
+                f_act(FeedbackAction::ResolveDiscussion {
+                    discussion_id: "d1".to_string(),
+                }),
+                f_act(FeedbackAction::PostPlainComment {
+                    body: body.to_string(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_skips_the_commit_when_the_agent_left_nothing_staged() {
+        let mut port = FakeFeedbackPort::new()
+            .with_changes(&[true])
+            .with_staged(&[false])
+            .with_origin_head("sha-after");
+        let (result, trace) = run_feedback(
+            &mut port,
+            feedback_input(&["d1"], addressed("Committed it itself")),
+        );
+
+        assert!(result.is_ok());
+        assert!(
+            !trace
+                .iter()
+                .any(|step| matches!(step, FeedbackStep::Act(FeedbackAction::Commit { .. })))
+        );
+        // The agent's own commit still counts as a change to push.
+        assert!(trace.contains(&f_act(FeedbackAction::PushSourceBranch)));
+    }
+
+    #[test]
+    fn feedback_holds_the_push_back_when_the_worktree_still_has_conflict_markers() {
+        let mut port = FakeFeedbackPort::new()
+            .with_changes(&[true])
+            .with_conflicts(&[true]);
+        let (result, trace) = run_feedback(
+            &mut port,
+            feedback_input(&["d1"], addressed("Half-resolved")),
+        );
+
+        assert!(result.is_ok());
+        assert!(!trace.contains(&f_act(FeedbackAction::PushSourceBranch)));
+        // The conflict probe answered "conflicts", so the second probe is
+        // skipped and the replies go out without resolving anything.
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|step| **step == f_observe(FeedbackQuery::MergeConflictsPresent))
+                .count(),
+            1
+        );
+        assert_eq!(
+            trace.last(),
+            Some(&f_act(FeedbackAction::ReplyToDiscussion {
+                discussion_id: "d1".to_string(),
+                body: "Half-resolved".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn feedback_fails_when_the_worker_produced_neither_changes_nor_an_explanation() {
+        let mut port = FakeFeedbackPort::new();
+        let (result, _) = run_feedback(
+            &mut port,
+            feedback_input(&["d1"], FeedbackResolution::default()),
+        );
+
+        let error = result.expect_err("a silent no-op run must fail the feedback cycle");
+        assert!(error.to_string().contains("no feedback reply"), "{error}");
+    }
+
+    #[test]
+    fn feedback_fails_the_run_when_a_required_git_step_fails() {
+        let mut fetching = FakeFeedbackPort::new().failing_action(FeedbackAction::FetchBranches);
+        let (result, _) = run_feedback(&mut fetching, feedback_input(&["d1"], addressed("x")));
+        assert!(result.is_err());
+
+        let mut pushing = FakeFeedbackPort::new()
+            .with_changes(&[true])
+            .failing_action(FeedbackAction::PushSourceBranch);
+        let (result, _) = run_feedback(&mut pushing, feedback_input(&["d1"], addressed("x")));
+        assert!(result.is_err());
+
+        let mut probing = FakeFeedbackPort::new()
+            .with_changes(&[true])
+            .failing_query(FeedbackQuery::MergeConflictsPresent);
+        let (result, _) = run_feedback(&mut probing, feedback_input(&["d1"], addressed("x")));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn worker_cycle_stops_before_polling_when_shutdown_was_requested() {
+        let mut port = FakeWorkerPort::new()
+            .listing(&[issue_observation(7, &[])])
+            .with_shutdown_answers(&[true]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        assert_eq!(run.trace, vec![w_shutdown()]);
+    }
+
+    #[test]
+    fn worker_cycle_stops_between_the_listing_and_the_first_candidate() {
+        let mut port = FakeWorkerPort::new()
+            .listing(&[issue_observation(7, &[])])
+            .with_shutdown_answers(&[false, true]);
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        assert_eq!(run.trace, polling_steps());
     }
 }

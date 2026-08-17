@@ -12,9 +12,16 @@ use super::settings::AgentSettings;
 use crate::core::agent::{AgentModel, ModelPreferences};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
+use crate::core::runtime::AgentRuntime;
 use crate::core::workflow::AgentSpawnContext;
 
 /// Shared runtime resources for one GitLab-backed agent instance.
+///
+/// Each role (`worker`, `reviewer`, `pmo`, `qa`, `ops`) embeds exactly one
+/// instance of this type instead of destructuring it into separate,
+/// duplicated struct fields. Role-specific state/config stays on the role's
+/// own struct; this type only ever grows fields that are genuinely shared
+/// bootstrap resources.
 pub struct GitLabAgentRuntime {
     pub agent_id: String,
     pub project_name: String,
@@ -24,6 +31,10 @@ pub struct GitLabAgentRuntime {
     pub gitlab: GitLabClient,
     pub scope_label: String,
     pub model: AgentModel,
+    /// The GENERAL core runtime for this instance: identity, shared
+    /// shutdown, and observable health. Supplied by the supervisor.
+    /// [`crate::core::agent::CoreAgent::runtime`] delegates to this field.
+    pub core: AgentRuntime,
 }
 
 /// Builds the common runtime resources for a configured GitLab agent role.
@@ -88,6 +99,7 @@ impl<'a> GitLabAgentBootstrap<'a> {
             gitlab,
             scope_label: settings.scope_label,
             model,
+            core: self.ctx.runtime.clone(),
         })
     }
 }

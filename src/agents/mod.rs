@@ -2,7 +2,8 @@ use anyhow::Result;
 
 use crate::core::workflow::Workflow;
 
-pub mod claim;
+pub(crate) mod artifact;
+pub(crate) mod claim;
 pub mod git;
 pub mod gitlab;
 pub mod labels;
@@ -12,6 +13,7 @@ pub(crate) mod qa;
 pub mod reviewer;
 pub mod settings;
 pub(crate) mod ssh_util;
+pub(crate) mod state;
 pub mod worker;
 pub mod workspace;
 
@@ -70,7 +72,7 @@ pub(crate) fn write_task_context_file(
     file_name: &str,
     content: &str,
 ) -> Result<String> {
-    let store = crate::core::artifact::ArtifactStore::new(work_dir);
+    let store = crate::agents::artifact::ArtifactStore::new(work_dir);
     Ok(store
         .write(file_name, content)?
         .to_string_lossy()
@@ -78,26 +80,33 @@ pub(crate) fn write_task_context_file(
 }
 
 pub(crate) fn issue_in_scope(issue: &Issue, scope_label: Option<&str>) -> bool {
+    issue_labels_in_scope(&issue.labels, scope_label)
+}
+
+/// Scope test for an issue known only by its labels, so a role that
+/// observes an issue through its own snapshot type still applies exactly
+/// the same rule as [`issue_in_scope`].
+pub(crate) fn issue_labels_in_scope(labels: &[String], scope_label: Option<&str>) -> bool {
     match scope_label {
         None => true,
-        Some(l) => issue.labels.iter().any(|x| x == l),
+        Some(l) => labels.iter().any(|x| x == l),
     }
 }
 
 pub(crate) fn mr_in_scope(mr: &MergeRequest, scope_label: Option<&str>) -> bool {
-    if mr
-        .labels
-        .as_ref()
-        .is_some_and(|labels| labels.iter().any(|x| x == labels::NEED_AI_WORKER))
-    {
+    mr_labels_in_scope(mr.labels.as_deref(), scope_label)
+}
+
+/// Scope test for a merge request known only by its labels, so a role that
+/// observes an MR through its own snapshot type still applies exactly the
+/// same rule as [`mr_in_scope`].
+pub(crate) fn mr_labels_in_scope(labels: Option<&[String]>, scope_label: Option<&str>) -> bool {
+    if labels.is_some_and(|labels| labels.iter().any(|x| x == labels::NEED_AI_WORKER)) {
         return true;
     }
     match scope_label {
         None => true,
-        Some(l) => mr
-            .labels
-            .as_ref()
-            .is_some_and(|labels| labels.iter().any(|x| x == l)),
+        Some(l) => labels.is_some_and(|labels| labels.iter().any(|x| x == l)),
     }
 }
 

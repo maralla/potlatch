@@ -8,18 +8,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
+use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::{claim, issue_in_scope, labels, strip_internal_markers};
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient, Issue, IssueThreadNote};
-use crate::agents::workspace::{GitLabAgentBootstrap, gitlab_banner};
+use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
+use crate::core::agent::schema::tagged;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
-use crate::core::agent::{InvokeOptions, ObjectSchema, SchemaField, StructuredOutput};
+use crate::core::agent::{
+    InvokeOptions, ObjectSchema, OneOfSchema, Schema, StructuredOutput, compat,
+};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::model::acp::capabilities::{AskAnswer, AskQuestion, CapabilityProvider};
 use crate::core::periodic::PeriodicTaskSpec;
+use crate::core::runtime::AgentRuntime;
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
@@ -27,7 +32,8 @@ const PMO_PROCESSED_LABEL: &str = "pmo-processed";
 /// One sub-issue as the model described it via the `plan` tool's `sub_issues`
 /// array, before the empty-title/description defensive filtering in
 /// [`normalize_sub_issues`] is applied.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct RawSubIssue {
     #[serde(default)]
     title: String,
@@ -90,111 +96,111 @@ fn normalize_sub_issues(raw: Vec<RawSubIssue>) -> Vec<PmoSubIssue> {
     normalized
 }
 
-/// Parse a JSON value as an issue IID, accepting numbers, numeric strings,
-/// and strings with a leading `#` (e.g. `727`, `"727"`, `"#727"`). Returns
-/// `None` for zero or non-numeric values.
-fn parse_iid_value(val: &Value) -> Option<u64> {
-    let n = val.as_u64().or_else(|| {
-        let s = val.as_str()?;
-        let s = s.trim().trim_start_matches('#').trim();
-        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse::<u64>().ok()
-    });
-    n.filter(|n| *n > 0)
-}
-
-/// The model may name the dependency field differently, or send the IID as
-/// a string (e.g. `"#727"`). Accept any of a set of plausible keys and parse
-/// leading digits; zero/unparseable values become `None` (see
-/// [`PmoOutput::WaitForDependency`]).
-fn deserialize_dependency_iid<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    Ok(parse_iid_value(&value))
-}
-
-/// The PMO's typed structured-output contract. The model calls the `plan`
-/// tool with its triage decision; core deserializes the captured JSON into
-/// this type (see [`AgentModel::complete_typed`]).
-#[derive(Debug, Clone)]
+/// The PMO's typed structured-output contract: a tagged union on `decision`,
+/// so each triage outcome carries exactly the fields it needs. The model
+/// calls the `plan` tool; core validates the captured JSON against
+/// [`PmoOutput::schema`] and deserializes it (see
+/// [`AgentModel::complete_typed`]).
+#[derive(Debug, Clone, PartialEq)]
 enum PmoOutput {
     GuideWorker {
-        instructions: Option<String>,
+        instructions: String,
     },
     Split {
         sub_issues: Vec<RawSubIssue>,
     },
     AlreadyDone {
-        reason: Option<String>,
+        reason: String,
     },
     NeedsClarification {
-        question: Option<String>,
+        question: String,
         plan_text: Option<String>,
     },
     WaitForDependency {
-        dependency_issue_iid: Option<u64>,
+        dependency_issue_iid: u64,
     },
 }
 
 #[derive(Deserialize)]
-struct PmoOutputWire {
-    decision: String,
-    #[serde(default)]
-    instructions: Option<String>,
-    #[serde(default)]
+#[serde(deny_unknown_fields)]
+struct GuideWorkerWire {
+    instructions: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplitWire {
     sub_issues: Vec<RawSubIssue>,
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    question: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AlreadyDoneWire {
+    reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NeedsClarificationWire {
+    question: String,
     #[serde(default)]
     plan_text: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_dependency_iid",
-        alias = "dependency_iid",
-        alias = "depends_on_issue",
-        alias = "blocked_by",
-        alias = "dependency"
-    )]
-    dependency_issue_iid: Option<u64>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitForDependencyWire {
+    dependency_issue_iid: u64,
+}
+
+/// Legacy names the model has been seen using for the dependency IID.
+const DEPENDENCY_IID_ALIASES: &[&str] = &[
+    "dependency_iid",
+    "depends_on_issue",
+    "blocked_by",
+    "dependency",
+];
+
+const PMO_DECISIONS: &[&str] = &[
+    "guide_worker",
+    "split",
+    "already_done",
+    "needs_clarification",
+    "wait_for_dependency",
+];
 
 impl<'de> Deserialize<'de> for PmoOutput {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = PmoOutputWire::deserialize(deserializer)?;
-        match wire.decision.trim().to_ascii_lowercase().as_str() {
-            "guide_worker" => Ok(Self::GuideWorker {
-                instructions: wire.instructions,
-            }),
-            "split" => Ok(Self::Split {
+        let (decision, fields) = tagged::parts(deserializer, "decision")?;
+        match decision.as_str() {
+            "guide_worker" => {
+                tagged::branch(fields).map(|wire: GuideWorkerWire| Self::GuideWorker {
+                    instructions: wire.instructions,
+                })
+            }
+            "split" => tagged::branch(fields).map(|wire: SplitWire| Self::Split {
                 sub_issues: wire.sub_issues,
             }),
-            "already_done" => Ok(Self::AlreadyDone {
-                reason: wire.reason,
+            "already_done" => {
+                tagged::branch(fields).map(|wire: AlreadyDoneWire| Self::AlreadyDone {
+                    reason: wire.reason,
+                })
+            }
+            "needs_clarification" => tagged::branch(fields).map(|wire: NeedsClarificationWire| {
+                Self::NeedsClarification {
+                    question: wire.question,
+                    plan_text: wire.plan_text,
+                }
             }),
-            "needs_clarification" => Ok(Self::NeedsClarification {
-                question: wire.question,
-                plan_text: wire.plan_text,
-            }),
-            "wait_for_dependency" => Ok(Self::WaitForDependency {
-                dependency_issue_iid: wire.dependency_issue_iid,
-            }),
-            decision => Err(serde::de::Error::unknown_variant(
-                decision,
-                &[
-                    "guide_worker",
-                    "split",
-                    "already_done",
-                    "needs_clarification",
-                    "wait_for_dependency",
-                ],
-            )),
+            "wait_for_dependency" => {
+                tagged::branch(fields).map(|wire: WaitForDependencyWire| Self::WaitForDependency {
+                    dependency_issue_iid: wire.dependency_issue_iid,
+                })
+            }
+            decision => Err(serde::de::Error::unknown_variant(decision, PMO_DECISIONS)),
         }
     }
 }
@@ -205,84 +211,112 @@ impl StructuredOutput for PmoOutput {
     }
 
     fn tool_description() -> &'static str {
-        "Emit your triage decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your decision and the fields relevant to it."
+        "Emit your triage decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with the decision and the fields that decision allows."
     }
 
-    fn schema() -> ObjectSchema {
-        ObjectSchema::new()
-            .property(
+    fn schema() -> Schema {
+        Schema::one_of(
+            OneOfSchema::new(
                 "decision",
-                SchemaField::string_enum(
-                    "Your triage decision. Must be exactly one of: \"guide_worker\", \"split\", \"already_done\", \"needs_clarification\", \"wait_for_dependency\".",
-                    &[
-                        "guide_worker",
-                        "split",
-                        "already_done",
-                        "needs_clarification",
-                        "wait_for_dependency",
-                    ],
-                ),
+                "Your triage decision. Pick exactly one and send only that decision's fields.",
             )
-            .property(
-                "instructions",
-                SchemaField::string(
-                    "For guide_worker: 3-5 sentences, one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.",
-                ),
-            )
-            .property(
-                "sub_issues",
-                SchemaField::array(
-                    "For split: the sub-issues to create. Each must have a title and description.",
-                    SchemaField::object(
-                        ObjectSchema::new()
-                            .property("title", SchemaField::string("Concise sub-issue title."))
-                            .property(
-                                "description",
-                                SchemaField::string(
-                                    "Scope and acceptance criteria. If this sub-issue depends on another, reference it by title.",
-                                ),
-                            )
-                            .property(
-                                "priority",
-                                SchemaField::integer_enum(
-                                    "Priority: 1 (critical/blocking), 2 (high/depended-on), 3 (normal/independent).",
-                                    &[1, 2, 3],
-                                ),
-                            )
-                            .property(
-                                "depends_on",
-                                SchemaField::integer(
-                                    "1-based index of another sub-issue this one depends on (omit or 0 if none).",
-                                ),
-                            )
-                            .required("title")
-                            .required("description"),
+            .variant(
+                "guide_worker",
+                "The issue is workable as-is; the worker just needs one focused instruction.",
+                ObjectSchema::new().required_property(
+                    "instructions",
+                    Schema::string(
+                        "3-5 sentences, one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.",
                     ),
                 ),
             )
-            .property(
-                "reason",
-                SchemaField::string("For already_done: why the codebase already satisfies the issue."),
-            )
-            .property(
-                "question",
-                SchemaField::string(
-                    "For needs_clarification: specific questions for a human. Posted as a GitLab comment.",
+            .variant(
+                "split",
+                "The issue is too broad and must become several smaller issues.",
+                ObjectSchema::new().required_property(
+                    "sub_issues",
+                    Schema::array(
+                        "The sub-issues to create, in the order they should be worked.",
+                        Schema::object(
+                            ObjectSchema::new()
+                                .describe("One sub-issue to create.")
+                                .required_property(
+                                    "title",
+                                    Schema::string("Concise sub-issue title."),
+                                )
+                                .required_property(
+                                    "description",
+                                    Schema::string(
+                                        "Scope and acceptance criteria. If this sub-issue depends on another, reference it by title.",
+                                    ),
+                                )
+                                .property(
+                                    "priority",
+                                    Schema::integer_enum(
+                                        "Priority: 1 (critical/blocking), 2 (high/depended-on), 3 (normal/independent).",
+                                        &[1, 2, 3],
+                                    ),
+                                )
+                                .property(
+                                    "depends_on",
+                                    Schema::integer(
+                                        "1-based index of another sub-issue this one depends on (omit or 0 if none).",
+                                    ),
+                                ),
+                        ),
+                    ),
                 ),
             )
-            .property(
-                "plan_text",
-                SchemaField::string(
-                    "For needs_clarification: your current best plan for this issue. The system will update the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version.",
+            .variant(
+                "already_done",
+                "The codebase already satisfies the issue, so it should be closed.",
+                ObjectSchema::new().required_property(
+                    "reason",
+                    Schema::string("Why the codebase already satisfies the issue."),
                 ),
             )
-            .property(
-                "dependency_issue_iid",
-                SchemaField::integer(
-                    "For wait_for_dependency: the IID (number) of the existing open issue this issue depends on and must wait for. Must be a positive integer.",
-                ),
+            .variant(
+                "needs_clarification",
+                "A human must answer something before the work can be scoped.",
+                ObjectSchema::new()
+                    .required_property(
+                        "question",
+                        Schema::string(
+                            "Specific questions for a human. Posted as a GitLab comment.",
+                        ),
+                    )
+                    .property(
+                        "plan_text",
+                        Schema::string(
+                            "Your current best plan for this issue. The system will update the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version.",
+                        ),
+                    ),
             )
-            .required("decision")
+            .variant(
+                "wait_for_dependency",
+                "The issue is blocked by another open issue and must be parked.",
+                ObjectSchema::new().required_property(
+                    "dependency_issue_iid",
+                    Schema::integer(
+                        "The IID (number) of the existing open issue this issue depends on and must wait for. Must be a positive integer.",
+                    ),
+                ),
+            ),
+        )
+    }
+
+    /// Tolerated: a decision spelled with different case, the dependency IID
+    /// under one of its legacy names or sent as `"#727"`, and a sub-issue
+    /// priority outside 1-3 (dropped, so the sub-issue inherits the parent's).
+    fn normalize(value: &mut Value) {
+        compat::normalize_tag(value, "decision");
+        for alias in DEPENDENCY_IID_ALIASES {
+            compat::rename_property(value, alias, "dependency_issue_iid");
+        }
+        compat::normalize_iid(value, "dependency_issue_iid");
+        compat::each_in_array(value, "sub_issues", |sub_issue| {
+            compat::drop_integer_outside(sub_issue, "priority", &[1, 2, 3]);
+        });
     }
 }
 
@@ -319,10 +353,15 @@ impl PmoAgentSettings {
     }
 }
 
-struct AgentState {
-    sessions_dir: String,
-    agent_id: String,
-    project_name: String,
+/// A borrowing view over the [`GitLabAgentRuntime`] identity/path fields
+/// the PMO cycle needs. Built fresh from `&GitLabAgentRuntime` at each use
+/// site rather than stored, so PMO never keeps a second copy of these
+/// fields — and, since it is never stored alongside the runtime it borrows
+/// from, it can't become self-referential.
+struct AgentState<'a> {
+    sessions_dir: &'a str,
+    agent_id: &'a str,
+    project_name: &'a str,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -330,7 +369,15 @@ struct PersistedPmoState {
     claimed_issue_iid: u64,
 }
 
-impl AgentState {
+impl AgentState<'_> {
+    fn from_runtime(runtime: &GitLabAgentRuntime) -> AgentState<'_> {
+        AgentState {
+            sessions_dir: &runtime.sessions_dir,
+            agent_id: &runtime.agent_id,
+            project_name: &runtime.project_name,
+        }
+    }
+
     fn ensure_sessions_dir(&self) -> Result<()> {
         let ctx_dir = path::Path::new(&self.sessions_dir);
         fs::create_dir_all(ctx_dir).context("Failed to create .potlatch-context directory")?;
@@ -342,12 +389,8 @@ impl AgentState {
         path::Path::new(&self.sessions_dir).join(format!("{}_state.json", &self.agent_id))
     }
 
-    fn claim_label(&self) -> String {
-        format!("claimed:{}", &self.agent_id)
-    }
-
     fn save_state(&self, issue_iid: u64) {
-        let store = crate::core::state::StateStore::new(self.state_path());
+        let store = crate::agents::state::StateStore::new(self.state_path());
         if let Err(e) = store.save(&PersistedPmoState {
             claimed_issue_iid: issue_iid,
         }) {
@@ -356,8 +399,8 @@ impl AgentState {
     }
 
     fn clear_state(&self) {
-        let store: crate::core::state::StateStore<PersistedPmoState> =
-            crate::core::state::StateStore::new(self.state_path());
+        let store: crate::agents::state::StateStore<PersistedPmoState> =
+            crate::agents::state::StateStore::new(self.state_path());
         let _ = store.remove();
     }
 
@@ -376,13 +419,9 @@ impl AgentState {
 }
 
 pub(crate) struct PmoAgent {
-    state: AgentState,
-    git_repo: GitRepo,
-    gitlab: GitLabClient,
-    model: AgentModel,
+    runtime: GitLabAgentRuntime,
     config: PmoConfig,
-    scope_label: String,
-    claimed_issue_iid: Option<u64>,
+    claimed_issue: Option<ClaimLease>,
 }
 
 impl CoreAgent for PmoAgent {
@@ -392,12 +431,8 @@ impl CoreAgent for PmoAgent {
         "pmo"
     }
 
-    fn agent_id(&self) -> &str {
-        &self.state.agent_id
-    }
-
-    fn shutdown(&self) -> &Arc<AtomicBool> {
-        self.model.shutdown()
+    fn runtime(&self) -> &AgentRuntime {
+        &self.runtime.core
     }
 
     fn banner(config: &Config, banner: &mut Banner) {
@@ -420,15 +455,16 @@ impl CoreAgent for PmoAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "gitlab_poll" => {
-                let scope = crate::agents::scope_label_filter(&self.scope_label);
-                let model = &self.model;
+                let scope = crate::agents::scope_label_filter(&self.runtime.scope_label);
+                let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
+                let state = AgentState::from_runtime(&self.runtime);
                 pmo_cycle(
-                    &self.state,
-                    &self.git_repo,
-                    &self.gitlab,
+                    &state,
+                    &self.runtime.git_repo,
+                    &self.runtime.gitlab,
                     model,
-                    &mut self.claimed_issue_iid,
+                    &mut self.claimed_issue,
                     Arc::clone(&shutdown),
                     scope,
                     &self.config,
@@ -445,71 +481,1302 @@ impl CoreAgent for PmoAgent {
             .agent("pmo")
             .context("[agent.pmo] section required")?;
         let settings = PmoAgentSettings::from_raw(&section.raw)?;
-        let runtime = GitLabAgentBootstrap::new(
-            &ctx,
-            "pmo",
-            ModelPreferences {
-                structured_output_tools: Some(vec![PmoOutput::tool_definition()]),
-                ..ModelPreferences::default()
-            },
-        )
-        .build()?;
-        let state = AgentState {
-            sessions_dir: runtime.sessions_dir,
-            agent_id: runtime.agent_id,
-            project_name: runtime.project_name,
-        };
-        state.ensure_sessions_dir()?;
+        let runtime =
+            GitLabAgentBootstrap::new(&ctx, "pmo", ModelPreferences::default()).build()?;
         let config = PmoConfig {
             poll_interval_secs: settings.poll_interval_secs,
             ask_via_gitlab: settings.ask_via_gitlab,
             ask_gitlab_timeout_secs: settings.ask_gitlab_timeout_secs,
         };
         let scope = crate::agents::scope_label_filter(&runtime.scope_label);
-        let claimed_issue_iid = try_resume_pmo_state(&state, &runtime.gitlab, scope);
-        if let Some(iid) = claimed_issue_iid {
-            match (runtime.gitlab.get_issue(iid), runtime.gitlab.list_issues()) {
-                (Ok(issue), Ok(issues)) => {
-                    if let Err(e) =
-                        refresh_pmo_issue_context_file(&state, &runtime.gitlab, &issue, &issues)
-                    {
-                        warn!(
-                            "{}: Could not refresh PMO context file after resuming claim on #{}: {}",
-                            &state.agent_id, iid, e
-                        );
+        let claimed_issue = {
+            let state = AgentState::from_runtime(&runtime);
+            state.ensure_sessions_dir()?;
+            let claimed_issue = try_resume_pmo_state(&state, &runtime.gitlab, scope);
+            if let Some(ref lease) = claimed_issue {
+                let iid = lease.resource().iid();
+                match (runtime.gitlab.get_issue(iid), runtime.gitlab.list_issues()) {
+                    (Ok(issue), Ok(issues)) => {
+                        if let Err(e) =
+                            refresh_pmo_issue_context_file(&state, &runtime.gitlab, &issue, &issues)
+                        {
+                            warn!(
+                                "{}: Could not refresh PMO context file after resuming claim on #{}: {}",
+                                &state.agent_id, iid, e
+                            );
+                        }
                     }
+                    (Err(e), _) => warn!(
+                        "{}: Could not fetch issue #{} to refresh context after resume: {}",
+                        &state.agent_id, iid, e
+                    ),
+                    (_, Err(e)) => warn!(
+                        "{}: Could not list issues to refresh context after resume: {}",
+                        &state.agent_id, e
+                    ),
                 }
-                (Err(e), _) => warn!(
-                    "{}: Could not fetch issue #{} to refresh context after resume: {}",
-                    &state.agent_id, iid, e
-                ),
-                (_, Err(e)) => warn!(
-                    "{}: Could not list issues to refresh context after resume: {}",
-                    &state.agent_id, e
-                ),
             }
-        }
+            claimed_issue
+        };
         Ok(Self {
-            state,
-            git_repo: runtime.git_repo,
-            gitlab: runtime.gitlab,
-            model: runtime.model,
+            runtime,
             config,
-            scope_label: runtime.scope_label,
-            claimed_issue_iid,
+            claimed_issue,
         })
     }
 
     fn on_shutdown(&mut self) {
-        info!("{}: Shutting down, cleaning up...", self.state.agent_id);
-        if let Some(issue_iid) = self.claimed_issue_iid {
+        info!("{}: Shutting down, cleaning up...", self.runtime.agent_id);
+        if let Some(lease) = self.claimed_issue.take() {
+            let issue_iid = lease.resource().iid();
             info!(
                 "{}: Preserving claim on issue #{} for restart",
-                self.state.agent_id, issue_iid
+                self.runtime.agent_id, issue_iid
             );
-            self.state.save_state(issue_iid);
+            AgentState::from_runtime(&self.runtime).save_state(issue_iid);
+            // GitLab's claim label plus the persisted state file are the
+            // source of truth across restarts (see `try_resume_pmo_state`).
+            lease.preserve();
         }
-        info!("{}: Stopped", self.state.agent_id);
+        info!("{}: Stopped", self.runtime.agent_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PMO role port and pure state machine
+// ---------------------------------------------------------------------------
+
+/// Immutable issue fields used by PMO policy. The machine deliberately does
+/// not receive GitLab's mutable/API-facing issue type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PmoIssueObservation {
+    iid: u64,
+    title: String,
+    description: String,
+    labels: Vec<String>,
+    state: String,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+impl From<&Issue> for PmoIssueObservation {
+    fn from(issue: &Issue) -> Self {
+        Self {
+            iid: issue.iid,
+            title: issue.title.clone(),
+            description: issue.description.clone(),
+            labels: issue.labels.clone(),
+            state: issue.state.clone(),
+            created_at: issue.created_at.clone(),
+            updated_at: issue.updated_at.clone(),
+        }
+    }
+}
+
+impl PmoIssueObservation {
+    fn priority(&self) -> u8 {
+        gitlab::priority_from_labels(&self.labels)
+    }
+
+    fn as_issue(&self) -> Issue {
+        Issue {
+            iid: self.iid,
+            title: self.title.clone(),
+            description: self.description.clone(),
+            labels: self.labels.clone(),
+            state: self.state.clone(),
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PmoQuery {
+    DefaultBranch,
+    ShutdownRequested,
+    PendingSplit,
+    Issue { issue_iid: u64 },
+    Issues,
+    NewHumanComments { issue_iid: u64 },
+    CurrentEpoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PmoFact {
+    DefaultBranch(String),
+    ShutdownRequested(bool),
+    PendingSplit(Option<PendingSplit>),
+    Issue(Option<PmoIssueObservation>),
+    Issues(Vec<PmoIssueObservation>),
+    NewHumanComments(bool),
+    CurrentEpoch(u64),
+}
+
+/// One externally visible PMO effect. Each variant is intentionally one
+/// operation; ordering and required/best-effort policy live in the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PmoAction {
+    FetchRepository,
+    CheckoutDefaultBranch {
+        branch: String,
+    },
+    ResetWorktree,
+    AcquireClaim {
+        issue_iid: u64,
+    },
+    ReleaseClaim,
+    SaveClaimState {
+        issue_iid: u64,
+    },
+    ClearClaimState,
+    PrepareIssueContext {
+        issue: PmoIssueObservation,
+        all_issues: Vec<PmoIssueObservation>,
+    },
+    InvokePlan {
+        issue: PmoIssueObservation,
+        context_path: String,
+    },
+    UpdateIssueDescription {
+        issue_iid: u64,
+        body: String,
+    },
+    AddIssueComment {
+        issue_iid: u64,
+        body: String,
+    },
+    AddIssueLabel {
+        issue_iid: u64,
+        label: String,
+    },
+    RemoveIssueLabel {
+        issue_iid: u64,
+        label: String,
+    },
+    CloseIssue {
+        issue_iid: u64,
+    },
+    SaveSplitCheckpoint(PendingSplit),
+    DeleteSplitCheckpoint,
+    CreateChild {
+        title: String,
+        description: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PmoClaimOutcome {
+    Won,
+    Lost,
+    Interrupted,
+}
+
+enum PmoOutcome {
+    Done,
+    Failed(anyhow::Error),
+    CheckoutFailed,
+    Claim(PmoClaimOutcome),
+    ContextPrepared(String),
+    Planned(PmoOutput),
+    IssueCreated(u64),
+}
+
+trait PmoPort {
+    fn default_branch(&self) -> Result<String>;
+    fn shutdown_requested(&self) -> bool;
+    fn pending_split(&self) -> Result<Option<PendingSplit>>;
+    fn issue(&self, issue_iid: u64) -> Option<PmoIssueObservation>;
+    fn issues(&self) -> Result<Vec<PmoIssueObservation>>;
+    fn new_human_comments(&self, issue_iid: u64) -> bool;
+    fn current_epoch(&self) -> u64;
+    fn execute(&mut self, action: &PmoAction) -> PmoOutcome;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PmoStep {
+    Observe(PmoQuery),
+    Act(PmoAction),
+    Finish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanOrigin {
+    Fresh,
+    Refinement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PmoStage {
+    ObserveDefaultBranch,
+    FetchRepository,
+    CheckoutDefaultBranch,
+    ResetAfterCheckoutFailure,
+    RetryCheckout,
+    ObservePendingSplit,
+    ObserveSplitParent,
+    ObserveSplitIssues,
+    PrepareSplitContext,
+    ObserveHeldIssue,
+    ReleaseInvalidHeldClaim,
+    ClearInvalidHeldState,
+    ObserveRefinementIssues,
+    PrepareRefinementContext,
+    ObserveRefinementComments,
+    PrepareRefinementPlanContext,
+    ObserveIssues,
+    ShutdownAfterIssues,
+    NextCandidate,
+    ShutdownBeforeCandidate,
+    AcquireCandidate,
+    ShutdownAfterClaim,
+    ReleaseInterruptedClaim,
+    SaveClaim,
+    PreparePlanContext,
+    InvokePlan,
+    DecisionAction,
+    BeginSplit,
+    NextChild,
+    CreateChild,
+    LabelChildPriority,
+    LabelChildScope,
+    HoldChild,
+    CheckpointChild,
+    NextDependency,
+    UnholdDependent,
+    LabelDependency,
+    CommentDependency,
+    CommentParentLinks,
+    RemoveParentActionRequired,
+    AddParentProcessed,
+    DeleteCheckpoint,
+    CloseSplitParent,
+    ReleaseCompletedClaim,
+    ClearCompletedState,
+    ShutdownAfterProcessingFailure,
+    ReleaseFailedClaim,
+    ClearFailedState,
+    ShutdownBeforePriorities,
+    NextDefaultPriority,
+    AddDefaultPriority,
+    ShutdownBeforeStale,
+    ObserveMaintenanceEpoch,
+    NextStaleIssue,
+    CommentStaleIssue,
+    CloseStaleIssue,
+    Finish,
+}
+
+struct PmoMachine<'a> {
+    agent_id: &'a str,
+    scope_label: Option<&'a str>,
+    held_issue_iid: Option<u64>,
+    stage: PmoStage,
+    default_branch: String,
+    pending: Option<PendingSplit>,
+    issues: Vec<PmoIssueObservation>,
+    issue_queue: std::collections::VecDeque<PmoIssueObservation>,
+    issue: Option<PmoIssueObservation>,
+    context_path: String,
+    plan_origin: PlanOrigin,
+    decision_actions: std::collections::VecDeque<(PmoAction, bool)>,
+    current_action_required: bool,
+    child_index: usize,
+    child_iid: Option<u64>,
+    dependency_index: usize,
+    maintenance_queue: std::collections::VecDeque<PmoIssueObservation>,
+    stale_queue: std::collections::VecDeque<PmoIssueObservation>,
+    stale_issue_iid: Option<u64>,
+    now: u64,
+    resumed_split: bool,
+    keep_claim_after_decision: bool,
+}
+
+impl<'a> PmoMachine<'a> {
+    fn new(agent_id: &'a str, scope_label: Option<&'a str>, held_issue_iid: Option<u64>) -> Self {
+        Self {
+            agent_id,
+            scope_label,
+            held_issue_iid,
+            stage: PmoStage::ObserveDefaultBranch,
+            default_branch: String::new(),
+            pending: None,
+            issues: Vec::new(),
+            issue_queue: std::collections::VecDeque::new(),
+            issue: None,
+            context_path: String::new(),
+            plan_origin: PlanOrigin::Fresh,
+            decision_actions: std::collections::VecDeque::new(),
+            current_action_required: true,
+            child_index: 0,
+            child_iid: None,
+            dependency_index: 0,
+            maintenance_queue: std::collections::VecDeque::new(),
+            stale_queue: std::collections::VecDeque::new(),
+            stale_issue_iid: None,
+            now: 0,
+            resumed_split: false,
+            keep_claim_after_decision: false,
+        }
+    }
+
+    fn issue(&self) -> &PmoIssueObservation {
+        self.issue.as_ref().expect("PMO issue stage has an issue")
+    }
+
+    fn pending(&self) -> &PendingSplit {
+        self.pending
+            .as_ref()
+            .expect("PMO split stage has a checkpoint")
+    }
+
+    fn child(&self) -> &PmoSubIssue {
+        &self.pending().sub_issues[self.child_index]
+    }
+
+    fn child_iid(&self) -> u64 {
+        self.child_iid
+            .expect("child labeling follows successful creation")
+    }
+
+    fn in_scope(&self, issue: &PmoIssueObservation) -> bool {
+        self.scope_label
+            .is_none_or(|label| issue.labels.iter().any(|candidate| candidate == label))
+    }
+
+    fn should_process(&self, issue: &PmoIssueObservation) -> bool {
+        should_process_issue(&issue.as_issue(), self.scope_label)
+    }
+
+    fn next_step(&mut self) -> PmoStep {
+        loop {
+            match self.stage {
+                PmoStage::ObserveDefaultBranch => {
+                    return PmoStep::Observe(PmoQuery::DefaultBranch);
+                }
+                PmoStage::FetchRepository => return PmoStep::Act(PmoAction::FetchRepository),
+                PmoStage::CheckoutDefaultBranch | PmoStage::RetryCheckout => {
+                    return PmoStep::Act(PmoAction::CheckoutDefaultBranch {
+                        branch: self.default_branch.clone(),
+                    });
+                }
+                PmoStage::ResetAfterCheckoutFailure => {
+                    return PmoStep::Act(PmoAction::ResetWorktree);
+                }
+                PmoStage::ObservePendingSplit => {
+                    return PmoStep::Observe(PmoQuery::PendingSplit);
+                }
+                PmoStage::ObserveHeldIssue => {
+                    let iid = self.held_issue_iid.expect("held issue stage has a claim");
+                    return PmoStep::Observe(PmoQuery::Issue { issue_iid: iid });
+                }
+                PmoStage::ObserveSplitParent => {
+                    return PmoStep::Observe(PmoQuery::Issue {
+                        issue_iid: self.pending().parent_issue_iid,
+                    });
+                }
+                PmoStage::ObserveSplitIssues => return PmoStep::Observe(PmoQuery::Issues),
+                PmoStage::ReleaseInvalidHeldClaim
+                | PmoStage::ReleaseInterruptedClaim
+                | PmoStage::ReleaseCompletedClaim
+                | PmoStage::ReleaseFailedClaim => return PmoStep::Act(PmoAction::ReleaseClaim),
+                PmoStage::ClearInvalidHeldState
+                | PmoStage::ClearCompletedState
+                | PmoStage::ClearFailedState => return PmoStep::Act(PmoAction::ClearClaimState),
+                PmoStage::ObserveRefinementIssues | PmoStage::ObserveIssues => {
+                    return PmoStep::Observe(PmoQuery::Issues);
+                }
+                PmoStage::PrepareRefinementContext
+                | PmoStage::PrepareRefinementPlanContext
+                | PmoStage::PreparePlanContext
+                | PmoStage::PrepareSplitContext => {
+                    return PmoStep::Act(PmoAction::PrepareIssueContext {
+                        issue: self.issue().clone(),
+                        all_issues: self.issues.clone(),
+                    });
+                }
+                PmoStage::ObserveRefinementComments => {
+                    return PmoStep::Observe(PmoQuery::NewHumanComments {
+                        issue_iid: self.issue().iid,
+                    });
+                }
+                PmoStage::ShutdownAfterIssues
+                | PmoStage::ShutdownBeforeCandidate
+                | PmoStage::ShutdownAfterClaim
+                | PmoStage::ShutdownAfterProcessingFailure
+                | PmoStage::ShutdownBeforePriorities
+                | PmoStage::ShutdownBeforeStale => {
+                    return PmoStep::Observe(PmoQuery::ShutdownRequested);
+                }
+                PmoStage::NextCandidate => match self.issue_queue.pop_front() {
+                    Some(issue)
+                        if self.should_process(&issue)
+                            && !issue
+                                .labels
+                                .iter()
+                                .any(|label| label.starts_with("claimed:")) =>
+                    {
+                        self.issue = Some(issue);
+                        self.stage = PmoStage::ShutdownBeforeCandidate;
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.maintenance_queue = self.issues.iter().cloned().collect();
+                        self.stage = PmoStage::ShutdownBeforePriorities;
+                    }
+                },
+                PmoStage::AcquireCandidate => {
+                    return PmoStep::Act(PmoAction::AcquireClaim {
+                        issue_iid: self.issue().iid,
+                    });
+                }
+                PmoStage::SaveClaim => {
+                    return PmoStep::Act(PmoAction::SaveClaimState {
+                        issue_iid: self.issue().iid,
+                    });
+                }
+                PmoStage::InvokePlan => {
+                    return PmoStep::Act(PmoAction::InvokePlan {
+                        issue: self.issue().clone(),
+                        context_path: self.context_path.clone(),
+                    });
+                }
+                PmoStage::DecisionAction => match self.decision_actions.front() {
+                    Some((action, required)) => {
+                        self.current_action_required = *required;
+                        return PmoStep::Act(action.clone());
+                    }
+                    None => {
+                        self.stage = if self.keep_claim_after_decision {
+                            PmoStage::Finish
+                        } else {
+                            PmoStage::ReleaseCompletedClaim
+                        };
+                    }
+                },
+                PmoStage::BeginSplit => {
+                    return PmoStep::Act(PmoAction::SaveSplitCheckpoint(self.pending().clone()));
+                }
+                PmoStage::NextChild => {
+                    self.child_index = self.pending().created_issue_ids.len();
+                    if self.child_index < self.pending().sub_issues.len()
+                        && !sub_issue_already_created(self.pending(), self.child_index)
+                    {
+                        self.child_iid = None;
+                        self.stage = PmoStage::CreateChild;
+                    } else {
+                        self.dependency_index = 0;
+                        self.stage = PmoStage::NextDependency;
+                    }
+                }
+                PmoStage::CreateChild => {
+                    let child = self.child();
+                    return PmoStep::Act(PmoAction::CreateChild {
+                        title: if child.title.is_empty() {
+                            self.pending().parent_issue_title.clone()
+                        } else {
+                            child.title.clone()
+                        },
+                        description: child.description.clone(),
+                    });
+                }
+                PmoStage::LabelChildPriority => {
+                    return PmoStep::Act(PmoAction::AddIssueLabel {
+                        issue_iid: self.child_iid(),
+                        label: gitlab::priority_label(
+                            self.child()
+                                .priority
+                                .unwrap_or(self.pending().parent_priority),
+                        ),
+                    });
+                }
+                PmoStage::LabelChildScope => {
+                    let Some(label) = self.scope_label else {
+                        self.stage = PmoStage::HoldChild;
+                        continue;
+                    };
+                    return PmoStep::Act(PmoAction::AddIssueLabel {
+                        issue_iid: self.child_iid(),
+                        label: label.to_string(),
+                    });
+                }
+                PmoStage::HoldChild => {
+                    if self.child().depends_on == 0 {
+                        self.stage = PmoStage::CheckpointChild;
+                        continue;
+                    }
+                    return PmoStep::Act(PmoAction::AddIssueLabel {
+                        issue_iid: self.child_iid(),
+                        label: labels::DO_NOT_IMPLEMENT.to_string(),
+                    });
+                }
+                PmoStage::CheckpointChild => {
+                    let mut checkpoint = self.pending().clone();
+                    checkpoint.created_issue_ids.push(self.child_iid());
+                    return PmoStep::Act(PmoAction::SaveSplitCheckpoint(checkpoint));
+                }
+                PmoStage::NextDependency => {
+                    while self.dependency_index < self.pending().sub_issues.len()
+                        && (self.pending().sub_issues[self.dependency_index].depends_on == 0
+                            || self.pending().sub_issues[self.dependency_index].depends_on
+                                > self.pending().created_issue_ids.len())
+                    {
+                        self.dependency_index += 1;
+                    }
+                    if self.dependency_index < self.pending().sub_issues.len() {
+                        self.stage = PmoStage::UnholdDependent;
+                    } else {
+                        self.stage = PmoStage::CommentParentLinks;
+                    }
+                }
+                PmoStage::UnholdDependent => {
+                    return PmoStep::Act(PmoAction::RemoveIssueLabel {
+                        issue_iid: self.pending().created_issue_ids[self.dependency_index],
+                        label: labels::DO_NOT_IMPLEMENT.to_string(),
+                    });
+                }
+                PmoStage::LabelDependency => {
+                    let dep_index = self.pending().sub_issues[self.dependency_index].depends_on - 1;
+                    return PmoStep::Act(PmoAction::AddIssueLabel {
+                        issue_iid: self.pending().created_issue_ids[self.dependency_index],
+                        label: format!(
+                            "waiting-on-issue:#{}",
+                            self.pending().created_issue_ids[dep_index]
+                        ),
+                    });
+                }
+                PmoStage::CommentDependency => {
+                    let dep_index = self.pending().sub_issues[self.dependency_index].depends_on - 1;
+                    return PmoStep::Act(PmoAction::AddIssueComment {
+                        issue_iid: self.pending().created_issue_ids[self.dependency_index],
+                        body: format!(
+                            "This sub-issue depends on #{} and will become actionable after that issue is closed.",
+                            self.pending().created_issue_ids[dep_index]
+                        ),
+                    });
+                }
+                PmoStage::CommentParentLinks => {
+                    let links = self
+                        .pending()
+                        .created_issue_ids
+                        .iter()
+                        .map(|iid| format!("- #{iid}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return PmoStep::Act(PmoAction::AddIssueComment {
+                        issue_iid: self.pending().parent_issue_iid,
+                        body: format!(
+                            "This issue has been split into {} smaller sub-issues by the PMO Agent:\n\n{}\n\nEach sub-issue is designed to stay around ~500 lines of non-test code (~1500 total including tests). Auto-generated code is excluded from these limits.",
+                            self.pending().created_issue_ids.len(),
+                            links
+                        ),
+                    });
+                }
+                PmoStage::RemoveParentActionRequired => {
+                    return PmoStep::Act(PmoAction::RemoveIssueLabel {
+                        issue_iid: self.pending().parent_issue_iid,
+                        label: ACTION_REQUIRED_LABEL.to_string(),
+                    });
+                }
+                PmoStage::AddParentProcessed => {
+                    return PmoStep::Act(PmoAction::AddIssueLabel {
+                        issue_iid: self.pending().parent_issue_iid,
+                        label: PMO_PROCESSED_LABEL.to_string(),
+                    });
+                }
+                PmoStage::DeleteCheckpoint => {
+                    return PmoStep::Act(PmoAction::DeleteSplitCheckpoint);
+                }
+                PmoStage::CloseSplitParent => {
+                    return PmoStep::Act(PmoAction::CloseIssue {
+                        issue_iid: self.pending().parent_issue_iid,
+                    });
+                }
+                PmoStage::NextDefaultPriority => match self.maintenance_queue.pop_front() {
+                    Some(issue)
+                        if issue.state == "opened"
+                            && self.in_scope(&issue)
+                            && !issue
+                                .labels
+                                .iter()
+                                .any(|label| label.starts_with(gitlab::PRIORITY_LABEL_PREFIX)) =>
+                    {
+                        self.stale_issue_iid = Some(issue.iid);
+                        self.stage = PmoStage::AddDefaultPriority;
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.stage = PmoStage::ShutdownBeforeStale;
+                    }
+                },
+                PmoStage::AddDefaultPriority => {
+                    return PmoStep::Act(PmoAction::AddIssueLabel {
+                        issue_iid: self.stale_issue_iid.expect("priority stage has issue"),
+                        label: gitlab::priority_label(gitlab::DEFAULT_PRIORITY),
+                    });
+                }
+                PmoStage::ObserveMaintenanceEpoch => {
+                    return PmoStep::Observe(PmoQuery::CurrentEpoch);
+                }
+                PmoStage::NextStaleIssue => match self.stale_queue.pop_front() {
+                    Some(issue)
+                        if issue.state == "opened"
+                            && self.in_scope(&issue)
+                            && issue
+                                .labels
+                                .iter()
+                                .any(|label| label == PMO_PROCESSED_LABEL)
+                            && issue
+                                .updated_at
+                                .as_deref()
+                                .and_then(parse_iso8601_to_epoch)
+                                .is_some_and(|updated| {
+                                    self.now.saturating_sub(updated) >= STALE_THRESHOLD_SECS
+                                }) =>
+                    {
+                        self.stale_issue_iid = Some(issue.iid);
+                        self.stage = PmoStage::CommentStaleIssue;
+                    }
+                    Some(_) => {}
+                    None => self.stage = PmoStage::Finish,
+                },
+                PmoStage::CommentStaleIssue => {
+                    return PmoStep::Act(PmoAction::AddIssueComment {
+                        issue_iid: self.stale_issue_iid.expect("stale stage has issue"),
+                        body: "Closing this issue — it has been marked as `pmo-processed` for over 1 hour with no further activity.".to_string(),
+                    });
+                }
+                PmoStage::CloseStaleIssue => {
+                    return PmoStep::Act(PmoAction::CloseIssue {
+                        issue_iid: self.stale_issue_iid.expect("stale stage has issue"),
+                    });
+                }
+                PmoStage::Finish => return PmoStep::Finish,
+            }
+        }
+    }
+
+    fn apply_fact(&mut self, fact: Result<PmoFact>) -> Result<()> {
+        match (&self.stage, fact) {
+            (PmoStage::ObserveDefaultBranch, Ok(PmoFact::DefaultBranch(branch))) => {
+                self.default_branch = branch;
+                self.stage = PmoStage::FetchRepository;
+            }
+            (PmoStage::ObservePendingSplit, Ok(PmoFact::PendingSplit(pending))) => {
+                self.pending = pending;
+                if self.pending.is_some() {
+                    self.resumed_split = true;
+                    self.stage = PmoStage::ObserveSplitParent;
+                } else if self.held_issue_iid.is_some() {
+                    self.stage = PmoStage::ObserveHeldIssue;
+                } else {
+                    self.stage = PmoStage::ObserveIssues;
+                }
+            }
+            (PmoStage::ObserveHeldIssue, Ok(PmoFact::Issue(issue))) => match issue {
+                Some(issue)
+                    if self.in_scope(&issue)
+                        && issue.labels.iter().any(|l| l == labels::PMO_PENDING) =>
+                {
+                    self.issue = Some(issue);
+                    self.stage = PmoStage::ObserveRefinementIssues;
+                }
+                _ => self.stage = PmoStage::ReleaseInvalidHeldClaim,
+            },
+            (PmoStage::ObserveSplitParent, Ok(PmoFact::Issue(issue))) => {
+                if let Some(issue) = issue {
+                    self.issue = Some(issue);
+                    self.stage = PmoStage::ObserveSplitIssues;
+                } else {
+                    self.stage = PmoStage::NextChild;
+                }
+            }
+            (PmoStage::ObserveSplitIssues, Ok(PmoFact::Issues(issues))) => {
+                self.issues = issues;
+                self.stage = PmoStage::PrepareSplitContext;
+            }
+            (PmoStage::ObserveRefinementIssues, Ok(PmoFact::Issues(issues))) => {
+                self.issues = issues;
+                self.stage = PmoStage::PrepareRefinementContext;
+            }
+            (PmoStage::ObserveRefinementComments, Ok(PmoFact::NewHumanComments(new))) => {
+                if new {
+                    self.plan_origin = PlanOrigin::Refinement;
+                    self.stage = PmoStage::PrepareRefinementPlanContext;
+                } else {
+                    self.stage = PmoStage::Finish;
+                }
+            }
+            (PmoStage::ObserveIssues, Ok(PmoFact::Issues(issues))) => {
+                self.issues = issues.clone();
+                self.issue_queue = issues.into();
+                self.stage = PmoStage::ShutdownAfterIssues;
+            }
+            (PmoStage::ShutdownAfterIssues, Ok(PmoFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    PmoStage::Finish
+                } else {
+                    PmoStage::NextCandidate
+                }
+            }
+            (PmoStage::ShutdownBeforeCandidate, Ok(PmoFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    PmoStage::Finish
+                } else {
+                    PmoStage::AcquireCandidate
+                }
+            }
+            (PmoStage::ShutdownAfterClaim, Ok(PmoFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    PmoStage::ReleaseInterruptedClaim
+                } else {
+                    PmoStage::SaveClaim
+                };
+            }
+            (PmoStage::ShutdownAfterProcessingFailure, Ok(PmoFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    PmoStage::Finish
+                } else {
+                    PmoStage::ReleaseFailedClaim
+                };
+            }
+            (PmoStage::ShutdownBeforePriorities, Ok(PmoFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    PmoStage::Finish
+                } else {
+                    PmoStage::NextDefaultPriority
+                };
+            }
+            (PmoStage::ShutdownBeforeStale, Ok(PmoFact::ShutdownRequested(stop))) => {
+                self.stage = if stop {
+                    PmoStage::Finish
+                } else {
+                    PmoStage::ObserveMaintenanceEpoch
+                };
+            }
+            (PmoStage::ObserveMaintenanceEpoch, Ok(PmoFact::CurrentEpoch(now))) => {
+                self.now = now;
+                self.stale_queue = self.issues.iter().cloned().collect();
+                self.stage = PmoStage::NextStaleIssue;
+            }
+            (stage, Ok(fact)) => anyhow::bail!("PMO port answered {stage:?} with {fact:?}"),
+            (_, Err(error)) => return Err(error),
+        }
+        Ok(())
+    }
+
+    fn apply_outcome(&mut self, outcome: PmoOutcome) -> Result<()> {
+        match (&self.stage, outcome) {
+            (PmoStage::FetchRepository, PmoOutcome::Done) => {
+                self.stage = PmoStage::CheckoutDefaultBranch
+            }
+            (PmoStage::CheckoutDefaultBranch, PmoOutcome::Done)
+            | (PmoStage::RetryCheckout, PmoOutcome::Done) => {
+                self.stage = PmoStage::ObservePendingSplit
+            }
+            (PmoStage::CheckoutDefaultBranch, PmoOutcome::CheckoutFailed) => {
+                self.stage = PmoStage::ResetAfterCheckoutFailure
+            }
+            (PmoStage::RetryCheckout, PmoOutcome::CheckoutFailed) => {
+                anyhow::bail!("failed to checkout default branch after resetting worktree")
+            }
+            (PmoStage::ResetAfterCheckoutFailure, PmoOutcome::Done) => {
+                self.stage = PmoStage::RetryCheckout
+            }
+            (PmoStage::ReleaseInvalidHeldClaim, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.held_issue_iid = None;
+                self.stage = PmoStage::ClearInvalidHeldState;
+            }
+            (PmoStage::ClearInvalidHeldState, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::ObserveIssues
+            }
+            (PmoStage::PrepareRefinementContext, PmoOutcome::ContextPrepared(_))
+            | (PmoStage::PrepareRefinementContext, PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::ObserveRefinementComments
+            }
+            (PmoStage::PrepareSplitContext, PmoOutcome::ContextPrepared(_))
+            | (PmoStage::PrepareSplitContext, PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::NextChild
+            }
+            (
+                PmoStage::PrepareRefinementPlanContext | PmoStage::PreparePlanContext,
+                PmoOutcome::ContextPrepared(path),
+            ) => {
+                self.context_path = path;
+                self.stage = PmoStage::InvokePlan;
+            }
+            (PmoStage::AcquireCandidate, PmoOutcome::Claim(PmoClaimOutcome::Won)) => {
+                self.held_issue_iid = Some(self.issue().iid);
+                self.stage = PmoStage::ShutdownAfterClaim;
+            }
+            (PmoStage::AcquireCandidate, PmoOutcome::Claim(PmoClaimOutcome::Lost)) => {
+                self.stage = PmoStage::NextCandidate
+            }
+            (PmoStage::AcquireCandidate, PmoOutcome::Claim(PmoClaimOutcome::Interrupted)) => {
+                self.stage = PmoStage::Finish
+            }
+            (PmoStage::ReleaseInterruptedClaim, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::Finish
+            }
+            (PmoStage::SaveClaim, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.plan_origin = PlanOrigin::Fresh;
+                self.stage = PmoStage::PreparePlanContext;
+            }
+            (PmoStage::InvokePlan, PmoOutcome::Planned(decision)) => {
+                self.install_decision(decision)?;
+            }
+            (PmoStage::InvokePlan, PmoOutcome::Failed(_))
+            | (PmoStage::PreparePlanContext, PmoOutcome::Failed(_))
+            | (PmoStage::PrepareRefinementPlanContext, PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::ShutdownAfterProcessingFailure
+            }
+            (PmoStage::DecisionAction, PmoOutcome::Done) => {
+                self.decision_actions.pop_front();
+            }
+            (PmoStage::DecisionAction, PmoOutcome::Failed(error)) => {
+                self.decision_actions.pop_front();
+                if self.current_action_required {
+                    warn!(
+                        "{}: required PMO decision action failed: {error}",
+                        self.agent_id
+                    );
+                    self.stage = PmoStage::ShutdownAfterProcessingFailure;
+                }
+            }
+            (PmoStage::BeginSplit, PmoOutcome::Done) => self.stage = PmoStage::NextChild,
+            (PmoStage::CreateChild, PmoOutcome::IssueCreated(iid)) => {
+                self.child_iid = Some(iid);
+                self.stage = PmoStage::LabelChildPriority;
+            }
+            (PmoStage::LabelChildPriority, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::LabelChildScope
+            }
+            (PmoStage::LabelChildScope, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::HoldChild
+            }
+            (PmoStage::HoldChild, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::CheckpointChild
+            }
+            (PmoStage::CheckpointChild, PmoOutcome::Done) => {
+                let child_iid = self.child_iid();
+                self.pending
+                    .as_mut()
+                    .expect("checkpoint stage has pending split")
+                    .created_issue_ids
+                    .push(child_iid);
+                self.stage = PmoStage::NextChild;
+            }
+            (PmoStage::UnholdDependent, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::LabelDependency
+            }
+            (PmoStage::LabelDependency, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::CommentDependency
+            }
+            (PmoStage::CommentDependency, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.dependency_index += 1;
+                self.stage = PmoStage::NextDependency;
+            }
+            (PmoStage::CommentParentLinks, PmoOutcome::Done) => {
+                self.stage = PmoStage::RemoveParentActionRequired
+            }
+            (PmoStage::RemoveParentActionRequired, PmoOutcome::Done) => {
+                self.stage = PmoStage::AddParentProcessed
+            }
+            (PmoStage::AddParentProcessed, PmoOutcome::Done) => {
+                self.stage = PmoStage::DeleteCheckpoint
+            }
+            (PmoStage::DeleteCheckpoint, PmoOutcome::Done) => {
+                self.stage = PmoStage::CloseSplitParent
+            }
+            (PmoStage::CloseSplitParent, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::ReleaseCompletedClaim
+            }
+            (PmoStage::ReleaseCompletedClaim, PmoOutcome::Done)
+            | (PmoStage::ReleaseCompletedClaim, PmoOutcome::Failed(_))
+                if self.resumed_split =>
+            {
+                self.held_issue_iid = None;
+                self.stage = PmoStage::ClearCompletedState;
+            }
+            (PmoStage::ReleaseCompletedClaim, PmoOutcome::Done) => {
+                self.held_issue_iid = None;
+                self.stage = PmoStage::ClearCompletedState;
+            }
+            (PmoStage::ClearCompletedState, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = if self.resumed_split || self.plan_origin == PlanOrigin::Refinement {
+                    PmoStage::Finish
+                } else {
+                    self.maintenance_queue = self.issues.iter().cloned().collect();
+                    PmoStage::ShutdownBeforePriorities
+                };
+            }
+            (PmoStage::ReleaseFailedClaim, PmoOutcome::Done) => {
+                self.held_issue_iid = None;
+                self.stage = PmoStage::ClearFailedState;
+            }
+            (PmoStage::ClearFailedState, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::ShutdownBeforePriorities
+            }
+            (PmoStage::AddDefaultPriority, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::NextDefaultPriority
+            }
+            (PmoStage::CommentStaleIssue, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::CloseStaleIssue
+            }
+            (PmoStage::CloseStaleIssue, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
+                self.stage = PmoStage::NextStaleIssue
+            }
+            (_, PmoOutcome::Failed(error)) => return Err(error),
+            (stage, _) => anyhow::bail!("PMO port reported unexpected outcome for {stage:?}"),
+        }
+        Ok(())
+    }
+
+    fn install_decision(&mut self, decision: PmoOutput) -> Result<()> {
+        let iid = self.issue().iid;
+        self.decision_actions.clear();
+        self.keep_claim_after_decision = false;
+        match decision {
+            PmoOutput::NeedsClarification {
+                question,
+                plan_text,
+            } => {
+                if let Some(plan) = plan_text.filter(|text| !text.trim().is_empty()) {
+                    let body = strip_internal_markers(plan.trim());
+                    if !body.is_empty() {
+                        self.decision_actions.push_back((
+                            PmoAction::UpdateIssueDescription {
+                                issue_iid: iid,
+                                body,
+                            },
+                            false,
+                        ));
+                    }
+                }
+                let question =
+                    strip_internal_markers(&clarification_question_or_default(&question));
+                self.decision_actions.push_back((
+                    PmoAction::AddIssueComment {
+                        issue_iid: iid,
+                        body: format!(
+                            "**PMO needs clarification before proceeding:**\n\n{question}\n\nPlease reply to this comment with the requested information. The PMO will refine the plan based on your feedback. Remove the `pmo-pending` label when you are satisfied with the plan to let the PMO proceed."
+                        ),
+                    },
+                    true,
+                ));
+                self.decision_actions.push_back((
+                    PmoAction::AddIssueLabel {
+                        issue_iid: iid,
+                        label: labels::PMO_PENDING.to_string(),
+                    },
+                    true,
+                ));
+                // Needs-clarification intentionally keeps its claim.
+                self.decision_actions
+                    .push_back((PmoAction::SaveClaimState { issue_iid: iid }, false));
+                self.keep_claim_after_decision = true;
+                self.stage = PmoStage::DecisionAction;
+            }
+            PmoOutput::AlreadyDone { reason } => {
+                let reason = strip_internal_markers(&already_done_reason_or_default(&reason));
+                self.queue_decision(
+                    PmoAction::AddIssueComment {
+                        issue_iid: iid,
+                        body: format!(
+                            "**PMO: Closing — this work is already implemented.**\n\n{reason}"
+                        ),
+                    },
+                    true,
+                );
+                self.queue_remove(iid, ACTION_REQUIRED_LABEL, false);
+                self.queue_remove(iid, PMO_PROCESSED_LABEL, false);
+                self.queue_decision(PmoAction::CloseIssue { issue_iid: iid }, true);
+                self.stage = PmoStage::DecisionAction;
+            }
+            PmoOutput::WaitForDependency {
+                dependency_issue_iid,
+            } => {
+                self.queue_decision(
+                    PmoAction::AddIssueLabel {
+                        issue_iid: iid,
+                        label: format!("waiting-on-issue:#{dependency_issue_iid}"),
+                    },
+                    false,
+                );
+                self.queue_remove(iid, ACTION_REQUIRED_LABEL, false);
+                self.queue_remove(iid, PMO_PROCESSED_LABEL, false);
+                self.queue_decision(
+                    PmoAction::AddIssueComment {
+                        issue_iid: iid,
+                        body: format!(
+                            "**PMO: Parking — this issue depends on issue #{dependency_issue_iid} which is still open.**\n\nThe worker will skip this issue until #{dependency_issue_iid} is closed, then resume automatically."
+                        ),
+                    },
+                    true,
+                );
+                self.stage = PmoStage::DecisionAction;
+            }
+            PmoOutput::GuideWorker { instructions } => {
+                let guidance = strip_internal_markers(&guidance_or_empty(&instructions));
+                if guidance.trim().is_empty() {
+                    anyhow::bail!(
+                        "PMO GUIDE_WORKER output for issue #{iid} had no usable guidance; retrying later"
+                    );
+                }
+                self.queue_decision(
+                    PmoAction::AddIssueComment {
+                        issue_iid: iid,
+                        body: format_pmo_guidance_comment(&guidance),
+                    },
+                    true,
+                );
+                self.queue_remove(iid, ACTION_REQUIRED_LABEL, true);
+                self.queue_remove(iid, PMO_PROCESSED_LABEL, false);
+                self.stage = PmoStage::DecisionAction;
+            }
+            PmoOutput::Split { sub_issues } => {
+                let sub_issues = normalize_sub_issues(sub_issues);
+                if sub_issues.is_empty() {
+                    anyhow::bail!(
+                        "PMO split output for issue #{iid} was not machine-readable; retrying later"
+                    );
+                }
+                self.pending = Some(PendingSplit {
+                    parent_issue_iid: iid,
+                    parent_issue_title: self.issue().title.clone(),
+                    parent_priority: self.issue().priority(),
+                    sub_issues,
+                    created_issue_ids: Vec::new(),
+                });
+                self.resumed_split = false;
+                self.stage = PmoStage::BeginSplit;
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_decision(&mut self, action: PmoAction, required: bool) {
+        self.decision_actions.push_back((action, required));
+    }
+
+    fn queue_remove(&mut self, issue_iid: u64, label: &str, required: bool) {
+        self.queue_decision(
+            PmoAction::RemoveIssueLabel {
+                issue_iid,
+                label: label.to_string(),
+            },
+            required,
+        );
+    }
+}
+
+fn observe_pmo(port: &dyn PmoPort, query: &PmoQuery) -> Result<PmoFact> {
+    Ok(match query {
+        PmoQuery::DefaultBranch => PmoFact::DefaultBranch(port.default_branch()?),
+        PmoQuery::ShutdownRequested => PmoFact::ShutdownRequested(port.shutdown_requested()),
+        PmoQuery::PendingSplit => PmoFact::PendingSplit(port.pending_split()?),
+        PmoQuery::Issue { issue_iid } => PmoFact::Issue(port.issue(*issue_iid)),
+        PmoQuery::Issues => PmoFact::Issues(port.issues()?),
+        PmoQuery::NewHumanComments { issue_iid } => {
+            PmoFact::NewHumanComments(port.new_human_comments(*issue_iid))
+        }
+        PmoQuery::CurrentEpoch => PmoFact::CurrentEpoch(port.current_epoch()),
+    })
+}
+
+fn drive_pmo(machine: &mut PmoMachine, port: &mut dyn PmoPort) -> Result<()> {
+    loop {
+        match machine.next_step() {
+            PmoStep::Observe(query) => machine.apply_fact(observe_pmo(port, &query))?,
+            PmoStep::Act(action) => {
+                let outcome = port.execute(&action);
+                machine.apply_outcome(outcome)?;
+            }
+            PmoStep::Finish => return Ok(()),
+        }
+    }
+}
+
+struct LivePmoPort<'a> {
+    state: &'a AgentState<'a>,
+    git_repo: &'a GitRepo,
+    gitlab: &'a GitLabClient,
+    model: &'a AgentModel,
+    claimed_issue: &'a mut Option<ClaimLease>,
+    shutdown: Arc<AtomicBool>,
+    config: &'a PmoConfig,
+}
+
+fn pmo_done(result: Result<()>) -> PmoOutcome {
+    match result {
+        Ok(()) => PmoOutcome::Done,
+        Err(error) => PmoOutcome::Failed(error),
+    }
+}
+
+impl PmoPort for LivePmoPort<'_> {
+    fn default_branch(&self) -> Result<String> {
+        self.git_repo.get_default_branch()
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    fn pending_split(&self) -> Result<Option<PendingSplit>> {
+        load_pending_split(&self.state.task_path())
+    }
+
+    fn issue(&self, issue_iid: u64) -> Option<PmoIssueObservation> {
+        self.gitlab
+            .get_issue(issue_iid)
+            .ok()
+            .as_ref()
+            .map(PmoIssueObservation::from)
+    }
+
+    fn issues(&self) -> Result<Vec<PmoIssueObservation>> {
+        Ok(self
+            .gitlab
+            .list_issues()?
+            .iter()
+            .map(PmoIssueObservation::from)
+            .collect())
+    }
+
+    fn new_human_comments(&self, issue_iid: u64) -> bool {
+        self.gitlab.get_issue(issue_iid).ok().is_some_and(|issue| {
+            has_new_comments_since_last_pmo_comment(self.gitlab, &issue, self.state.agent_id)
+        })
+    }
+
+    fn current_epoch(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn execute(&mut self, action: &PmoAction) -> PmoOutcome {
+        match action {
+            PmoAction::FetchRepository => pmo_done(self.git_repo.fetch()),
+            PmoAction::CheckoutDefaultBranch { branch } => {
+                match self.git_repo.checkout_remote_branch(branch) {
+                    Ok(()) => PmoOutcome::Done,
+                    Err(_) => PmoOutcome::CheckoutFailed,
+                }
+            }
+            PmoAction::ResetWorktree => pmo_done(self.git_repo.reset_hard()),
+            PmoAction::AcquireClaim { issue_iid } => match claim::acquire(
+                self.gitlab,
+                ClaimResource::Issue(*issue_iid),
+                self.state.agent_id,
+                self.shutdown.as_ref(),
+            ) {
+                Ok(ClaimAcquireOutcome::Won(lease)) => {
+                    *self.claimed_issue = Some(lease);
+                    PmoOutcome::Claim(PmoClaimOutcome::Won)
+                }
+                Ok(ClaimAcquireOutcome::Lost) => PmoOutcome::Claim(PmoClaimOutcome::Lost),
+                Ok(ClaimAcquireOutcome::Interrupted) => {
+                    PmoOutcome::Claim(PmoClaimOutcome::Interrupted)
+                }
+                Err(error) => PmoOutcome::Failed(error),
+            },
+            PmoAction::ReleaseClaim => {
+                let Some(lease) = self.claimed_issue.take() else {
+                    return PmoOutcome::Done;
+                };
+                pmo_done(lease.release(self.gitlab))
+            }
+            PmoAction::SaveClaimState { issue_iid } => {
+                self.state.save_state(*issue_iid);
+                PmoOutcome::Done
+            }
+            PmoAction::ClearClaimState => {
+                self.state.clear_state();
+                PmoOutcome::Done
+            }
+            PmoAction::PrepareIssueContext { issue, all_issues } => {
+                let issue = issue.as_issue();
+                let all_issues: Vec<Issue> = all_issues
+                    .iter()
+                    .map(PmoIssueObservation::as_issue)
+                    .collect();
+                match refresh_pmo_issue_context_file(self.state, self.gitlab, &issue, &all_issues) {
+                    Ok(path) => PmoOutcome::ContextPrepared(path),
+                    Err(error) => PmoOutcome::Failed(error),
+                }
+            }
+            PmoAction::InvokePlan {
+                issue,
+                context_path,
+            } => {
+                let issue_value = issue.as_issue();
+                let prompt = match build_split_prompt(
+                    self.state,
+                    &issue_value,
+                    context_path,
+                    issue.priority(),
+                ) {
+                    Ok(prompt) => prompt,
+                    Err(error) => return PmoOutcome::Failed(error),
+                };
+                let provider: Option<Arc<dyn CapabilityProvider>> = if self.config.ask_via_gitlab {
+                    let timeout = (self.config.ask_gitlab_timeout_secs > 0)
+                        .then(|| Duration::from_secs(self.config.ask_gitlab_timeout_secs));
+                    Some(Arc::new(GitLabIssueAskHandler::new(
+                        issue.iid,
+                        self.gitlab.clone(),
+                        Arc::clone(&self.shutdown),
+                        timeout,
+                    )))
+                } else {
+                    None
+                };
+                self.model.set_capability_provider(provider);
+                let result = self.model.complete_typed::<PmoOutput>(
+                    &prompt,
+                    &InvokeOptions {
+                        activity_label: Some(format!(
+                            "{} triaging issue #{}",
+                            self.state.agent_id, issue.iid
+                        )),
+                        ..InvokeOptions::default()
+                    },
+                );
+                self.model.set_capability_provider(None);
+                match result {
+                    Ok(completion) => PmoOutcome::Planned(completion.output),
+                    Err(error) => PmoOutcome::Failed(error),
+                }
+            }
+            PmoAction::UpdateIssueDescription { issue_iid, body } => {
+                pmo_done(self.gitlab.update_issue_description(*issue_iid, body))
+            }
+            PmoAction::AddIssueComment { issue_iid, body } => {
+                pmo_done(self.gitlab.add_issue_comment(*issue_iid, body))
+            }
+            PmoAction::AddIssueLabel { issue_iid, label } => {
+                pmo_done(self.gitlab.add_issue_label(*issue_iid, label))
+            }
+            PmoAction::RemoveIssueLabel { issue_iid, label } => {
+                pmo_done(self.gitlab.remove_issue_label(*issue_iid, label))
+            }
+            PmoAction::CloseIssue { issue_iid } => pmo_done(self.gitlab.close_issue(*issue_iid)),
+            PmoAction::SaveSplitCheckpoint(pending) => {
+                pmo_done(save_pending_split(&self.state.task_path(), pending))
+            }
+            PmoAction::DeleteSplitCheckpoint => {
+                pmo_done(delete_pending_split(&self.state.task_path()))
+            }
+            PmoAction::CreateChild { title, description } => {
+                match self.gitlab.create_issue(title, description) {
+                    Ok(iid) => PmoOutcome::IssueCreated(iid),
+                    Err(error) => PmoOutcome::Failed(error),
+                }
+            }
+        }
     }
 }
 
@@ -519,386 +1786,26 @@ fn pmo_cycle(
     git_repo: &GitRepo,
     gitlab: &GitLabClient,
     model: &AgentModel,
-    claimed_issue_iid: &mut Option<u64>,
+    claimed_issue: &mut Option<ClaimLease>,
     shutdown: Arc<AtomicBool>,
     scope_label: Option<&str>,
     pmo_config: &PmoConfig,
 ) -> Result<()> {
-    let default_branch = git_repo.get_default_branch()?;
-    git_repo.fetch()?;
-
-    // Ensure we're on the latest upstream — hard reset if checkout fails
-    if let Err(e) = git_repo.checkout_remote_branch(&default_branch) {
-        warn!(
-            "{}: Failed to checkout {}: {}, forcing reset",
-            &state.agent_id, default_branch, e
-        );
-
-        let _ = git_repo.reset_hard();
-        git_repo.checkout_remote_branch(&default_branch)?;
-    }
-
-    // If we still hold a claim from a previous run, decide what to do.
-    if let Some(held_iid) = *claimed_issue_iid {
-        // Pending splits take priority — handled below
-        let pending_file_check = state.task_path();
-        let has_pending = load_pending_split(&pending_file_check)?;
-        if has_pending.is_some() {
-            // Fall through to pending split handling
-        } else if let Ok(issue) = gitlab.get_issue(held_iid) {
-            if !issue_in_scope(&issue, scope_label) {
-                info!(
-                    "{}: Held issue #{} left scope label {:?}, releasing",
-                    &state.agent_id, held_iid, scope_label
-                );
-
-                let _ = claim::release_claim(gitlab, held_iid, &state.agent_id);
-                *claimed_issue_iid = None;
-
-                state.clear_state();
-            } else if issue.labels.contains(&labels::PMO_PENDING.to_string()) {
-                // PMO is in plan-refinement mode: the issue description holds
-                // the PMO's draft plan, and the comment thread has the Q&A.
-                // Re-triage only when there are new human comments since the
-                // last PMO triage — otherwise just wait.
-                let issues = gitlab.list_issues();
-                match issues {
-                    Ok(issues) => {
-                        if let Err(e) =
-                            refresh_pmo_issue_context_file(state, gitlab, &issue, &issues)
-                        {
-                            warn!(
-                                "{}: Could not refresh PMO context file while pmo-pending on #{}: {}",
-                                &state.agent_id, held_iid, e
-                            );
-                        }
-
-                        if has_new_comments_since_last_pmo_comment(gitlab, &issue, &state.agent_id)
-                        {
-                            info!(
-                                "{}: Issue #{} has new comments, re-triaging pmo-pending refinement",
-                                &state.agent_id, held_iid
-                            );
-                            // Re-run triage with the refreshed context. The PMO
-                            // may refine the plan (needs_clarification again) or
-                            // reach a final decision. Either way, pmo-pending
-                            // stays — only a human removes it.
-                            match process_action_required_issue(
-                                state,
-                                gitlab,
-                                model,
-                                &issue,
-                                &issues,
-                                scope_label,
-                                Arc::clone(&shutdown),
-                                pmo_config,
-                            ) {
-                                Ok(keep_claim) => {
-                                    if !keep_claim {
-                                        // The PMO reached a final decision — but
-                                        // pmo-pending is still on the issue (the
-                                        // PMO never removes it). The decision
-                                        // was already acted on inside
-                                        // process_action_required_issue. Release
-                                        // the claim so the normal flow continues.
-                                        let _ =
-                                            claim::release_claim(gitlab, held_iid, &state.agent_id);
-                                        *claimed_issue_iid = None;
-                                        state.clear_state();
-                                    }
-                                    // If keep_claim, the PMO refined the plan and
-                                    // is still waiting. Keep the claim and wait
-                                    // for the next cycle.
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "{}: Failed to re-triage pmo-pending issue #{}: {}",
-                                        &state.agent_id, held_iid, e
-                                    );
-                                }
-                            }
-                        } else {
-                            debug!(
-                                "{}: Issue #{} still pmo-pending, no new comments, waiting",
-                                &state.agent_id, held_iid
-                            );
-                        }
-                    }
-                    Err(e) => warn!(
-                        "{}: Could not list issues to refresh context (pmo-pending #{}): {}",
-                        &state.agent_id, held_iid, e
-                    ),
-                }
-
-                return Ok(());
-            } else {
-                // No longer pending (human removed the label) — release claim so it
-                // can be re-processed as a fresh action-required issue.
-                info!(
-                    "{}: Releasing claim on issue #{} from previous run",
-                    &state.agent_id, held_iid
-                );
-
-                let _ = claim::release_claim(gitlab, held_iid, &state.agent_id);
-                *claimed_issue_iid = None;
-
-                state.clear_state();
-            }
-        } else {
-            // Can't fetch issue — release to be safe
-            let _ = claim::release_claim(gitlab, held_iid, &state.agent_id);
-            *claimed_issue_iid = None;
-
-            state.clear_state();
-        }
-    }
-
-    let pending_file = state.task_path();
-    if let Some(pending_split) = load_pending_split(&pending_file)? {
-        info!(
-            "{}: Resuming pending split for issue #{} ({} sub-issues remaining)",
-            &state.agent_id,
-            pending_split.parent_issue_iid,
-            pending_split.sub_issues.len()
-        );
-
-        match (
-            gitlab.get_issue(pending_split.parent_issue_iid),
-            gitlab.list_issues(),
-        ) {
-            (Ok(parent_issue), Ok(issues)) => {
-                if let Err(e) =
-                    refresh_pmo_issue_context_file(state, gitlab, &parent_issue, &issues)
-                {
-                    warn!(
-                        "{}: Could not refresh PMO context file before pending split on #{}: {}",
-                        &state.agent_id, pending_split.parent_issue_iid, e
-                    );
-                }
-            }
-            (Err(e), _) => warn!(
-                "{}: Could not fetch parent issue #{} for context refresh: {}",
-                &state.agent_id, pending_split.parent_issue_iid, e
-            ),
-            (_, Err(e)) => warn!(
-                "{}: Could not list issues for context refresh (pending split): {}",
-                &state.agent_id, e
-            ),
-        }
-
-        match resume_split(&pending_file, gitlab, &pending_split, scope_label) {
-            Ok(_) => {
-                info!(
-                    "{}: Successfully completed pending split for issue #{}",
-                    &state.agent_id, pending_split.parent_issue_iid
-                );
-
-                delete_pending_split(&pending_file)?;
-                // Release the claim from the split
-                if let Some(held_iid) = *claimed_issue_iid {
-                    let _ = claim::release_claim(gitlab, held_iid, &state.agent_id);
-                    *claimed_issue_iid = None;
-
-                    state.clear_state();
-                }
-            }
-            Err(e) => {
-                error!(
-                    "{}: Failed to complete pending split: {}",
-                    &state.agent_id, e
-                );
-            }
-        }
-
-        return Ok(());
-    }
-
-    let issues = gitlab.list_issues()?;
-
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    for issue in &issues {
-        if shutdown.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-
-        if !should_process_issue(issue, scope_label) {
-            continue;
-        }
-
-        if claim::is_claimed(&issue.labels) {
-            debug!(
-                "{}: Issue #{} already claimed, skipping",
-                &state.agent_id, issue.iid
-            );
-            continue;
-        }
-
-        if !claim::try_claim_issue(gitlab, issue.iid, &state.agent_id, shutdown.as_ref())? {
-            info!(
-                "{}: Failed to claim issue #{}, skipping",
-                &state.agent_id, issue.iid
-            );
-            continue;
-        }
-
-        if shutdown.load(Ordering::SeqCst) {
-            let _ = claim::release_claim(gitlab, issue.iid, &state.agent_id);
-            return Ok(());
-        }
-
-        *claimed_issue_iid = Some(issue.iid);
-
-        state.save_state(issue.iid);
-
-        info!(
-            "{}: Processing issue #{}: {}",
-            &state.agent_id, issue.iid, issue.title
-        );
-
-        match process_action_required_issue(
-            state,
-            gitlab,
-            model,
-            issue,
-            &issues,
-            scope_label,
-            Arc::clone(&shutdown),
-            pmo_config,
-        ) {
-            Ok(keep_claim) => {
-                info!(
-                    "{}: Successfully processed issue #{}",
-                    &state.agent_id, issue.iid
-                );
-                if keep_claim {
-                    info!(
-                        "{}: Keeping claim on issue #{} (pmo-pending)",
-                        &state.agent_id, issue.iid
-                    );
-                } else {
-                    claim::release_claim(gitlab, issue.iid, &state.agent_id)?;
-                    *claimed_issue_iid = None;
-
-                    state.clear_state();
-                }
-            }
-            Err(e) => {
-                error!(
-                    "{}: Failed to process issue #{}: {}",
-                    &state.agent_id, issue.iid, e
-                );
-
-                if shutdown.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-
-                claim::release_claim(gitlab, issue.iid, &state.agent_id)?;
-                *claimed_issue_iid = None;
-
-                state.clear_state();
-            }
-        }
-
-        break;
-    }
-
-    // Assign default priority to open issues that lack a priority label.
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    assign_default_priority(&state.agent_id, &issues, gitlab, scope_label);
-
-    // Close stale pmo-processed issues that have not been picked up for over 1 hour.
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    close_stale_processed_issues(&state.agent_id, &issues, gitlab, scope_label);
-
-    Ok(())
-}
-
-fn assign_default_priority(
-    agent_id: &str,
-    issues: &[Issue],
-    gitlab: &GitLabClient,
-    scope_label: Option<&str>,
-) {
-    for issue in issues {
-        if issue.state != "opened" {
-            continue;
-        }
-        if !issue_in_scope(issue, scope_label) {
-            continue;
-        }
-        let has_priority = issue
-            .labels
-            .iter()
-            .any(|l| l.starts_with(gitlab::PRIORITY_LABEL_PREFIX));
-        if !has_priority {
-            let label = gitlab::priority_label(gitlab::DEFAULT_PRIORITY);
-            debug!(
-                "{}: Assigning default {} to issue #{}",
-                agent_id, label, issue.iid
-            );
-            let _ = gitlab.add_issue_label(issue.iid, &label);
-        }
-    }
+    let held_issue_iid = claimed_issue.as_ref().map(|lease| lease.resource().iid());
+    let mut machine = PmoMachine::new(state.agent_id, scope_label, held_issue_iid);
+    let mut port = LivePmoPort {
+        state,
+        git_repo,
+        gitlab,
+        model,
+        claimed_issue,
+        shutdown: Arc::clone(&shutdown),
+        config: pmo_config,
+    };
+    drive_pmo(&mut machine, &mut port)
 }
 
 const STALE_THRESHOLD_SECS: u64 = 3600; // 1 hour
-
-fn close_stale_processed_issues(
-    agent_id: &str,
-    issues: &[Issue],
-    gitlab: &GitLabClient,
-    scope_label: Option<&str>,
-) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    for issue in issues {
-        if issue.state != "opened" {
-            continue;
-        }
-        if !issue_in_scope(issue, scope_label) {
-            continue;
-        }
-        if !issue.labels.contains(&PMO_PROCESSED_LABEL.to_string()) {
-            continue;
-        }
-
-        let Some(ref updated_str) = issue.updated_at else {
-            continue;
-        };
-
-        let Some(updated_epoch) = parse_iso8601_to_epoch(updated_str) else {
-            debug!(
-                "{}: Could not parse updated_at for issue #{}: {}",
-                agent_id, issue.iid, updated_str
-            );
-            continue;
-        };
-
-        if now.saturating_sub(updated_epoch) >= STALE_THRESHOLD_SECS {
-            info!(
-                "{}: Issue #{} has been pmo-processed for over 1 hour with no activity, closing",
-                agent_id, issue.iid
-            );
-            let _ = gitlab.add_issue_comment(
-                issue.iid,
-                "Closing this issue — it has been marked as `pmo-processed` for over 1 hour with no further activity.",
-            );
-            let _ = gitlab.close_issue(issue.iid);
-        }
-    }
-}
 
 fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
     // GitLab returns timestamps like "2026-03-18T05:30:00.000Z" or "2026-03-18T05:30:00+00:00"
@@ -977,234 +1884,6 @@ fn should_process_issue(issue: &Issue, scope_label: Option<&str>) -> bool {
     }
 
     true
-}
-
-/// Returns `Ok(true)` if the PMO should keep its claim (pmo-pending / needs clarification).
-/// Returns `Ok(false)` if the claim can be released.
-#[allow(clippy::too_many_arguments)]
-fn process_action_required_issue(
-    state: &AgentState,
-    gitlab: &GitLabClient,
-    model: &AgentModel,
-    issue: &Issue,
-    all_issues: &[Issue],
-    scope_label: Option<&str>,
-    shutdown: Arc<AtomicBool>,
-    pmo_config: &PmoConfig,
-) -> Result<bool> {
-    let parent_priority = issue.priority();
-    let context_path = refresh_pmo_issue_context_file(state, gitlab, issue, all_issues)?;
-    let prompt = build_split_prompt(state, issue, &context_path, parent_priority)?;
-
-    let provider: Option<
-        std::sync::Arc<dyn crate::core::model::acp::capabilities::CapabilityProvider>,
-    > = if pmo_config.ask_via_gitlab {
-        let timeout = if pmo_config.ask_gitlab_timeout_secs > 0 {
-            Some(std::time::Duration::from_secs(
-                pmo_config.ask_gitlab_timeout_secs,
-            ))
-        } else {
-            None
-        };
-        Some(std::sync::Arc::new(GitLabIssueAskHandler::new(
-            issue.iid,
-            gitlab.clone(),
-            Arc::clone(&shutdown),
-            timeout,
-        )))
-    } else {
-        None
-    };
-
-    model.set_capability_provider(provider);
-
-    info!(
-        "{}: PMO agent triaging issue #{}",
-        &state.agent_id, issue.iid
-    );
-    let completion = model.complete_typed::<PmoOutput>(
-        &prompt,
-        &InvokeOptions {
-            activity_label: Some(format!("{} triaging issue #{}", &state.agent_id, issue.iid)),
-            ..InvokeOptions::default()
-        },
-    )?;
-    model.set_capability_provider(None);
-    info!(
-        "{}: PMO agent finished triaging issue #{}",
-        &state.agent_id, issue.iid
-    );
-
-    let sub_issues = match completion.output {
-        // --- NEEDS_CLARIFICATION: PMO needs human input, refine plan ---
-        PmoOutput::NeedsClarification {
-            question,
-            plan_text,
-        } => {
-            let question = strip_internal_markers(&clarification_question_or_default(question));
-            info!(
-                "PMO: Issue #{} needs clarification, marking pmo-pending and updating plan",
-                issue.iid
-            );
-
-            // Update the issue description with the PMO's current plan draft, so
-            // humans can see and refine the proposed approach directly in the
-            // GitLab issue body.
-            if let Some(plan_text) = plan_text.filter(|t| !t.trim().is_empty()) {
-                let cleaned = strip_internal_markers(plan_text.trim());
-                if !cleaned.is_empty()
-                    && let Err(e) = gitlab.update_issue_description(issue.iid, &cleaned)
-                {
-                    warn!(
-                        "PMO: Failed to update issue #{} description with plan: {}",
-                        issue.iid, e
-                    );
-                }
-            }
-
-            gitlab.add_issue_comment(
-                issue.iid,
-                &format!(
-                    "**PMO needs clarification before proceeding:**\n\n{}\n\n\
-                     Please reply to this comment with the requested information. \
-                     The PMO will refine the plan based on your feedback. \
-                     Remove the `pmo-pending` label when you are satisfied with the plan to let the PMO proceed.",
-                    question
-                ),
-            )?;
-
-            gitlab.add_issue_label(issue.iid, labels::PMO_PENDING)?;
-            return Ok(true); // keep claim
-        }
-
-        // --- ALREADY_DONE: work is already implemented, close the issue ---
-        PmoOutput::AlreadyDone { reason } => {
-            let reason = strip_internal_markers(&already_done_reason_or_default(reason));
-            info!("PMO: Issue #{} is already implemented, closing", issue.iid);
-            gitlab.add_issue_comment(
-                issue.iid,
-                &format!(
-                    "**PMO: Closing — this work is already implemented.**\n\n{}",
-                    reason
-                ),
-            )?;
-            let _ = gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL);
-            let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
-            gitlab.close_issue(issue.iid)?;
-            return Ok(false);
-        }
-
-        // --- WAIT_FOR_DEPENDENCY: issue depends on another open issue, park it ---
-        PmoOutput::WaitForDependency {
-            dependency_issue_iid,
-        } => {
-            let Some(dep_iid) = dependency_issue_iid else {
-                warn!(
-                    "PMO: wait_for_dependency decision for issue #{} but no dependency_issue_iid provided, releasing claim for retry",
-                    issue.iid
-                );
-                anyhow::bail!(
-                    "PMO wait_for_dependency for issue #{} missing dependency_issue_iid; retrying later",
-                    issue.iid
-                );
-            };
-            info!(
-                "PMO: Issue #{} depends on open issue #{}, parking",
-                issue.iid, dep_iid
-            );
-            let label = format!("waiting-on-issue:#{dep_iid}");
-            let _ = gitlab.add_issue_label(issue.iid, &label);
-            let _ = gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL);
-            let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
-            gitlab.add_issue_comment(
-                issue.iid,
-                &format!(
-                    "**PMO: Parking — this issue depends on issue #{dep_iid} which is still open.**\n\n\
-                     The worker will skip this issue until #{} is closed, then resume automatically.",
-                    dep_iid
-                ),
-            )?;
-            return Ok(false);
-        }
-
-        // --- GUIDE_WORKER: single focused retry instruction ---
-        PmoOutput::GuideWorker { instructions } => {
-            let guidance = strip_internal_markers(&guidance_or_empty(instructions));
-            if guidance.trim().is_empty() {
-                warn!(
-                    "PMO: GUIDE_WORKER output for issue #{} had no usable guidance, releasing claim for retry",
-                    issue.iid
-                );
-                anyhow::bail!(
-                    "PMO GUIDE_WORKER output for issue #{} had no usable guidance; retrying later",
-                    issue.iid
-                );
-            }
-            info!("PMO: Issue #{} needs guidance, not splitting", issue.iid);
-            gitlab.add_issue_comment(issue.iid, &format_pmo_guidance_comment(&guidance))?;
-            gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
-            let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
-            return Ok(false);
-        }
-
-        // --- SPLIT: create sub-issues, close the parent as a task container ---
-        PmoOutput::Split { sub_issues } => normalize_sub_issues(sub_issues),
-    };
-
-    if sub_issues.is_empty() {
-        warn!("PMO: No sub-issues from plan tool for issue #{}", issue.iid);
-
-        anyhow::bail!(
-            "PMO split output for issue #{} was not machine-readable; retrying later",
-            issue.iid
-        );
-    }
-
-    let pending_file = state.task_path();
-
-    let pending_split = PendingSplit {
-        parent_issue_iid: issue.iid,
-        parent_issue_title: issue.title.clone(),
-        parent_priority: issue.priority(),
-        sub_issues: sub_issues.clone(),
-        created_issue_ids: Vec::new(),
-    };
-
-    save_pending_split(&pending_file, &pending_split)?;
-
-    match resume_split(&pending_file, gitlab, &pending_split, scope_label) {
-        Ok(_) => {
-            info!(
-                "{}: Successfully split issue #{} into sub-issues",
-                &state.agent_id, issue.iid
-            );
-            delete_pending_split(&pending_file)?;
-        }
-        Err(e) => {
-            error!(
-                "{}: Failed to create all sub-issues: {}",
-                &state.agent_id, e
-            );
-            return Err(e);
-        }
-    }
-
-    // Close the parent issue — it served as a task container, the real work
-    // is now tracked in the sub-issues.
-    info!(
-        "{}: Closing parent issue #{} (task container)",
-        &state.agent_id, issue.iid
-    );
-
-    let _ = gitlab.add_issue_comment(
-        issue.iid,
-        "Closing this issue — it has been split into sub-issues above. \
-         The sub-issues now track the actual work.",
-    );
-
-    let _ = gitlab.close_issue(issue.iid);
-
-    Ok(false)
 }
 
 fn build_existing_issues_summary(current_iid: u64, all_issues: &[Issue]) -> String {
@@ -1562,7 +2241,7 @@ Proceed with analyzing the issue autonomously.
     Ok(prompt)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingSplit {
     parent_issue_iid: u64,
     parent_issue_title: String,
@@ -1574,31 +2253,31 @@ struct PendingSplit {
 
 // --- Field extractors (typed `PmoOutput` fields only) ---
 
-fn already_done_reason_or_default(reason: Option<String>) -> String {
-    reason
-        .map(|r| r.trim().to_string())
-        .filter(|r| !r.is_empty())
-        .unwrap_or_else(|| {
-            "The work described in this issue is already fully implemented in the codebase."
-                .to_string()
-        })
+fn already_done_reason_or_default(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        "The work described in this issue is already fully implemented in the codebase.".to_string()
+    } else {
+        reason.to_string()
+    }
 }
 
-fn clarification_question_or_default(question: Option<String>) -> String {
-    question
-        .map(|q| q.trim().to_string())
-        .filter(|q| !q.is_empty())
-        .unwrap_or_else(|| {
-            "The PMO agent could not determine how to proceed with this issue. Please provide more details about the expected scope and acceptance criteria.".to_string()
-        })
+fn clarification_question_or_default(question: &str) -> String {
+    let question = question.trim();
+    if question.is_empty() {
+        "The PMO agent could not determine how to proceed with this issue. Please provide more details about the expected scope and acceptance criteria.".to_string()
+    } else {
+        question.to_string()
+    }
 }
 
-fn guidance_or_empty(instructions: Option<String>) -> String {
-    instructions
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .map(|t| cap_guidance_length(&t))
-        .unwrap_or_default()
+fn guidance_or_empty(instructions: &str) -> String {
+    let instructions = instructions.trim();
+    if instructions.is_empty() {
+        String::new()
+    } else {
+        cap_guidance_length(instructions)
+    }
 }
 
 /// Check whether there are new human comments on the issue since the last
@@ -1661,7 +2340,7 @@ fn format_pmo_guidance_comment(guidance: &str) -> String {
 }
 
 fn save_pending_split(path: &str, pending: &PendingSplit) -> Result<()> {
-    crate::core::state::StateStore::new(path)
+    crate::agents::state::StateStore::new(path)
         .save(pending)
         .context("Failed to save pending split file")?;
     info!(
@@ -1674,14 +2353,18 @@ fn save_pending_split(path: &str, pending: &PendingSplit) -> Result<()> {
 }
 
 fn load_pending_split(path: &str) -> Result<Option<PendingSplit>> {
-    crate::core::state::StateStore::new(path)
+    // Strict: unlike the resumable claim state below, a corrupt or
+    // unsupported pending-split checkpoint is quarantined (never losing
+    // bytes) but still surfaced as an error — resuming a split from bad
+    // checkpoint data would risk re-creating or losing sub-issues.
+    crate::agents::state::StateStore::new(path)
         .load()
         .context("Failed to load pending split file")
 }
 
 fn delete_pending_split(path: &str) -> Result<()> {
-    let store: crate::core::state::StateStore<PendingSplit> =
-        crate::core::state::StateStore::new(path);
+    let store: crate::agents::state::StateStore<PendingSplit> =
+        crate::agents::state::StateStore::new(path);
     let existed = store.path().exists();
     store
         .remove()
@@ -1696,31 +2379,30 @@ fn try_resume_pmo_state(
     state: &AgentState,
     gitlab: &GitLabClient,
     scope_label: Option<&str>,
-) -> Option<u64> {
-    // Invalid persisted PMO state has historically been ignored.
-    let persisted: PersistedPmoState = crate::core::state::StateStore::new(state.state_path())
-        .load()
-        .ok()
-        .flatten()?;
+) -> Option<ClaimLease> {
+    // Tolerant: invalid persisted PMO claim state has historically been
+    // ignored, warn and treat as "nothing to resume" rather than failing.
+    let store: crate::agents::state::StateStore<PersistedPmoState> =
+        crate::agents::state::StateStore::new(state.state_path());
+    let persisted = match store.load() {
+        Ok(Some(persisted)) => persisted,
+        Ok(None) => return None,
+        Err(error) => {
+            warn!(
+                "{}: Failed to load persisted PMO state: {:#}",
+                &state.agent_id, error
+            );
+            return None;
+        }
+    };
     let issue_iid = persisted.claimed_issue_iid;
 
-    let claim_label = state.claim_label();
     match gitlab.get_issue(issue_iid) {
         Ok(issue) => {
             if issue.state != "opened" {
                 info!(
                     "{}: Previously claimed issue #{} is {}, discarding state",
                     &state.agent_id, issue_iid, issue.state
-                );
-
-                state.clear_state();
-
-                return None;
-            }
-            if !issue.labels.contains(&claim_label) {
-                info!(
-                    "{}: Claim label missing from issue #{}, discarding state",
-                    &state.agent_id, issue_iid
                 );
 
                 state.clear_state();
@@ -1736,10 +2418,27 @@ fn try_resume_pmo_state(
                 state.clear_state();
                 return None;
             }
+            // Only ever resumed once the claim label has just been
+            // verified live on GitLab above — never from the persisted
+            // state file alone.
+            let Some(lease) = ClaimLease::recover(
+                ClaimResource::Issue(issue_iid),
+                state.agent_id,
+                &issue.labels,
+            ) else {
+                info!(
+                    "{}: Claim label missing from issue #{}, discarding state",
+                    &state.agent_id, issue_iid
+                );
+
+                state.clear_state();
+
+                return None;
+            };
 
             info!("{}: Resumed claim on issue #{}", &state.agent_id, issue_iid);
 
-            Some(issue_iid)
+            Some(lease)
         }
         Err(e) => {
             warn!(
@@ -1754,156 +2453,14 @@ fn try_resume_pmo_state(
     }
 }
 
-fn resume_split(
-    pending_file: &str,
-    gitlab: &GitLabClient,
-    pending: &PendingSplit,
-    scope_label: Option<&str>,
-) -> Result<()> {
-    let mut created_issue_ids = pending.created_issue_ids.clone();
-    let total_sub_issues = pending.sub_issues.len();
-    let already_created = created_issue_ids.len();
-
-    // Create remaining sub-issues
-    for (index, sub_issue) in pending.sub_issues.iter().enumerate() {
-        // Skip already created sub-issues
-        if index < already_created {
-            debug!(
-                "PMO: Skipping already created sub-issue {}/{}",
-                index + 1,
-                total_sub_issues
-            );
-            continue;
-        }
-
-        let sub_issue_title = if sub_issue.title.is_empty() {
-            &pending.parent_issue_title
-        } else {
-            &sub_issue.title
-        };
-
-        let resolved_description = sub_issue.description.clone();
-
-        match gitlab.create_issue(sub_issue_title, &resolved_description) {
-            Ok(sub_issue_iid) => {
-                info!(
-                    "PMO: Created sub-issue #{}: {}",
-                    sub_issue_iid, sub_issue_title
-                );
-
-                let p = sub_issue.priority.unwrap_or(pending.parent_priority);
-                if let Err(e) = gitlab.add_issue_label(sub_issue_iid, &gitlab::priority_label(p)) {
-                    warn!(
-                        "PMO: Failed to set priority label on #{}: {}",
-                        sub_issue_iid, e
-                    );
-                }
-
-                if let Some(lbl) = scope_label
-                    && let Err(e) = gitlab.add_issue_label(sub_issue_iid, lbl)
-                {
-                    warn!(
-                        "PMO: Failed to add scope label {:?} on #{}: {}",
-                        lbl, sub_issue_iid, e
-                    );
-                }
-
-                // If this sub-issue declares a dependency, add a temporary
-                // `do-not-implement` label so the worker skips it immediately.
-                // The label is swapped for the real `waiting-on-issue:#N` label
-                // in the post-loop pass once all IIDs are known. This closes
-                // the race: the issue is blocked from the moment it's created.
-                if sub_issue.depends_on > 0
-                    && let Err(e) = gitlab.add_issue_label(sub_issue_iid, labels::DO_NOT_IMPLEMENT)
-                {
-                    warn!(
-                        "PMO: Failed to add temporary do-not-implement label to sub-issue #{sub_issue_iid}: {e}"
-                    );
-                }
-
-                created_issue_ids.push(sub_issue_iid);
-
-                let updated_pending = PendingSplit {
-                    parent_issue_iid: pending.parent_issue_iid,
-                    parent_issue_title: pending.parent_issue_title.clone(),
-                    parent_priority: pending.parent_priority,
-                    sub_issues: pending.sub_issues.clone(),
-                    created_issue_ids: created_issue_ids.clone(),
-                };
-                save_pending_split(pending_file, &updated_pending)?;
-            }
-            Err(e) => {
-                error!(
-                    "PMO: Failed to create sub-issue {}/{}: {}",
-                    index + 1,
-                    total_sub_issues,
-                    e
-                );
-                return Err(e);
-            }
-        }
-    }
-
-    // Post-loop pass: replace the temporary `do-not-implement` label with the
-    // real `waiting-on-issue:#N` label now that all sub-issue IIDs are known.
-    // Both backward and forward references are handled — the temporary label
-    // blocked the worker throughout the creation loop, so there's no race.
-    for (index, sub_issue) in pending.sub_issues.iter().enumerate() {
-        if sub_issue.depends_on == 0 {
-            continue;
-        }
-        let dep_idx = sub_issue.depends_on - 1;
-        let Some(&dep_iid) = created_issue_ids.get(dep_idx) else {
-            warn!(
-                "PMO: sub-issue {} depends on sub-issue {} but the dependency was not created, leaving do-not-implement label",
-                index + 1,
-                sub_issue.depends_on
-            );
-            continue;
-        };
-        let Some(&dependent_iid) = created_issue_ids.get(index) else {
-            continue;
-        };
-        // Swap: remove the temporary hold, add the real dependency label.
-        let _ = gitlab.remove_issue_label(dependent_iid, labels::DO_NOT_IMPLEMENT);
-        let label = format!("waiting-on-issue:#{dep_iid}");
-        if let Err(e) = gitlab.add_issue_label(dependent_iid, &label) {
-            warn!("PMO: Failed to add dependency label {label} to sub-issue #{dependent_iid}: {e}");
-        } else {
-            info!("PMO: Sub-issue #{dependent_iid} depends on #{dep_iid}, labeled {label}");
-        }
-    }
-
-    // All sub-issues created successfully, add comment to parent issue
-    if !created_issue_ids.is_empty() {
-        let sub_issue_links = created_issue_ids
-            .iter()
-            .map(|iid| format!("- #{}", iid))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        gitlab.add_issue_comment(
-            pending.parent_issue_iid,
-            &format!(
-                "This issue has been split into {} smaller sub-issues by the PMO Agent:\n\n{}\n\n\
-                 Each sub-issue is designed to stay around ~500 lines of non-test code (~1500 total including tests). Auto-generated code is excluded from these limits.",
-                created_issue_ids.len(),
-                sub_issue_links
-            ),
-        )?;
-
-        // Remove action-required and mark as processed
-        gitlab.remove_issue_label(pending.parent_issue_iid, ACTION_REQUIRED_LABEL)?;
-        gitlab.add_issue_label(pending.parent_issue_iid, PMO_PROCESSED_LABEL)?;
-
-        info!(
-            "PMO: Successfully completed split of issue #{} into {} sub-issues",
-            pending.parent_issue_iid,
-            created_issue_ids.len()
-        );
-    }
-
-    Ok(())
+/// Checkpoint resume decision: index `index` of `pending.sub_issues` was
+/// already created in a prior (possibly crashed) run when it is covered by
+/// the persisted `created_issue_ids` prefix. Pure — characterizes the
+/// split's checkpoint-then-create resumability without any GitLab call:
+/// `resume_split` always skips exactly this prefix, in order, and never
+/// re-creates a sub-issue the checkpoint already recorded.
+fn sub_issue_already_created(pending: &PendingSplit, index: usize) -> bool {
+    index < pending.created_issue_ids.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -2200,6 +2757,673 @@ impl CapabilityProvider for GitLabIssueAskHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agent::schema::conformance;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    struct FakePmoPort {
+        trace: RefCell<Vec<String>>,
+        shutdown: RefCell<VecDeque<bool>>,
+        pending: Option<PendingSplit>,
+        issues: Vec<PmoIssueObservation>,
+        plan: PmoOutput,
+        next_iid: Cell<u64>,
+        fail_required: Option<&'static str>,
+        fail_best_effort: Vec<&'static str>,
+    }
+
+    impl FakePmoPort {
+        fn split_plan() -> PmoOutput {
+            PmoOutput::Split {
+                sub_issues: vec![
+                    RawSubIssue {
+                        title: "Foundation".into(),
+                        description: "Build the foundation".into(),
+                        priority: Some(1),
+                        depends_on: 0,
+                    },
+                    RawSubIssue {
+                        title: "Integration".into(),
+                        description: "Integrate the foundation".into(),
+                        priority: None,
+                        depends_on: 1,
+                    },
+                ],
+            }
+        }
+
+        fn issue(iid: u64) -> PmoIssueObservation {
+            PmoIssueObservation {
+                iid,
+                title: "Broad parent".into(),
+                description: "Split this work".into(),
+                labels: vec![
+                    ACTION_REQUIRED_LABEL.into(),
+                    "priority::2".into(),
+                    "scope::test".into(),
+                ],
+                state: "opened".into(),
+                created_at: None,
+                updated_at: None,
+            }
+        }
+
+        fn successful() -> Self {
+            Self {
+                trace: RefCell::new(Vec::new()),
+                shutdown: RefCell::new(VecDeque::new()),
+                pending: None,
+                issues: vec![Self::issue(10)],
+                plan: Self::split_plan(),
+                next_iid: Cell::new(101),
+                fail_required: None,
+                fail_best_effort: Vec::new(),
+            }
+        }
+
+        fn record(&self, event: impl Into<String>) {
+            self.trace.borrow_mut().push(event.into());
+        }
+
+        fn action_name(action: &PmoAction) -> &'static str {
+            match action {
+                PmoAction::FetchRepository => "fetch",
+                PmoAction::CheckoutDefaultBranch { .. } => "checkout",
+                PmoAction::ResetWorktree => "reset",
+                PmoAction::AcquireClaim { .. } => "claim",
+                PmoAction::ReleaseClaim => "release",
+                PmoAction::SaveClaimState { .. } => "save_claim",
+                PmoAction::ClearClaimState => "clear_claim",
+                PmoAction::PrepareIssueContext { .. } => "context",
+                PmoAction::InvokePlan { .. } => "model",
+                PmoAction::UpdateIssueDescription { .. } => "description",
+                PmoAction::AddIssueComment { .. } => "comment",
+                PmoAction::AddIssueLabel { .. } => "add_label",
+                PmoAction::RemoveIssueLabel { .. } => "remove_label",
+                PmoAction::CloseIssue { .. } => "close",
+                PmoAction::SaveSplitCheckpoint(_) => "checkpoint",
+                PmoAction::DeleteSplitCheckpoint => "delete_checkpoint",
+                PmoAction::CreateChild { .. } => "create",
+            }
+        }
+
+        fn event(action: &PmoAction) -> String {
+            match action {
+                PmoAction::FetchRepository => "act:fetch".into(),
+                PmoAction::CheckoutDefaultBranch { branch } => {
+                    format!("act:checkout:{branch}")
+                }
+                PmoAction::ResetWorktree => "act:reset".into(),
+                PmoAction::AcquireClaim { issue_iid } => format!("act:claim:{issue_iid}"),
+                PmoAction::ReleaseClaim => "act:release".into(),
+                PmoAction::SaveClaimState { issue_iid } => {
+                    format!("act:save_claim:{issue_iid}")
+                }
+                PmoAction::ClearClaimState => "act:clear_claim".into(),
+                PmoAction::PrepareIssueContext { issue, .. } => {
+                    format!("act:context:{}", issue.iid)
+                }
+                PmoAction::InvokePlan { issue, .. } => format!("act:model:{}", issue.iid),
+                PmoAction::UpdateIssueDescription { issue_iid, .. } => {
+                    format!("act:description:{issue_iid}")
+                }
+                PmoAction::AddIssueComment { issue_iid, body } => {
+                    if body.starts_with("This issue has been split") {
+                        format!("act:parent_comment:{issue_iid}")
+                    } else if body.starts_with("This sub-issue depends") {
+                        format!("act:dependency_comment:{issue_iid}")
+                    } else {
+                        format!("act:comment:{issue_iid}")
+                    }
+                }
+                PmoAction::AddIssueLabel { issue_iid, label } => {
+                    format!("act:add:{issue_iid}:{label}")
+                }
+                PmoAction::RemoveIssueLabel { issue_iid, label } => {
+                    format!("act:remove:{issue_iid}:{label}")
+                }
+                PmoAction::CloseIssue { issue_iid } => format!("act:close:{issue_iid}"),
+                PmoAction::SaveSplitCheckpoint(checkpoint) => {
+                    format!("act:checkpoint:{:?}", checkpoint.created_issue_ids)
+                }
+                PmoAction::DeleteSplitCheckpoint => "act:delete_checkpoint".into(),
+                PmoAction::CreateChild { title, .. } => format!("act:create:{title}"),
+            }
+        }
+    }
+
+    impl PmoPort for FakePmoPort {
+        fn default_branch(&self) -> Result<String> {
+            self.record("observe:default_branch");
+            Ok("main".into())
+        }
+
+        fn shutdown_requested(&self) -> bool {
+            self.record("observe:shutdown");
+            self.shutdown.borrow_mut().pop_front().unwrap_or(false)
+        }
+
+        fn pending_split(&self) -> Result<Option<PendingSplit>> {
+            self.record("observe:pending");
+            Ok(self.pending.clone())
+        }
+
+        fn issue(&self, issue_iid: u64) -> Option<PmoIssueObservation> {
+            self.record(format!("observe:issue:{issue_iid}"));
+            self.issues
+                .iter()
+                .find(|issue| issue.iid == issue_iid)
+                .cloned()
+        }
+
+        fn issues(&self) -> Result<Vec<PmoIssueObservation>> {
+            self.record("observe:issues");
+            Ok(self.issues.clone())
+        }
+
+        fn new_human_comments(&self, issue_iid: u64) -> bool {
+            self.record(format!("observe:comments:{issue_iid}"));
+            true
+        }
+
+        fn current_epoch(&self) -> u64 {
+            self.record("observe:epoch");
+            1_800_000_000
+        }
+
+        fn execute(&mut self, action: &PmoAction) -> PmoOutcome {
+            self.record(Self::event(action));
+            let name = Self::action_name(action);
+            let child_label_failure = self.fail_best_effort.contains(&"child_label")
+                && matches!(
+                    action,
+                    PmoAction::AddIssueLabel { issue_iid, .. }
+                        | PmoAction::RemoveIssueLabel { issue_iid, .. }
+                        if *issue_iid != 10
+                );
+            if self.fail_required == Some(name)
+                || self.fail_best_effort.contains(&name)
+                || child_label_failure
+            {
+                return PmoOutcome::Failed(anyhow::anyhow!("injected {name} failure"));
+            }
+            match action {
+                PmoAction::AcquireClaim { .. } => PmoOutcome::Claim(PmoClaimOutcome::Won),
+                PmoAction::PrepareIssueContext { .. } => {
+                    PmoOutcome::ContextPrepared("/sessions/pmo-issue.md".into())
+                }
+                PmoAction::InvokePlan { .. } => PmoOutcome::Planned(self.plan.clone()),
+                PmoAction::CreateChild { .. } => {
+                    let iid = self.next_iid.get();
+                    self.next_iid.set(iid + 1);
+                    PmoOutcome::IssueCreated(iid)
+                }
+                _ => PmoOutcome::Done,
+            }
+        }
+    }
+
+    fn run_fake(port: &mut FakePmoPort, held_issue_iid: Option<u64>) -> Result<()> {
+        let mut machine = PmoMachine::new("pmo-0", Some("scope::test"), held_issue_iid);
+        drive_pmo(&mut machine, port)
+    }
+
+    #[test]
+    fn pmo_machine_records_full_split_order_and_generated_iids() {
+        let mut port = FakePmoPort::successful();
+        run_fake(&mut port, None).unwrap();
+        assert_eq!(
+            *port.trace.borrow(),
+            vec![
+                "observe:default_branch",
+                "act:fetch",
+                "act:checkout:main",
+                "observe:pending",
+                "observe:issues",
+                "observe:shutdown",
+                "observe:shutdown",
+                "act:claim:10",
+                "observe:shutdown",
+                "act:save_claim:10",
+                "act:context:10",
+                "act:model:10",
+                "act:checkpoint:[]",
+                "act:create:Foundation",
+                "act:add:101:priority::1",
+                "act:add:101:scope::test",
+                "act:checkpoint:[101]",
+                "act:create:Integration",
+                "act:add:102:priority::2",
+                "act:add:102:scope::test",
+                "act:add:102:do-not-implement",
+                "act:checkpoint:[101, 102]",
+                "act:remove:102:do-not-implement",
+                "act:add:102:waiting-on-issue:#101",
+                "act:dependency_comment:102",
+                "act:parent_comment:10",
+                "act:remove:10:action-required",
+                "act:add:10:pmo-processed",
+                "act:delete_checkpoint",
+                "act:close:10",
+                "act:release",
+                "act:clear_claim",
+                "observe:shutdown",
+                "observe:shutdown",
+                "observe:epoch",
+            ]
+        );
+    }
+
+    #[test]
+    fn pmo_machine_resumes_from_generated_iid_checkpoint_without_recreating_prefix() {
+        let mut port = FakePmoPort::successful();
+        let mut pending = match FakePmoPort::split_plan() {
+            PmoOutput::Split { sub_issues } => PendingSplit {
+                parent_issue_iid: 10,
+                parent_issue_title: "Broad parent".into(),
+                parent_priority: 2,
+                sub_issues: normalize_sub_issues(sub_issues),
+                created_issue_ids: vec![501],
+            },
+            _ => unreachable!(),
+        };
+        pending.sub_issues[1].depends_on = 1;
+        port.pending = Some(pending);
+        port.next_iid.set(502);
+
+        run_fake(&mut port, Some(10)).unwrap();
+        let trace = port.trace.borrow();
+        assert!(!trace.iter().any(|event| event == "act:create:Foundation"));
+        assert!(trace.iter().any(|event| event == "act:create:Integration"));
+        assert!(
+            trace
+                .iter()
+                .any(|event| event == "act:add:502:waiting-on-issue:#501")
+        );
+        assert_eq!(trace.last().map(String::as_str), Some("act:clear_claim"));
+    }
+
+    #[test]
+    fn pmo_machine_aborts_required_split_failures_but_continues_best_effort_labels() {
+        let mut required = FakePmoPort::successful();
+        required.fail_required = Some("checkpoint");
+        assert!(run_fake(&mut required, None).is_err());
+
+        let mut best_effort = FakePmoPort::successful();
+        best_effort.fail_best_effort = vec!["child_label"];
+        run_fake(&mut best_effort, None).unwrap();
+        assert!(
+            best_effort
+                .trace
+                .borrow()
+                .contains(&"act:delete_checkpoint".to_string())
+        );
+    }
+
+    #[test]
+    fn pmo_machine_honors_shutdown_before_claim_and_after_claim() {
+        let mut before = FakePmoPort::successful();
+        before.shutdown.borrow_mut().push_back(true);
+        run_fake(&mut before, None).unwrap();
+        assert!(
+            !before
+                .trace
+                .borrow()
+                .iter()
+                .any(|event| event.starts_with("act:claim"))
+        );
+
+        let mut after = FakePmoPort::successful();
+        after.shutdown.borrow_mut().extend([false, false, true]);
+        run_fake(&mut after, None).unwrap();
+        assert!(after.trace.borrow().contains(&"act:release".to_string()));
+        assert!(!after.trace.borrow().contains(&"act:model:10".to_string()));
+    }
+
+    // -----------------------------------------------------------------
+    // Split checkpoint/create/label/finalize ordering (`resume_split`).
+    // -----------------------------------------------------------------
+
+    fn sample_pending(created_issue_ids: Vec<u64>) -> PendingSplit {
+        PendingSplit {
+            parent_issue_iid: 100,
+            parent_issue_title: "Parent issue".to_string(),
+            parent_priority: 2,
+            sub_issues: vec![
+                PmoSubIssue {
+                    title: "Sub A".to_string(),
+                    description: "desc A".to_string(),
+                    priority: None,
+                    depends_on: 0,
+                },
+                PmoSubIssue {
+                    title: "Sub B".to_string(),
+                    description: "desc B".to_string(),
+                    priority: None,
+                    depends_on: 0,
+                },
+                PmoSubIssue {
+                    title: "Sub C".to_string(),
+                    description: "desc C".to_string(),
+                    priority: None,
+                    depends_on: 0,
+                },
+            ],
+            created_issue_ids,
+        }
+    }
+
+    #[test]
+    fn sub_issue_already_created_covers_exactly_the_checkpointed_prefix() {
+        let pending = sample_pending(vec![201, 202]);
+        assert!(sub_issue_already_created(&pending, 0));
+        assert!(sub_issue_already_created(&pending, 1));
+        assert!(!sub_issue_already_created(&pending, 2));
+    }
+
+    #[test]
+    fn sub_issue_already_created_recreates_nothing_from_a_fresh_split() {
+        let pending = sample_pending(vec![]);
+        assert!(!sub_issue_already_created(&pending, 0));
+        assert!(!sub_issue_already_created(&pending, 1));
+        assert!(!sub_issue_already_created(&pending, 2));
+    }
+
+    #[test]
+    fn sub_issue_already_created_treats_a_fully_completed_checkpoint_as_done() {
+        let pending = sample_pending(vec![201, 202, 203]);
+        for index in 0..pending.sub_issues.len() {
+            assert!(sub_issue_already_created(&pending, index));
+        }
+    }
+
+    // Checkpoint persistence round trip: real temp files, no GitLab call.
+    // `resume_split` relies on this surviving a crash between sub-issue
+    // creations — the checkpoint records exactly the `created_issue_ids`
+    // prefix so a restart resumes instead of re-creating issues.
+
+    fn pending_split_test_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "potlatch-pmo-pending-split-{name}-{}",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn load_pending_split_returns_none_when_no_checkpoint_exists() {
+        let path = pending_split_test_path("missing");
+        assert!(load_pending_split(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_split_checkpoint_round_trips_through_save_and_load() {
+        let path = pending_split_test_path("roundtrip");
+        let pending = sample_pending(vec![201]);
+
+        save_pending_split(&path, &pending).unwrap();
+        let loaded = load_pending_split(&path).unwrap().unwrap();
+        assert_eq!(loaded.parent_issue_iid, pending.parent_issue_iid);
+        assert_eq!(loaded.created_issue_ids, pending.created_issue_ids);
+        assert_eq!(loaded.sub_issues, pending.sub_issues);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pending_split_checkpoint_is_updated_incrementally_as_issues_are_created() {
+        let path = pending_split_test_path("incremental");
+        let mut pending = sample_pending(vec![]);
+        save_pending_split(&path, &pending).unwrap();
+
+        // Simulate the per-created-issue checkpoint write inside the
+        // `resume_split` loop: each successful `create_issue` immediately
+        // persists the updated `created_issue_ids` prefix before moving on.
+        pending.created_issue_ids.push(301);
+        save_pending_split(&path, &pending).unwrap();
+        assert_eq!(
+            load_pending_split(&path)
+                .unwrap()
+                .unwrap()
+                .created_issue_ids,
+            vec![301]
+        );
+
+        pending.created_issue_ids.push(302);
+        save_pending_split(&path, &pending).unwrap();
+        assert_eq!(
+            load_pending_split(&path)
+                .unwrap()
+                .unwrap()
+                .created_issue_ids,
+            vec![301, 302]
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_pending_split_finalizes_by_removing_the_checkpoint() {
+        let path = pending_split_test_path("finalize");
+        let pending = sample_pending(vec![301, 302, 303]);
+        save_pending_split(&path, &pending).unwrap();
+        assert!(load_pending_split(&path).unwrap().is_some());
+
+        delete_pending_split(&path).unwrap();
+        assert!(load_pending_split(&path).unwrap().is_none());
+        // Deleting an already-absent checkpoint is idempotent.
+        delete_pending_split(&path).unwrap();
+    }
+
+    #[test]
+    fn pending_split_checkpoint_round_trips_through_the_v1_envelope() {
+        let path = pending_split_test_path("v1-envelope");
+        let pending = sample_pending(vec![201]);
+        save_pending_split(&path, &pending).unwrap();
+
+        let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 1);
+        assert_eq!(on_disk["state"]["parent_issue_iid"], 100);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_pending_split_reads_the_legacy_unversioned_format_and_migrates_it() {
+        let path = pending_split_test_path("legacy");
+        let pending = sample_pending(vec![301]);
+        // The bare pre-envelope payload written by older builds.
+        fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+
+        let loaded = load_pending_split(&path).unwrap().unwrap();
+        assert_eq!(loaded.parent_issue_iid, pending.parent_issue_iid);
+        assert_eq!(loaded.created_issue_ids, pending.created_issue_ids);
+
+        let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 1);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A dedicated, per-test directory for the quarantine tests below (unlike
+    /// `pending_split_test_path`, which places its file directly in the
+    /// shared system temp dir — fine for name-based lookups, but not safe
+    /// to `read_dir` and scan for stray quarantine files from other tests).
+    fn pending_split_quarantine_test_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "potlatch-pmo-pending-split-quarantine-{name}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn load_pending_split_is_strict_and_quarantines_malformed_json() {
+        let dir = pending_split_quarantine_test_dir("corrupt");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json").to_string_lossy().into_owned();
+        fs::write(&path, b"not valid json").unwrap();
+
+        let error = load_pending_split(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to load pending split file")
+        );
+
+        // Strict: quarantined (bytes preserved) rather than silently reset —
+        // resuming from bad checkpoint data risks re-creating sub-issues.
+        assert!(!path::Path::new(&path).exists());
+        let quarantined: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("quarantined"))
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read(quarantined[0].path()).unwrap(), b"not valid json");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_pending_split_is_strict_and_quarantines_an_unsupported_version() {
+        let dir = pending_split_quarantine_test_dir("unsupported-version");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json").to_string_lossy().into_owned();
+        fs::write(&path, br#"{"version":3,"state":{}}"#).unwrap();
+
+        let error = load_pending_split(&path).unwrap_err();
+        assert!(error.chain().any(|e| {
+            e.to_string()
+                .contains("Unsupported state envelope version 3")
+        }));
+        assert!(!path::Path::new(&path).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // PMO claim state persistence (`save_state`/`clear_state`/
+    // `try_resume_pmo_state`): tolerant policy. Invalid persisted state
+    // has historically been ignored (warn + treat as "nothing to
+    // resume") rather than failing PMO startup. `GitLabClient::for_test`
+    // is a network-free constructor, and every case below returns before
+    // `try_resume_pmo_state` would ever reach a real GitLab call.
+    // -----------------------------------------------------------------
+
+    fn pmo_test_agent_state<'a>(sessions_dir: &'a str, agent_id: &'a str) -> AgentState<'a> {
+        AgentState {
+            sessions_dir,
+            agent_id,
+            project_name: "test-project",
+        }
+    }
+
+    fn pmo_state_test_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "potlatch-pmo-claim-state-{name}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn pmo_claim_state_round_trips_through_save_state_and_the_v1_envelope() {
+        let dir = pmo_state_test_dir("roundtrip");
+        fs::create_dir_all(&dir).unwrap();
+        let sessions_dir = dir.to_string_lossy().into_owned();
+        let state = pmo_test_agent_state(&sessions_dir, "pmo-0");
+
+        state.save_state(55);
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.state_path()).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 1);
+        assert_eq!(on_disk["state"]["claimed_issue_iid"], 55);
+
+        state.clear_state();
+        assert!(!state.state_path().exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pmo_claim_state_reads_the_legacy_unversioned_format_and_migrates_it() {
+        let dir = pmo_state_test_dir("legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let sessions_dir = dir.to_string_lossy().into_owned();
+        let state = pmo_test_agent_state(&sessions_dir, "pmo-1");
+        let path = state.state_path();
+
+        // The bare pre-envelope payload written by older builds.
+        fs::write(
+            &path,
+            serde_json::to_vec(&PersistedPmoState {
+                claimed_issue_iid: 77,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store: crate::agents::state::StateStore<PersistedPmoState> =
+            crate::agents::state::StateStore::new(&path);
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.claimed_issue_iid, 77);
+
+        let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_resume_pmo_state_tolerates_a_missing_state_file() {
+        let dir = pmo_state_test_dir("missing");
+        let sessions_dir = dir.to_string_lossy().into_owned();
+        let state = pmo_test_agent_state(&sessions_dir, "pmo-2");
+        let gitlab = GitLabClient::for_test("/tmp/unused-repo");
+
+        assert!(try_resume_pmo_state(&state, &gitlab, None).is_none());
+    }
+
+    #[test]
+    fn try_resume_pmo_state_tolerates_corrupt_state_by_warning_and_returning_none() {
+        let dir = pmo_state_test_dir("corrupt");
+        fs::create_dir_all(&dir).unwrap();
+        let sessions_dir = dir.to_string_lossy().into_owned();
+        let state = pmo_test_agent_state(&sessions_dir, "pmo-3");
+        fs::write(state.state_path(), b"not valid json").unwrap();
+        let gitlab = GitLabClient::for_test("/tmp/unused-repo");
+
+        assert!(try_resume_pmo_state(&state, &gitlab, None).is_none());
+
+        // Quarantined beside the original rather than deleted outright.
+        assert!(!state.state_path().exists());
+        let quarantined: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("quarantined"))
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_resume_pmo_state_tolerates_an_unsupported_envelope_version() {
+        let dir = pmo_state_test_dir("unsupported-version");
+        fs::create_dir_all(&dir).unwrap();
+        let sessions_dir = dir.to_string_lossy().into_owned();
+        let state = pmo_test_agent_state(&sessions_dir, "pmo-4");
+        fs::write(state.state_path(), br#"{"version":4,"state":{}}"#).unwrap();
+        let gitlab = GitLabClient::for_test("/tmp/unused-repo");
+
+        assert!(try_resume_pmo_state(&state, &gitlab, None).is_none());
+        assert!(!state.state_path().exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn existing_issues_summary_puts_newest_first_within_priority() {
@@ -2234,9 +3458,9 @@ mod tests {
     #[test]
     fn build_split_prompt_documents_plan_tool_only() {
         let state = AgentState {
-            sessions_dir: "/tmp".into(),
-            agent_id: "pmo-test".into(),
-            project_name: "test-proj".into(),
+            sessions_dir: "/tmp",
+            agent_id: "pmo-test",
+            project_name: "test-proj",
         };
         let issue = Issue {
             iid: 42,
@@ -2268,15 +3492,19 @@ mod tests {
     }
 
     #[test]
+    fn pmo_contract_passes_the_shared_conformance_suite() {
+        conformance::assert_contract::<PmoOutput>();
+    }
+
+    #[test]
     fn pmo_output_deserializes_split_with_sub_issues() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+        let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
             "decision": "split",
             "sub_issues": [
                 {"title": "First", "description": "Do the first thing", "priority": 1},
                 {"title": "Second", "description": "Do the second thing", "priority": 2, "depends_on": 1}
             ]
-        }))
-        .unwrap();
+        }));
         let PmoOutput::Split { sub_issues } = output else {
             panic!("expected Split");
         };
@@ -2317,146 +3545,178 @@ mod tests {
 
     #[test]
     fn pmo_output_deserializes_guide_worker_instructions() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
-            "decision": "guide_worker",
-            "instructions": "Use flag --foo instead of --bar."
-        }))
-        .unwrap();
-        match output {
-            PmoOutput::GuideWorker { instructions } => {
-                assert_eq!(
-                    instructions.as_deref(),
-                    Some("Use flag --foo instead of --bar.")
-                );
+        assert_eq!(
+            conformance::assert_accepts::<PmoOutput>(serde_json::json!({
+                "decision": "guide_worker",
+                "instructions": "Use flag --foo instead of --bar."
+            })),
+            PmoOutput::GuideWorker {
+                instructions: "Use flag --foo instead of --bar.".into()
             }
-            other => panic!("expected GuideWorker, got {other:?}"),
-        }
+        );
     }
 
     #[test]
     fn pmo_output_decision_is_case_insensitive() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
-            "decision": "GUIDE_WORKER",
+        let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
+            "decision": " GUIDE_WORKER ",
             "instructions": "Proceed."
-        }))
-        .unwrap();
+        }));
         assert!(matches!(output, PmoOutput::GuideWorker { .. }));
     }
 
     #[test]
     fn pmo_output_deserializes_already_done_reason() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
-            "decision": "already_done",
-            "reason": "The feature exists in src/lib.rs."
-        }))
-        .unwrap();
-        match output {
-            PmoOutput::AlreadyDone { reason } => {
-                assert!(reason.unwrap().contains("src/lib.rs"));
+        assert_eq!(
+            conformance::assert_accepts::<PmoOutput>(serde_json::json!({
+                "decision": "already_done",
+                "reason": "The feature exists in src/lib.rs."
+            })),
+            PmoOutput::AlreadyDone {
+                reason: "The feature exists in src/lib.rs.".into()
             }
-            other => panic!("expected AlreadyDone, got {other:?}"),
-        }
+        );
     }
 
     #[test]
     fn pmo_output_deserializes_needs_clarification_question() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
-            "decision": "needs_clarification",
-            "question": "Which modules should be covered?"
-        }))
-        .unwrap();
-        match output {
-            PmoOutput::NeedsClarification { question, .. } => {
-                assert!(question.unwrap().contains("modules"));
+        assert_eq!(
+            conformance::assert_accepts::<PmoOutput>(serde_json::json!({
+                "decision": "needs_clarification",
+                "question": "Which modules should be covered?"
+            })),
+            PmoOutput::NeedsClarification {
+                question: "Which modules should be covered?".into(),
+                plan_text: None
             }
-            other => panic!("expected NeedsClarification, got {other:?}"),
-        }
+        );
     }
 
     #[test]
     fn pmo_output_deserializes_wait_for_dependency_iid() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
-            "decision": "wait_for_dependency",
-            "dependency_issue_iid": 47
-        }))
-        .unwrap();
-        match output {
+        assert_eq!(
+            conformance::assert_accepts::<PmoOutput>(serde_json::json!({
+                "decision": "wait_for_dependency",
+                "dependency_issue_iid": 47
+            })),
             PmoOutput::WaitForDependency {
-                dependency_issue_iid,
-            } => {
-                assert_eq!(dependency_issue_iid, Some(47));
+                dependency_issue_iid: 47
             }
-            other => panic!("expected WaitForDependency, got {other:?}"),
-        }
+        );
     }
 
     #[test]
-    fn pmo_output_ignores_zero_dependency_issue_iid() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+    fn pmo_output_rejects_zero_dependency_issue_iid() {
+        let error = conformance::assert_rejects::<PmoOutput>(serde_json::json!({
             "decision": "wait_for_dependency",
             "dependency_issue_iid": 0
-        }))
-        .unwrap();
-        match output {
-            PmoOutput::WaitForDependency {
-                dependency_issue_iid,
-            } => {
-                assert_eq!(dependency_issue_iid, None);
-            }
-            other => panic!("expected WaitForDependency, got {other:?}"),
-        }
+        }));
+        assert_eq!(
+            error,
+            "$.dependency_issue_iid: required property is missing"
+        );
     }
 
     #[test]
     fn pmo_output_accepts_string_dependency_issue_iid() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
-            "decision": "wait_for_dependency",
-            "dependency_issue_iid": "#727"
-        }))
-        .unwrap();
-        match output {
+        assert_eq!(
+            conformance::assert_accepts::<PmoOutput>(serde_json::json!({
+                "decision": "wait_for_dependency",
+                "dependency_issue_iid": "#727"
+            })),
             PmoOutput::WaitForDependency {
-                dependency_issue_iid,
-            } => {
-                assert_eq!(dependency_issue_iid, Some(727));
+                dependency_issue_iid: 727
             }
-            other => panic!("expected WaitForDependency, got {other:?}"),
-        }
+        );
     }
 
     #[test]
     fn pmo_output_accepts_alternative_dependency_field_names() {
-        for key in [
-            "dependency_iid",
-            "depends_on_issue",
-            "blocked_by",
-            "dependency",
-        ] {
-            let output: PmoOutput = serde_json::from_value(serde_json::json!({
-                "decision": "wait_for_dependency",
-                key: 727
-            }))
-            .unwrap();
-            match output {
+        for key in DEPENDENCY_IID_ALIASES {
+            let mut captured = serde_json::json!({"decision": "wait_for_dependency"});
+            captured[*key] = serde_json::json!(727);
+            assert_eq!(
+                conformance::assert_accepts::<PmoOutput>(captured),
                 PmoOutput::WaitForDependency {
-                    dependency_issue_iid,
-                } => {
-                    assert_eq!(
-                        dependency_issue_iid,
-                        Some(727),
-                        "failed for alternative field name `{key}`"
-                    );
-                }
-                other => panic!("expected WaitForDependency, got {other:?}"),
-            }
+                    dependency_issue_iid: 727
+                },
+                "failed for alternative field name `{key}`"
+            );
         }
     }
 
     #[test]
     fn pmo_output_rejects_unknown_decision() {
-        let err = serde_json::from_value::<PmoOutput>(serde_json::json!({"decision": "bogus"}))
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown variant"));
+        let error = conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+            "decision": "bogus"
+        }));
+        assert!(error.starts_with("$.decision: expected one of"), "{error}");
+    }
+
+    #[test]
+    fn pmo_output_requires_each_decision_branch_field() {
+        assert_eq!(
+            conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+                "decision": "guide_worker"
+            })),
+            "$.instructions: required property is missing"
+        );
+        assert_eq!(
+            conformance::assert_rejects::<PmoOutput>(serde_json::json!({"decision": "split"})),
+            "$.sub_issues: required property is missing"
+        );
+        assert_eq!(
+            conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+                "decision": "already_done"
+            })),
+            "$.reason: required property is missing"
+        );
+        assert_eq!(
+            conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+                "decision": "needs_clarification"
+            })),
+            "$.question: required property is missing"
+        );
+    }
+
+    #[test]
+    fn pmo_output_rejects_fields_from_another_decision() {
+        let error = conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+            "decision": "already_done",
+            "reason": "done",
+            "sub_issues": []
+        }));
+        assert!(
+            error.starts_with("$.sub_issues: unexpected property"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pmo_output_reports_the_offending_sub_issue_by_index() {
+        let error = conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+            "decision": "split",
+            "sub_issues": [
+                {"title": "First", "description": "one"},
+                {"title": "Second"}
+            ]
+        }));
+        assert_eq!(
+            error,
+            "$.sub_issues[1].description: required property is missing"
+        );
+    }
+
+    #[test]
+    fn pmo_output_drops_an_out_of_range_sub_issue_priority() {
+        let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
+            "decision": "split",
+            "sub_issues": [{"title": "First", "description": "one", "priority": 9}]
+        }));
+        let PmoOutput::Split { sub_issues } = output else {
+            panic!("expected Split");
+        };
+        assert_eq!(sub_issues[0].priority, None);
     }
 
     #[test]
@@ -2538,20 +3798,20 @@ mod tests {
     #[test]
     fn guidance_or_empty_returns_instructions() {
         assert_eq!(
-            guidance_or_empty(Some("Use the existing config loader.".into())),
+            guidance_or_empty("Use the existing config loader."),
             "Use the existing config loader."
         );
     }
 
     #[test]
-    fn guidance_or_empty_returns_empty_when_no_instructions() {
-        assert!(guidance_or_empty(None).is_empty());
+    fn guidance_or_empty_returns_empty_when_instructions_are_blank() {
+        assert!(guidance_or_empty("   ").is_empty());
     }
 
     #[test]
     fn guidance_or_empty_truncates_long_instructions() {
         let long = "Do this. ".repeat(80);
-        let extracted = guidance_or_empty(Some(long));
+        let extracted = guidance_or_empty(&long);
         assert!(extracted.len() <= 502);
         assert!(extracted.starts_with("Do this."));
     }
@@ -2582,37 +3842,34 @@ mod tests {
 
     #[test]
     fn already_done_reason_or_default_uses_field() {
-        assert!(
-            already_done_reason_or_default(Some("Implemented in module X.".into()))
-                .contains("module X")
-        );
+        assert!(already_done_reason_or_default("Implemented in module X.").contains("module X"));
     }
 
     #[test]
-    fn already_done_reason_or_default_falls_back_when_absent() {
-        assert!(!already_done_reason_or_default(None).is_empty());
+    fn already_done_reason_or_default_falls_back_when_blank() {
+        assert!(!already_done_reason_or_default("  ").is_empty());
     }
 
     #[test]
     fn clarification_question_or_default_uses_field() {
         assert_eq!(
-            clarification_question_or_default(Some("Which modules?".into())),
+            clarification_question_or_default("Which modules?"),
             "Which modules?"
         );
     }
 
     #[test]
-    fn clarification_question_or_default_falls_back_when_absent() {
-        assert!(!clarification_question_or_default(None).is_empty());
+    fn clarification_question_or_default_falls_back_when_blank() {
+        assert!(!clarification_question_or_default("").is_empty());
     }
 
     #[test]
     fn pmo_output_deserializes_needs_clarification_plan_text() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+        let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
             "decision": "needs_clarification",
+            "question": "Which config?",
             "plan_text": "## Plan Draft\n\n1. Implement X\n2. Test X\n\nOpen question: which config?"
-        }))
-        .unwrap();
+        }));
         match output {
             PmoOutput::NeedsClarification { plan_text, .. } => {
                 let plan = plan_text.unwrap();
@@ -2625,10 +3882,10 @@ mod tests {
 
     #[test]
     fn pmo_output_needs_clarification_plan_text_absent_when_not_provided() {
-        let output: PmoOutput = serde_json::from_value(serde_json::json!({
-            "decision": "needs_clarification"
-        }))
-        .unwrap();
+        let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
+            "decision": "needs_clarification",
+            "question": "Which config?"
+        }));
         match output {
             PmoOutput::NeedsClarification { plan_text, .. } => {
                 assert!(plan_text.is_none());

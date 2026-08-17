@@ -2,27 +2,29 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::AgentHandoff;
-use super::schema::{StructuredOutput, StructuredOutputTool};
+use super::schema::{OutputError, StructuredOutput};
 use crate::core::activity::SharedActivityReporter;
-use crate::core::model::engine::{
-    ModelEngine, ModelSessionOptions, spawn_model_engine, structured_output_tools_wire_json,
-};
+use crate::core::model::engine::{ModelEngine, ModelSessionOptions, spawn_model_engine};
 use crate::core::workflow::AgentSpawnContext;
 
-use super::{InvokeOptions, ModelResponse};
+use super::InvokeOptions;
+
+/// How many times a role's structured output may be repaired inside the task's
+/// own session before the task fails. Each repair is one extra prompt asking
+/// the model to fix its tool call — the task itself is never restated and the
+/// session is never rotated.
+const MAX_STRUCTURED_OUTPUT_REPAIRS: u32 = 3;
 
 /// Model preferences selected by callers without exposing engine construction.
+/// Structured-output contracts are *not* here: they belong to a single
+/// completion, not to the connection, and are passed to
+/// [`AgentModel::complete_typed`].
 #[derive(Debug, Clone, Default)]
 pub struct ModelPreferences {
     pub preferred_session_mode: Option<&'static str>,
-    /// Caller-defined structured-output tool contracts, backend-agnostic.
-    /// Converted to the model backend's wire format (e.g. ACP/harness
-    /// `structured_output_tools` JSON) at connect time — see
-    /// [`crate::core::model::engine::structured_output_tools_wire_json`].
-    pub structured_output_tools: Option<Vec<StructuredOutputTool>>,
 }
 
 /// Result of a typed structured-output completion: the backend-neutral
@@ -65,10 +67,6 @@ impl AgentModel {
             Arc::clone(&shutdown),
             ModelSessionOptions {
                 preferred_session_mode: prefs.preferred_session_mode,
-                structured_output_tools: prefs
-                    .structured_output_tools
-                    .as_deref()
-                    .map(structured_output_tools_wire_json),
             },
         )?;
         Ok(Self {
@@ -87,38 +85,39 @@ impl AgentModel {
         &self.shutdown
     }
 
-    pub fn invoke(&self, prompt: &str, options: &InvokeOptions) -> Result<ModelResponse> {
-        let activity_label = options
-            .activity_label
-            .clone()
-            .unwrap_or_else(|| self.agent_id.clone());
-        let _activity = self.activity.start(activity_label);
-        self.engine.invoke(prompt, options)
-    }
-
-    /// Run a prompt and return the model handoff (primary API for agent cycle logic).
-    pub fn complete(&self, prompt: &str, options: &InvokeOptions) -> Result<AgentHandoff> {
-        self.invoke(prompt, options).map(|r| r.handoff)
-    }
-
     /// Run a prompt and deserialize the role's required structured-output
-    /// tool call into `T`. This is the primary typed completion API — role
-    /// cycle logic should prefer this over reading `structured_outputs` JSON
-    /// by hand.
+    /// tool call into `T`. This is the only typed completion API — role cycle
+    /// logic never reads `structured_outputs` JSON by hand.
     ///
-    /// Returns a clear error when: the model never called the `T::tool_name()`
-    /// tool (missing tool output), the captured JSON has the wrong shape or
-    /// types, an enum field has an unrecognized value, or a required field is
-    /// missing. Retry behavior for a model that fails to call the tool lives
-    /// at the ACP runtime boundary (nudge-and-retry within the same session)
-    /// and is unaffected by this method.
+    /// The contract for `T` is registered with the ACP session created for
+    /// *this* task, so a role can ask for a different shape on every call.
+    /// When the model's answer does not satisfy that contract — it never
+    /// called the tool, called a different one, broke the schema, or produced
+    /// something the Rust type rejects — the model is asked to correct itself
+    /// inside the same session, up to [`MAX_STRUCTURED_OUTPUT_REPAIRS`] times,
+    /// and the task is never restated. Transport-level retries (the ACP child
+    /// dying mid-prompt) are handled below this layer and are not counted as
+    /// repairs.
     pub fn complete_typed<T: StructuredOutput>(
         &self,
         prompt: &str,
         options: &InvokeOptions,
     ) -> Result<TypedCompletion<T>> {
-        let handoff = self.complete(prompt, options)?;
-        let completion = decode_structured_completion::<T>(handoff, &self.agent_id)?;
+        let activity_label = options
+            .activity_label
+            .clone()
+            .unwrap_or_else(|| self.agent_id.clone());
+        let _activity = self.activity.start(activity_label);
+
+        let tools = [T::tool_definition()];
+        let initial = self.engine.invoke(prompt, options, &tools)?.handoff;
+        let completion =
+            resolve_structured_output::<T>(&self.agent_id, initial, |repair_prompt| {
+                self.engine
+                    .invoke_in_session(repair_prompt, options)
+                    .map(|response| response.handoff)
+            })?;
+
         let narration = completion.response.trim();
         if !narration.is_empty() {
             debug!(
@@ -158,10 +157,6 @@ impl AgentModel {
             Arc::clone(&shutdown),
             ModelSessionOptions {
                 preferred_session_mode: prefs.preferred_session_mode,
-                structured_output_tools: prefs
-                    .structured_output_tools
-                    .as_deref()
-                    .map(structured_output_tools_wire_json),
             },
         )?;
         Ok(Self {
@@ -173,49 +168,136 @@ impl AgentModel {
     }
 }
 
-/// Decode one role's structured-output tool call out of a backend-neutral
-/// [`AgentHandoff`]. Shared by [`AgentModel::complete_typed`] and unit tests
-/// so the error messages stay consistent without going through a live model.
-fn decode_structured_completion<T: StructuredOutput>(
-    handoff: AgentHandoff,
-    agent_id: &str,
-) -> Result<TypedCompletion<T>> {
+/// Why one model turn did not produce the role's structured output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CaptureError {
+    /// The expected tool was not called. `called` lists the structured-output
+    /// tools that *were* called, if any.
+    MissingToolCall { called: Vec<String> },
+    /// The tool was called with arguments the contract rejects.
+    Invalid(OutputError),
+}
+
+impl CaptureError {
+    /// The concise, model-facing statement of what is wrong. This is what a
+    /// repair prompt carries, so it names the exact path and expectation
+    /// rather than dumping the whole captured value back at the model.
+    fn correction(&self, tool: &str) -> String {
+        match self {
+            CaptureError::MissingToolCall { called } if called.is_empty() => {
+                format!("you ended your turn without calling the required `{tool}` tool")
+            }
+            CaptureError::MissingToolCall { called } => format!(
+                "you called {} instead of the required `{tool}` tool",
+                called
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            CaptureError::Invalid(error) => {
+                format!("your `{tool}` arguments were rejected — {error}")
+            }
+        }
+    }
+}
+
+/// Pull the role's tool call out of one handoff and decode it.
+fn capture_structured_output<T: StructuredOutput>(
+    handoff: &AgentHandoff,
+) -> std::result::Result<T, CaptureError> {
     let tool_name = T::tool_name();
-    let response_preview: String = handoff.response.chars().take(800).collect();
-    let value = handoff
+    let outputs = handoff
         .structured_outputs
         .as_ref()
-        .and_then(|outputs| outputs.get(tool_name))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{agent_id}: model did not call the required `{tool_name}` structured-output tool; \
-                 response preview: {response_preview:?}"
-            )
-        })?;
-    let output: T = serde_json::from_value(value.clone()).with_context(|| {
-        format!("{agent_id}: `{tool_name}` structured-output tool call had invalid output: {value}")
-    })?;
-    Ok(TypedCompletion {
-        response: handoff.response,
-        output,
-    })
+        .and_then(|v| v.as_object());
+    let Some(value) = outputs.and_then(|outputs| outputs.get(tool_name)) else {
+        return Err(CaptureError::MissingToolCall {
+            called: outputs
+                .map(|outputs| outputs.keys().cloned().collect())
+                .unwrap_or_default(),
+        });
+    };
+    T::decode(value.clone()).map_err(CaptureError::Invalid)
+}
+
+/// The concise correction prompt sent back into the task's own session.
+fn structured_output_repair_prompt(
+    tool: &str,
+    error: &CaptureError,
+    attempt: u32,
+    max_attempts: u32,
+) -> String {
+    format!(
+        "Your structured output was not accepted: {correction}.\n\n\
+         Call the `{tool}` tool now with corrected arguments that satisfy its schema. \
+         Do not redo the task and do not repeat your previous explanation — this conversation \
+         still has all of it. Send the corrected `{tool}` call and nothing else. \
+         (Correction attempt {attempt} of {max_attempts}; after that the task fails.)",
+        correction = error.correction(tool),
+    )
+}
+
+/// Decode the role's output from `initial`, asking the model to correct itself
+/// through `send_repair` when the contract is not met. `send_repair` continues
+/// the same session, so every attempt keeps the task's context — and, at the
+/// call site, its cancellation check and follow-up polling.
+///
+/// Split out from [`AgentModel::complete_typed`] so the repair sequence can be
+/// driven without a live model.
+fn resolve_structured_output<T: StructuredOutput>(
+    agent_id: &str,
+    initial: AgentHandoff,
+    mut send_repair: impl FnMut(&str) -> Result<AgentHandoff>,
+) -> Result<TypedCompletion<T>> {
+    let tool_name = T::tool_name();
+    let mut handoff = initial;
+    let mut attempt: u32 = 0;
+    loop {
+        let error = match capture_structured_output::<T>(&handoff) {
+            Ok(output) => {
+                return Ok(TypedCompletion {
+                    response: handoff.response,
+                    output,
+                });
+            }
+            Err(error) => error,
+        };
+
+        if attempt >= MAX_STRUCTURED_OUTPUT_REPAIRS {
+            let preview: String = handoff.response.chars().take(800).collect();
+            anyhow::bail!(
+                "{agent_id}: `{tool_name}` structured output still invalid after \
+                 {MAX_STRUCTURED_OUTPUT_REPAIRS} correction attempt(s) — {correction}; \
+                 last response preview: {preview:?}",
+                correction = error.correction(tool_name),
+            );
+        }
+
+        attempt += 1;
+        warn!(
+            "{agent_id}: {correction}. Repair {attempt}/{MAX_STRUCTURED_OUTPUT_REPAIRS} in the same session",
+            correction = error.correction(tool_name),
+        );
+        handoff = send_repair(&structured_output_repair_prompt(
+            tool_name,
+            &error,
+            attempt,
+            MAX_STRUCTURED_OUTPUT_REPAIRS,
+        ))?;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agent::schema::{ObjectSchema, OneOfSchema, Schema, compat};
     use crate::core::config::Config;
+    use serde_json::{Value, json};
+    use std::cell::RefCell;
 
     fn sample_section(model: Option<&str>) -> crate::core::config::AgentSection {
-        let toml = match model {
-            Some(m) => format!("[agent.alpha]\nmodel = \"{m}\"\ninstances = 1"),
-            None => "[agent.alpha]\ninstances = 1".to_string(),
-        };
-        Config::from_toml_str(&toml)
-            .unwrap()
-            .agent("alpha")
-            .unwrap()
-            .clone()
+        sample_config(model).agent("alpha").unwrap().clone()
     }
 
     fn sample_config(model: Option<&str>) -> Config {
@@ -248,7 +330,7 @@ mod tests {
     }
 
     #[derive(Debug, serde::Deserialize, PartialEq)]
-    #[serde(tag = "decision", rename_all = "snake_case")]
+    #[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
     enum SampleOutput {
         Approve,
         RequestChanges { feedback: String },
@@ -263,69 +345,191 @@ mod tests {
             "sample"
         }
 
-        fn schema() -> crate::core::agent::schema::ObjectSchema {
-            crate::core::agent::schema::ObjectSchema::new()
+        fn schema() -> Schema {
+            Schema::one_of(
+                OneOfSchema::new("decision", "The decision.")
+                    .variant("approve", "Approve it.", ObjectSchema::new())
+                    .variant(
+                        "request_changes",
+                        "Ask for changes.",
+                        ObjectSchema::new()
+                            .required_property("feedback", Schema::string("What to fix.")),
+                    ),
+            )
+        }
+
+        fn normalize(value: &mut Value) {
+            compat::normalize_tag(value, "decision");
         }
     }
 
-    fn handoff_with_tool(tool: &str, value: serde_json::Value) -> AgentHandoff {
+    fn handoff_with_tool(tool: &str, value: Value) -> AgentHandoff {
         AgentHandoff {
             response: "narration".into(),
-            structured_outputs: Some(serde_json::json!({ tool: value })),
+            structured_outputs: Some(json!({ tool: value })),
         }
     }
 
+    /// Drives [`resolve_structured_output`] with a scripted sequence of model
+    /// answers, recording every repair prompt that was sent.
+    fn resolve_with_script(
+        initial: AgentHandoff,
+        script: Vec<AgentHandoff>,
+    ) -> (Result<TypedCompletion<SampleOutput>>, Vec<String>) {
+        let prompts = RefCell::new(Vec::new());
+        let remaining = RefCell::new(script.into_iter());
+        let result = resolve_structured_output::<SampleOutput>("agent-0", initial, |prompt| {
+            prompts.borrow_mut().push(prompt.to_string());
+            remaining
+                .borrow_mut()
+                .next()
+                .context("test script ran out of scripted model answers")
+        });
+        (result, prompts.into_inner())
+    }
+
     #[test]
-    fn decode_structured_completion_returns_response_and_typed_output() {
-        let handoff = handoff_with_tool("sample_tool", serde_json::json!({"decision": "approve"}));
-        let completion = decode_structured_completion::<SampleOutput>(handoff, "agent-0").unwrap();
+    fn valid_first_answer_needs_no_repair() {
+        let (result, prompts) = resolve_with_script(
+            handoff_with_tool("sample_tool", json!({"decision": "approve"})),
+            vec![],
+        );
+        let completion = result.unwrap();
         assert_eq!(completion.response, "narration");
         assert_eq!(completion.output, SampleOutput::Approve);
+        assert!(prompts.is_empty());
     }
 
     #[test]
-    fn decode_structured_completion_errors_when_tool_not_called() {
-        let handoff = AgentHandoff {
-            response: "no tool call".into(),
-            structured_outputs: None,
-        };
-        let err = decode_structured_completion::<SampleOutput>(handoff, "agent-0").unwrap_err();
-        assert!(err.to_string().contains("did not call"));
-        assert!(err.to_string().contains("sample_tool"));
-        assert!(err.to_string().contains("no tool call"));
-    }
-
-    #[test]
-    fn decode_structured_completion_errors_when_other_tool_called() {
-        let handoff = handoff_with_tool("other_tool", serde_json::json!({"decision": "approve"}));
-        let err = decode_structured_completion::<SampleOutput>(handoff, "agent-0").unwrap_err();
-        assert!(err.to_string().contains("did not call"));
-    }
-
-    #[test]
-    fn decode_structured_completion_errors_on_unknown_enum_value() {
-        let handoff = handoff_with_tool("sample_tool", serde_json::json!({"decision": "bogus"}));
-        let err = decode_structured_completion::<SampleOutput>(handoff, "agent-0").unwrap_err();
-        assert!(err.to_string().contains("invalid output"));
-    }
-
-    #[test]
-    fn decode_structured_completion_errors_on_missing_required_field() {
-        let handoff = handoff_with_tool(
-            "sample_tool",
-            serde_json::json!({"decision": "request_changes"}),
+    fn missing_tool_call_is_repaired_in_the_same_session() {
+        let (result, prompts) = resolve_with_script(
+            AgentHandoff {
+                response: "I'm done!".into(),
+                structured_outputs: None,
+            },
+            vec![handoff_with_tool(
+                "sample_tool",
+                json!({"decision": "approve"}),
+            )],
         );
-        let err = decode_structured_completion::<SampleOutput>(handoff, "agent-0").unwrap_err();
-        assert!(err.to_string().contains("invalid output"));
+        assert_eq!(result.unwrap().output, SampleOutput::Approve);
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("without calling the required `sample_tool` tool"));
+        assert!(prompts[0].contains("Do not redo the task"));
     }
 
     #[test]
-    fn decode_structured_completion_errors_on_wrong_type() {
-        let handoff = handoff_with_tool(
-            "sample_tool",
-            serde_json::json!({"decision": "request_changes", "feedback": 123}),
+    fn calling_the_wrong_tool_names_it_in_the_correction() {
+        let (result, prompts) = resolve_with_script(
+            handoff_with_tool("plan", json!({"decision": "approve"})),
+            vec![handoff_with_tool(
+                "sample_tool",
+                json!({"decision": "approve"}),
+            )],
         );
-        let err = decode_structured_completion::<SampleOutput>(handoff, "agent-0").unwrap_err();
-        assert!(err.to_string().contains("invalid output"));
+        assert!(result.is_ok());
+        assert!(
+            prompts[0].contains("you called `plan` instead of the required `sample_tool` tool")
+        );
+    }
+
+    #[test]
+    fn schema_violations_are_repaired_with_the_offending_path() {
+        let (result, prompts) = resolve_with_script(
+            handoff_with_tool("sample_tool", json!({"decision": "maybe"})),
+            vec![handoff_with_tool(
+                "sample_tool",
+                json!({"decision": "request_changes", "feedback": "fix the test"}),
+            )],
+        );
+        assert_eq!(
+            result.unwrap().output,
+            SampleOutput::RequestChanges {
+                feedback: "fix the test".into()
+            }
+        );
+        assert!(prompts[0].contains("$.decision: expected one of"));
+    }
+
+    #[test]
+    fn missing_branch_field_is_repaired_with_the_offending_path() {
+        let (result, prompts) = resolve_with_script(
+            handoff_with_tool("sample_tool", json!({"decision": "request_changes"})),
+            vec![handoff_with_tool(
+                "sample_tool",
+                json!({"decision": "request_changes", "feedback": "fix it"}),
+            )],
+        );
+        assert!(result.is_ok());
+        assert!(prompts[0].contains("$.feedback: required property is missing"));
+    }
+
+    #[test]
+    fn every_repair_attempt_is_actually_sent_before_giving_up() {
+        let bad = || handoff_with_tool("sample_tool", json!({"decision": "maybe"}));
+        let (result, prompts) = resolve_with_script(bad(), vec![bad(), bad(), bad()]);
+        let error = result.unwrap_err().to_string();
+        assert_eq!(prompts.len(), MAX_STRUCTURED_OUTPUT_REPAIRS as usize);
+        for (index, prompt) in prompts.iter().enumerate() {
+            assert!(
+                prompt.contains(&format!(
+                    "Correction attempt {} of {MAX_STRUCTURED_OUTPUT_REPAIRS}",
+                    index + 1
+                )),
+                "unexpected repair prompt: {prompt}"
+            );
+        }
+        assert!(error.contains("still invalid after"));
+    }
+
+    #[test]
+    fn exhaustion_reports_the_last_failure_not_the_first() {
+        let (result, _prompts) = resolve_with_script(
+            AgentHandoff {
+                response: "nothing".into(),
+                structured_outputs: None,
+            },
+            vec![
+                handoff_with_tool("sample_tool", json!({"decision": "maybe"})),
+                handoff_with_tool("sample_tool", json!({"decision": "request_changes"})),
+                handoff_with_tool("sample_tool", json!({"decision": "approve", "extra": 1})),
+            ],
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("$.extra: unexpected property"), "{error}");
+        assert!(error.contains("last response preview"));
+    }
+
+    #[test]
+    fn a_transport_failure_during_repair_is_returned_unchanged() {
+        let prompts = RefCell::new(0u32);
+        let result = resolve_structured_output::<SampleOutput>(
+            "agent-0",
+            AgentHandoff {
+                response: String::new(),
+                structured_outputs: None,
+            },
+            |_| {
+                *prompts.borrow_mut() += 1;
+                Err(anyhow::anyhow!("ACP session/prompt: broken pipe"))
+            },
+        );
+        assert_eq!(prompts.into_inner(), 1);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("ACP session/prompt: broken pipe")
+        );
+    }
+
+    #[test]
+    fn compatibility_normalization_runs_before_a_repair_is_considered() {
+        let (result, prompts) = resolve_with_script(
+            handoff_with_tool("sample_tool", json!({"decision": "Approve"})),
+            vec![],
+        );
+        assert_eq!(result.unwrap().output, SampleOutput::Approve);
+        assert!(prompts.is_empty());
     }
 }

@@ -68,11 +68,7 @@ mod tests {
             "alpha"
         }
 
-        fn agent_id(&self) -> &str {
-            unreachable!("test agent is never run")
-        }
-
-        fn shutdown(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
+        fn runtime(&self) -> &crate::core::runtime::AgentRuntime {
             unreachable!("test agent is never run")
         }
 

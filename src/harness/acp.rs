@@ -998,6 +998,94 @@ mod tests {
     }
 
     #[test]
+    fn session_new_registers_caller_defined_structured_output_schemas_verbatim() {
+        // The harness has no notion of the orchestrator's schema types: it
+        // forwards whatever `parameters` JSON the caller registered, so a
+        // tagged union with `oneOf`/`const`/`additionalProperties` reaches the
+        // model exactly as the adapter emitted it.
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm: Arc<dyn ChatClient> =
+            Arc::new(ToolsCapturingClient::new(std::sync::Arc::clone(&captured)));
+        let mut server = AcpServer::new(llm);
+
+        let parameters = json!({
+            "type": "object",
+            "description": "How the run ended.",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "description": "It is done.",
+                    "additionalProperties": false,
+                    "properties": {
+                        "outcome": {
+                            "type": "string",
+                            "const": "implemented",
+                            "enum": ["implemented"],
+                            "description": "It is done."
+                        }
+                    },
+                    "required": ["outcome"]
+                },
+                {
+                    "type": "object",
+                    "description": "It is blocked.",
+                    "additionalProperties": false,
+                    "properties": {
+                        "outcome": {
+                            "type": "string",
+                            "const": "blocked",
+                            "enum": ["blocked"],
+                            "description": "It is blocked."
+                        },
+                        "reason": {"type": "string", "description": "Why."}
+                    },
+                    "required": ["outcome", "reason"]
+                }
+            ]
+        });
+        let new_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {
+                "cwd": "/tmp",
+                "structured_output_tools": [{
+                    "name": "handoff",
+                    "description": "Hand the run back.",
+                    "parameters": parameters,
+                }]
+            }
+        });
+        let (resp, _) = collect_output(&mut server, &new_msg);
+        let session_id = match resp {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected session/new response"),
+        };
+
+        let prompt_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "go" }]
+            }
+        });
+        let _ = collect_output(&mut server, &prompt_msg);
+
+        let tools = captured.lock().unwrap().clone();
+        let handoff = tools
+            .iter()
+            .find(|tool| tool["function"]["name"] == json!("handoff"))
+            .expect("the caller-defined tool must be registered for the session");
+        assert_eq!(handoff["function"]["description"], "Hand the run back.");
+        assert_eq!(handoff["function"]["parameters"], parameters);
+    }
+
+    #[test]
     fn default_mode_keeps_file_edit_registered() {
         let tools = run_session_prompt_in_mode("");
         assert!(tools.contains(&"edit".to_string()));

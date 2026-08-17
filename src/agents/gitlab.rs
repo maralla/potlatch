@@ -264,6 +264,21 @@ impl GitLabClient {
         })
     }
 
+    /// Construct a client for characterization tests without resolving a
+    /// real GitLab project (no network access). Values built this way must
+    /// never reach a method that shells out to `glab` — they only exist so
+    /// tests can construct role `AgentState`-style structs that embed a
+    /// client field to exercise pure/file-only logic paths.
+    #[cfg(test)]
+    pub(crate) fn for_test(repo_path: impl Into<String>) -> Self {
+        Self {
+            repo_path: repo_path.into(),
+            host: "gitlab.example.com".to_string(),
+            project_id: 1,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     fn api_path(&self, tail: &str) -> String {
         format!(
             "projects/{}/{}",

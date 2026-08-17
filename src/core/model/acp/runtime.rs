@@ -4,6 +4,13 @@
 //! the model does not keep prior in-agent transcript; workflow continuity stays in Potlatch’s
 //! state files and token use stays lower than reusing one session for every task.
 //!
+//! The structured-output contract is **per task**: [`AcpRuntime::run_task`] takes the tool
+//! definitions for the task it is starting and registers them with the session it creates or
+//! rotates, so a role can ask for a different shape on every call.
+//! [`AcpRuntime::run_in_current_session`] sends a follow-up prompt into that same session without
+//! rotating it — it is how the structured-output repair loop asks the model to fix its tool call
+//! without making it redo the task.
+//!
 //! [ACP slash commands](https://agentclientprotocol.com/protocol/slash-commands): the agent may
 //! send `available_commands_update`; [`StreamTextHooks`] records command names for future
 //! role-specific prompt logic (not wired into prompts yet).
@@ -42,6 +49,11 @@ Treat this assignment as a fresh task. Do not rely on prior chat history or assu
 
 "#;
 
+/// How many times a task prompt is resent after a *transport* failure (the
+/// ACP child exited, or `session/prompt` itself errored). Unrelated to
+/// structured-output repair, which lives above this layer.
+const MAX_TRANSPORT_RETRIES: u32 = 5;
+
 struct AcpSession {
     client: Arc<AcpClient>,
     child: Child,
@@ -79,10 +91,13 @@ pub(crate) struct AcpRuntime {
     vendor_ext: Option<Arc<dyn AcpVendorExtension>>,
     /// Capability provider (set by the agent at construction).
     capability_provider: Mutex<Option<Arc<dyn CapabilityProvider>>>,
-    /// Caller-defined structured-output tool definitions, passed to the
-    /// harness via `session/new` params. Each entry has `name`, `description`,
-    /// and `parameters` (JSON schema).
-    structured_output_tools: Option<Vec<serde_json::Value>>,
+    /// Structured-output tool definitions for the task currently in flight,
+    /// passed to the harness via `session/new` params. Each entry has `name`,
+    /// `description`, and `parameters` (JSON schema). Set per task by
+    /// [`AcpRuntime::run_task`], so a task's contract is registered with the
+    /// session created (or rotated) for it — including a session recreated
+    /// by a transport retry.
+    structured_output_tools: Mutex<Vec<Value>>,
     shutdown: Arc<AtomicBool>,
     agent_id: String,
     acp: Mutex<Option<AcpSession>>,
@@ -98,7 +113,6 @@ impl AcpRuntime {
         acp_command: Vec<String>,
         acp_env: std::collections::HashMap<String, String>,
         preferred_session_mode: Option<&'static str>,
-        structured_output_tools: Option<Vec<serde_json::Value>>,
         shutdown: Arc<AtomicBool>,
         agent_id: String,
     ) -> Self {
@@ -110,7 +124,7 @@ impl AcpRuntime {
             endpoint_model,
             acp_command,
             acp_env,
-            structured_output_tools,
+            structured_output_tools: Mutex::new(Vec::new()),
             shutdown,
             agent_id,
             acp: Mutex::new(None),
@@ -129,20 +143,22 @@ impl AcpRuntime {
         *self.capability_provider.lock().unwrap() = provider;
     }
 
-    /// Run one task: ensure a fresh ACP session (`session/close` then `session/new` on the same
-    /// child when the process is already running), send `session/prompt`. Retries after transport
-    /// failures keep the same session while the child stays up; if the child exits, a new process
-    /// and session are created.
-    pub fn run_with_cancel(
+    /// Run one task: register this task's structured-output contract, ensure a
+    /// fresh ACP session (`session/close` then `session/new` on the same child
+    /// when the process is already running), and send `session/prompt`.
+    /// Retries after transport failures keep the same session while the child
+    /// stays up; if the child exits, a new process and session are created and
+    /// the same contract is registered again.
+    pub fn run_task(
         &self,
         prompt: &str,
+        structured_output_tools: Vec<Value>,
         cancel_check: Option<&dyn Fn() -> bool>,
         follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
     ) -> Result<AgentHandoff> {
         let prompt = prepare_task_prompt(prompt);
-        const MAX_UNFINISHED_TASK_RETRIES: u32 = 5;
-        const MAX_EMPTY_OUTPUT_RETRIES: u32 = 5;
-        let mut empty_output_retries: u32 = 0;
+        self.register_task_contract(structured_output_tools);
+
         if let Some(model_uri) = &self.model_uri {
             info!(
                 "Running ACP agent {} model={:?} prompt_len={} (new session per task, same process)",
@@ -160,239 +176,181 @@ impl AcpRuntime {
         debug!("Agent task prompt: {}", prompt);
 
         self.rotate_acp_session_for_new_task()?;
+        self.run_prompt_with_transport_retry(&prompt, cancel_check, follow_up_poll)
+    }
 
-        let mut unfinished_task_retries: u32 = 0;
+    /// Send a follow-up prompt into the session the current task is already
+    /// running in: no rotation, no contract re-registration, no restatement of
+    /// the task. The model keeps its full conversation for this task, so the
+    /// prompt only has to say what to fix. Used by structured-output repair.
+    ///
+    /// Transport failures are returned as-is rather than retried: a respawned
+    /// child would have lost the task context this prompt depends on, which
+    /// makes a retry here worse than letting the caller fail the task.
+    pub fn run_in_current_session(
+        &self,
+        prompt: &str,
+        cancel_check: Option<&dyn Fn() -> bool>,
+        follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
+    ) -> Result<AgentHandoff> {
+        debug!(
+            "Agent {} follow-up prompt in current session: {}",
+            self.agent_id(),
+            prompt
+        );
+        self.run_prompt_once(prompt, cancel_check, follow_up_poll)
+    }
+
+    /// Record the structured-output contract the task being started asks for.
+    /// It stays registered for every session this task needs — including one
+    /// recreated by a transport retry — until the next task replaces it.
+    fn register_task_contract(&self, tools: Vec<Value>) {
+        *self.structured_output_tools.lock().unwrap() = tools;
+    }
+
+    /// The `structured_output_tools` value for `session/new`: the contract the
+    /// current task registered, or nothing when it registered none.
+    fn session_structured_output_tools(&self) -> Option<Vec<Value>> {
+        let tools = self.structured_output_tools.lock().unwrap().clone();
+        (!tools.is_empty()).then_some(tools)
+    }
+
+    fn run_prompt_with_transport_retry(
+        &self,
+        prompt: &str,
+        cancel_check: Option<&dyn Fn() -> bool>,
+        follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
+    ) -> Result<AgentHandoff> {
+        let mut transport_retries: u32 = 0;
+        loop {
+            match self.run_prompt_once(prompt, cancel_check, follow_up_poll) {
+                Ok(handoff) => return Ok(handoff),
+                Err(error) if is_transport_failure(&error) => {
+                    transport_retries += 1;
+                    if transport_retries > MAX_TRANSPORT_RETRIES {
+                        return Err(error);
+                    }
+                    warn!(
+                        "ACP task failed for {} ({error}). Retry {transport_retries}/{MAX_TRANSPORT_RETRIES}",
+                        self.agent_id(),
+                    );
+                    self.unexpected_quits_count.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(retry_backoff_for_unfinished_task(transport_retries));
+                    self.ensure_acp_session_for_retry()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// One `session/prompt` round trip on the current session, with the
+    /// cancellation check and follow-up forwarding running while it is in
+    /// flight. Captures from any earlier turn are cleared first, so what comes
+    /// back belongs to this prompt only.
+    fn run_prompt_once(
+        &self,
+        prompt: &str,
+        cancel_check: Option<&dyn Fn() -> bool>,
+        follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
+    ) -> Result<AgentHandoff> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.kill_child();
+            anyhow::bail!("Agent interrupted by shutdown");
+        }
+
+        let (client, session_id, hooks) = {
+            let g = self.acp.lock().unwrap();
+            let s = g.as_ref().context("ACP session missing after ensure")?;
+            (
+                Arc::clone(&s.client),
+                s.session_id.clone(),
+                Arc::clone(&s.hooks),
+            )
+        };
+
+        hooks.clear();
+        if let Some(ref ext) = self.vendor_ext {
+            let provider = self.capability_provider.lock().unwrap().clone();
+            hooks.set_vendor_state(Some(ext.create_state(provider)));
+        }
+
+        let prompt_owned = prompt.to_string();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<PromptResult, String>>();
+        let client_for_thread = Arc::clone(&client);
+        let session_id_for_thread = session_id.clone();
+        thread::spawn(move || {
+            let out = client_for_thread
+                .session_prompt(&session_id_for_thread, &prompt_owned)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(out);
+        });
+
         let mut polls_since_cancel_check: u32 = 0;
         const CANCEL_CHECK_INTERVAL: u32 = 25;
 
-        loop {
+        let handoff_result = loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 self.kill_child();
-                anyhow::bail!("Agent interrupted by shutdown");
+                break Err(anyhow::anyhow!("Agent interrupted by shutdown"));
             }
-
-            let (client, session_id, hooks) = {
-                let g = self.acp.lock().unwrap();
-                let s = g.as_ref().context("ACP session missing after ensure")?;
-                (
-                    Arc::clone(&s.client),
-                    s.session_id.clone(),
-                    Arc::clone(&s.hooks),
-                )
-            };
-
-            hooks.clear();
-            if let Some(ref ext) = self.vendor_ext {
-                let provider = self.capability_provider.lock().unwrap().clone();
-                hooks.set_vendor_state(Some(ext.create_state(provider)));
-            }
-            let prompt_owned = prompt.clone();
-            let (tx, rx) = std::sync::mpsc::channel::<Result<PromptResult, String>>();
-            let client_for_thread = Arc::clone(&client);
-            let session_id_for_thread = session_id.clone();
-            thread::spawn(move || {
-                let out = client_for_thread
-                    .session_prompt(&session_id_for_thread, &prompt_owned)
-                    .map_err(|e| e.to_string());
-                let _ = tx.send(out);
-            });
-
-            let handoff_result = loop {
-                if self.shutdown.load(Ordering::SeqCst) {
+            polls_since_cancel_check += 1;
+            if polls_since_cancel_check >= CANCEL_CHECK_INTERVAL {
+                polls_since_cancel_check = 0;
+                if let Some(check) = cancel_check
+                    && check()
+                {
+                    warn!(
+                        "Cancel check triggered, killing ACP agent {}",
+                        self.agent_id()
+                    );
                     self.kill_child();
-                    break Err(anyhow::anyhow!("Agent interrupted by shutdown"));
+                    break Err(anyhow::anyhow!("Agent cancelled by external condition"));
                 }
-                polls_since_cancel_check += 1;
-                if polls_since_cancel_check >= CANCEL_CHECK_INTERVAL {
-                    polls_since_cancel_check = 0;
-                    if let Some(check) = cancel_check
-                        && check()
+
+                // Poll for follow-up messages and forward them to the
+                // running session via the vendor extension (session/inject
+                // on the potlatch harness backend; no-op on others).
+                if let Some(poll) = follow_up_poll {
+                    let msgs = poll();
+                    if !msgs.is_empty()
+                        && let Some(ref ext) = self.vendor_ext
                     {
-                        warn!(
-                            "Cancel check triggered, killing ACP agent {}",
-                            self.agent_id()
-                        );
-                        self.kill_child();
-                        break Err(anyhow::anyhow!("Agent cancelled by external condition"));
-                    }
-
-                    // Poll for follow-up messages and forward them to the
-                    // running session via the vendor extension (session/inject
-                    // on the potlatch harness backend; no-op on others).
-                    if let Some(poll) = follow_up_poll {
-                        let msgs = poll();
-                        if !msgs.is_empty()
-                            && let Some(ref ext) = self.vendor_ext
-                        {
-                            ext.forward_followups(&client, &session_id, &msgs);
-                        }
+                        ext.forward_followups(&client, &session_id, &msgs);
                     }
                 }
+            }
 
-                if let Some(exit) = self.take_child_exit_status()? {
-                    self.kill_child();
-                    break Err(anyhow::anyhow!(
-                        "agent {} exited during prompt ({})",
-                        self.agent_id(),
-                        exit
+            if let Some(exit) = self.take_child_exit_status()? {
+                self.kill_child();
+                break Err(anyhow::anyhow!(
+                    "agent {} exited during prompt ({})",
+                    self.agent_id(),
+                    exit
+                ));
+            }
+
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(pr)) => {
+                    self.wait_for_followup_if_vendor(&hooks, cancel_check)?;
+                    break Ok(handoff_from_prompt_hooks(
+                        &hooks,
+                        pr,
+                        self.vendor_ext.as_ref(),
                     ));
                 }
-
-                match rx.recv_timeout(Duration::from_millis(200)) {
-                    Ok(Ok(pr)) => {
-                        self.wait_for_followup_if_vendor(&hooks, cancel_check)?;
-                        break Ok(handoff_from_prompt_hooks(
-                            &hooks,
-                            pr,
-                            self.vendor_ext.as_ref(),
-                        ));
-                    }
-                    Ok(Err(e)) => break Err(anyhow::anyhow!("ACP session/prompt: {}", e)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        break Err(anyhow::anyhow!(
-                            "ACP prompt thread died for {}",
-                            self.agent_id()
-                        ));
-                    }
-                }
-            };
-
-            hooks.set_vendor_state(None);
-
-            match handoff_result {
-                Ok(h) => {
-                    // When structured-output tools were registered but the
-                    // model didn't call any (empty structured_outputs), retry
-                    // with a nudge. The harness retains context across
-                    // session/prompt calls (single long session), so the
-                    // retry sees the full conversation history.
-                    if self.structured_output_tools.is_some()
-                        && h.structured_outputs.is_none()
-                        && empty_output_retries < MAX_EMPTY_OUTPUT_RETRIES
-                    {
-                        empty_output_retries += 1;
-                        warn!(
-                            "ACP agent {} produced no structured output. Retry {empty_output_retries}/{MAX_EMPTY_OUTPUT_RETRIES}",
-                            self.agent_id()
-                        );
-                        // Keep the same session — context is retained. Just
-                        // send a new session/prompt with a nudge.
-                        let nudge = "You stopped without calling the structured-output tool. Call the tool now with your result. Do not repeat your previous work — the conversation context is retained.";
-                        drop(h);
-                        let prompt = nudge.to_string();
-                        // Re-enter the loop with the nudge prompt.
-                        // The session is still alive (no rotation needed).
-                        let (client, session_id, hooks) = {
-                            let g = self.acp.lock().unwrap();
-                            let s = g
-                                .as_ref()
-                                .context("ACP session missing after empty output")?;
-                            (
-                                Arc::clone(&s.client),
-                                s.session_id.clone(),
-                                Arc::clone(&s.hooks),
-                            )
-                        };
-                        hooks.clear();
-                        if let Some(ref ext) = self.vendor_ext {
-                            let provider = self.capability_provider.lock().unwrap().clone();
-                            hooks.set_vendor_state(Some(ext.create_state(provider)));
-                        }
-                        let prompt_owned = prompt;
-                        let (tx, rx) = std::sync::mpsc::channel::<Result<PromptResult, String>>();
-                        thread::spawn(move || {
-                            let out = client
-                                .session_prompt(&session_id, &prompt_owned)
-                                .map_err(|e| e.to_string());
-                            let _ = tx.send(out);
-                        });
-                        // Re-run the inner wait loop with the nudge.
-                        let handoff_result = loop {
-                            if self.shutdown.load(Ordering::SeqCst) {
-                                self.kill_child();
-                                break Err(anyhow::anyhow!("Agent interrupted by shutdown"));
-                            }
-                            if let Some(exit) = self.take_child_exit_status()? {
-                                self.kill_child();
-                                break Err(anyhow::anyhow!(
-                                    "agent {} exited during prompt ({})",
-                                    self.agent_id(),
-                                    exit
-                                ));
-                            }
-                            match rx.recv_timeout(Duration::from_millis(200)) {
-                                Ok(Ok(pr)) => {
-                                    self.wait_for_followup_if_vendor(&hooks, cancel_check)?;
-                                    break Ok(handoff_from_prompt_hooks(
-                                        &hooks,
-                                        pr,
-                                        self.vendor_ext.as_ref(),
-                                    ));
-                                }
-                                Ok(Err(e)) => {
-                                    break Err(anyhow::anyhow!("ACP session/prompt: {}", e));
-                                }
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                    continue;
-                                }
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                    break Err(anyhow::anyhow!(
-                                        "ACP prompt thread died for {}",
-                                        self.agent_id()
-                                    ));
-                                }
-                            }
-                        };
-                        hooks.set_vendor_state(None);
-                        match handoff_result {
-                            Ok(h) => return Ok(h),
-                            Err(e) => {
-                                let msg = e.to_string();
-                                if msg.contains("exited during prompt")
-                                    || msg.contains("ACP session/prompt")
-                                {
-                                    unfinished_task_retries += 1;
-                                    if unfinished_task_retries > MAX_UNFINISHED_TASK_RETRIES {
-                                        return Err(e);
-                                    }
-                                    warn!(
-                                        "ACP task failed for {} ({msg}). Retry {unfinished_task_retries}/{MAX_UNFINISHED_TASK_RETRIES}",
-                                        self.agent_id(),
-                                    );
-                                    self.unexpected_quits_count.fetch_add(1, Ordering::SeqCst);
-                                    thread::sleep(retry_backoff_for_unfinished_task(
-                                        unfinished_task_retries,
-                                    ));
-                                    self.ensure_acp_session_for_retry()?;
-                                    continue;
-                                }
-                                return Err(e);
-                            }
-                        }
-                    }
-                    return Ok(h);
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("exited during prompt") || msg.contains("ACP session/prompt") {
-                        unfinished_task_retries += 1;
-                        if unfinished_task_retries > MAX_UNFINISHED_TASK_RETRIES {
-                            return Err(e);
-                        }
-                        warn!(
-                            "ACP task failed for {} ({msg}). Retry {unfinished_task_retries}/{MAX_UNFINISHED_TASK_RETRIES}",
-                            self.agent_id(),
-                        );
-                        self.unexpected_quits_count.fetch_add(1, Ordering::SeqCst);
-                        thread::sleep(retry_backoff_for_unfinished_task(unfinished_task_retries));
-                        self.ensure_acp_session_for_retry()?;
-                        continue;
-                    }
-                    return Err(e);
+                Ok(Err(e)) => break Err(anyhow::anyhow!("ACP session/prompt: {}", e)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(anyhow::anyhow!(
+                        "ACP prompt thread died for {}",
+                        self.agent_id()
+                    ));
                 }
             }
-        }
+        };
+
+        hooks.set_vendor_state(None);
+        handoff_result
     }
 
     fn wait_for_followup_if_vendor(
@@ -512,7 +470,7 @@ impl AcpRuntime {
             .session_new(&NewSessionParams {
                 cwd: cwd.to_string_lossy().into_owned(),
                 mcp_servers: vec![],
-                structured_output_tools: self.structured_output_tools.clone(),
+                structured_output_tools: self.session_structured_output_tools(),
             })
             .context("ACP session/new")?;
 
@@ -675,6 +633,14 @@ impl AcpRuntime {
     }
 }
 
+/// Whether an error from one prompt round trip is the transport giving out
+/// (child gone, `session/prompt` failed) rather than a task-level outcome.
+/// Only these are worth resending the same prompt for.
+fn is_transport_failure(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("exited during prompt") || message.contains("ACP session/prompt")
+}
+
 fn collect_text_fragments_from_value(v: &Value, out: &mut Vec<String>) {
     match v {
         Value::String(s) => {
@@ -799,6 +765,42 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_runtime() -> AcpRuntime {
+        AcpRuntime::new(
+            "/tmp/repo".into(),
+            None,
+            None,
+            vec!["true".into()],
+            std::collections::HashMap::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            "worker-0".into(),
+        )
+    }
+
+    #[test]
+    fn each_task_registers_its_own_contract_for_the_sessions_it_needs() {
+        let runtime = test_runtime();
+        assert_eq!(runtime.session_structured_output_tools(), None);
+
+        let handoff = json!({"name": "handoff", "description": "d", "parameters": {}});
+        runtime.register_task_contract(vec![handoff.clone()]);
+        // Every session this task creates — including one recreated by a
+        // transport retry, and the one a repair prompt keeps using — carries
+        // the same contract, because nothing but a new task replaces it.
+        assert_eq!(
+            runtime.session_structured_output_tools(),
+            Some(vec![handoff])
+        );
+
+        let review = json!({"name": "review", "description": "d", "parameters": {}});
+        runtime.register_task_contract(vec![review.clone()]);
+        assert_eq!(
+            runtime.session_structured_output_tools(),
+            Some(vec![review])
+        );
+    }
+
     #[test]
     fn prepends_fresh_context_guidance_to_each_task() {
         let prompt = prepare_task_prompt("Implement issue #42.");
@@ -820,6 +822,22 @@ mod tests {
             retry_backoff_for_unfinished_task(99),
             Duration::from_millis(1000)
         );
+    }
+
+    #[test]
+    fn only_transport_errors_are_worth_resending_the_prompt_for() {
+        assert!(is_transport_failure(&anyhow::anyhow!(
+            "agent worker-0 exited during prompt (signal: 9)"
+        )));
+        assert!(is_transport_failure(&anyhow::anyhow!(
+            "ACP session/prompt: broken pipe"
+        )));
+        assert!(!is_transport_failure(&anyhow::anyhow!(
+            "Agent cancelled by external condition"
+        )));
+        assert!(!is_transport_failure(&anyhow::anyhow!(
+            "Agent interrupted by shutdown"
+        )));
     }
 
     #[test]
