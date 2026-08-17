@@ -59,7 +59,7 @@ impl StructuredOutput for OpsOutput {
     }
 
     fn tool_description() -> &'static str {
-        "Emit your log analysis findings as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your findings."
+        "The new actionable issues found during this log analysis run."
     }
 
     fn schema() -> Schema {
@@ -1147,10 +1147,8 @@ Use the project codebase to map log errors to likely code paths, root causes, an
 
 For each NEW distinct problem that is not already covered, propose one GitLab issue.
 
-Call the `ops_report` tool exactly once with your findings — this tool call is the only output channel Potlatch reads; there is no text-based fallback. The tool's `issues` field is a JSON array of objects with `title`, `description`, `priority` (1-3), and `log_line`. Return an empty array if there are no new actionable errors.
-
 Rules:
-- Return an empty JSON array [] if there are no NEW actionable errors.
+- Report no issues if there are no NEW actionable errors.
 - Do not propose issues for errors already represented in the history or GitLab context files.
 - Do not propose issues for errors that appear already fixed in the current codebase.
 - Titles must be specific and actionable.
@@ -2419,6 +2417,10 @@ mod tests {
         assert!(prompt.contains("inspect the current project codebase"));
         assert!(prompt.contains("already fixed in the current codebase"));
         assert!(prompt.contains("Descriptions must cite log evidence and relevant code context"));
+        assert!(!prompt.contains("ops_report"));
+        assert!(!prompt.contains("output contract"));
+        assert!(!prompt.contains("tool's `issues` field"));
+        assert!(!prompt.contains("JSON array of objects"));
     }
 
     #[test]

@@ -211,7 +211,7 @@ impl StructuredOutput for PmoOutput {
     }
 
     fn tool_description() -> &'static str {
-        "Emit your triage decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with the decision and the fields that decision allows."
+        "The PMO triage result for an issue the worker could not complete."
     }
 
     fn schema() -> Schema {
@@ -2136,7 +2136,7 @@ CONTEXT:
 An automated worker agent attempted to implement this issue but was unable to complete it.
 Potlatch wrote the path above as a markdown file: **full issue description**, **every GitLab issue comment** (including worker rejection / PMO notes), **closed merge request context** (MR comments, reviewer feedback, and diff from the worker's closed MR, when one exists), and **the list of other open issues**. That file is the authoritative written context for this triage.
 - Use your **file-reading** capability on the absolute path and read it **end-to-end** before you decide the situation is unclear.
-- The single line `ISSUE #…: title` in this prompt is **not** a substitute for the file; do not claim "no context" or choose NEEDS_CLARIFICATION only because you did not read the task context file.
+- The single line `ISSUE #…: title` in this prompt is **not** a substitute for the file; do not claim "no context" merely because you did not read the task context file.
 - The **Closed merge request context** section is especially important when the worker closed an MR after failing to resolve reviewer feedback — the MR comments and diff show what the reviewer asked for and what the worker tried.
 Your job is to analyze the failure reason (from the file + repo when needed) and take the appropriate action.
 
@@ -2145,90 +2145,35 @@ CRITICAL REQUIREMENTS:
 - You do NOT write new production code — you inspect the existing project state, then write comments and create issue descriptions as needed
 - The worker agent has FULL ACCESS to shell commands (rm, mv, git, etc.) and all build/test tools
 - If the worker claimed it "cannot run commands" or "cannot delete files", that is WRONG — it CAN. Instruct it clearly.
-- Before deciding GUIDE_WORKER or SPLIT, you MUST verify whether the issue is already implemented in the current project state when that is plausible from the issue, comments, or worker output. If the behavior/tests/code already exist, choose ALREADY_DONE so Potlatch will close the issue and add a comment.
+- Before giving guidance or decomposing the work, verify whether the required behavior, tests, or code already exist when the issue or comments make that plausible. If the repository already satisfies the issue, report it as complete so Potlatch can close it.
 
-## Output — call the `plan` tool with your decision
+TRIAGE POLICY:
+- Give focused worker guidance only for a single focused task blocked by one specific misunderstanding, wrong command, or simple technical obstacle. The guidance should be one clear action.
+- Decompose broad task containers, work spanning multiple independent modules/files/components, lists of distinct tasks, or work estimated above roughly 500 non-test lines or 1500 total lines. Auto-generated code does not count. Prefer focused sub-issues over a laundry-list instruction.
+- Do not invent a speculative decomposition. If the context remains too vague to define concrete sub-issues after reading the file and inspecting the repository as needed, provide your best current plan and the specific questions a human must answer.
+- If the repository already fully implements the requested behavior, report that fact instead of guiding or decomposing.
+- Park work behind an existing open issue only when that issue is a real build-order prerequisite. Merely related or parallel work is not a dependency.
+- Produce one triage result; do not combine alternatives.
 
-Call the `plan` tool with your decision as its arguments. Potlatch reads the tool's arguments directly — your streamed text is ignored for decision parsing. This is the ONLY output channel; you MUST call `plan` with your decision. The tool's parameters are:
+DECOMPOSITION POLICY:
+- The parent is a task container and will be closed after its sub-issues are created.
+- Keep each sub-issue focused around the same approximate size limits as above.
+- The parent priority is {parent_priority}. Give blockers, security fixes, and shared prerequisites higher priority than independent leaf work.
+- Record dependencies only for real build order. Potlatch parks dependent sub-issues until their prerequisites close.
+- Review the existing-open-issues section before proposing sub-issues. Never duplicate or substantially overlap existing work.
+- If an existing open but inactive issue covers part of the work, reference it instead of creating a duplicate. If an in-progress issue covers it, skip that part. If existing issues cover everything, guide the worker to those issues instead of creating more.
 
-- `decision` (required): one of `guide_worker`, `split`, `already_done`, `needs_clarification`, `wait_for_dependency`
-- `instructions` (for guide_worker): 3-5 sentences, one clear action for the worker — posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.
-- `sub_issues` (for split): array of `{{"title": "...", "description": "...", "priority": 1-3, "depends_on": N}}` where `depends_on` is the 1-based index of another sub-issue this one depends on (omit or 0 if none). Example: if sub-issue 2 builds on sub-issue 1's work, set `"depends_on": 1`. The system automatically labels dependent issues so the worker won't start them until their dependency is closed.
-- `reason` (for already_done): why the codebase already satisfies the issue
-- `question` (for needs_clarification): specific questions for a human. Posted as a GitLab comment.
-- `plan_text` (for needs_clarification): your current best plan for this issue. The system updates the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version.
-- `dependency_issue_iid` (for wait_for_dependency): the IID of the existing open issue this issue depends on and must wait for
-
-Only fill the parameter(s) relevant to your decision. Everything you put in `instructions`, `reason`, or `question` is human-facing and posted to GitLab verbatim — do not include any internal markers, harness instructions, or meta-commentary.
-
-DECISION — choose EXACTLY ONE of the following:
-
-1. GUIDE_WORKER — Use ONLY when ALL of these are true:
-   a) The issue describes a SINGLE, focused task (not a list of modules/files/components)
-   b) The worker failed due to a specific misunderstanding, wrong command, or simple technical obstacle
-   c) The fix is ONE clear action (e.g. "use flag X instead of Y", "the config file is at path Z")
-   If your guidance would enumerate 2+ independent modules, files, or components, you MUST choose SPLIT instead.
-
-2. SPLIT — Use when ANY of these are true:
-   - The issue is a "task container" describing a broad goal (e.g. "add tests for module X", "refactor all Y", "check full code for Z") — these ALWAYS need splitting into concrete sub-tasks
-   - The issue involves work on 2+ independent modules, files, or components
-   - The issue is too large (estimated >500 lines of non-test code, or >1500 lines total including tests; auto-generated code does not count)
-   - The issue description or worker rejection lists multiple distinct things to do
-   - Your guidance would need to enumerate 2+ independent items
-   Do NOT force a speculative split. If you cannot clearly define the sub-issues with concrete titles and descriptions, choose NEEDS_CLARIFICATION instead and draft your best understanding of the decomposition in `plan_text`.
-   When splitting, the PARENT ISSUE will be CLOSED automatically as a task container. The sub-issues become the real tracked work.
-   Each sub-issue should target ~500 lines of non-test code, ~1500 total including tests; auto-generated code does not count.
-
-   PRIORITY LEVELS:
-   - 1 = Critical: blocking other work, security fix, core dependency that other sub-issues depend on
-   - 2 = High: important feature, depended on by lower-priority sub-issues
-   - 3 = Normal: independent work, enhancements, nice-to-haves
-   The parent issue has priority {parent_priority}. Sub-issues that are dependencies for others should get higher priority (lower number). Independent leaf tasks can inherit the parent priority or be lower.
-
-   DEPENDENCIES:
-   When a sub-issue cannot be started until another sub-issue is done, set `"depends_on"` to the 1-based index of the dependency. Example: if sub-issue 2 builds on the primitives from sub-issue 1, set `"depends_on": 1` on sub-issue 2. The system parks sub-issue 2 (labels it `waiting-on-issue:#N`) so the worker skips it until sub-issue 1 is closed. Use this for real build-order dependencies — do not set `depends_on` for issues that are merely related or could run in parallel.
-
-3. ALREADY_DONE — Use when the work described in the issue is ALREADY fully implemented in the codebase:
-   - The worker's output or your analysis shows the feature/tests/code already exists
-   - There is nothing left to implement — the issue is simply outdated or redundant
-   - Prefer ALREADY_DONE over GUIDE_WORKER or SPLIT when the required behavior is already present in the repository as it exists now
-
-4. NEEDS_CLARIFICATION — Use when you need more information from a human, OR when you are unsure how to decompose the issue:
-   - After reading the **task context file** and (if needed) the repo, the issue is still too vague to determine scope or intent
-   - The worker's rejection and the issue (as given in that file) still don't give enough to guide or split
-   - You need specific information from a human (e.g. which modules to cover, what the acceptance criteria are)
-   - You are unsure how to split the issue into well-defined sub-issues
-   Do **not** use this option because you skipped reading the task context file.
-   When you choose NEEDS_CLARIFICATION, write your current best plan in `plan_text` — the system will update the issue description so the human can see your proposed approach. Post your specific questions in `question` — they'll appear as a comment. You may be re-triaged multiple times as the human replies; each time, refine `plan_text` with your updated understanding. The `pmo-pending` label stays until a human removes it — when you reach a confident decision during refinement, still use `needs_clarification` and describe your recommendation in `question`. The human will remove the label to trigger final processing.
-
-5. WAIT_FOR_DEPENDENCY — Use when this issue cannot be implemented until another EXISTING OPEN issue is closed:
-   - The dependency is a real build-order blocker (the code from the other issue is a prerequisite)
-   - Set `dependency_issue_iid` to the IID of the blocking issue (it must appear in the EXISTING OPEN ISSUES list)
-   - The system parks this issue (labels it `waiting-on-issue:#N`) so the worker skips it until the dependency closes, then resumes automatically
-   - Do NOT use this for issues that are merely related or could run in parallel — only for real prerequisites
-   - Do NOT use this as a substitute for SPLIT's `depends_on` (that's for sub-issues you're creating now); use WAIT_FOR_DEPENDENCY only when the dependency is an already-existing separate issue
-
-DUPLICATE / OVERLAP RULES (STRICT):
-- Review the EXISTING OPEN ISSUES list above before creating any sub-issue.
-- Do NOT create a sub-issue that duplicates or substantially overlaps with an existing open issue.
-- If an existing OPEN (not IN-PROGRESS) issue covers part of the work, reference it (e.g. "See existing #42") instead of creating a new sub-issue for that part.
-- If an existing IN-PROGRESS issue already covers it, simply skip that part entirely — do not create a sub-issue or reference.
-- If ALL sub-issues would duplicate existing issues, choose GUIDE_WORKER instead and tell the worker which existing issues already cover the work.
+CLARIFICATION POLICY:
+- Ask for human input only after reading the entire task context and inspecting the repository when needed.
+- Include the best current scope and approach with the specific unresolved questions. On later triage cycles, refine that plan from the human replies.
+- The pending label remains until a human removes it; during refinement, state your recommendation and questions rather than taking an unapproved final action.
 
 INSTRUCTIONS:
 1. Open and read the **entire** TASK CONTEXT FILE at the absolute path above (description, GitLab comments, closed MR context, existing issues). Do this first.
 2. From that file, read the issue description and **all** comments — especially the worker's rejection reason. If there is a **Closed merge request context** section, read the MR comments and diff to understand what the reviewer asked for and what the worker tried.
 3. Review the EXISTING OPEN ISSUES section in that same file to see what is already tracked.
-4. TASK CONTAINER TEST: Does the issue describe a broad goal that involves multiple independent pieces of work (e.g. "add tests for all modules", "refactor X across the codebase", "check code for Y")? If YES → SPLIT. The parent issue is just a container; the real work is in the sub-issues.
-5. GUIDANCE TEST: Is there ONE specific thing the worker misunderstood or did wrong? If YES → GUIDE_WORKER.
-6. ENUMERATION TEST: If your guidance would list 2+ independent modules, files, or components → SPLIT, not GUIDE_WORKER.
-7. CLARITY TEST: Only if the task context file plus (if needed) repo inspection still leaves intent unclear → NEEDS_CLARIFICATION.
-8. COMPLETION TEST: Does the worker's output, the comments in the file, or your direct inspection of the current project state indicate the work is already fully implemented in the codebase? If YES → ALREADY_DONE.
-9. DEPENDENCY TEST: Does this issue require code from another EXISTING OPEN issue to be implemented first? If YES → WAIT_FOR_DEPENDENCY (set `dependency_issue_iid`).
-10. Choose EXACTLY ONE of GUIDE_WORKER, SPLIT, ALREADY_DONE, NEEDS_CLARIFICATION, or WAIT_FOR_DEPENDENCY — never combine them.
-11. When in doubt between GUIDE_WORKER and SPLIT, prefer SPLIT — it's better to create focused sub-issues than to give the worker a laundry list.
-12. Call the `plan` tool with the JSON shape above. This is the last step — your turn is not complete until you call `plan`.
-
+4. Verify whether the repository already satisfies the issue.
+5. Apply the triage, decomposition, dependency, duplicate, and clarification policies above.
 Proceed with analyzing the issue autonomously.
 "#,
         project = &state.project_name,
@@ -3456,7 +3401,7 @@ mod tests {
     }
 
     #[test]
-    fn build_split_prompt_documents_plan_tool_only() {
+    fn build_split_prompt_contains_policy_without_structured_output_markers() {
         let state = AgentState {
             sessions_dir: "/tmp",
             agent_id: "pmo-test",
@@ -3472,23 +3417,36 @@ mod tests {
             updated_at: None,
         };
         let prompt = build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2).unwrap();
-        // The plan tool is the ONLY output channel.
-        assert!(prompt.contains("call the `plan` tool"));
-        assert!(prompt.contains("`decision`"));
-        assert!(prompt.contains("guide_worker"));
-        assert!(prompt.contains("split"));
-        assert!(prompt.contains("already_done"));
-        assert!(prompt.contains("needs_clarification"));
+        // Structured-output presentation belongs to the backend vendor, not
+        // the role prompt.
+        assert!(!prompt.contains("`plan` tool"));
+        assert!(!prompt.contains("output contract"));
+        assert!(!prompt.contains("The tool's parameters are"));
+        assert!(!prompt.contains("JSON shape above"));
+        for marker in [
+            "guide_worker",
+            "already_done",
+            "needs_clarification",
+            "wait_for_dependency",
+            "depends_on",
+            "plan_text",
+            "dependency_issue_iid",
+            "SUB_ISSUE_N:",
+            "GUIDE_WORKER",
+            "ALREADY_DONE",
+            "NEEDS_CLARIFICATION",
+            "WAIT_FOR_DEPENDENCY",
+            "PUBLIC_COMMENT_BEGIN",
+            "text-marker",
+        ] {
+            assert!(!prompt.contains(marker), "unexpected marker {marker:?}");
+        }
         // No text-marker fallback.
         assert!(!prompt.contains("SUB_ISSUE_N:"));
-        assert!(!prompt.contains("GUIDE_WORKER\n"));
-        assert!(!prompt.contains("ALREADY_DONE\n"));
-        assert!(!prompt.contains("NEEDS_CLARIFICATION\n"));
-        assert!(!prompt.contains("PUBLIC_COMMENT_BEGIN"));
-        assert!(!prompt.contains("text-marker"));
         // Reasoning guidance is intact.
-        assert!(prompt.contains("TASK CONTAINER TEST"));
-        assert!(prompt.contains("DUPLICATE / OVERLAP RULES"));
+        assert!(prompt.contains("broad task containers"));
+        assert!(prompt.contains("Never duplicate or substantially overlap existing work"));
+        assert!(prompt.contains("repository already fully implements"));
     }
 
     #[test]

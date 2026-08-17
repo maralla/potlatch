@@ -32,6 +32,7 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
 
+use super::backends::{AcpVendorExtension, StructuredOutputBackend};
 use super::capabilities::CapabilityProvider;
 use super::client::AcpClient;
 use super::orchestrator_hooks::StreamTextHooks;
@@ -40,7 +41,6 @@ use super::types::{
     InitializeParams, NewSessionParams, NewSessionResult, PromptResult, mode_id_is_available,
     model_selector_for_session, select_option_allows_value,
 };
-use super::vendor::AcpVendorExtension;
 use crate::core::agent::AgentHandoff;
 use crate::core::config::build_acp_spawn_command;
 
@@ -89,14 +89,14 @@ pub(crate) struct AcpRuntime {
     acp_env: std::collections::HashMap<String, String>,
     /// Vendor ACP extension — None when the vendor has no extension.
     vendor_ext: Option<Arc<dyn AcpVendorExtension>>,
+    /// Structured-output rendering/capture strategy selected by vendor.
+    structured_output_backend: Arc<dyn StructuredOutputBackend>,
     /// Capability provider (set by the agent at construction).
     capability_provider: Mutex<Option<Arc<dyn CapabilityProvider>>>,
-    /// Structured-output tool definitions for the task currently in flight,
-    /// passed to the harness via `session/new` params. Each entry has `name`,
-    /// `description`, and `parameters` (JSON schema). Set per task by
-    /// [`AcpRuntime::run_task`], so a task's contract is registered with the
-    /// session created (or rotated) for it — including a session recreated
-    /// by a transport retry.
+    /// Structured-output definitions for the task currently in flight. The
+    /// selected backend either passes them to the harness via `session/new` or
+    /// renders them into the marker prompt. Set per task by
+    /// [`AcpRuntime::run_task`] and retained across transport retries.
     structured_output_tools: Mutex<Vec<Value>>,
     shutdown: Arc<AtomicBool>,
     agent_id: String,
@@ -117,7 +117,9 @@ impl AcpRuntime {
         agent_id: String,
     ) -> Self {
         let vendor_ext =
-            super::vendor::resolve_vendor_extension(model_uri.as_deref(), preferred_session_mode);
+            super::backends::resolve_vendor_extension(model_uri.as_deref(), preferred_session_mode);
+        let structured_output_backend =
+            super::backends::resolve_structured_output_backend(model_uri.as_deref());
         Self {
             repo_path,
             model_uri,
@@ -130,6 +132,7 @@ impl AcpRuntime {
             acp: Mutex::new(None),
             unexpected_quits_count: Arc::new(AtomicU64::new(0)),
             vendor_ext,
+            structured_output_backend,
             capability_provider: Mutex::new(None),
         }
     }
@@ -156,8 +159,9 @@ impl AcpRuntime {
         cancel_check: Option<&dyn Fn() -> bool>,
         follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
     ) -> Result<AgentHandoff> {
-        let prompt = prepare_task_prompt(prompt);
         self.register_task_contract(structured_output_tools);
+        let prompt = self.prompt_with_structured_output(prompt);
+        let prompt = prepare_task_prompt(&prompt);
 
         if let Some(model_uri) = &self.model_uri {
             info!(
@@ -193,12 +197,13 @@ impl AcpRuntime {
         cancel_check: Option<&dyn Fn() -> bool>,
         follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
     ) -> Result<AgentHandoff> {
+        let prompt = self.prompt_with_structured_output(prompt);
         debug!(
             "Agent {} follow-up prompt in current session: {}",
             self.agent_id(),
             prompt
         );
-        self.run_prompt_once(prompt, cancel_check, follow_up_poll)
+        self.run_prompt_once(&prompt, cancel_check, follow_up_poll)
     }
 
     /// Record the structured-output contract the task being started asks for.
@@ -208,11 +213,18 @@ impl AcpRuntime {
         *self.structured_output_tools.lock().unwrap() = tools;
     }
 
-    /// The `structured_output_tools` value for `session/new`: the contract the
-    /// current task registered, or nothing when it registered none.
+    fn prompt_with_structured_output(&self, prompt: &str) -> String {
+        let tools = self.structured_output_tools.lock().unwrap();
+        self.structured_output_backend
+            .prepare_prompt(prompt, &tools)
+    }
+
+    /// The backend-specific `structured_output_tools` value for `session/new`.
+    /// The Potlatch harness receives tool definitions; marker vendors receive
+    /// the same contract in their prompt and therefore expose no wire tools.
     fn session_structured_output_tools(&self) -> Option<Vec<Value>> {
         let tools = self.structured_output_tools.lock().unwrap().clone();
-        (!tools.is_empty()).then_some(tools)
+        self.structured_output_backend.session_tools(&tools)
     }
 
     fn run_prompt_with_transport_retry(
@@ -336,6 +348,7 @@ impl AcpRuntime {
                         &hooks,
                         pr,
                         self.vendor_ext.as_ref(),
+                        Some(self.structured_output_backend.as_ref()),
                     ));
                 }
                 Ok(Err(e)) => break Err(anyhow::anyhow!("ACP session/prompt: {}", e)),
@@ -705,6 +718,7 @@ fn handoff_from_prompt_hooks(
     hooks: &StreamTextHooks,
     pr: PromptResult,
     vendor_ext: Option<&Arc<dyn AcpVendorExtension>>,
+    structured_output_backend: Option<&dyn StructuredOutputBackend>,
 ) -> AgentHandoff {
     let stream = hooks.take_text();
     let final_text = final_text_from_prompt_extra(&pr.extra);
@@ -733,7 +747,10 @@ fn handoff_from_prompt_hooks(
         .extra
         .get("structured_outputs")
         .filter(|value| value.as_object().is_some_and(|outputs| !outputs.is_empty()))
-        .cloned();
+        .cloned()
+        .or_else(|| {
+            structured_output_backend.and_then(|backend| backend.extract_outputs(&response))
+        });
 
     AgentHandoff {
         response,
@@ -765,10 +782,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn test_runtime() -> AcpRuntime {
+    fn test_runtime_with_model(model_uri: Option<&str>) -> AcpRuntime {
         AcpRuntime::new(
             "/tmp/repo".into(),
-            None,
+            model_uri.map(str::to_string),
             None,
             vec!["true".into()],
             std::collections::HashMap::new(),
@@ -778,9 +795,13 @@ mod tests {
         )
     }
 
+    fn test_runtime() -> AcpRuntime {
+        test_runtime_with_model(None)
+    }
+
     #[test]
-    fn each_task_registers_its_own_contract_for_the_sessions_it_needs() {
-        let runtime = test_runtime();
+    fn potlatch_tasks_register_their_contract_for_the_sessions_they_need() {
+        let runtime = test_runtime_with_model(Some("acp://potlatch/test"));
         assert_eq!(runtime.session_structured_output_tools(), None);
 
         let handoff = json!({"name": "handoff", "description": "d", "parameters": {}});
@@ -798,6 +819,23 @@ mod tests {
         assert_eq!(
             runtime.session_structured_output_tools(),
             Some(vec![review])
+        );
+    }
+
+    #[test]
+    fn default_vendor_keeps_contract_out_of_session_new() {
+        let runtime = test_runtime();
+        runtime.register_task_contract(vec![json!({
+            "name": "handoff",
+            "description": "d",
+            "parameters": {}
+        })]);
+
+        assert_eq!(runtime.session_structured_output_tools(), None);
+        assert!(
+            runtime
+                .prompt_with_structured_output("Do the task.")
+                .contains("BREEZE_STRUCTURED_OUTPUT_BEGIN")
         );
     }
 
@@ -855,7 +893,7 @@ mod tests {
             "message": "from result"
         }))
         .unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr, None);
+        let h = handoff_from_prompt_hooks(&hooks, pr, None, None);
         assert_eq!(h.response, "from result");
 
         let hooks_m = StreamTextHooks::new();
@@ -865,7 +903,7 @@ mod tests {
             "message": "SUB_ISSUE_1:\nTITLE: T\nDESCRIPTION:\nD"
         }))
         .unwrap();
-        let hm = handoff_from_prompt_hooks(&hooks_m, pr_m, None);
+        let hm = handoff_from_prompt_hooks(&hooks_m, pr_m, None, None);
         assert_eq!(hm.response, "SUB_ISSUE_1:\nTITLE: T\nDESCRIPTION:\nD");
 
         let hooks2 = StreamTextHooks::new();
@@ -874,7 +912,7 @@ mod tests {
             "message": "only result"
         }))
         .unwrap();
-        let h2 = handoff_from_prompt_hooks(&hooks2, pr2, None);
+        let h2 = handoff_from_prompt_hooks(&hooks2, pr2, None, None);
         assert_eq!(h2.response, "only result");
 
         let hooks3 = StreamTextHooks::new();
@@ -883,7 +921,7 @@ mod tests {
             "stopReason": "end_turn"
         }))
         .unwrap();
-        let h3 = handoff_from_prompt_hooks(&hooks3, pr3, None);
+        let h3 = handoff_from_prompt_hooks(&hooks3, pr3, None, None);
         assert_eq!(h3.response, "from stream");
     }
 
@@ -899,7 +937,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = handoff_from_prompt_hooks(&hooks, pr, None);
+        let out = handoff_from_prompt_hooks(&hooks, pr, None, None);
         assert!(out.response.contains("SUB_ISSUE_1:"));
         assert!(out.response.contains("TITLE: Refactor queue"));
     }
@@ -913,10 +951,29 @@ mod tests {
             "structured_outputs": {"plan": {"decision": "split", "sub_issues": [{"title": "A"}]}}
         }))
         .unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr, None);
+        let h = handoff_from_prompt_hooks(&hooks, pr, None, None);
         assert_eq!(
             h.structured_outputs,
             Some(json!({"plan": {"decision": "split", "sub_issues": [{"title": "A"}]}}))
+        );
+    }
+
+    #[test]
+    fn handoff_extracts_default_backend_marker_output() {
+        let hooks = StreamTextHooks::new();
+        let pr: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "message": "done\nBREEZE_STRUCTURED_OUTPUT_BEGIN\n\
+                {\"plan\":{\"decision\":\"split\",\"sub_issues\":[]}}\n\
+                BREEZE_STRUCTURED_OUTPUT_END"
+        }))
+        .unwrap();
+        let backend = crate::core::model::acp::backends::resolve_structured_output_backend(None);
+        let handoff = handoff_from_prompt_hooks(&hooks, pr, None, Some(backend.as_ref()));
+
+        assert_eq!(
+            handoff.structured_outputs,
+            Some(json!({"plan": {"decision": "split", "sub_issues": []}}))
         );
     }
 
@@ -925,7 +982,7 @@ mod tests {
         let hooks = StreamTextHooks::new();
         let pr: PromptResult =
             serde_json::from_value(json!({"stopReason": "end_turn", "message": "done"})).unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr, None);
+        let h = handoff_from_prompt_hooks(&hooks, pr, None, None);
         assert!(h.structured_outputs.is_none());
     }
 
@@ -938,7 +995,7 @@ mod tests {
             "structured_outputs": null
         }))
         .unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr, None);
+        let h = handoff_from_prompt_hooks(&hooks, pr, None, None);
         assert!(h.structured_outputs.is_none());
     }
 
@@ -951,7 +1008,7 @@ mod tests {
             "structured_outputs": {}
         }))
         .unwrap();
-        let h = handoff_from_prompt_hooks(&hooks, pr, None);
+        let h = handoff_from_prompt_hooks(&hooks, pr, None, None);
         assert!(h.structured_outputs.is_none());
     }
 }

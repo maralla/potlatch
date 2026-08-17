@@ -230,9 +230,10 @@ fn structured_output_repair_prompt(
 ) -> String {
     format!(
         "Your structured output was not accepted: {correction}.\n\n\
-         Call the `{tool}` tool now with corrected arguments that satisfy its schema. \
+         Submit a corrected `{tool}` result now using the structured-output format provided by \
+         the backend and arguments that satisfy its schema. \
          Do not redo the task and do not repeat your previous explanation — this conversation \
-         still has all of it. Send the corrected `{tool}` call and nothing else. \
+         still has all of it. Send the corrected structured result and nothing else. \
          (Correction attempt {attempt} of {max_attempts}; after that the task fails.)",
         correction = error.correction(tool),
     )

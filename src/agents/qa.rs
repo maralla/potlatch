@@ -122,7 +122,7 @@ impl StructuredOutput for QaOutput {
     }
 
     fn tool_description() -> &'static str {
-        "Emit your QA test findings and clarification questions as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your results."
+        "The findings and clarification questions from this QA run."
     }
 
     fn schema() -> Schema {
@@ -1485,8 +1485,8 @@ Use `git log --oneline -5` and the changed files above to identify which user-fa
 
 1. **Read the QA issues file and your knowledge files first.** Before any other action, read `{qa_issues_path}` with `read` (`outside_cwd: true`) to gather acceptance criteria and testing instructions for the functions in scope. Also read your knowledge files under `{knowledge_dir}/` to recall your functionality map and test plan.
 2. **Never fetch GitLab yourself.** Do not call `glab`, `fetch`, or any tool to read issues/MRs/commits from GitLab. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` and the full open-issue listing into `{open_issues_path}` — read those files.
-3. **Never report a duplicate finding.** Before including a finding in the `qa_report` tool call, read `{open_issues_path}` and check whether an open issue already describes the same problem (by the QA agent, another agent, or a human). If it does, do not report that finding — the issue is already tracked. Compare by the underlying problem, not just exact-title match: a finding about "login returns 500 on empty password" duplicates an issue titled "Auth API crashes on malformed input" even though the wording differs. Only report a finding if no open issue covers the same root cause.
-4. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your `qa_report` tool call's `findings` and `clarifications`.
+3. **Never report a duplicate finding.** Before reporting a finding, read `{open_issues_path}` and check whether an open issue already describes the same problem (by the QA agent, another agent, or a human). If it does, do not report that finding — the issue is already tracked. Compare by the underlying problem, not just exact-title match: a finding about "login returns 500 on empty password" duplicates an issue titled "Auth API crashes on malformed input" even though the wording differs. Only report a finding if no open issue covers the same root cause.
+4. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your structured result.
 5. **Never modify the working directory.** Do not use `write` or `edit` to create, modify, or delete anything inside the checked-out repo. Do not run `cd`, `git checkout`, `git commit`, or any command that mutates the repo tree.
 6. **Never run unit tests, build commands, or liveness/ops endpoints.** Do not run `cargo test`, `go test`, `go build`, `go vet`, `pytest`, `npm test`, or similar — these are the developer's responsibility and redundant for end-user testing; build commands also write artifacts into the repo. Do not test ops/liveness/health endpoints (`/ping`, `/monitor`, `/health`, `/metrics`, `/ready`, etc.) unless a QA-labeled issue explicitly asks you to — they are not functionality and testing them is noise. Allowed commands: `curl`/`python3` against real functionality APIs, invoking an already-built CLI binary the way a user would, and `python3` to run your own test scripts.
 
@@ -1504,13 +1504,7 @@ Use `git log --oneline -5` and the changed files above to identify which user-fa
 
 Report genuine bugs, security vulnerabilities, race conditions, correctness issues, and incomplete feature implementations you encounter **while testing as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
 
-## Output Format
-
-Call the `qa_report` tool exactly once with your results — this tool call is the only output channel Potlatch reads; there is no text-based fallback. The tool has two fields:
-- `findings` (required): a JSON array of objects with `title`, `description`, `severity` (critical/high/medium/low), and optional `file` (e.g. "src/path/to/file.rs:123"). Empty array if no bugs found.
-- `clarifications` (optional): a JSON array of objects with `question` and `context`. Omit or use empty array if no clarification needed.
-
-Only critical, high, and medium findings will be created as GitLab issues; low-severity findings are logged but not tracked. The `file` field is optional — leave it empty when the finding is observed externally and you cannot tie it to a specific source location. Findings and clarification questions may both be emitted in the same run."##
+Only critical, high, and medium findings will be created as GitLab issues; low-severity findings are logged but not tracked. Findings and clarification questions may both be reported in the same run."##
     )
 }
 
@@ -2300,10 +2294,14 @@ mod tests {
         assert!(prompt.contains("abc123"));
         assert!(prompt.contains("def456"));
         assert!(prompt.contains("src/main.rs"));
-        // The `qa_report` tool is the only output channel.
-        assert!(prompt.contains("Call the `qa_report` tool"));
+        // Structured-output presentation belongs to the backend vendor, not
+        // the role prompt.
+        assert!(!prompt.contains("qa_report"));
+        assert!(!prompt.contains("output contract"));
         assert!(prompt.contains("findings"));
-        assert!(prompt.contains("clarifications"));
+        assert!(prompt.contains("clarification questions"));
+        assert!(!prompt.contains("tool has two fields"));
+        assert!(!prompt.contains("JSON array of objects"));
         // No text-marker fallback or removed blocks.
         assert!(!prompt.contains("TEXT MARKER FALLBACK"));
         assert!(!prompt.contains("QA_FINDINGS_BEGIN"));

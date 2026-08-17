@@ -9,20 +9,18 @@ use crate::core::config::{AcpSpawnConfig, Config};
 use crate::core::model::acp::AcpRuntime;
 
 /// Model backend boundary: converts the neutral [`StructuredOutputTool`]
-/// contract into the ACP/harness `structured_output_tools` wire JSON
-/// (`{"name", "description", "parameters"}` with a JSON-schema `parameters`
-/// value). The harness (ACP runtime, `NewSessionParams`) only ever sees this
-/// raw JSON and stays fully generic — it has no notion of [`Schema`] or
-/// [`ObjectSchema`].
+/// contract into generic JSON (`{"name", "description", "parameters"}` with
+/// JSON-schema parameters). The selected ACP backend then either exposes that
+/// JSON as Potlatch harness tools or renders it into a portable marker prompt.
 ///
 /// Objects become closed (`additionalProperties: false`) and tagged unions
 /// become `oneOf` branches whose discriminator property carries a `const`,
 /// so the backend enforces the same shape core validates.
-pub(crate) fn structured_output_tools_wire_json(tools: &[StructuredOutputTool]) -> Vec<Value> {
-    tools.iter().map(structured_output_tool_wire_json).collect()
+pub(crate) fn structured_output_contracts_json(tools: &[StructuredOutputTool]) -> Vec<Value> {
+    tools.iter().map(structured_output_contract_json).collect()
 }
 
-fn structured_output_tool_wire_json(tool: &StructuredOutputTool) -> Value {
+fn structured_output_contract_json(tool: &StructuredOutputTool) -> Value {
     json!({
         "name": tool.name,
         "description": tool.description,
@@ -217,19 +215,18 @@ impl ModelEngine {
     }
 
     /// Start a new task: the structured-output contract for *this* task is
-    /// converted to backend wire JSON and registered with the session the
-    /// runtime creates or rotates for it.
+    /// converted to generic JSON and handed to the selected ACP backend.
     pub fn invoke(
         &self,
         prompt: &str,
         options: &InvokeOptions,
         tools: &[StructuredOutputTool],
     ) -> Result<crate::core::agent::ModelResponse> {
-        let wire_tools = structured_output_tools_wire_json(tools);
+        let contracts = structured_output_contracts_json(tools);
         let (cancel_check, follow_up_poll) = live_callbacks(options);
         let handoff = self
             .inner
-            .run_task(prompt, wire_tools, cancel_check, follow_up_poll)?;
+            .run_task(prompt, contracts, cancel_check, follow_up_poll)?;
         Ok(crate::core::agent::ModelResponse { handoff })
     }
 
@@ -389,7 +386,7 @@ mod tests {
             ),
         };
 
-        let wire = structured_output_tools_wire_json(std::slice::from_ref(&tool));
+        let wire = structured_output_contracts_json(std::slice::from_ref(&tool));
         assert_eq!(wire.len(), 1);
         assert_eq!(
             wire[0],
@@ -438,7 +435,7 @@ mod tests {
             ),
         };
 
-        let wire = structured_output_tool_wire_json(&tool);
+        let wire = structured_output_contract_json(&tool);
         assert_eq!(
             wire["parameters"]["properties"]["sub_issues"],
             json!({
@@ -479,7 +476,7 @@ mod tests {
             ),
         };
 
-        let wire = structured_output_tool_wire_json(&tool);
+        let wire = structured_output_contract_json(&tool);
         assert_eq!(
             wire["parameters"],
             json!({
@@ -532,7 +529,7 @@ mod tests {
                     .property("x", Schema::boolean("x flag")),
             ),
         };
-        let wire = structured_output_tool_wire_json(&tool);
+        let wire = structured_output_contract_json(&tool);
         assert!(wire["parameters"].get("required").is_none());
         assert_eq!(wire["parameters"]["additionalProperties"], json!(false));
     }
