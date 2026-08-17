@@ -1522,7 +1522,7 @@ fn process_issue(
     info!("Created MR !{} for issue #{}", mr_iid, issue.iid);
 
     if let Some(lbl) = scope_label
-        && let Err(e) = state.glab.add_mr_label_with_transient_retries(mr_iid, lbl)
+        && let Err(e) = state.glab.add_mr_label_with_retries(mr_iid, lbl)
     {
         warn!(
             "{}: Failed to add scope label {:?} to MR !{} (permanent error): {}",

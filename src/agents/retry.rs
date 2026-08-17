@@ -2,39 +2,34 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use tracing::{debug, info};
+use tracing::{info, warn};
 
-/// Returns `true` when an error string suggests a transient network/API problem worth retrying.
-pub(crate) fn transient_error_should_retry(err_msg: &str) -> bool {
-    let m = err_msg.to_lowercase();
-    // Permanent client / validation errors — repeating the request is unlikely to help.
-    if m.contains("http 401")
-        || m.contains("http 403")
-        || m.contains("http 404")
-        || m.contains("http 400")
-        || m.contains("http 405")
-        || m.contains("http 422")
-        || m.contains("unauthorized")
-        || m.contains("authentication failed")
-        || m.contains("invalid ref")
-        || m.contains("unknown revision")
-        || m.contains("nothing to commit")
-        || m.contains("already exists")
-        || m.contains("cannot lock ref")
-        || m.contains("repository not found")
-    {
-        return false;
-    }
-    true
-}
-
-pub(crate) fn with_transient_retries<T, F>(context: &str, mut operation: F) -> Result<T>
+pub(crate) fn with_backoff_retries<T, F>(context: &str, operation: F) -> Result<T>
 where
     F: FnMut() -> Result<T>,
 {
+    with_backoff_retries_using(
+        context,
+        operation,
+        Duration::from_secs(1),
+        Duration::from_secs(3 * 60 * 60),
+        thread::sleep,
+    )
+}
+
+fn with_backoff_retries_using<T, F, S>(
+    context: &str,
+    mut operation: F,
+    initial_delay: Duration,
+    max_delay: Duration,
+    mut sleep: S,
+) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+    S: FnMut(Duration),
+{
     let mut attempt = 0u32;
-    let mut delay = Duration::from_secs(1);
-    const MAX_DELAY: Duration = Duration::from_secs(60);
+    let mut delay = initial_delay;
     loop {
         attempt += 1;
         match operation() {
@@ -45,16 +40,12 @@ where
                 return Ok(value);
             }
             Err(e) => {
-                let msg = e.to_string();
-                if !transient_error_should_retry(&msg) {
-                    return Err(e);
-                }
-                debug!(
-                    "Transient failure {} (attempt {}), retrying in {:?}: {}",
-                    context, attempt, delay, msg
+                warn!(
+                    "{} failed (attempt {}), retrying in {:?}: {}",
+                    context, attempt, delay, e
                 );
-                thread::sleep(delay);
-                delay = (delay * 2).min(MAX_DELAY);
+                sleep(delay);
+                delay = (delay * 2).min(max_delay);
             }
         }
     }
@@ -65,40 +56,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transient_error_retry_heuristic_matches_glab_500() {
-        assert!(transient_error_should_retry(
-            "Failed to add label to MR: glab: 500 Internal Server Error (HTTP 500)"
-        ));
+    fn backoff_retries_until_success() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let result = with_backoff_retries_using(
+            "test operation",
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    anyhow::bail!("temporary failure");
+                }
+                Ok("done")
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            |delay| delays.push(delay),
+        );
+
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(attempts, 3);
+        assert_eq!(delays, vec![Duration::from_secs(1), Duration::from_secs(2)]);
     }
 
     #[test]
-    fn transient_error_retry_heuristic_matches_tls_handshake_timeout() {
-        assert!(transient_error_should_retry(
-            "glab api issue discussions failed: ERROR Get \"https://gitlab.example/api\": net/http: TLS handshake timeout."
-        ));
-    }
+    fn backoff_caps_delay_while_retrying_until_success() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let result = with_backoff_retries_using(
+            "test operation",
+            || {
+                attempts += 1;
+                if attempts < 5 {
+                    anyhow::bail!("temporary failure");
+                }
+                Ok("done")
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            |delay| delays.push(delay),
+        );
 
-    #[test]
-    fn transient_error_retry_heuristic_matches_git_connection_closed() {
-        assert!(transient_error_should_retry(
-            "Git fetch failed: Connection closed by 192.0.2.1 port 22 fatal: Could not read from remote repository. Please make sure you have the correct access rights and the repository exists."
-        ));
-    }
-
-    #[test]
-    fn transient_error_retry_skips_permanent_http_codes() {
-        assert!(!transient_error_should_retry(
-            "Failed to add label to MR: glab: 404 Not Found (HTTP 404)"
-        ));
-        assert!(!transient_error_should_retry(
-            "Failed to add label to MR: HTTP 403 Forbidden"
-        ));
-    }
-
-    #[test]
-    fn transient_error_retry_skips_git_auth_failures() {
-        assert!(!transient_error_should_retry(
-            "Git fetch failed: fatal: Authentication failed for 'https://gitlab.example/group/project.git/'"
-        ));
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(attempts, 5);
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            ]
+        );
     }
 }

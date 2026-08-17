@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 use tracing::{debug, warn};
 
-use super::retry::with_transient_retries;
+use super::retry::with_backoff_retries;
 
 pub struct GitRepo {
     pub path: String,
@@ -31,7 +31,7 @@ impl GitRepo {
     }
 
     pub fn clone(&self, repo_url: &str) -> Result<()> {
-        with_transient_retries(&format!("git clone into {}", self.path), || {
+        with_backoff_retries(&format!("git clone into {}", self.path), || {
             debug!("Cloning repository {} to {}", repo_url, self.path);
 
             let output = Command::new("git")
@@ -48,7 +48,7 @@ impl GitRepo {
     }
 
     pub fn fetch(&self) -> Result<()> {
-        with_transient_retries(&format!("git fetch in {}", self.path), || {
+        with_backoff_retries(&format!("git fetch in {}", self.path), || {
             debug!("Fetching latest changes in {}", self.path);
 
             let output = Command::new("git")
@@ -116,7 +116,7 @@ impl GitRepo {
         let mut args = vec!["fetch", "origin"];
         args.extend(spec.iter().map(String::as_str));
 
-        with_transient_retries(
+        with_backoff_retries(
             &format!("git fetch branches {:?} in {}", branches, self.path),
             || {
                 debug!("Fetching branches {:?} in {}", branches, self.path);
@@ -526,7 +526,7 @@ impl GitRepo {
     }
 
     pub fn delete_remote_branch(&self, branch_name: &str) -> Result<()> {
-        with_transient_retries(&format!("git push --delete origin {branch_name}"), || {
+        with_backoff_retries(&format!("git push --delete origin {branch_name}"), || {
             self.delete_remote_branch_once(branch_name)
         })
     }
@@ -603,7 +603,7 @@ impl GitRepo {
     }
 
     pub fn push(&self, branch: &str) -> Result<()> {
-        with_transient_retries(&format!("git push origin {branch}"), || {
+        with_backoff_retries(&format!("git push origin {branch}"), || {
             debug!("Pushing branch {}", branch);
 
             let output = Command::new("git")
