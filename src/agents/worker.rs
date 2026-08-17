@@ -94,6 +94,10 @@ fn handoff_tool_definition() -> serde_json::Value {
                 "post_plain_comment": {
                     "type": "boolean",
                     "description": "Whether to post a new plain MR comment (non-resolvable)."
+                },
+                "existing_mr_iid": {
+                    "type": "integer",
+                    "description": "IID of an existing open MR that already implements this issue (discovered during work). Set this instead of creating a new MR when you find the issue is already implemented by an existing MR. The system will track it as this issue's MR."
                 }
             }
         }
@@ -1201,6 +1205,10 @@ fn has_worker_skip_label(labels: &[String]) -> bool {
     labels.contains(&WORKING_ON_LABEL.to_string()) || has_worker_resume_abandon_label(labels)
 }
 
+fn has_worker_claim(labels: &[String], agent_id: &str) -> bool {
+    labels.contains(&claim::claim_label(agent_id))
+}
+
 fn process_issue(
     state: &AgentState,
     model: &AgentModel,
@@ -1345,6 +1353,42 @@ fn process_issue(
         "{}: Worker agent finished issue #{}",
         &state.agent_id, issue.iid
     );
+
+    // The model found an existing open MR that already implements this issue.
+    // Track it in worker state instead of creating a new MR.
+    if let Some(mr_iid) = extract_existing_mr_iid(&agent_output) {
+        if let Ok(mr) = state.glab.get_merge_request(mr_iid) {
+            if mr.state == "opened" {
+                info!(
+                    "Issue #{}: model identified existing MR !{} as the implementation; tracking it",
+                    issue.iid, mr_iid
+                );
+                // Clean up the worker-created branch (if any).
+                let _ = state.git_repo.reset_hard();
+                let default_branch = state
+                    .git_repo
+                    .get_default_branch()
+                    .unwrap_or_else(|_| "main".to_string());
+                let _ = state.git_repo.checkout_remote_branch(&default_branch);
+                let _ = state.git_repo.delete_local_branch(&branch_name);
+                // Track the existing MR in worker state.
+                current.mr_iid = Some(mr_iid);
+                current.mr_created = true;
+                state.save_session(issue.iid, mr_iid)?;
+                let _ = state.glab.add_issue_label(issue.iid, WORKING_ON_LABEL);
+                return Ok(Some(mr_iid));
+            }
+            warn!(
+                "Issue #{}: model identified MR !{} but it is not open (state={}); proceeding with new MR",
+                issue.iid, mr_iid, mr.state
+            );
+        } else {
+            warn!(
+                "Issue #{}: model identified MR !{} but it could not be fetched; proceeding with new MR",
+                issue.iid, mr_iid
+            );
+        }
+    }
 
     if output_signals_cannot_implement(&agent_output) {
         let reason = if output_needs_split(&agent_output) {
@@ -2088,7 +2132,7 @@ struct SessionFile {
 }
 
 /// On startup, try to resume a session this worker previously owned.
-/// Checks the stored agent_id first, then falls back to checking GitLab labels.
+/// A stored agent_id is only valid while the issue still has this worker's claim.
 fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<ActiveIssue> {
     let claim_label = format!("claimed:{}", &state.agent_id);
     let issue_prefix = format!("{}_issue_", &state.agent_id);
@@ -2141,6 +2185,15 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                 if issue.state != "opened" {
                     let mr_iid = (session.mr_iid > 0).then_some(session.mr_iid);
                     state.abandon_closed_issue(issue_iid, mr_iid);
+                    continue;
+                }
+
+                if !has_worker_claim(&issue.labels, &state.agent_id) {
+                    info!(
+                        "{}: Session for issue #{} has no matching claim label, discarding stale session",
+                        &state.agent_id, issue_iid
+                    );
+                    state.cleanup_session(issue_iid);
                     continue;
                 }
 
@@ -3410,6 +3463,7 @@ Call `handoff` with the fields relevant to your outcome:
 - `public_comment` (string): Human-facing GitLab comment text (separate from MR description).
 - `mark_discussions_resolved` (boolean): Whether to mark open review discussions as resolved.
 - `post_plain_comment` (boolean): Whether to post a new plain MR comment.
+- `existing_mr_iid` (integer): IID of an existing open MR that already implements this issue. Set this when you discover the issue is already implemented by an existing MR, instead of creating a new MR. The system will track it as this issue's MR.
 
 All fields are optional — include only the ones relevant to your outcome. Call `handoff` exactly once when you're done.
 
@@ -3606,6 +3660,15 @@ fn extract_depends_on_issue(agent_output: &AgentHandoff) -> Option<u64> {
     // dependency without using the explicit marker, so scan for issue
     // references preceded by dependency keywords.
     extract_depends_on_issue_from_prose(response)
+}
+
+/// Extract `existing_mr_iid` from the `handoff` tool output.
+/// Returns `Some(iid)` only when the field is a positive integer.
+fn extract_existing_mr_iid(agent_output: &AgentHandoff) -> Option<u64> {
+    handoff_output(agent_output)?
+        .get("existing_mr_iid")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| *n > 0)
 }
 
 /// Scan prose for dependency phrases followed by `#<N>` issue references.
@@ -4062,6 +4125,19 @@ mod tests {
         assert!(has_worker_skip_label(&[PMO_PROCESSED_LABEL.to_string()]));
         assert!(has_worker_skip_label(&[PMO_PENDING_LABEL.to_string()]));
         assert!(!has_worker_skip_label(&["claimed:worker-0".to_string()]));
+    }
+
+    #[test]
+    fn worker_session_requires_its_live_claim_label() {
+        assert!(has_worker_claim(
+            &["claimed:worker-4".to_string(), WORKING_ON_LABEL.to_string()],
+            "worker-4"
+        ));
+        assert!(!has_worker_claim(
+            &["claimed:worker-3".to_string(), WORKING_ON_LABEL.to_string()],
+            "worker-4"
+        ));
+        assert!(!has_worker_claim(&[], "worker-4"));
     }
 
     #[test]
@@ -4628,5 +4704,44 @@ mod tests {
         let msgs = collect_new_follow_ups(&[], &mut last_seen, 1);
         assert!(msgs.is_empty());
         assert_eq!(last_seen, 3);
+    }
+
+    #[test]
+    fn extract_existing_mr_iid_reads_structured_field() {
+        let handoff = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "handoff": { "existing_mr_iid": 42 }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(extract_existing_mr_iid(&handoff), Some(42));
+    }
+
+    #[test]
+    fn extract_existing_mr_iid_returns_none_when_absent() {
+        let handoff = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "handoff": { "mr_title": "Fix bug" }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(extract_existing_mr_iid(&handoff), None);
+    }
+
+    #[test]
+    fn extract_existing_mr_iid_returns_none_for_zero_or_negative() {
+        let handoff = AgentHandoff {
+            structured_outputs: Some(serde_json::json!({
+                "handoff": { "existing_mr_iid": 0 }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(extract_existing_mr_iid(&handoff), None);
+    }
+
+    #[test]
+    fn extract_existing_mr_iid_returns_none_when_no_structured_outputs() {
+        let handoff = AgentHandoff::default();
+        assert_eq!(extract_existing_mr_iid(&handoff), None);
     }
 }
