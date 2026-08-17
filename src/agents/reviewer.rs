@@ -1,58 +1,105 @@
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use super::{claim, extract_public_comment_block, mr_in_scope, write_task_context_file};
+use super::{claim, mr_in_scope, write_task_context_file};
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient, Issue, MergeRequest};
-use crate::agents::settings;
-use crate::agents::workspace::{
-    ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
-};
-use crate::core::agent::{AgentHandoff, InvokeOptions};
+use crate::agents::workspace::{GitLabAgentBootstrap, gitlab_banner};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::agent::{InvokeOptions, ObjectSchema, SchemaField, StructuredOutput};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
+use crate::core::periodic::PeriodicTaskSpec;
 
 const REVIEWER_APPROVED_LABEL: &str = "reviewer-approved";
 const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
 
-/// The reviewer's structured-output tool definition. Passed to the harness
-/// via `session/new` so the harness registers a generic `StructuredOutputTool`
-/// named `review`. The model calls it with its review decision as structured
-/// JSON instead of emitting text markers.
-fn review_tool_definition() -> serde_json::Value {
-    serde_json::json!({
-        "name": "review",
-        "description": "Emit your review decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response. Call this exactly once with your decision and the fields relevant to it. For approvals, keep `summary` to ONE LINE — do NOT write a multi-paragraph review narrative.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "decision": {
-                    "description": "Your review decision. Must be exactly one of: \"approve\", \"request_changes\".",
-                    "type": "string",
-                    "enum": ["approve", "request_changes"]
-                },
-                "summary": {
-                    "description": "For approve: ignored — the posted GitLab comment is always just 'LGTM'. You may leave this empty.",
-                    "type": "string"
-                },
-                "feedback": {
-                    "description": "For request_changes: specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads.",
-                    "type": "string"
-                },
-                "public_comment": {
-                    "description": "Human-facing GitLab comment text (separate from feedback). Use for explanations, context, or recommendations that don't require code changes.",
-                    "type": "string"
-                }
-            },
-            "required": ["decision"]
+/// The reviewer's typed structured-output contract. The model calls the
+/// `review` tool with its decision; core deserializes the captured JSON into
+/// this type (see [`AgentModel::complete_typed`]). Core converts the
+/// declarative [`ObjectSchema`] below to whatever wire format the model
+/// backend expects — this file never builds backend JSON directly.
+#[derive(Debug, Clone)]
+enum ReviewerOutput {
+    Approve,
+    RequestChanges {
+        feedback: Option<String>,
+        public_comment: Option<String>,
+    },
+}
+
+#[derive(Deserialize)]
+struct ReviewerOutputWire {
+    decision: String,
+    #[serde(default)]
+    feedback: Option<String>,
+    #[serde(default)]
+    public_comment: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ReviewerOutput {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ReviewerOutputWire::deserialize(deserializer)?;
+        match wire.decision.trim().to_ascii_lowercase().as_str() {
+            "approve" => Ok(Self::Approve),
+            "request_changes" => Ok(Self::RequestChanges {
+                feedback: wire.feedback,
+                public_comment: wire.public_comment,
+            }),
+            decision => Err(serde::de::Error::unknown_variant(
+                decision,
+                &["approve", "request_changes"],
+            )),
         }
-    })
+    }
+}
+
+impl StructuredOutput for ReviewerOutput {
+    fn tool_name() -> &'static str {
+        "review"
+    }
+
+    fn tool_description() -> &'static str {
+        "Emit your review decision as structured JSON. This is the canonical output channel. Call this exactly once with your decision and the fields relevant to it. For approvals, keep `summary` to ONE LINE — do NOT write a multi-paragraph review narrative."
+    }
+
+    fn schema() -> ObjectSchema {
+        ObjectSchema::new()
+            .property(
+                "decision",
+                SchemaField::string_enum(
+                    "Your review decision. Must be exactly one of: \"approve\", \"request_changes\".",
+                    &["approve", "request_changes"],
+                ),
+            )
+            .property(
+                "summary",
+                SchemaField::string(
+                    "For approve: ignored — the posted GitLab comment is always just 'LGTM'. You may leave this empty.",
+                ),
+            )
+            .property(
+                "feedback",
+                SchemaField::string(
+                    "For request_changes: specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads.",
+                ),
+            )
+            .property(
+                "public_comment",
+                SchemaField::string(
+                    "Human-facing GitLab comment text (separate from feedback). Use for explanations, context, or recommendations that don't require code changes.",
+                ),
+            )
+            .required("decision")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,24 +153,29 @@ impl CoreAgent for ReviewerAgent {
         "reviewer"
     }
 
-    fn model(&self) -> &AgentModel {
-        &self.model
+    fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 
-    fn banner(_config: &Config, banner: &mut Banner) {
-        if let Some(repo) = settings::settings().gitlab_repo() {
-            banner.set_once("repo", repo);
-        }
+    fn shutdown(&self) -> &Arc<AtomicBool> {
+        self.model.shutdown()
+    }
+
+    fn banner(config: &Config, banner: &mut Banner) {
+        gitlab_banner(config, banner);
+    }
+
+    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+        super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        ReviewerAgentSettings::from_raw(&section.raw)?;
+        Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
-        vec![PeriodicTaskSpec {
-            id: "gitlab_poll",
-            interval: Duration::from_secs(self.config.poll_interval_secs),
-            jitter: JitterPolicy::BeforeEachCycle,
-            jitter_max_ms: 5000,
-            autostart: true,
-        }]
+        vec![PeriodicTaskSpec::polling(
+            "gitlab_poll",
+            Duration::from_secs(self.config.poll_interval_secs),
+        )]
     }
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
@@ -132,7 +184,7 @@ impl CoreAgent for ReviewerAgent {
                 let scope = crate::agents::scope_label_filter(&self.scope_label);
                 let model = &self.model;
                 let shutdown = Arc::clone(model.shutdown());
-                if let Err(e) = reviewer_cycle(
+                reviewer_cycle(
                     &self.agent_id,
                     &self.project_name,
                     &self.reviewer_dir,
@@ -145,62 +197,44 @@ impl CoreAgent for ReviewerAgent {
                     &mut self.claimed_mr_iid,
                     &shutdown,
                     scope,
-                ) && !shutdown.load(Ordering::SeqCst)
-                {
-                    error!("{}: Cycle error: {}", self.agent_id, e);
-                }
-                Ok(())
+                )
             }
             _ => Ok(()),
         }
     }
 
     fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let gitlab_repo = require_gitlab_repo()?;
         let section = ctx
             .workflow
             .config
             .agent("reviewer")
             .context("[agent.reviewer] section required")?;
         let settings = ReviewerAgentSettings::from_raw(&section.raw)?;
-        let project_name = extract_project_name(&gitlab_repo)?;
-        let agent_id = format!("reviewer-{}", ctx.instance_id);
-        ensure_agent_repo(
-            &ctx.workflow.base_dir,
-            &gitlab_repo,
-            &project_name,
-            &agent_id,
-        )?;
-        let reviewer_dir = work_dir(&ctx.workflow.base_dir, &project_name, &agent_id);
-        let sessions_dir = sessions_dir(&ctx.workflow.base_dir, &project_name);
         let config = ReviewerConfig {
             poll_interval_secs: settings.poll_interval_secs,
             merge_when_approved: settings.merge_when_approved,
         };
-        let git_repo = GitRepo::new(reviewer_dir.clone());
-        let gitlab = GitLabClient::new(reviewer_dir.clone(), &gitlab_repo)?;
-        let model = AgentModel::connect(
+        let runtime = GitLabAgentBootstrap::new(
             &ctx,
             "reviewer",
-            reviewer_dir.clone(),
             ModelPreferences {
-                structured_output_tools: Some(vec![review_tool_definition()]),
+                structured_output_tools: Some(vec![ReviewerOutput::tool_definition()]),
                 ..ModelPreferences::default()
             },
-        )?;
-        let agent_settings = settings::settings();
-        let scope = agent_settings.scope_label_filter();
-        let claimed_mr_iid = find_claimed_mr(&agent_id, &gitlab, scope);
+        )
+        .build()?;
+        let scope = crate::agents::scope_label_filter(&runtime.scope_label);
+        let claimed_mr_iid = find_claimed_mr(&runtime.agent_id, &runtime.gitlab, scope);
         Ok(Self {
-            agent_id,
-            project_name,
-            reviewer_dir,
-            sessions_dir,
+            agent_id: runtime.agent_id,
+            project_name: runtime.project_name,
+            reviewer_dir: runtime.working_dir,
+            sessions_dir: runtime.sessions_dir,
             config,
-            git_repo,
-            gitlab,
-            model,
-            scope_label: agent_settings.scope_label.clone(),
+            git_repo: runtime.git_repo,
+            gitlab: runtime.gitlab,
+            model: runtime.model,
+            scope_label: runtime.scope_label,
             merged_mrs: HashSet::new(),
             claimed_mr_iid,
         })
@@ -390,7 +424,9 @@ fn reviewer_cycle(
                 *claimed_mr_iid = None;
             }
             Err(e) => {
-                error!("{}: Failed to review MR !{}: {}", agent_id, mr.iid, e);
+                if !shutdown.load(Ordering::SeqCst) {
+                    error!("{}: Failed to review MR !{}: {}", agent_id, mr.iid, e);
+                }
                 release_mr_claim_or_warn(gitlab, mr.iid, agent_id);
                 *claimed_mr_iid = None;
                 if shutdown.load(Ordering::SeqCst) {
@@ -528,13 +564,13 @@ fn review_merge_request(
         sessions_dir,
     })?;
 
-    let agent_output = apply_reviewer_handoff(model.complete(
+    let completion = model.complete_typed::<ReviewerOutput>(
         &prompt,
         &InvokeOptions {
             activity_label: Some(format!("{} reviewing MR !{}", model.agent_id(), mr.iid)),
             ..InvokeOptions::default()
         },
-    )?);
+    )?;
     info!(
         "{}: Reviewer agent finished MR !{}",
         model.agent_id(),
@@ -543,69 +579,64 @@ fn review_merge_request(
 
     git_repo.checkout_remote_branch(&mr.target_branch)?;
 
-    if reviewer_approves(&agent_output) {
-        info!("MR !{} approved by reviewer", mr.iid);
+    match completion.output {
+        ReviewerOutput::Approve => {
+            info!("MR !{} approved by reviewer", mr.iid);
 
-        // Re-check for unresolved discussions before merging — another reviewer
-        // or the worker may have left new comments during the review.
-        match has_unresolved_comments(gitlab, mr.iid) {
-            Ok(true) => {
-                warn!(
-                    "MR !{} approved but has unresolved discussions, skipping merge",
-                    mr.iid
-                );
-                return Ok(ReviewOutcome::NeedsChanges);
-            }
-            Ok(false) => {}
-            Err(e) => {
-                return Err(e.context(format!(
-                    "Could not verify discussions are resolved for MR !{} before merge",
-                    mr.iid
-                )));
-            }
-        }
-
-        if config.merge_when_approved {
-            match gitlab.merge_mr(mr.iid) {
-                Ok(_) => {
-                    info!("Successfully merged MR !{}", mr.iid);
-                    return Ok(ReviewOutcome::Merged);
+            // Re-check for unresolved discussions before merging — another reviewer
+            // or the worker may have left new comments during the review.
+            match has_unresolved_comments(gitlab, mr.iid) {
+                Ok(true) => {
+                    warn!(
+                        "MR !{} approved but has unresolved discussions, skipping merge",
+                        mr.iid
+                    );
+                    return Ok(ReviewOutcome::NeedsChanges);
                 }
+                Ok(false) => {}
                 Err(e) => {
-                    warn!("Failed to merge MR !{}: {}", mr.iid, e);
-                    gitlab.add_mr_discussion(
-                        mr.iid,
-                        &format!(
-                            "Code is approved, but automatic merge failed (`{}`). \
-                             This is likely due to merge conflicts with the target branch. \
-                             Please rebase or resolve conflicts and push again.",
-                            e
-                        ),
-                    )?;
+                    return Err(e.context(format!(
+                        "Could not verify discussions are resolved for MR !{} before merge",
+                        mr.iid
+                    )));
                 }
             }
-        } else {
-            let approval_message = extract_approval_message(&agent_output);
-            gitlab.add_resolved_mr_discussion(mr.iid, &approval_message)?;
-            gitlab.add_mr_label_with_retries(mr.iid, REVIEWER_APPROVED_LABEL)?;
-            return Ok(ReviewOutcome::ApprovedWithoutMerge);
-        }
-    } else if reviewer_requests_changes(&agent_output) {
-        info!("MR !{} needs changes", mr.iid);
 
-        let feedback = extract_review_feedback(&agent_output);
-        gitlab.add_mr_discussion(mr.iid, &feedback)?;
-    } else if let Some(feedback) = extract_fallback_review_feedback(&agent_output) {
-        warn!(
-            "MR !{} reviewer output missed decision marker, posting fallback feedback",
-            mr.iid
-        );
-        gitlab.add_mr_discussion(mr.iid, &feedback)?;
-    } else {
-        warn!(
-            "MR !{} reviewer output missed decision marker; not posting unstructured output",
-            mr.iid
-        );
+            if config.merge_when_approved {
+                match gitlab.merge_mr(mr.iid) {
+                    Ok(_) => {
+                        info!("Successfully merged MR !{}", mr.iid);
+                        return Ok(ReviewOutcome::Merged);
+                    }
+                    Err(e) => {
+                        warn!("Failed to merge MR !{}: {}", mr.iid, e);
+                        gitlab.add_mr_discussion(
+                            mr.iid,
+                            &format!(
+                                "Code is approved, but automatic merge failed (`{}`). \
+                                 This is likely due to merge conflicts with the target branch. \
+                                 Please rebase or resolve conflicts and push again.",
+                                e
+                            ),
+                        )?;
+                    }
+                }
+            } else {
+                let approval_message = extract_approval_message();
+                gitlab.add_resolved_mr_discussion(mr.iid, &approval_message)?;
+                gitlab.add_mr_label_with_retries(mr.iid, REVIEWER_APPROVED_LABEL)?;
+                return Ok(ReviewOutcome::ApprovedWithoutMerge);
+            }
+        }
+        ReviewerOutput::RequestChanges {
+            feedback,
+            public_comment,
+        } => {
+            info!("MR !{} needs changes", mr.iid);
+
+            let feedback = extract_review_feedback(feedback.as_deref(), public_comment.as_deref());
+            gitlab.add_mr_discussion(mr.iid, &feedback)?;
+        }
     }
 
     Ok(ReviewOutcome::NeedsChanges)
@@ -678,9 +709,9 @@ fn build_review_prompt(input: ReviewPromptInput<'_>) -> Result<String> {
     )?;
 
     let completeness_line = if input.is_need_ai_worker_mr {
-        "9. COMPLETENESS CHECK (STRICT): For `need-ai-worker` MRs, evaluate completeness against the current MR title, MR description, diff, and comment history (do not require linked issue context). Treat later comments as updates to the requested work. If the current scope implied by those sources is missing or partial, list missing items and REQUEST_CHANGES.".to_string()
+        "9. COMPLETENESS CHECK (STRICT): For `need-ai-worker` MRs, evaluate completeness against the current MR title, MR description, diff, and comment history (do not require linked issue context). Treat later comments as updates to the requested work. If the current scope implied by those sources is missing or partial, list missing items and request changes.".to_string()
     } else {
-        "9. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the CURRENT linked issue requirements: issue title, issue description, issue comments, MR description, and MR comment history. Later comments may clarify, narrow, expand, or supersede earlier issue text. Every current requirement MUST be addressed in the implementation, but do not request changes for an older constraint that later comments removed, changed, or accepted as intentionally out of scope. If any current requirement is missing or only partially implemented, list missing items and REQUEST_CHANGES. This check is critical to avoid shipping incomplete features.".to_string()
+        "9. COMPLETENESS CHECK (STRICT): Compare the actual local diff and changed files against the CURRENT linked issue requirements: issue title, issue description, issue comments, MR description, and MR comment history. Later comments may clarify, narrow, expand, or supersede earlier issue text. Every current requirement MUST be addressed in the implementation, but do not request changes for an older constraint that later comments removed, changed, or accepted as intentionally out of scope. If any current requirement is missing or only partially implemented, list missing items and request changes. This check is critical to avoid shipping incomplete features.".to_string()
     };
     let prompt = format!(
         r#"You are reviewing a merge request for a software project in a fully automated, non-interactive environment.
@@ -705,17 +736,17 @@ CRITICAL REQUIREMENTS:
 - Treat comments after the original issue description as requirement updates when they clarify, narrow, expand, or supersede earlier constraints
 - Do NOT request changes for outdated requirements from the original issue when later issue or MR comments clearly changed the accepted scope
 
-GITLAB COMMENT STYLE (STRICT — for REQUEST_CHANGES and any posted feedback):
+GITLAB COMMENT STYLE (STRICT — for requesting changes and any posted feedback):
 - Do NOT start with a long paragraph of hollow praise or thanks that only restates the diff or issue number (e.g. listing routes, files, or "aligns with #N" without adding a review decision). That adds no value and wastes the reader's time.
 - Lead with what matters: **what must change before merge**, or **why you approve**. Use a direct lead-in such as `Request before merge:` or `Blocking:` when the MR must not merge until the item is addressed.
 - For approvals, the posted GitLab comment is "LGTM" by default (no summary or description).
 - Only request MR description updates after you have read the full `## MR description` section in the task context file (including everything after any `Closes #N` line). Do **not** treat an opening `Closes #N` as “description is only the closing line” when the rest of that section documents the work. If it already states goal, implementation approach, and verification, do not ask to expand the description.
-- Public GitLab comments must use reader-facing wording only. Do NOT mention internal response fields or protocol tokens such as `MR_DESCRIPTION`, `MR_TITLE`, `FEEDBACK`, `PUBLIC_COMMENT_BEGIN`, or `PUBLIC_COMMENT_END`. For example, say "Please update the MR description to include the actual verification and testing performed", not "Update MR_DESCRIPTION with the actual verification/testing performed."
+- Public GitLab comments must use reader-facing wording only. Do NOT mention internal field names such as `decision`, `feedback`, or `public_comment`. For example, say "Please update the MR description to include the actual verification and testing performed", not "Update MR_DESCRIPTION with the actual verification/testing performed."
 - Keep the public comment focused: one short optional line of genuine substance is OK, but **never** pad with a multi-sentence "thanks for the thorough coverage" preface that duplicates the diff.
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before starting the review. Treat it as authoritative project policy.
-2. Before inspecting or judging code, perform any repository setup or pre-review steps required by `AGENTS.md` (for example, updating submodules when the project policy says to do so). If a required setup command fails, REQUEST_CHANGES and include the failure as blocking review feedback.
+2. Before inspecting or judging code, perform any repository setup or pre-review steps required by `AGENTS.md` (for example, updating submodules when the project policy says to do so). If a required setup command fails, request changes and include the failure as blocking review feedback.
 3. Read the task context file above before starting the review. For description quality, rely on the full text under `## MR description` there (do not judge from the MR title line alone).
 4. Review the full comment history to understand previous feedback, worker responses, and scope updates after the original issue was written
 5. The source branch has already been merged with the target branch locally - you are on the merged result
@@ -761,31 +792,12 @@ FILE HYGIENE (STRICT — reject if violated):
 - Do NOT allow leftover artifacts: generated files that should be gitignored, editor config files, OS-specific metadata files (e.g. .DS_Store, Thumbs.db), or log files.
 - If unsure whether a file belongs, check the project structure and AGENTS.md for conventions.
 
-After your review, call the `review` tool with your decision:
+After your review, call the `review` tool exactly once with your decision. This tool call is the only output channel Potlatch reads — there is no text-based fallback.
 
 - `decision` (required): "approve" if the MR is good to merge, "request_changes" if changes are needed.
 - `summary` (for approve): ignored — the posted GitLab comment is always just 'LGTM'. You may leave this empty.
 - `feedback` (for request_changes): specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads.
-- `public_comment` (optional): human-facing GitLab comment text for explanations or recommendations that don't require code changes.
-
-The `review` tool is the primary output channel — Potlatch reads the tool's JSON, not text markers. Call it exactly once.
-
-TEXT MARKER FALLBACK — if for any reason you cannot call the `review` tool, you may use these text markers instead:
-
-If the MR is good to merge:
-APPROVE
-LGTM
-
-If changes are needed:
-REQUEST_CHANGES
-FEEDBACK:
-- <specific issue 1>
-- <specific issue 2>
-
-For any human-facing GitLab comment text, include:
-PUBLIC_COMMENT_BEGIN
-<only final public comment text; no progress/status/tool logs>
-PUBLIC_COMMENT_END
+- `public_comment` (optional): human-facing GitLab comment text for explanations or recommendations that don't require code changes. Only final public comment text; no progress/status/tool logs.
 
 Proceed with the review autonomously. Do not ask for any user input.
 "#,
@@ -874,59 +886,8 @@ fn is_generic_description(desc: &str) -> bool {
         || lower == "implementation changes."
 }
 
-/// Get a reference to the `review` tool's captured JSON from
-/// `agent_output.structured_outputs`, or `None` if the tool wasn't called.
-fn review_output(agent_output: &AgentHandoff) -> Option<&serde_json::Value> {
-    agent_output
-        .structured_outputs
-        .as_ref()
-        .and_then(|s| s.get("review"))
-}
-
-/// Apply the structured JSON the model emitted via the `review` structured-output
-/// tool. Populates the handoff's shared fields (`decision`, `feedback`) from the
-/// JSON. Returns the handoff unchanged when `structured_outputs` is absent or
-/// has no `review` entry.
-fn apply_reviewer_handoff(mut handoff: AgentHandoff) -> AgentHandoff {
-    let Some(review) = review_output(&handoff).cloned() else {
-        return handoff;
-    };
-
-    if let Some(d) = review.get("decision").and_then(serde_json::Value::as_str) {
-        let d = d.trim();
-        if !d.is_empty() {
-            handoff.decision = Some(d.to_lowercase());
-        }
-    }
-
-    if let Some(feedback) = review.get("feedback").and_then(serde_json::Value::as_str) {
-        let t = feedback.trim();
-        if !t.is_empty() {
-            handoff.feedback = Some(t.to_string());
-        }
-    }
-
-    handoff
-}
-
-fn reviewer_approves(agent_output: &AgentHandoff) -> bool {
-    agent_output
-        .decision
-        .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("approve"))
-        || (agent_output.response.contains("APPROVE") && agent_output.response.contains("LGTM"))
-}
-
-fn reviewer_requests_changes(agent_output: &AgentHandoff) -> bool {
-    agent_output
-        .decision
-        .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("request_changes"))
-        || agent_output.response.contains("REQUEST_CHANGES")
-}
-
 /// Resolved approval thread on GitLab: always just "LGTM" — no description.
-fn extract_approval_message(_agent_output: &AgentHandoff) -> String {
+fn extract_approval_message() -> String {
     "LGTM".to_string()
 }
 
@@ -982,98 +943,23 @@ fn normalize_review_comment_body(text: &str) -> String {
     stripped.trim().to_string()
 }
 
-fn extract_review_feedback(agent_output: &AgentHandoff) -> String {
-    // Structured output first (from the `review` tool).
-    if let Some(ro) = review_output(agent_output) {
-        if let Some(feedback) = ro.get("feedback").and_then(serde_json::Value::as_str) {
-            let out = normalize_review_comment_body(feedback.trim());
-            if !out.is_empty() {
-                return out;
-            }
-        }
-        if let Some(comment) = ro.get("public_comment").and_then(serde_json::Value::as_str) {
-            let out = normalize_review_comment_body(comment.trim());
-            if !out.is_empty() {
-                return out;
-            }
-        }
-    }
-    // Fallback: text markers.
-    if let Some(block) = extract_public_comment_block(&agent_output.response) {
-        let out = normalize_review_comment_body(block.trim());
-        if !out.is_empty() {
-            return out;
-        }
-    }
-    if let Some(feedback) = &agent_output.feedback {
-        if let Some(block) = extract_public_comment_block(feedback) {
-            let out = normalize_review_comment_body(block.trim());
-            if !out.is_empty() {
-                return out;
-            }
-        }
-        let trimmed = feedback.trim();
-        if !trimmed.is_empty() {
-            let out = normalize_review_comment_body(trimmed);
-            if !out.is_empty() {
-                return out;
-            }
-        }
-    }
-    if let Some(pos) = agent_output.response.find("FEEDBACK:") {
-        let feedback = &agent_output.response[pos + 9..];
+/// Builds the GitLab discussion body for a `request_changes` decision from
+/// the typed `feedback`/`public_comment` fields, falling back to a generic
+/// message when the model left both empty.
+fn extract_review_feedback(feedback: Option<&str>, public_comment: Option<&str>) -> String {
+    if let Some(feedback) = feedback {
         let out = normalize_review_comment_body(feedback.trim());
         if !out.is_empty() {
             return out;
         }
     }
-
-    if let Some(pos) = find_request_changes_ignore_case(&agent_output.response) {
-        let tail = agent_output.response[pos..].trim_start();
-        let out = normalize_review_comment_body(tail);
+    if let Some(comment) = public_comment {
+        let out = normalize_review_comment_body(comment.trim());
         if !out.is_empty() {
             return out;
         }
     }
-
     "Please review the changes and address any issues.".to_string()
-}
-
-fn find_request_changes_ignore_case(haystack: &str) -> Option<usize> {
-    const NEEDLE: &[u8] = b"REQUEST_CHANGES";
-    let h = haystack.as_bytes();
-    let n = NEEDLE.len();
-    if h.len() < n {
-        return None;
-    }
-    for i in 0..=h.len() - n {
-        if h[i..i + n].eq_ignore_ascii_case(NEEDLE) {
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn extract_fallback_review_feedback(agent_output: &AgentHandoff) -> Option<String> {
-    if let Some(block) = extract_public_comment_block(&agent_output.response) {
-        let trimmed = block.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    if let Some(feedback) = &agent_output.feedback {
-        if let Some(block) = extract_public_comment_block(feedback) {
-            let trimmed = block.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-        let trimmed = feedback.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    None
 }
 
 fn mr_has_label(mr: &MergeRequest, label: &str) -> bool {
@@ -1127,107 +1013,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_review_feedback_ignores_unstructured_reviewer_output() {
-        let output = AgentHandoff {
-            response: r#"I’ll review the MR from the local merged branch.
-A key prior blocker is still present.
-Error: T: Connection stalled"#
-                .to_string(),
-            ..Default::default()
-        };
-
-        assert!(extract_fallback_review_feedback(&output).is_none());
-    }
-
-    #[test]
     fn extract_approval_message_is_always_short_lgtm() {
-        let output = AgentHandoff::default();
-
-        assert_eq!(extract_approval_message(&output), "LGTM");
-    }
-
-    #[test]
-    fn extract_approval_message_uses_structured_summary() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "review": {
-                    "decision": "approve",
-                    "summary": "LGTM: all tests pass, code is clean"
-                }
-            })),
-            ..Default::default()
-        };
-        assert_eq!(extract_approval_message(&output), "LGTM");
-    }
-
-    #[test]
-    fn extract_approval_message_truncates_long_summary_to_first_line() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "review": {
-                    "decision": "approve",
-                    "summary": "LGTM: tests pass.\n\nThe implementation is thorough and follows project conventions. All edge cases are covered.\n\nAdditional details about the review..."
-                }
-            })),
-            ..Default::default()
-        };
-        assert_eq!(extract_approval_message(&output), "LGTM");
+        assert_eq!(extract_approval_message(), "LGTM");
     }
 
     #[test]
     fn extract_review_feedback_uses_structured_feedback() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "review": {
-                    "decision": "request_changes",
-                    "feedback": "- Fix the error handling in main.go\n- Add test for edge case"
-                }
-            })),
-            ..Default::default()
-        };
-        let feedback = extract_review_feedback(&output);
+        let feedback = extract_review_feedback(
+            Some("- Fix the error handling in main.go\n- Add test for edge case"),
+            None,
+        );
         assert!(feedback.contains("Fix the error handling"));
         assert!(feedback.contains("Add test for edge case"));
     }
 
     #[test]
-    fn reviewer_approves_reads_structured_decision() {
-        let output = apply_reviewer_handoff(AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "review": {"decision": "approve"}
-            })),
-            ..Default::default()
-        });
-        assert!(reviewer_approves(&output));
-        assert!(!reviewer_requests_changes(&output));
+    fn reviewer_output_deserializes_approve_decision() {
+        let output: ReviewerOutput =
+            serde_json::from_value(serde_json::json!({"decision": "approve"})).unwrap();
+        assert!(matches!(output, ReviewerOutput::Approve));
     }
 
     #[test]
-    fn reviewer_requests_changes_reads_structured_decision() {
-        let output = apply_reviewer_handoff(AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "review": {"decision": "request_changes"}
-            })),
-            ..Default::default()
-        });
-        assert!(reviewer_requests_changes(&output));
-        assert!(!reviewer_approves(&output));
+    fn reviewer_output_decision_is_case_insensitive() {
+        let output: ReviewerOutput =
+            serde_json::from_value(serde_json::json!({"decision": "APPROVE"})).unwrap();
+        assert!(matches!(output, ReviewerOutput::Approve));
     }
 
     #[test]
-    fn apply_reviewer_handoff_populates_decision_and_feedback() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "review": {
-                    "decision": "request_changes",
-                    "feedback": "- Fix X"
-                }
-            })),
-            ..Default::default()
-        };
-        let applied = apply_reviewer_handoff(handoff);
-        assert_eq!(applied.decision.as_deref(), Some("request_changes"));
-        assert_eq!(applied.feedback.as_deref(), Some("- Fix X"));
+    fn reviewer_output_deserializes_request_changes_decision() {
+        let output: ReviewerOutput = serde_json::from_value(serde_json::json!({
+            "decision": "request_changes",
+            "feedback": "- Fix X"
+        }))
+        .unwrap();
+        match output {
+            ReviewerOutput::RequestChanges { feedback, .. } => {
+                assert_eq!(feedback.as_deref(), Some("- Fix X"));
+            }
+            other => panic!("expected RequestChanges, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reviewer_output_rejects_unknown_decision() {
+        let err =
+            serde_json::from_value::<ReviewerOutput>(serde_json::json!({"decision": "maybe"}))
+                .unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
     }
 
     #[test]
@@ -1280,34 +1114,32 @@ Error: T: Connection stalled"#
 
     #[test]
     fn extract_review_feedback_strips_request_changes_and_boilerplate() {
-        let output = AgentHandoff {
-            response: "REQUEST_CHANGES — please fix the following before review:\n\nThe MR title `x` is too generic."
-                .to_string(),
-            ..Default::default()
-        };
+        // Even structured `feedback` text gets normalized in case the model
+        // habitually prepends the old marker vocabulary or boilerplate.
         assert_eq!(
-            extract_review_feedback(&output),
+            extract_review_feedback(
+                Some(
+                    "REQUEST_CHANGES — please fix the following before review:\n\nThe MR title `x` is too generic."
+                ),
+                None
+            ),
             "The MR title `x` is too generic."
         );
     }
 
     #[test]
-    fn extract_review_feedback_prefers_public_comment_block() {
-        let output = AgentHandoff {
-            response:
-                "REQUEST_CHANGES\nPUBLIC_COMMENT_BEGIN\nPlease add one integration test.\nPUBLIC_COMMENT_END"
-                    .to_string(),
-            ..Default::default()
-        };
+    fn extract_review_feedback_falls_back_to_public_comment() {
         assert_eq!(
-            extract_review_feedback(&output),
+            extract_review_feedback(None, Some("Please add one integration test.")),
             "Please add one integration test."
         );
     }
 
     #[test]
-    fn find_request_changes_ignore_case_finds_mixed_case() {
-        let s = "Prefix request_changes: more text";
-        assert_eq!(find_request_changes_ignore_case(s), Some(7));
+    fn extract_review_feedback_falls_back_to_generic_message_when_empty() {
+        assert_eq!(
+            extract_review_feedback(None, None),
+            "Please review the changes and address any issues."
+        );
     }
 }

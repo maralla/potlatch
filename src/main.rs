@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 
 mod agents;
 mod core;
@@ -9,8 +10,6 @@ mod util;
 
 use core::config::Config;
 use core::workflow::Workflow;
-
-use agents::settings::AgentSettings;
 
 #[derive(Parser, Debug)]
 #[command(about = "Potlatch — fully automatic agentic platform", long_about = None)]
@@ -91,11 +90,10 @@ fn run_workflow(config: Option<String>) -> Result<()> {
         .map(str::to_string)
         .unwrap_or_else(|| "potlatch.toml".to_string());
 
-    let (config, content) = Config::load_with_content(Some(&config_path))?;
-    let agent_settings = AgentSettings::from_toml_str(&content)?;
-    agents::settings::init(agent_settings);
+    let config = Config::load(Some(&config_path))?;
 
-    let mut workflow = Workflow::new(config, config_path);
+    let mut workflow =
+        Workflow::new(config, config_path).with_activity_reporter(Arc::new(ui::UiActivityReporter));
     agents::register(&mut workflow);
     workflow.run()
 }

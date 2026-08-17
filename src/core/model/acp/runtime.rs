@@ -742,7 +742,6 @@ fn handoff_from_prompt_hooks(
 ) -> AgentHandoff {
     let stream = hooks.take_text();
     let final_text = final_text_from_prompt_extra(&pr.extra);
-    let has_final_result_text = final_text.is_some();
 
     // Prefer final prompt result text (`message` / `output`) over streamed chunks.
     // Streamed chunks can contain intermediate progress narration, while `extra` carries
@@ -767,15 +766,12 @@ fn handoff_from_prompt_hooks(
     let structured_outputs = pr
         .extra
         .get("structured_outputs")
-        .filter(|v| !v.is_null() && v.is_object())
+        .filter(|value| value.as_object().is_some_and(|outputs| !outputs.is_empty()))
         .cloned();
 
     AgentHandoff {
         response,
-        has_final_result_text,
-
         structured_outputs,
-        ..Default::default()
     }
 }
 
@@ -843,7 +839,6 @@ mod tests {
         .unwrap();
         let h = handoff_from_prompt_hooks(&hooks, pr, None);
         assert_eq!(h.response, "from result");
-        assert!(h.has_final_result_text);
 
         let hooks_m = StreamTextHooks::new();
         hooks_m.on_agent_notification("session/update", &params);
@@ -854,7 +849,6 @@ mod tests {
         .unwrap();
         let hm = handoff_from_prompt_hooks(&hooks_m, pr_m, None);
         assert_eq!(hm.response, "SUB_ISSUE_1:\nTITLE: T\nDESCRIPTION:\nD");
-        assert!(hm.has_final_result_text);
 
         let hooks2 = StreamTextHooks::new();
         let pr2: PromptResult = serde_json::from_value(json!({
@@ -864,7 +858,6 @@ mod tests {
         .unwrap();
         let h2 = handoff_from_prompt_hooks(&hooks2, pr2, None);
         assert_eq!(h2.response, "only result");
-        assert!(h2.has_final_result_text);
 
         let hooks3 = StreamTextHooks::new();
         hooks3.on_agent_notification("session/update", &params);
@@ -874,7 +867,6 @@ mod tests {
         .unwrap();
         let h3 = handoff_from_prompt_hooks(&hooks3, pr3, None);
         assert_eq!(h3.response, "from stream");
-        assert!(!h3.has_final_result_text);
     }
 
     #[test]
@@ -890,7 +882,6 @@ mod tests {
         }))
         .unwrap();
         let out = handoff_from_prompt_hooks(&hooks, pr, None);
-        assert!(out.has_final_result_text);
         assert!(out.response.contains("SUB_ISSUE_1:"));
         assert!(out.response.contains("TITLE: Refactor queue"));
     }
@@ -927,6 +918,19 @@ mod tests {
             "stopReason": "end_turn",
             "message": "done",
             "structured_outputs": null
+        }))
+        .unwrap();
+        let h = handoff_from_prompt_hooks(&hooks, pr, None);
+        assert!(h.structured_outputs.is_none());
+    }
+
+    #[test]
+    fn handoff_structured_outputs_none_when_empty() {
+        let hooks = StreamTextHooks::new();
+        let pr: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "message": "done",
+            "structured_outputs": {}
         }))
         .unwrap();
         let h = handoff_from_prompt_hooks(&hooks, pr, None);

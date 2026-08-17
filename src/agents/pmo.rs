@@ -13,87 +13,277 @@ use tracing::{debug, error, info, warn};
 use super::{claim, issue_in_scope, labels, strip_internal_markers};
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient, Issue, IssueThreadNote};
-use crate::agents::settings;
-use crate::agents::workspace::{
-    ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
-};
-use crate::core::agent::{AgentHandoff, HandoffSubIssue, InvokeOptions};
+use crate::agents::workspace::{GitLabAgentBootstrap, gitlab_banner};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::agent::{InvokeOptions, ObjectSchema, SchemaField, StructuredOutput};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::model::acp::capabilities::{AskAnswer, AskQuestion, CapabilityProvider};
-use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
+use crate::core::periodic::PeriodicTaskSpec;
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
 
-/// The PMO's structured-output tool definition. Passed to the harness via
-/// `session/new` so the harness registers a generic `StructuredOutputTool`
-/// named `plan`. The model calls it with its triage decision as structured
-/// JSON.
-fn plan_tool_definition() -> serde_json::Value {
-    serde_json::json!({
-        "name": "plan",
-        "description": "Emit your triage decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your decision and the fields relevant to it.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "decision": {
-                    "description": "Your triage decision. Must be exactly one of: \"guide_worker\", \"split\", \"already_done\", \"needs_clarification\", \"wait_for_dependency\".",
-                    "type": "string",
-                    "enum": ["guide_worker", "split", "already_done", "needs_clarification", "wait_for_dependency"]
-                },
-                "instructions": {
-                    "description": "For guide_worker: 3-5 sentences, one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.",
-                    "type": "string"
-                },
-                "sub_issues": {
-                    "description": "For split: the sub-issues to create. Each must have a title and description.",
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {
-                                "description": "Concise sub-issue title.",
-                                "type": "string"
-                            },
-                            "description": {
-                                "description": "Scope and acceptance criteria. If this sub-issue depends on another, reference it by title.",
-                                "type": "string"
-                            },
-                            "priority": {
-                                "description": "Priority: 1 (critical/blocking), 2 (high/depended-on), 3 (normal/independent).",
-                                "type": "integer",
-                                "enum": [1, 2, 3]
-                            },
-                            "depends_on": {
-                                "description": "1-based index of another sub-issue this one depends on (omit or 0 if none).",
-                                "type": "integer"
-                            }
-                        },
-                        "required": ["title", "description"]
-                    }
-                },
-                "reason": {
-                    "description": "For already_done: why the codebase already satisfies the issue.",
-                    "type": "string"
-                },
-                "question": {
-                    "description": "For needs_clarification: specific questions for a human. Posted as a GitLab comment.",
-                    "type": "string"
-                },
-                "plan_text": {
-                    "description": "For needs_clarification: your current best plan for this issue. The system will update the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version.",
-                    "type": "string"
-                },
-                "dependency_issue_iid": {
-                    "description": "For wait_for_dependency: the IID (number) of the existing open issue this issue depends on and must wait for. Must be a positive integer.",
-                    "type": "integer"
-                }
-            },
-            "required": ["decision"]
+/// One sub-issue as the model described it via the `plan` tool's `sub_issues`
+/// array, before the empty-title/description defensive filtering in
+/// [`normalize_sub_issues`] is applied.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawSubIssue {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    priority: Option<u64>,
+    #[serde(default)]
+    depends_on: usize,
+}
+
+/// A sub-issue to create for a `split` decision. Owned by PMO — this is the
+/// only role that creates sub-issues, so the type has no reason to live in
+/// core.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct PmoSubIssue {
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    priority: Option<u8>,
+    #[serde(default)]
+    depends_on: usize,
+}
+
+/// Drop sub-issues with an empty title or description (the model
+/// occasionally emits a placeholder entry), and clamp `priority` to the
+/// valid 1..=3 range instead of erroring on an out-of-range value.
+fn normalize_sub_issues(raw: Vec<RawSubIssue>) -> Vec<PmoSubIssue> {
+    let mut old_to_new = vec![None; raw.len() + 1];
+    let mut normalized = Vec::new();
+
+    for (old_index, issue) in raw.into_iter().enumerate() {
+        let title = issue.title.trim().to_string();
+        let description = issue.description.trim().to_string();
+        if title.is_empty() || description.is_empty() {
+            continue;
         }
-    })
+        let priority = issue
+            .priority
+            .filter(|priority| (1..=3).contains(priority))
+            .map(|priority| priority as u8);
+        old_to_new[old_index + 1] = Some(normalized.len() + 1);
+        normalized.push(PmoSubIssue {
+            title,
+            description,
+            priority,
+            depends_on: issue.depends_on,
+        });
+    }
+
+    for issue in &mut normalized {
+        issue.depends_on = old_to_new
+            .get(issue.depends_on)
+            .copied()
+            .flatten()
+            .unwrap_or(0);
+    }
+
+    normalized
+}
+
+/// Parse a JSON value as an issue IID, accepting numbers, numeric strings,
+/// and strings with a leading `#` (e.g. `727`, `"727"`, `"#727"`). Returns
+/// `None` for zero or non-numeric values.
+fn parse_iid_value(val: &Value) -> Option<u64> {
+    let n = val.as_u64().or_else(|| {
+        let s = val.as_str()?;
+        let s = s.trim().trim_start_matches('#').trim();
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().ok()
+    });
+    n.filter(|n| *n > 0)
+}
+
+/// The model may name the dependency field differently, or send the IID as
+/// a string (e.g. `"#727"`). Accept any of a set of plausible keys and parse
+/// leading digits; zero/unparseable values become `None` (see
+/// [`PmoOutput::WaitForDependency`]).
+fn deserialize_dependency_iid<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(parse_iid_value(&value))
+}
+
+/// The PMO's typed structured-output contract. The model calls the `plan`
+/// tool with its triage decision; core deserializes the captured JSON into
+/// this type (see [`AgentModel::complete_typed`]).
+#[derive(Debug, Clone)]
+enum PmoOutput {
+    GuideWorker {
+        instructions: Option<String>,
+    },
+    Split {
+        sub_issues: Vec<RawSubIssue>,
+    },
+    AlreadyDone {
+        reason: Option<String>,
+    },
+    NeedsClarification {
+        question: Option<String>,
+        plan_text: Option<String>,
+    },
+    WaitForDependency {
+        dependency_issue_iid: Option<u64>,
+    },
+}
+
+#[derive(Deserialize)]
+struct PmoOutputWire {
+    decision: String,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    sub_issues: Vec<RawSubIssue>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default)]
+    plan_text: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_dependency_iid",
+        alias = "dependency_iid",
+        alias = "depends_on_issue",
+        alias = "blocked_by",
+        alias = "dependency"
+    )]
+    dependency_issue_iid: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for PmoOutput {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = PmoOutputWire::deserialize(deserializer)?;
+        match wire.decision.trim().to_ascii_lowercase().as_str() {
+            "guide_worker" => Ok(Self::GuideWorker {
+                instructions: wire.instructions,
+            }),
+            "split" => Ok(Self::Split {
+                sub_issues: wire.sub_issues,
+            }),
+            "already_done" => Ok(Self::AlreadyDone {
+                reason: wire.reason,
+            }),
+            "needs_clarification" => Ok(Self::NeedsClarification {
+                question: wire.question,
+                plan_text: wire.plan_text,
+            }),
+            "wait_for_dependency" => Ok(Self::WaitForDependency {
+                dependency_issue_iid: wire.dependency_issue_iid,
+            }),
+            decision => Err(serde::de::Error::unknown_variant(
+                decision,
+                &[
+                    "guide_worker",
+                    "split",
+                    "already_done",
+                    "needs_clarification",
+                    "wait_for_dependency",
+                ],
+            )),
+        }
+    }
+}
+
+impl StructuredOutput for PmoOutput {
+    fn tool_name() -> &'static str {
+        "plan"
+    }
+
+    fn tool_description() -> &'static str {
+        "Emit your triage decision as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your decision and the fields relevant to it."
+    }
+
+    fn schema() -> ObjectSchema {
+        ObjectSchema::new()
+            .property(
+                "decision",
+                SchemaField::string_enum(
+                    "Your triage decision. Must be exactly one of: \"guide_worker\", \"split\", \"already_done\", \"needs_clarification\", \"wait_for_dependency\".",
+                    &[
+                        "guide_worker",
+                        "split",
+                        "already_done",
+                        "needs_clarification",
+                        "wait_for_dependency",
+                    ],
+                ),
+            )
+            .property(
+                "instructions",
+                SchemaField::string(
+                    "For guide_worker: 3-5 sentences, one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.",
+                ),
+            )
+            .property(
+                "sub_issues",
+                SchemaField::array(
+                    "For split: the sub-issues to create. Each must have a title and description.",
+                    SchemaField::object(
+                        ObjectSchema::new()
+                            .property("title", SchemaField::string("Concise sub-issue title."))
+                            .property(
+                                "description",
+                                SchemaField::string(
+                                    "Scope and acceptance criteria. If this sub-issue depends on another, reference it by title.",
+                                ),
+                            )
+                            .property(
+                                "priority",
+                                SchemaField::integer_enum(
+                                    "Priority: 1 (critical/blocking), 2 (high/depended-on), 3 (normal/independent).",
+                                    &[1, 2, 3],
+                                ),
+                            )
+                            .property(
+                                "depends_on",
+                                SchemaField::integer(
+                                    "1-based index of another sub-issue this one depends on (omit or 0 if none).",
+                                ),
+                            )
+                            .required("title")
+                            .required("description"),
+                    ),
+                ),
+            )
+            .property(
+                "reason",
+                SchemaField::string("For already_done: why the codebase already satisfies the issue."),
+            )
+            .property(
+                "question",
+                SchemaField::string(
+                    "For needs_clarification: specific questions for a human. Posted as a GitLab comment.",
+                ),
+            )
+            .property(
+                "plan_text",
+                SchemaField::string(
+                    "For needs_clarification: your current best plan for this issue. The system will update the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version.",
+                ),
+            )
+            .property(
+                "dependency_issue_iid",
+                SchemaField::integer(
+                    "For wait_for_dependency: the IID (number) of the existing open issue this issue depends on and must wait for. Must be a positive integer.",
+                ),
+            )
+            .required("decision")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -131,9 +321,13 @@ impl PmoAgentSettings {
 
 struct AgentState {
     sessions_dir: String,
-    working_dir: String,
     agent_id: String,
     project_name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPmoState {
+    claimed_issue_iid: u64,
 }
 
 impl AgentState {
@@ -153,15 +347,18 @@ impl AgentState {
     }
 
     fn save_state(&self, issue_iid: u64) {
-        let path = self.state_path();
-        let json = format!(r#"{{"claimed_issue_iid":{}}}"#, issue_iid);
-        if let Err(e) = fs::write(&path, json) {
+        let store = crate::core::state::StateStore::new(self.state_path());
+        if let Err(e) = store.save(&PersistedPmoState {
+            claimed_issue_iid: issue_iid,
+        }) {
             warn!("Failed to save PMO state: {}", e);
         }
     }
 
     fn clear_state(&self) {
-        let _ = fs::remove_file(self.state_path());
+        let store: crate::core::state::StateStore<PersistedPmoState> =
+            crate::core::state::StateStore::new(self.state_path());
+        let _ = store.remove();
     }
 
     fn context_path(&self, id: u64) -> path::PathBuf {
@@ -195,24 +392,29 @@ impl CoreAgent for PmoAgent {
         "pmo"
     }
 
-    fn model(&self) -> &AgentModel {
-        &self.model
+    fn agent_id(&self) -> &str {
+        &self.state.agent_id
     }
 
-    fn banner(_config: &Config, banner: &mut Banner) {
-        if let Some(repo) = settings::settings().gitlab_repo() {
-            banner.set_once("repo", repo);
-        }
+    fn shutdown(&self) -> &Arc<AtomicBool> {
+        self.model.shutdown()
+    }
+
+    fn banner(config: &Config, banner: &mut Banner) {
+        gitlab_banner(config, banner);
+    }
+
+    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+        super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        PmoAgentSettings::from_raw(&section.raw)?;
+        Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
-        vec![PeriodicTaskSpec {
-            id: "gitlab_poll",
-            interval: Duration::from_secs(self.config.poll_interval_secs),
-            jitter: JitterPolicy::BeforeEachCycle,
-            jitter_max_ms: 5000,
-            autostart: true,
-        }]
+        vec![PeriodicTaskSpec::polling(
+            "gitlab_poll",
+            Duration::from_secs(self.config.poll_interval_secs),
+        )]
     }
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
@@ -221,7 +423,7 @@ impl CoreAgent for PmoAgent {
                 let scope = crate::agents::scope_label_filter(&self.scope_label);
                 let model = &self.model;
                 let shutdown = Arc::clone(model.shutdown());
-                if let Err(e) = pmo_cycle(
+                pmo_cycle(
                     &self.state,
                     &self.git_repo,
                     &self.gitlab,
@@ -230,39 +432,32 @@ impl CoreAgent for PmoAgent {
                     Arc::clone(&shutdown),
                     scope,
                     &self.config,
-                ) && !shutdown.load(Ordering::SeqCst)
-                {
-                    error!("{}: Cycle error: {}", self.state.agent_id, e);
-                }
-                Ok(())
+                )
             }
             _ => Ok(()),
         }
     }
 
     fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let gitlab_repo = require_gitlab_repo()?;
         let section = ctx
             .workflow
             .config
             .agent("pmo")
             .context("[agent.pmo] section required")?;
         let settings = PmoAgentSettings::from_raw(&section.raw)?;
-        let project_name = extract_project_name(&gitlab_repo)?;
-        let agent_id = format!("pmo-{}", ctx.instance_id);
-        ensure_agent_repo(
-            &ctx.workflow.base_dir,
-            &gitlab_repo,
-            &project_name,
-            &agent_id,
-        )?;
-        let pmo_dir = work_dir(&ctx.workflow.base_dir, &project_name, &agent_id);
-        let sessions_dir = sessions_dir(&ctx.workflow.base_dir, &project_name);
+        let runtime = GitLabAgentBootstrap::new(
+            &ctx,
+            "pmo",
+            ModelPreferences {
+                structured_output_tools: Some(vec![PmoOutput::tool_definition()]),
+                ..ModelPreferences::default()
+            },
+        )
+        .build()?;
         let state = AgentState {
-            sessions_dir,
-            working_dir: pmo_dir.clone(),
-            agent_id: agent_id.clone(),
-            project_name,
+            sessions_dir: runtime.sessions_dir,
+            agent_id: runtime.agent_id,
+            project_name: runtime.project_name,
         };
         state.ensure_sessions_dir()?;
         let config = PmoConfig {
@@ -270,24 +465,13 @@ impl CoreAgent for PmoAgent {
             ask_via_gitlab: settings.ask_via_gitlab,
             ask_gitlab_timeout_secs: settings.ask_gitlab_timeout_secs,
         };
-        let git_repo = GitRepo::new(state.working_dir.clone());
-        let gitlab = GitLabClient::new(state.working_dir.clone(), &gitlab_repo)?;
-        let model = AgentModel::connect(
-            &ctx,
-            "pmo",
-            state.working_dir.clone(),
-            ModelPreferences {
-                structured_output_tools: Some(vec![plan_tool_definition()]),
-                ..ModelPreferences::default()
-            },
-        )?;
-        let agent_settings = settings::settings();
-        let scope = agent_settings.scope_label_filter();
-        let claimed_issue_iid = try_resume_pmo_state(&state, &gitlab, scope);
+        let scope = crate::agents::scope_label_filter(&runtime.scope_label);
+        let claimed_issue_iid = try_resume_pmo_state(&state, &runtime.gitlab, scope);
         if let Some(iid) = claimed_issue_iid {
-            match (gitlab.get_issue(iid), gitlab.list_issues()) {
+            match (runtime.gitlab.get_issue(iid), runtime.gitlab.list_issues()) {
                 (Ok(issue), Ok(issues)) => {
-                    if let Err(e) = refresh_pmo_issue_context_file(&state, &gitlab, &issue, &issues)
+                    if let Err(e) =
+                        refresh_pmo_issue_context_file(&state, &runtime.gitlab, &issue, &issues)
                     {
                         warn!(
                             "{}: Could not refresh PMO context file after resuming claim on #{}: {}",
@@ -307,11 +491,11 @@ impl CoreAgent for PmoAgent {
         }
         Ok(Self {
             state,
-            git_repo,
-            gitlab,
-            model,
+            git_repo: runtime.git_repo,
+            gitlab: runtime.gitlab,
+            model: runtime.model,
             config,
-            scope_label: agent_settings.scope_label.clone(),
+            scope_label: runtime.scope_label,
             claimed_issue_iid,
         })
     }
@@ -838,7 +1022,7 @@ fn process_action_required_issue(
         "{}: PMO agent triaging issue #{}",
         &state.agent_id, issue.iid
     );
-    let mut agent_output = model.complete(
+    let completion = model.complete_typed::<PmoOutput>(
         &prompt,
         &InvokeOptions {
             activity_label: Some(format!("{} triaging issue #{}", &state.agent_id, issue.iid)),
@@ -850,162 +1034,125 @@ fn process_action_required_issue(
         "{}: PMO agent finished triaging issue #{}",
         &state.agent_id, issue.iid
     );
-    // Apply the structured JSON the model emitted via the `plan` tool.
-    // This populates the handoff's structured fields (decision, sub_issues,
-    // instructions, etc.) which the decision functions below read.
-    let had_plan_output = handoff_has_plan_output(&agent_output);
-    agent_output = apply_pmo_handoff(agent_output);
-    // The model must call the `plan` tool. If it didn't, bail with a clear
-    // error rather than falling through to the decision predicates (which
-    // would all return false and hit the SPLIT path with a misleading
-    // "No sub-issues" error).
-    if !had_plan_output {
-        let preview = pmo_truncate_utf8_by_bytes(agent_output.response.trim(), 800);
-        warn!(
-            "PMO: Model did not call `plan` tool for issue #{} (response preview, {} bytes): {}",
-            issue.iid,
-            preview.len(),
-            preview
-        );
-        anyhow::bail!(
-            "PMO did not call `plan` tool for issue #{}; retrying later",
-            issue.iid
-        );
-    }
-    if agent_output.decision.is_none() && agent_output.sub_issues.is_empty() {
-        let preview = pmo_truncate_utf8_by_bytes(agent_output.response.trim(), 800);
-        warn!(
-            "PMO: Plan tool output had no decision and no sub-issues for issue #{} (response preview, {} bytes): {}",
-            issue.iid,
-            preview.len(),
-            preview
-        );
-        anyhow::bail!(
-            "PMO plan output for issue #{} had no decision; retrying later",
-            issue.iid
-        );
-    }
 
-    // --- NEEDS_CLARIFICATION: PMO needs human input, refine plan ---
-    if pmo_needs_clarification(&agent_output) {
-        let question = strip_internal_markers(&extract_clarification_question(&agent_output));
-        info!(
-            "PMO: Issue #{} needs clarification, marking pmo-pending and updating plan",
-            issue.iid
-        );
+    let sub_issues = match completion.output {
+        // --- NEEDS_CLARIFICATION: PMO needs human input, refine plan ---
+        PmoOutput::NeedsClarification {
+            question,
+            plan_text,
+        } => {
+            let question = strip_internal_markers(&clarification_question_or_default(question));
+            info!(
+                "PMO: Issue #{} needs clarification, marking pmo-pending and updating plan",
+                issue.iid
+            );
 
-        // Update the issue description with the PMO's current plan draft, so
-        // humans can see and refine the proposed approach directly in the
-        // GitLab issue body.
-        if let Some(plan_text) = extract_plan_text(&agent_output) {
-            let cleaned = strip_internal_markers(&plan_text);
-            if !cleaned.is_empty()
-                && let Err(e) = gitlab.update_issue_description(issue.iid, &cleaned)
-            {
+            // Update the issue description with the PMO's current plan draft, so
+            // humans can see and refine the proposed approach directly in the
+            // GitLab issue body.
+            if let Some(plan_text) = plan_text.filter(|t| !t.trim().is_empty()) {
+                let cleaned = strip_internal_markers(plan_text.trim());
+                if !cleaned.is_empty()
+                    && let Err(e) = gitlab.update_issue_description(issue.iid, &cleaned)
+                {
+                    warn!(
+                        "PMO: Failed to update issue #{} description with plan: {}",
+                        issue.iid, e
+                    );
+                }
+            }
+
+            gitlab.add_issue_comment(
+                issue.iid,
+                &format!(
+                    "**PMO needs clarification before proceeding:**\n\n{}\n\n\
+                     Please reply to this comment with the requested information. \
+                     The PMO will refine the plan based on your feedback. \
+                     Remove the `pmo-pending` label when you are satisfied with the plan to let the PMO proceed.",
+                    question
+                ),
+            )?;
+
+            gitlab.add_issue_label(issue.iid, labels::PMO_PENDING)?;
+            return Ok(true); // keep claim
+        }
+
+        // --- ALREADY_DONE: work is already implemented, close the issue ---
+        PmoOutput::AlreadyDone { reason } => {
+            let reason = strip_internal_markers(&already_done_reason_or_default(reason));
+            info!("PMO: Issue #{} is already implemented, closing", issue.iid);
+            gitlab.add_issue_comment(
+                issue.iid,
+                &format!(
+                    "**PMO: Closing — this work is already implemented.**\n\n{}",
+                    reason
+                ),
+            )?;
+            let _ = gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL);
+            let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
+            gitlab.close_issue(issue.iid)?;
+            return Ok(false);
+        }
+
+        // --- WAIT_FOR_DEPENDENCY: issue depends on another open issue, park it ---
+        PmoOutput::WaitForDependency {
+            dependency_issue_iid,
+        } => {
+            let Some(dep_iid) = dependency_issue_iid else {
                 warn!(
-                    "PMO: Failed to update issue #{} description with plan: {}",
-                    issue.iid, e
+                    "PMO: wait_for_dependency decision for issue #{} but no dependency_issue_iid provided, releasing claim for retry",
+                    issue.iid
+                );
+                anyhow::bail!(
+                    "PMO wait_for_dependency for issue #{} missing dependency_issue_iid; retrying later",
+                    issue.iid
+                );
+            };
+            info!(
+                "PMO: Issue #{} depends on open issue #{}, parking",
+                issue.iid, dep_iid
+            );
+            let label = format!("waiting-on-issue:#{dep_iid}");
+            let _ = gitlab.add_issue_label(issue.iid, &label);
+            let _ = gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL);
+            let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
+            gitlab.add_issue_comment(
+                issue.iid,
+                &format!(
+                    "**PMO: Parking — this issue depends on issue #{dep_iid} which is still open.**\n\n\
+                     The worker will skip this issue until #{} is closed, then resume automatically.",
+                    dep_iid
+                ),
+            )?;
+            return Ok(false);
+        }
+
+        // --- GUIDE_WORKER: single focused retry instruction ---
+        PmoOutput::GuideWorker { instructions } => {
+            let guidance = strip_internal_markers(&guidance_or_empty(instructions));
+            if guidance.trim().is_empty() {
+                warn!(
+                    "PMO: GUIDE_WORKER output for issue #{} had no usable guidance, releasing claim for retry",
+                    issue.iid
+                );
+                anyhow::bail!(
+                    "PMO GUIDE_WORKER output for issue #{} had no usable guidance; retrying later",
+                    issue.iid
                 );
             }
+            info!("PMO: Issue #{} needs guidance, not splitting", issue.iid);
+            gitlab.add_issue_comment(issue.iid, &format_pmo_guidance_comment(&guidance))?;
+            gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
+            let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
+            return Ok(false);
         }
 
-        gitlab.add_issue_comment(
-            issue.iid,
-            &format!(
-                "**PMO needs clarification before proceeding:**\n\n{}\n\n\
-                 Please reply to this comment with the requested information. \
-                 The PMO will refine the plan based on your feedback. \
-                 Remove the `pmo-pending` label when you are satisfied with the plan to let the PMO proceed.",
-                question
-            ),
-        )?;
-
-        gitlab.add_issue_label(issue.iid, labels::PMO_PENDING)?;
-        return Ok(true); // keep claim
-    }
-
-    // --- ALREADY_DONE: work is already implemented, close the issue ---
-    if is_pmo_already_done_response(&agent_output) {
-        let reason = strip_internal_markers(&extract_already_done_reason(&agent_output));
-        info!("PMO: Issue #{} is already implemented, closing", issue.iid);
-        gitlab.add_issue_comment(
-            issue.iid,
-            &format!(
-                "**PMO: Closing — this work is already implemented.**\n\n{}",
-                reason
-            ),
-        )?;
-        let _ = gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL);
-        let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
-        gitlab.close_issue(issue.iid)?;
-        return Ok(false);
-    }
-
-    // --- WAIT_FOR_DEPENDENCY: issue depends on another open issue, park it ---
-    if pmo_wait_for_dependency(&agent_output) {
-        let Some(dep_iid) = agent_output.depends_on_issue else {
-            warn!(
-                "PMO: wait_for_dependency decision for issue #{} but no dependency_issue_iid provided, releasing claim for retry",
-                issue.iid
-            );
-            anyhow::bail!(
-                "PMO wait_for_dependency for issue #{} missing dependency_issue_iid; retrying later",
-                issue.iid
-            );
-        };
-        info!(
-            "PMO: Issue #{} depends on open issue #{}, parking",
-            issue.iid, dep_iid
-        );
-        let label = format!("waiting-on-issue:#{dep_iid}");
-        let _ = gitlab.add_issue_label(issue.iid, &label);
-        let _ = gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL);
-        let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
-        gitlab.add_issue_comment(
-            issue.iid,
-            &format!(
-                "**PMO: Parking — this issue depends on issue #{dep_iid} which is still open.**\n\n\
-                 The worker will skip this issue until #{} is closed, then resume automatically.",
-                dep_iid
-            ),
-        )?;
-        return Ok(false);
-    }
-
-    // --- GUIDE_WORKER: single focused retry instruction ---
-    if pmo_guides_worker(&agent_output) {
-        let guidance = strip_internal_markers(&extract_guidance(&agent_output));
-        if guidance.trim().is_empty() {
-            warn!(
-                "PMO: GUIDE_WORKER output for issue #{} had no usable guidance, releasing claim for retry",
-                issue.iid
-            );
-            anyhow::bail!(
-                "PMO GUIDE_WORKER output for issue #{} had no usable guidance; retrying later",
-                issue.iid
-            );
-        }
-        info!("PMO: Issue #{} needs guidance, not splitting", issue.iid);
-        gitlab.add_issue_comment(issue.iid, &format_pmo_guidance_comment(&guidance))?;
-        gitlab.remove_issue_label(issue.iid, ACTION_REQUIRED_LABEL)?;
-        let _ = gitlab.remove_issue_label(issue.iid, PMO_PROCESSED_LABEL);
-        return Ok(false);
-    }
-
-    // --- SPLIT: create sub-issues, close the parent as a task container ---
-    // Sub-issues come from the structured `plan` tool output (populated by
-    // `apply_pmo_handoff` into `agent_output.sub_issues`). No text-marker
-    // parsing — the model must call the `plan` tool with a `sub_issues` array.
-    let sub_issues = agent_output.sub_issues.clone();
+        // --- SPLIT: create sub-issues, close the parent as a task container ---
+        PmoOutput::Split { sub_issues } => normalize_sub_issues(sub_issues),
+    };
 
     if sub_issues.is_empty() {
-        let preview = pmo_truncate_utf8_by_bytes(agent_output.response.trim(), 800);
-        warn!(
-            "PMO: No sub-issues from plan tool for issue #{} (response preview, {} bytes): {}",
-            issue.iid,
-            preview.len(),
-            preview
-        );
+        warn!("PMO: No sub-issues from plan tool for issue #{}", issue.iid);
 
         anyhow::bail!(
             "PMO split output for issue #{} was not machine-readable; retrying later",
@@ -1421,74 +1568,37 @@ struct PendingSplit {
     parent_issue_title: String,
     #[serde(default)]
     parent_priority: u8,
-    sub_issues: Vec<HandoffSubIssue>,
+    sub_issues: Vec<PmoSubIssue>,
     created_issue_ids: Vec<u64>,
 }
 
-// --- Decision predicates (structured-fields only) ---
-// The PMO's decision is read from the `plan` tool's JSON via
-// `apply_pmo_handoff`, which populates `AgentHandoff.decision` and the
-// supporting fields. No text-marker parsing — the harness guarantees the
-// structured path.
+// --- Field extractors (typed `PmoOutput` fields only) ---
 
-fn pmo_needs_clarification(output: &AgentHandoff) -> bool {
-    output
-        .decision
-        .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("needs_clarification"))
-        || output.needs_clarification.is_some()
-        || output.question.is_some()
+fn already_done_reason_or_default(reason: Option<String>) -> String {
+    reason
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| {
+            "The work described in this issue is already fully implemented in the codebase."
+                .to_string()
+        })
 }
 
-fn pmo_guides_worker(output: &AgentHandoff) -> bool {
-    output
-        .decision
-        .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("guide_worker"))
-        || output.instructions.is_some()
+fn clarification_question_or_default(question: Option<String>) -> String {
+    question
+        .map(|q| q.trim().to_string())
+        .filter(|q| !q.is_empty())
+        .unwrap_or_else(|| {
+            "The PMO agent could not determine how to proceed with this issue. Please provide more details about the expected scope and acceptance criteria.".to_string()
+        })
 }
 
-fn is_pmo_already_done_response(output: &AgentHandoff) -> bool {
-    output
-        .decision
-        .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("already_done"))
-}
-
-fn pmo_wait_for_dependency(output: &AgentHandoff) -> bool {
-    output
-        .decision
-        .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("wait_for_dependency"))
-        || output.depends_on_issue.is_some()
-}
-
-// --- Field extractors (structured-fields only) ---
-
-fn extract_already_done_reason(agent_output: &AgentHandoff) -> String {
-    if let Some(reason) = &agent_output.reason {
-        let trimmed = reason.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    "The work described in this issue is already fully implemented in the codebase.".to_string()
-}
-
-fn extract_clarification_question(agent_output: &AgentHandoff) -> String {
-    if let Some(question) = &agent_output.question {
-        let trimmed = question.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    if let Some(clarification) = &agent_output.needs_clarification {
-        let trimmed = clarification.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    "The PMO agent could not determine how to proceed with this issue. Please provide more details about the expected scope and acceptance criteria.".to_string()
+fn guidance_or_empty(instructions: Option<String>) -> String {
+    instructions
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .map(|t| cap_guidance_length(&t))
+        .unwrap_or_default()
 }
 
 /// Check whether there are new human comments on the issue since the last
@@ -1526,16 +1636,6 @@ fn has_new_comments_since_last_pmo_comment(
     }
 }
 
-fn extract_guidance(agent_output: &AgentHandoff) -> String {
-    if let Some(instructions) = &agent_output.instructions {
-        let trimmed = instructions.trim();
-        if !trimmed.is_empty() {
-            return cap_guidance_length(trimmed);
-        }
-    }
-    String::new()
-}
-
 /// Cap guidance length — keep it brief and actionable. Truncates at the last
 /// sentence boundary within the limit, falling back to an ellipsis suffix.
 fn cap_guidance_length(raw: &str) -> String {
@@ -1560,179 +1660,10 @@ fn format_pmo_guidance_comment(guidance: &str) -> String {
     format!("**PMO guidance for the worker agent:**\n\n{trimmed}")
 }
 
-fn pmo_truncate_utf8_by_bytes(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
-}
-
-/// Parse a JSON value as an issue IID, accepting numbers, numeric strings,
-/// and strings with a leading `#` (e.g. `727`, `"727"`, `"#727"`). Returns
-/// `None` for zero or non-numeric values.
-fn parse_iid_value(val: &Value) -> Option<u64> {
-    let n = val.as_u64().or_else(|| {
-        let s = val.as_str()?;
-        let s = s.trim().trim_start_matches('#').trim();
-        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse::<u64>().ok()
-    });
-    n.filter(|n| *n > 0)
-}
-
-/// Check whether the agent's structured output contains a `plan` entry
-/// (i.e. the model called the `plan` structured-output tool).
-fn handoff_has_plan_output(handoff: &AgentHandoff) -> bool {
-    handoff
-        .structured_outputs
-        .as_ref()
-        .is_some_and(|s| s.get("plan").is_some())
-}
-
-/// Get a reference to the `plan` tool's captured JSON from
-/// `agent_output.structured_outputs`, or `None` if the tool wasn't called.
-fn plan_output(agent_output: &AgentHandoff) -> Option<&serde_json::Value> {
-    agent_output
-        .structured_outputs
-        .as_ref()
-        .and_then(|s| s.get("plan"))
-}
-
-/// Extract the `plan_text` field from the `plan` tool's structured output.
-/// This is the PMO's proposed plan that gets written into the issue description
-/// during the needs_clarification refinement loop.
-fn extract_plan_text(agent_output: &AgentHandoff) -> Option<String> {
-    let plan = plan_output(agent_output)?;
-    plan.get("plan_text")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Apply the structured JSON the model emitted via the `plan` structured-output
-/// tool. Populates the handoff's structured fields (`decision`, `instructions`,
-/// `sub_issues`, `reason`, `question`, `needs_clarification`, `depends_on_issue`)
-/// from the JSON. Returns the handoff unchanged when `structured_outputs` is
-/// absent or has no `plan` entry.
-fn apply_pmo_handoff(mut handoff: AgentHandoff) -> AgentHandoff {
-    let Some(outputs) = handoff.structured_outputs.take() else {
-        return handoff;
-    };
-    let Some(plan) = outputs.get("plan").cloned() else {
-        // Put it back — not our tool.
-        handoff.structured_outputs = Some(outputs);
-        return handoff;
-    };
-
-    if let Some(d) = plan.get("decision").and_then(Value::as_str) {
-        let d = d.trim();
-        if !d.is_empty() {
-            handoff.decision = Some(d.to_lowercase());
-        }
-    }
-
-    if let Some(instructions) = plan.get("instructions").and_then(Value::as_str) {
-        let t = instructions.trim();
-        if !t.is_empty() {
-            handoff.instructions = Some(t.to_string());
-        }
-    }
-
-    if let Some(reason) = plan.get("reason").and_then(Value::as_str) {
-        let t = reason.trim();
-        if !t.is_empty() {
-            handoff.reason = Some(t.to_string());
-        }
-    }
-
-    if let Some(question) = plan.get("question").and_then(Value::as_str) {
-        let t = question.trim();
-        if !t.is_empty() {
-            handoff.question = Some(t.to_string());
-            handoff.needs_clarification = Some(t.to_string());
-        }
-    }
-
-    // PMO wait_for_dependency: the model may use different field names or
-    // provide the IID as a string (e.g. "#727" or "727"). Accept any of a
-    // set of plausible keys and parse the leading digits.
-    for key in [
-        "dependency_issue_iid",
-        "dependency_iid",
-        "depends_on_issue",
-        "blocked_by",
-        "dependency",
-    ] {
-        if let Some(val) = plan.get(key)
-            && let Some(n) = parse_iid_value(val)
-        {
-            handoff.depends_on_issue = Some(n);
-            break;
-        }
-    }
-
-    if let Some(sub_issues) = plan.get("sub_issues").and_then(Value::as_array) {
-        let parsed: Vec<HandoffSubIssue> = sub_issues
-            .iter()
-            .filter_map(|s| {
-                let title = s.get("title").and_then(Value::as_str)?.trim().to_string();
-                if title.is_empty() {
-                    return None;
-                }
-                let description = s
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if description.is_empty() {
-                    return None;
-                }
-                let priority = s
-                    .get("priority")
-                    .and_then(Value::as_u64)
-                    .filter(|p| (1..=3).contains(p))
-                    .map(|p| p as u8);
-                // depends_on is a 1-based index into the sub_issues array
-                // (matching how the model references "sub-issue 1"). 0/absent
-                // means no dependency.
-                let depends_on = s
-                    .get("depends_on")
-                    .and_then(Value::as_u64)
-                    .map(|d| d as usize)
-                    .unwrap_or(0);
-                Some(HandoffSubIssue {
-                    title,
-                    description,
-                    priority,
-                    depends_on,
-                })
-            })
-            .collect();
-        if !parsed.is_empty() {
-            handoff.sub_issues = parsed;
-        }
-    }
-
-    info!(
-        "PMO: applied structured plan output (decision={:?}, sub_issues={})",
-        handoff.decision.as_deref().unwrap_or(""),
-        handoff.sub_issues.len()
-    );
-
-    handoff
-}
-
 fn save_pending_split(path: &str, pending: &PendingSplit) -> Result<()> {
-    let json = serde_json::to_string_pretty(pending)?;
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        fs::create_dir_all(parent).context("Failed to create .potlatch-context for pending split")?;
-    }
-    fs::write(path, json).context("Failed to save pending split file")?;
+    crate::core::state::StateStore::new(path)
+        .save(pending)
+        .context("Failed to save pending split file")?;
     info!(
         "PMO: Saved pending split for issue #{} with {} sub-issues to {}",
         pending.parent_issue_iid,
@@ -1743,20 +1674,19 @@ fn save_pending_split(path: &str, pending: &PendingSplit) -> Result<()> {
 }
 
 fn load_pending_split(path: &str) -> Result<Option<PendingSplit>> {
-    if !std::path::Path::new(path).exists() {
-        return Ok(None);
-    }
-
-    let content = fs::read_to_string(path).context("Failed to read pending split file")?;
-    let pending: PendingSplit =
-        serde_json::from_str(&content).context("Failed to parse pending split file")?;
-
-    Ok(Some(pending))
+    crate::core::state::StateStore::new(path)
+        .load()
+        .context("Failed to load pending split file")
 }
 
 fn delete_pending_split(path: &str) -> Result<()> {
-    if std::path::Path::new(path).exists() {
-        fs::remove_file(path).context("Failed to delete pending split file")?;
+    let store: crate::core::state::StateStore<PendingSplit> =
+        crate::core::state::StateStore::new(path);
+    let existed = store.path().exists();
+    store
+        .remove()
+        .context("Failed to delete pending split file")?;
+    if existed {
         info!("PMO: Deleted pending split file {}", path);
     }
     Ok(())
@@ -1767,10 +1697,12 @@ fn try_resume_pmo_state(
     gitlab: &GitLabClient,
     scope_label: Option<&str>,
 ) -> Option<u64> {
-    let path = state.state_path();
-    let content = fs::read_to_string(&path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let issue_iid = v.get("claimed_issue_iid")?.as_u64()?;
+    // Invalid persisted PMO state has historically been ignored.
+    let persisted: PersistedPmoState = crate::core::state::StateStore::new(state.state_path())
+        .load()
+        .ok()
+        .flatten()?;
+    let issue_iid = persisted.claimed_issue_iid;
 
     let claim_label = state.claim_label();
     match gitlab.get_issue(issue_iid) {
@@ -2303,7 +2235,6 @@ mod tests {
     fn build_split_prompt_documents_plan_tool_only() {
         let state = AgentState {
             sessions_dir: "/tmp".into(),
-            working_dir: "/tmp".into(),
             agent_id: "pmo-test".into(),
             project_name: "test-proj".into(),
         };
@@ -2337,187 +2268,233 @@ mod tests {
     }
 
     #[test]
-    fn apply_pmo_handoff_populates_structured_fields_for_split() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({"plan": {
-                "decision": "split",
-                "sub_issues": [
-                    {"title": "First", "description": "Do the first thing", "priority": 1},
-                    {"title": "Second", "description": "Do the second thing", "priority": 2, "depends_on": 1}
-                ]
-            }})),
-            ..Default::default()
+    fn pmo_output_deserializes_split_with_sub_issues() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "split",
+            "sub_issues": [
+                {"title": "First", "description": "Do the first thing", "priority": 1},
+                {"title": "Second", "description": "Do the second thing", "priority": 2, "depends_on": 1}
+            ]
+        }))
+        .unwrap();
+        let PmoOutput::Split { sub_issues } = output else {
+            panic!("expected Split");
         };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.decision.as_deref(), Some("split"));
-        assert_eq!(applied.sub_issues.len(), 2);
-        assert_eq!(applied.sub_issues[0].title, "First");
-        assert_eq!(applied.sub_issues[0].priority, Some(1));
-        assert_eq!(applied.sub_issues[0].depends_on, 0);
-        assert_eq!(applied.sub_issues[1].title, "Second");
-        assert_eq!(applied.sub_issues[1].priority, Some(2));
-        assert_eq!(applied.sub_issues[1].depends_on, 1);
-        assert!(applied.structured_outputs.is_none());
+        let normalized = normalize_sub_issues(sub_issues);
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].title, "First");
+        assert_eq!(normalized[0].priority, Some(1));
+        assert_eq!(normalized[0].depends_on, 0);
+        assert_eq!(normalized[1].title, "Second");
+        assert_eq!(normalized[1].priority, Some(2));
+        assert_eq!(normalized[1].depends_on, 1);
     }
 
     #[test]
-    fn apply_pmo_handoff_populates_instructions_for_guide_worker() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({"plan": {
-                "decision": "guide_worker",
-                "instructions": "Use flag --foo instead of --bar."
-            }})),
-            ..Default::default()
-        };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.decision.as_deref(), Some("guide_worker"));
-        assert_eq!(
-            applied.instructions.as_deref(),
-            Some("Use flag --foo instead of --bar.")
-        );
-        assert!(pmo_guides_worker(&applied));
+    fn normalize_sub_issues_remaps_dependencies_after_filtering() {
+        let normalized = normalize_sub_issues(vec![
+            RawSubIssue {
+                title: String::new(),
+                description: "placeholder".into(),
+                ..Default::default()
+            },
+            RawSubIssue {
+                title: "First".into(),
+                description: "one".into(),
+                ..Default::default()
+            },
+            RawSubIssue {
+                title: "Second".into(),
+                description: "two".into(),
+                depends_on: 2,
+                ..Default::default()
+            },
+        ]);
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[1].depends_on, 1);
     }
 
     #[test]
-    fn apply_pmo_handoff_populates_reason_for_already_done() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({"plan": {
-                "decision": "already_done",
-                "reason": "The feature exists in src/lib.rs."
-            }})),
-            ..Default::default()
-        };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.decision.as_deref(), Some("already_done"));
-        assert!(applied.reason.as_deref().unwrap().contains("src/lib.rs"));
-        assert!(is_pmo_already_done_response(&applied));
+    fn pmo_output_deserializes_guide_worker_instructions() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "guide_worker",
+            "instructions": "Use flag --foo instead of --bar."
+        }))
+        .unwrap();
+        match output {
+            PmoOutput::GuideWorker { instructions } => {
+                assert_eq!(
+                    instructions.as_deref(),
+                    Some("Use flag --foo instead of --bar.")
+                );
+            }
+            other => panic!("expected GuideWorker, got {other:?}"),
+        }
     }
 
     #[test]
-    fn apply_pmo_handoff_populates_question_for_needs_clarification() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({"plan": {
-                "decision": "needs_clarification",
-                "question": "Which modules should be covered?"
-            }})),
-            ..Default::default()
-        };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.decision.as_deref(), Some("needs_clarification"));
-        assert!(applied.question.as_deref().unwrap().contains("modules"));
-        assert!(pmo_needs_clarification(&applied));
+    fn pmo_output_decision_is_case_insensitive() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "GUIDE_WORKER",
+            "instructions": "Proceed."
+        }))
+        .unwrap();
+        assert!(matches!(output, PmoOutput::GuideWorker { .. }));
     }
 
     #[test]
-    fn apply_pmo_handoff_populates_depends_on_issue_for_wait_for_dependency() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({"plan": {
-                "decision": "wait_for_dependency",
-                "dependency_issue_iid": 47
-            }})),
-            ..Default::default()
-        };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.decision.as_deref(), Some("wait_for_dependency"));
-        assert_eq!(applied.depends_on_issue, Some(47));
-        assert!(pmo_wait_for_dependency(&applied));
+    fn pmo_output_deserializes_already_done_reason() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "already_done",
+            "reason": "The feature exists in src/lib.rs."
+        }))
+        .unwrap();
+        match output {
+            PmoOutput::AlreadyDone { reason } => {
+                assert!(reason.unwrap().contains("src/lib.rs"));
+            }
+            other => panic!("expected AlreadyDone, got {other:?}"),
+        }
     }
 
     #[test]
-    fn apply_pmo_handoff_ignores_zero_dependency_issue_iid() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({"plan": {
-                "decision": "wait_for_dependency",
-                "dependency_issue_iid": 0
-            }})),
-            ..Default::default()
-        };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.decision.as_deref(), Some("wait_for_dependency"));
-        assert_eq!(applied.depends_on_issue, None);
+    fn pmo_output_deserializes_needs_clarification_question() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "needs_clarification",
+            "question": "Which modules should be covered?"
+        }))
+        .unwrap();
+        match output {
+            PmoOutput::NeedsClarification { question, .. } => {
+                assert!(question.unwrap().contains("modules"));
+            }
+            other => panic!("expected NeedsClarification, got {other:?}"),
+        }
     }
 
     #[test]
-    fn apply_pmo_handoff_accepts_string_dependency_issue_iid() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({"plan": {
-                "decision": "wait_for_dependency",
-                "dependency_issue_iid": "#727"
-            }})),
-            ..Default::default()
-        };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.depends_on_issue, Some(727));
+    fn pmo_output_deserializes_wait_for_dependency_iid() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "wait_for_dependency",
+            "dependency_issue_iid": 47
+        }))
+        .unwrap();
+        match output {
+            PmoOutput::WaitForDependency {
+                dependency_issue_iid,
+            } => {
+                assert_eq!(dependency_issue_iid, Some(47));
+            }
+            other => panic!("expected WaitForDependency, got {other:?}"),
+        }
     }
 
     #[test]
-    fn apply_pmo_handoff_accepts_alternative_field_names() {
+    fn pmo_output_ignores_zero_dependency_issue_iid() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "wait_for_dependency",
+            "dependency_issue_iid": 0
+        }))
+        .unwrap();
+        match output {
+            PmoOutput::WaitForDependency {
+                dependency_issue_iid,
+            } => {
+                assert_eq!(dependency_issue_iid, None);
+            }
+            other => panic!("expected WaitForDependency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pmo_output_accepts_string_dependency_issue_iid() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "wait_for_dependency",
+            "dependency_issue_iid": "#727"
+        }))
+        .unwrap();
+        match output {
+            PmoOutput::WaitForDependency {
+                dependency_issue_iid,
+            } => {
+                assert_eq!(dependency_issue_iid, Some(727));
+            }
+            other => panic!("expected WaitForDependency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pmo_output_accepts_alternative_dependency_field_names() {
         for key in [
             "dependency_iid",
             "depends_on_issue",
             "blocked_by",
             "dependency",
         ] {
-            let handoff = AgentHandoff {
-                structured_outputs: Some(serde_json::json!({"plan": {
-                    "decision": "wait_for_dependency",
-                    key: 727
-                }})),
-                ..Default::default()
-            };
-            let applied = apply_pmo_handoff(handoff);
-            assert_eq!(
-                applied.depends_on_issue,
-                Some(727),
-                "failed for alternative field name `{key}`"
-            );
+            let output: PmoOutput = serde_json::from_value(serde_json::json!({
+                "decision": "wait_for_dependency",
+                key: 727
+            }))
+            .unwrap();
+            match output {
+                PmoOutput::WaitForDependency {
+                    dependency_issue_iid,
+                } => {
+                    assert_eq!(
+                        dependency_issue_iid,
+                        Some(727),
+                        "failed for alternative field name `{key}`"
+                    );
+                }
+                other => panic!("expected WaitForDependency, got {other:?}"),
+            }
         }
     }
 
     #[test]
-    fn apply_pmo_handoff_none_leaves_handoff_unchanged() {
-        let handoff = AgentHandoff {
-            response: "some text".into(),
-            ..Default::default()
-        };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.decision, None);
-        assert_eq!(applied.instructions, None);
-        assert_eq!(applied.response, "some text");
+    fn pmo_output_rejects_unknown_decision() {
+        let err = serde_json::from_value::<PmoOutput>(serde_json::json!({"decision": "bogus"}))
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
     }
 
     #[test]
-    fn apply_pmo_handoff_skips_empty_sub_issue_titles() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({"plan": {
-                "decision": "split",
-                "sub_issues": [
-                    {"title": "", "description": "no title"},
-                    {"title": "Valid", "description": "has title"}
-                ]
-            }})),
-            ..Default::default()
-        };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.sub_issues.len(), 1);
-        assert_eq!(applied.sub_issues[0].title, "Valid");
+    fn normalize_sub_issues_skips_empty_titles() {
+        let raw = vec![
+            RawSubIssue {
+                title: "".into(),
+                description: "no title".into(),
+                ..Default::default()
+            },
+            RawSubIssue {
+                title: "Valid".into(),
+                description: "has title".into(),
+                ..Default::default()
+            },
+        ];
+        let normalized = normalize_sub_issues(raw);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].title, "Valid");
     }
 
     #[test]
-    fn apply_pmo_handoff_skips_empty_sub_issue_descriptions() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({"plan": {
-                "decision": "split",
-                "sub_issues": [
-                    {"title": "No desc", "description": ""},
-                    {"title": "Valid", "description": "has desc"}
-                ]
-            }})),
-            ..Default::default()
-        };
-        let applied = apply_pmo_handoff(handoff);
-        assert_eq!(applied.sub_issues.len(), 1);
-        assert_eq!(applied.sub_issues[0].title, "Valid");
+    fn normalize_sub_issues_skips_empty_descriptions() {
+        let raw = vec![
+            RawSubIssue {
+                title: "No desc".into(),
+                description: "".into(),
+                ..Default::default()
+            },
+            RawSubIssue {
+                title: "Valid".into(),
+                description: "has desc".into(),
+                ..Default::default()
+            },
+        ];
+        let normalized = normalize_sub_issues(raw);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].title, "Valid");
     }
 
     #[test]
@@ -2559,31 +2536,22 @@ mod tests {
     }
 
     #[test]
-    fn extract_guidance_returns_structured_instructions() {
-        let output = AgentHandoff {
-            instructions: Some("Use the existing config loader.".into()),
-            ..Default::default()
-        };
-        assert_eq!(extract_guidance(&output), "Use the existing config loader.");
+    fn guidance_or_empty_returns_instructions() {
+        assert_eq!(
+            guidance_or_empty(Some("Use the existing config loader.".into())),
+            "Use the existing config loader."
+        );
     }
 
     #[test]
-    fn extract_guidance_returns_empty_when_no_instructions() {
-        let output = AgentHandoff {
-            response: "some response text".into(),
-            ..Default::default()
-        };
-        assert!(extract_guidance(&output).is_empty());
+    fn guidance_or_empty_returns_empty_when_no_instructions() {
+        assert!(guidance_or_empty(None).is_empty());
     }
 
     #[test]
-    fn extract_guidance_truncates_long_instructions() {
+    fn guidance_or_empty_truncates_long_instructions() {
         let long = "Do this. ".repeat(80);
-        let output = AgentHandoff {
-            instructions: Some(long),
-            ..Default::default()
-        };
-        let extracted = extract_guidance(&output);
+        let extracted = guidance_or_empty(Some(long));
         assert!(extracted.len() <= 502);
         assert!(extracted.starts_with("Do this."));
     }
@@ -2613,142 +2581,60 @@ mod tests {
     }
 
     #[test]
-    fn decision_predicates_use_structured_fields_only() {
-        // needs_clarification
-        let nc = AgentHandoff {
-            decision: Some("needs_clarification".into()),
-            ..Default::default()
-        };
-        assert!(pmo_needs_clarification(&nc));
-        assert!(!pmo_guides_worker(&nc));
-        assert!(!is_pmo_already_done_response(&nc));
-
-        // guide_worker
-        let gw = AgentHandoff {
-            decision: Some("guide_worker".into()),
-            ..Default::default()
-        };
-        assert!(pmo_guides_worker(&gw));
-        assert!(!pmo_needs_clarification(&gw));
-
-        // already_done
-        let ad = AgentHandoff {
-            decision: Some("already_done".into()),
-            ..Default::default()
-        };
-        assert!(is_pmo_already_done_response(&ad));
-        assert!(!pmo_guides_worker(&ad));
-
-        // wait_for_dependency
-        let wd = AgentHandoff {
-            decision: Some("wait_for_dependency".into()),
-            depends_on_issue: Some(42),
-            ..Default::default()
-        };
-        assert!(pmo_wait_for_dependency(&wd));
-        assert!(!pmo_guides_worker(&wd));
-        assert!(!is_pmo_already_done_response(&wd));
-        assert!(!pmo_needs_clarification(&wd));
-
-        // depends_on_issue alone also triggers the predicate (structured field)
-        let wd_field = AgentHandoff {
-            depends_on_issue: Some(7),
-            ..Default::default()
-        };
-        assert!(pmo_wait_for_dependency(&wd_field));
-
-        // No decision
-        let none = AgentHandoff::default();
-        assert!(!pmo_needs_clarification(&none));
-        assert!(!pmo_guides_worker(&none));
-        assert!(!is_pmo_already_done_response(&none));
-        assert!(!pmo_wait_for_dependency(&none));
+    fn already_done_reason_or_default_uses_field() {
+        assert!(
+            already_done_reason_or_default(Some("Implemented in module X.".into()))
+                .contains("module X")
+        );
     }
 
     #[test]
-    fn decision_predicates_ignore_text_markers() {
-        // Text markers in the response must NOT trigger decisions — only
-        // structured fields count.
-        let output = AgentHandoff {
-            response: "GUIDE_WORKER\nINSTRUCTIONS:\ndo something".into(),
-            ..Default::default()
-        };
-        assert!(!pmo_guides_worker(&output));
-        assert!(!pmo_needs_clarification(&output));
-
-        let output = AgentHandoff {
-            response: "ALREADY_DONE\nREASON: done".into(),
-            ..Default::default()
-        };
-        assert!(!is_pmo_already_done_response(&output));
+    fn already_done_reason_or_default_falls_back_when_absent() {
+        assert!(!already_done_reason_or_default(None).is_empty());
     }
 
     #[test]
-    fn extract_already_done_reason_uses_structured_field() {
-        let output = AgentHandoff {
-            reason: Some("Implemented in module X.".into()),
-            ..Default::default()
-        };
-        assert!(extract_already_done_reason(&output).contains("module X"));
+    fn clarification_question_or_default_uses_field() {
+        assert_eq!(
+            clarification_question_or_default(Some("Which modules?".into())),
+            "Which modules?"
+        );
     }
 
     #[test]
-    fn extract_already_done_reason_defaults_when_no_field() {
-        let output = AgentHandoff::default();
-        let reason = extract_already_done_reason(&output);
-        assert!(!reason.is_empty());
+    fn clarification_question_or_default_falls_back_when_absent() {
+        assert!(!clarification_question_or_default(None).is_empty());
     }
 
     #[test]
-    fn extract_clarification_question_uses_structured_field() {
-        let output = AgentHandoff {
-            question: Some("Which modules?".into()),
-            ..Default::default()
-        };
-        assert_eq!(extract_clarification_question(&output), "Which modules?");
+    fn pmo_output_deserializes_needs_clarification_plan_text() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "needs_clarification",
+            "plan_text": "## Plan Draft\n\n1. Implement X\n2. Test X\n\nOpen question: which config?"
+        }))
+        .unwrap();
+        match output {
+            PmoOutput::NeedsClarification { plan_text, .. } => {
+                let plan = plan_text.unwrap();
+                assert!(plan.contains("## Plan Draft"));
+                assert!(plan.contains("Implement X"));
+            }
+            other => panic!("expected NeedsClarification, got {other:?}"),
+        }
     }
 
     #[test]
-    fn extract_clarification_question_defaults_when_no_field() {
-        let output = AgentHandoff::default();
-        let q = extract_clarification_question(&output);
-        assert!(!q.is_empty());
-    }
-
-    #[test]
-    fn extract_plan_text_reads_from_structured_output() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "plan": {
-                    "decision": "needs_clarification",
-                    "plan_text": "## Plan Draft\n\n1. Implement X\n2. Test X\n\nOpen question: which config?"
-                }
-            })),
-            ..Default::default()
-        };
-        let plan = extract_plan_text(&output).unwrap();
-        assert!(plan.contains("## Plan Draft"));
-        assert!(plan.contains("Implement X"));
-    }
-
-    #[test]
-    fn extract_plan_text_returns_none_when_absent() {
-        let output = AgentHandoff::default();
-        assert!(extract_plan_text(&output).is_none());
-    }
-
-    #[test]
-    fn extract_plan_text_returns_none_when_empty() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "plan": {
-                    "decision": "needs_clarification",
-                    "plan_text": "  "
-                }
-            })),
-            ..Default::default()
-        };
-        assert!(extract_plan_text(&output).is_none());
+    fn pmo_output_needs_clarification_plan_text_absent_when_not_provided() {
+        let output: PmoOutput = serde_json::from_value(serde_json::json!({
+            "decision": "needs_clarification"
+        }))
+        .unwrap();
+        match output {
+            PmoOutput::NeedsClarification { plan_text, .. } => {
+                assert!(plan_text.is_none());
+            }
+            other => panic!("expected NeedsClarification, got {other:?}"),
+        }
     }
 
     #[test]

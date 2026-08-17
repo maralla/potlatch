@@ -9,7 +9,6 @@ pub mod labels;
 pub mod ops;
 pub mod pmo;
 pub(crate) mod qa;
-pub(crate) mod retry;
 pub mod reviewer;
 pub mod settings;
 pub(crate) mod ssh_util;
@@ -22,27 +21,6 @@ use crate::agents::gitlab::{Issue, MergeRequest};
 pub fn scope_label_filter(scope_label: &str) -> Option<&str> {
     let t = scope_label.trim();
     if t.is_empty() { None } else { Some(t) }
-}
-
-/// Stable machine-readable block for public GitLab comments embedded in agent text output.
-pub(crate) fn extract_public_comment_block(text: &str) -> Option<String> {
-    extract_marker_block(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END")
-}
-
-/// Generic single-block extractor: returns the trimmed body between the first
-/// `begin` marker and the next `end` marker. `None` when either marker is
-/// missing or the body is empty.
-fn extract_marker_block(text: &str, begin: &str, end: &str) -> Option<String> {
-    let start = text.find(begin)?;
-    let body_start = start + begin.len();
-    let rest = &text[body_start..];
-    let end_rel = rest.find(end)?;
-    let body = rest[..end_rel].trim();
-    if body.is_empty() {
-        None
-    } else {
-        Some(body.to_string())
-    }
 }
 
 pub(crate) fn strip_public_comment_blocks(text: &str) -> String {
@@ -92,20 +70,11 @@ pub(crate) fn write_task_context_file(
     file_name: &str,
     content: &str,
 ) -> Result<String> {
-    use anyhow::Context;
-    use std::path::Path;
-
-    anyhow::ensure!(
-        !file_name.contains('/') && !file_name.contains('\\') && !file_name.is_empty(),
-        "task context file_name must be a simple file name, got {:?}",
-        file_name
-    );
-    let base = Path::new(work_dir);
-    std::fs::create_dir_all(base).context("Failed to create task context directory")?;
-    let path = base.join(file_name);
-    std::fs::write(&path, content).context("Failed to write task context file")?;
-    let abs = std::fs::canonicalize(&path).unwrap_or(path);
-    Ok(abs.to_string_lossy().into_owned())
+    let store = crate::core::artifact::ArtifactStore::new(work_dir);
+    Ok(store
+        .write(file_name, content)?
+        .to_string_lossy()
+        .into_owned())
 }
 
 pub(crate) fn issue_in_scope(issue: &Issue, scope_label: Option<&str>) -> bool {
@@ -143,8 +112,7 @@ pub fn register(workflow: &mut Workflow) {
 #[cfg(test)]
 mod scope_tests {
     use super::{
-        extract_public_comment_block, issue_in_scope, mr_in_scope, register,
-        strip_internal_markers, strip_public_comment_blocks,
+        issue_in_scope, mr_in_scope, register, strip_internal_markers, strip_public_comment_blocks,
     };
     use crate::agents::gitlab::{Issue, MergeRequest};
     use crate::core::config::Config;
@@ -206,15 +174,6 @@ mod scope_tests {
 
         let ai_worker = sample_mr(Some(vec![super::labels::NEED_AI_WORKER]));
         assert!(mr_in_scope(&ai_worker, Some("other-scope")));
-    }
-
-    #[test]
-    fn extract_public_comment_block_reads_stable_markers() {
-        let text = "noise\nPUBLIC_COMMENT_BEGIN\nFinal public comment.\nPUBLIC_COMMENT_END\nmore";
-        assert_eq!(
-            extract_public_comment_block(text).as_deref(),
-            Some("Final public comment.")
-        );
     }
 
     #[test]

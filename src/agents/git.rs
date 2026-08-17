@@ -1,17 +1,20 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tracing::{debug, warn};
 
-use super::retry::with_backoff_retries;
+use crate::core::retry::with_backoff_retries;
 
 pub struct GitRepo {
     pub path: String,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl GitRepo {
-    pub fn new(path: String) -> Self {
-        Self { path }
+    pub fn new(path: String, shutdown: Arc<AtomicBool>) -> Self {
+        Self { path, shutdown }
     }
 
     pub fn exists(&self) -> bool {
@@ -31,76 +34,86 @@ impl GitRepo {
     }
 
     pub fn clone(&self, repo_url: &str) -> Result<()> {
-        with_backoff_retries(&format!("git clone into {}", self.path), || {
-            debug!("Cloning repository {} to {}", repo_url, self.path);
+        with_backoff_retries(
+            &self.shutdown,
+            &format!("git clone into {}", self.path),
+            || {
+                debug!("Cloning repository {} to {}", repo_url, self.path);
 
-            let output = Command::new("git")
-                .args(["clone", repo_url, &self.path])
-                .output()
-                .context("Failed to execute git clone")?;
+                let output = Command::new("git")
+                    .args(["clone", repo_url, &self.path])
+                    .output()
+                    .context("Failed to execute git clone")?;
 
-            if !output.status.success() {
-                anyhow::bail!("Git clone failed: {}", Self::command_error(&output));
-            }
+                if !output.status.success() {
+                    anyhow::bail!("Git clone failed: {}", Self::command_error(&output));
+                }
 
-            Ok(())
-        })
+                Ok(())
+            },
+        )
     }
 
     pub fn fetch(&self) -> Result<()> {
-        with_backoff_retries(&format!("git fetch in {}", self.path), || {
-            debug!("Fetching latest changes in {}", self.path);
+        with_backoff_retries(
+            &self.shutdown,
+            &format!("git fetch in {}", self.path),
+            || {
+                debug!("Fetching latest changes in {}", self.path);
 
-            let output = Command::new("git")
-                .args(["fetch", "origin"])
-                .current_dir(&self.path)
-                .output()
-                .context("Failed to execute git fetch")?;
+                let output = Command::new("git")
+                    .args(["fetch", "origin"])
+                    .current_dir(&self.path)
+                    .output()
+                    .context("Failed to execute git fetch")?;
 
-            if !output.status.success() {
-                let err = Self::command_error(&output);
-                // Ref namespace conflict: a branch like `hotfix` conflicts
-                // with `hotfix/branch` because Git can't have both a file
-                // and a directory at the same ref path. Prune stale refs and
-                // retry once. If it still fails, the conflict is on the
-                // remote (both branches exist) — fetch only the default
-                // branch ref to avoid the conflicting ref path.
-                if err.contains("cannot lock ref") || err.contains("could not be updated") {
-                    debug!("git fetch ref conflict, pruning and retrying: {err}");
-                    let _ = Command::new("git")
-                        .args(["remote", "prune", "origin"])
-                        .current_dir(&self.path)
-                        .output();
-                    let retry = Command::new("git")
-                        .args(["fetch", "origin"])
-                        .current_dir(&self.path)
-                        .output()
-                        .context("Failed to execute git fetch (retry)")?;
-                    if retry.status.success() {
-                        return Ok(());
-                    }
-                    let retry_err = Self::command_error(&retry);
-                    if retry_err.contains("cannot lock ref")
-                        || retry_err.contains("could not be updated")
-                    {
-                        debug!("git fetch still has ref conflict after prune, fetching HEAD only");
-                        let head = Command::new("git")
-                            .args(["fetch", "origin", "HEAD"])
+                if !output.status.success() {
+                    let err = Self::command_error(&output);
+                    // Ref namespace conflict: a branch like `hotfix` conflicts
+                    // with `hotfix/branch` because Git can't have both a file
+                    // and a directory at the same ref path. Prune stale refs and
+                    // retry once. If it still fails, the conflict is on the
+                    // remote (both branches exist) — fetch only the default
+                    // branch ref to avoid the conflicting ref path.
+                    if err.contains("cannot lock ref") || err.contains("could not be updated") {
+                        debug!("git fetch ref conflict, pruning and retrying: {err}");
+                        let _ = Command::new("git")
+                            .args(["remote", "prune", "origin"])
+                            .current_dir(&self.path)
+                            .output();
+                        let retry = Command::new("git")
+                            .args(["fetch", "origin"])
                             .current_dir(&self.path)
                             .output()
-                            .context("Failed to execute git fetch HEAD")?;
-                        if head.status.success() {
+                            .context("Failed to execute git fetch (retry)")?;
+                        if retry.status.success() {
                             return Ok(());
                         }
-                        anyhow::bail!("Git fetch failed: {}", Self::command_error(&head));
+                        let retry_err = Self::command_error(&retry);
+                        if retry_err.contains("cannot lock ref")
+                            || retry_err.contains("could not be updated")
+                        {
+                            debug!(
+                                "git fetch still has ref conflict after prune, fetching HEAD only"
+                            );
+                            let head = Command::new("git")
+                                .args(["fetch", "origin", "HEAD"])
+                                .current_dir(&self.path)
+                                .output()
+                                .context("Failed to execute git fetch HEAD")?;
+                            if head.status.success() {
+                                return Ok(());
+                            }
+                            anyhow::bail!("Git fetch failed: {}", Self::command_error(&head));
+                        }
+                        anyhow::bail!("Git fetch failed: {retry_err}");
                     }
-                    anyhow::bail!("Git fetch failed: {retry_err}");
+                    anyhow::bail!("Git fetch failed: {err}");
                 }
-                anyhow::bail!("Git fetch failed: {err}");
-            }
 
-            Ok(())
-        })
+                Ok(())
+            },
+        )
     }
 
     /// Fetch the latest tips for specific remote branches (e.g. MR source and target).
@@ -117,6 +130,7 @@ impl GitRepo {
         args.extend(spec.iter().map(String::as_str));
 
         with_backoff_retries(
+            &self.shutdown,
             &format!("git fetch branches {:?} in {}", branches, self.path),
             || {
                 debug!("Fetching branches {:?} in {}", branches, self.path);
@@ -526,9 +540,11 @@ impl GitRepo {
     }
 
     pub fn delete_remote_branch(&self, branch_name: &str) -> Result<()> {
-        with_backoff_retries(&format!("git push --delete origin {branch_name}"), || {
-            self.delete_remote_branch_once(branch_name)
-        })
+        with_backoff_retries(
+            &self.shutdown,
+            &format!("git push --delete origin {branch_name}"),
+            || self.delete_remote_branch_once(branch_name),
+        )
     }
 
     /// Best-effort remote branch delete for cleanup paths that must not block the agent loop.
@@ -603,7 +619,7 @@ impl GitRepo {
     }
 
     pub fn push(&self, branch: &str) -> Result<()> {
-        with_backoff_retries(&format!("git push origin {branch}"), || {
+        with_backoff_retries(&self.shutdown, &format!("git push origin {branch}"), || {
             debug!("Pushing branch {}", branch);
 
             let output = Command::new("git")
@@ -677,6 +693,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
 
     fn run_git(repo: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -706,7 +723,10 @@ mod tests {
         run_git(&dir, &["add", "conflicted.rs"]);
         run_git(&dir, &["commit", "-m", "add conflict markers"]);
 
-        let repo = GitRepo::new(dir.to_string_lossy().into_owned());
+        let repo = GitRepo::new(
+            dir.to_string_lossy().into_owned(),
+            Arc::new(AtomicBool::new(false)),
+        );
         let files = repo.list_conflict_marker_files().unwrap();
         assert_eq!(files, vec!["conflicted.rs".to_string()]);
 
@@ -746,7 +766,10 @@ mod tests {
 
         fs::write(dir.join("file.txt"), "resolved\n").unwrap();
 
-        let repo = GitRepo::new(dir.to_string_lossy().into_owned());
+        let repo = GitRepo::new(
+            dir.to_string_lossy().into_owned(),
+            Arc::new(AtomicBool::new(false)),
+        );
         assert!(repo.is_merge_in_progress().unwrap());
         assert!(!repo.list_unmerged_paths().unwrap().is_empty());
         assert!(repo.stage_resolved_unmerged_paths().unwrap());

@@ -1,10 +1,81 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde_json::{Map, Value, json};
 
 use crate::core::agent::InvokeOptions;
+use crate::core::agent::schema::{ObjectSchema, SchemaField, StructuredOutputTool};
 use crate::core::config::{AcpSpawnConfig, Config};
 use crate::core::model::acp::AcpRuntime;
+
+/// Model backend boundary: converts the neutral [`StructuredOutputTool`]
+/// contract into the ACP/harness `structured_output_tools` wire JSON
+/// (`{"name", "description", "parameters"}` with a JSON-schema `parameters`
+/// object). The harness (ACP runtime, `NewSessionParams`) only ever sees
+/// this raw JSON and stays fully generic — it has no notion of
+/// [`SchemaField`] or [`ObjectSchema`].
+pub(crate) fn structured_output_tools_wire_json(tools: &[StructuredOutputTool]) -> Vec<Value> {
+    tools.iter().map(structured_output_tool_wire_json).collect()
+}
+
+fn structured_output_tool_wire_json(tool: &StructuredOutputTool) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": object_schema_wire_json(&tool.parameters),
+    })
+}
+
+fn object_schema_wire_json(schema: &ObjectSchema) -> Value {
+    let mut properties = Map::new();
+    for (name, field) in &schema.properties {
+        properties.insert(name.clone(), schema_field_wire_json(field));
+    }
+    let mut obj = json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+    });
+    if !schema.required.is_empty() {
+        obj["required"] = Value::Array(schema.required.iter().cloned().map(Value::from).collect());
+    }
+    obj
+}
+
+fn schema_field_wire_json(field: &SchemaField) -> Value {
+    match field {
+        SchemaField::String {
+            description,
+            enum_values,
+        } => {
+            let mut obj = json!({"type": "string", "description": description});
+            if !enum_values.is_empty() {
+                obj["enum"] = Value::Array(enum_values.iter().cloned().map(Value::from).collect());
+            }
+            obj
+        }
+        SchemaField::Integer {
+            description,
+            enum_values,
+        } => {
+            let mut obj = json!({"type": "integer", "description": description});
+            if !enum_values.is_empty() {
+                obj["enum"] = Value::Array(enum_values.iter().cloned().map(Value::from).collect());
+            }
+            obj
+        }
+        SchemaField::Boolean { description } => {
+            json!({"type": "boolean", "description": description})
+        }
+        SchemaField::Array { description, items } => {
+            json!({
+                "type": "array",
+                "description": description,
+                "items": schema_field_wire_json(items),
+            })
+        }
+        SchemaField::Object(schema) => object_schema_wire_json(schema),
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelSessionOptions {
@@ -209,5 +280,96 @@ mod tests {
         )
         .unwrap();
         let _ = engine;
+    }
+
+    #[test]
+    fn structured_output_tools_wire_json_converts_flat_object_schema() {
+        let tool = StructuredOutputTool {
+            name: "review".into(),
+            description: "Emit your review decision".into(),
+            parameters: ObjectSchema::new()
+                .property(
+                    "decision",
+                    SchemaField::string_enum("Your decision.", &["approve", "request_changes"]),
+                )
+                .property("feedback", SchemaField::string("Feedback text."))
+                .required("decision"),
+        };
+
+        let wire = structured_output_tools_wire_json(std::slice::from_ref(&tool));
+        assert_eq!(wire.len(), 1);
+        assert_eq!(
+            wire[0],
+            serde_json::json!({
+                "name": "review",
+                "description": "Emit your review decision",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {
+                            "type": "string",
+                            "description": "Your decision.",
+                            "enum": ["approve", "request_changes"]
+                        },
+                        "feedback": {
+                            "type": "string",
+                            "description": "Feedback text."
+                        }
+                    },
+                    "required": ["decision"]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn structured_output_tools_wire_json_converts_nested_array_of_objects() {
+        let tool = StructuredOutputTool {
+            name: "plan".into(),
+            description: "Emit a plan".into(),
+            parameters: ObjectSchema::new().property(
+                "sub_issues",
+                SchemaField::array(
+                    "The sub-issues to create.",
+                    SchemaField::object(
+                        ObjectSchema::new()
+                            .property("title", SchemaField::string("Title."))
+                            .property(
+                                "priority",
+                                SchemaField::integer_enum("Priority.", &[1, 2, 3]),
+                            )
+                            .required("title"),
+                    ),
+                ),
+            ),
+        };
+
+        let wire = structured_output_tool_wire_json(&tool);
+        assert_eq!(
+            wire["parameters"]["properties"]["sub_issues"],
+            serde_json::json!({
+                "type": "array",
+                "description": "The sub-issues to create.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Title."},
+                        "priority": {"type": "integer", "description": "Priority.", "enum": [1, 2, 3]}
+                    },
+                    "required": ["title"]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn structured_output_tools_wire_json_omits_required_when_empty() {
+        let tool = StructuredOutputTool {
+            name: "t".into(),
+            description: "d".into(),
+            parameters: ObjectSchema::new().property("x", SchemaField::boolean("x flag")),
+        };
+        let wire = structured_output_tool_wire_json(&tool);
+        assert!(wire["parameters"].get("required").is_none());
     }
 }

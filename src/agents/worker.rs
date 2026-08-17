@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -8,20 +9,19 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    claim, extract_public_comment_block, issue_in_scope, strip_public_comment_blocks,
+    claim, issue_in_scope, strip_internal_markers, strip_public_comment_blocks,
     write_task_context_file,
 };
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{GitLabClient, Issue};
-use crate::agents::settings;
-use crate::agents::workspace::{
-    ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
+use crate::agents::workspace::{GitLabAgentBootstrap, gitlab_banner};
+use crate::core::agent::{
+    AgentModel, CoreAgent, InvokeOptions, ModelPreferences, ObjectSchema, SchemaField,
+    StructuredOutput,
 };
-use crate::core::agent::{AgentHandoff, InvokeOptions};
-use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
+use crate::core::periodic::PeriodicTaskSpec;
 
 const WORKING_ON_LABEL: &str = "in-progress";
 /// Root-level file updated by Potlatch after each successful worker run (impl or MR feedback).
@@ -36,72 +36,156 @@ const WORKER_REVIEW_ONLY_LABEL: &str = "review-only";
 /// ACP runtime message when `cancel_check` returns true.
 const WORKER_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
 
-/// The worker's structured-output tool definition. Passed to the harness via
-/// `session/new` so the harness registers a generic `StructuredOutputTool`
-/// named `handoff`. The model calls it with structured JSON instead of
-/// emitting text markers.
-fn handoff_tool_definition() -> serde_json::Value {
-    serde_json::json!({
-        "name": "handoff",
-        "description": "Emit your implementation output as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response. Call this once when you're done (or when you need to signal a dependency/split/clarification). All fields are optional — include only the ones relevant to your outcome.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "mr_title": {
-                    "type": "string",
-                    "description": "Short MR title (max 8-10 words). Focus on WHAT, not HOW. No markdown."
-                },
-                "mr_description": {
-                    "type": "string",
-                    "description": "Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections."
-                },
-                "changes_summary": {
-                    "type": "string",
-                    "description": "A concise sentence summarizing the substance of changes made (for commit messages)."
-                },
-                "depends_on_issue": {
-                    "type": "integer",
-                    "description": "IID of a dependency issue that must close before this work can proceed. Set when the issue is hard-blocked on another open issue."
-                },
-                "needs_split": {
-                    "type": "string",
-                    "description": "Reason the issue needs splitting into smaller issues."
-                },
-                "needs_clarification": {
-                    "type": "string",
-                    "description": "What information is needed from a human to proceed."
-                },
-                "cannot_implement": {
-                    "type": "boolean",
-                    "description": "Set to true when the issue cannot be implemented (too broad, unclear, blocked)."
-                },
-                "cannot_resolve": {
-                    "type": "boolean",
-                    "description": "Set to true when reviewer feedback cannot be resolved autonomously."
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Explanation for cannot_implement, cannot_resolve, or no-code-changes."
-                },
-                "public_comment": {
-                    "type": "string",
-                    "description": "Human-facing GitLab comment text (separate from MR description)."
-                },
-                "mark_discussions_resolved": {
-                    "type": "boolean",
-                    "description": "Whether to mark open review discussions as resolved after your reply."
-                },
-                "post_plain_comment": {
-                    "type": "boolean",
-                    "description": "Whether to post a new plain MR comment (non-resolvable)."
-                },
-                "existing_mr_iid": {
-                    "type": "integer",
-                    "description": "IID of an existing open MR that already implements this issue (discovered during work). Set this instead of creating a new MR when you find the issue is already implemented by an existing MR. The system will track it as this issue's MR."
-                }
-            }
-        }
-    })
+fn deserialize_optional_iid<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let iid = value.as_u64().or_else(|| {
+        value
+            .as_str()?
+            .trim()
+            .trim_start_matches(['#', '!'])
+            .parse()
+            .ok()
+    });
+    Ok(iid.filter(|iid| *iid > 0))
+}
+
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_bool().or_else(|| {
+        value
+            .as_str()
+            .and_then(|value| value.trim().parse::<bool>().ok())
+    }))
+}
+
+/// The worker's typed structured-output contract. The model calls the
+/// `handoff` tool with these fields; core deserializes the captured JSON
+/// into this type (see [`AgentModel::complete_typed`]). Unlike the
+/// discriminated-union outputs of other roles, the worker's outcome is a
+/// grab-bag of independent signals (a dependency, a split/clarification
+/// request, an existing MR, or ordinary implementation metadata) that the
+/// caller inspects in priority order — so this stays a flat struct with
+/// every field optional, matching the original tool schema.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WorkerOutput {
+    #[serde(default)]
+    mr_title: Option<String>,
+    #[serde(default)]
+    mr_description: Option<String>,
+    #[serde(default)]
+    changes_summary: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_iid")]
+    depends_on_issue: Option<u64>,
+    #[serde(default)]
+    needs_split: Option<String>,
+    #[serde(default)]
+    needs_clarification: Option<String>,
+    #[serde(default)]
+    cannot_implement: bool,
+    #[serde(default)]
+    cannot_resolve: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    public_comment: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    mark_discussions_resolved: Option<bool>,
+    #[serde(default)]
+    post_plain_comment: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_iid")]
+    existing_mr_iid: Option<u64>,
+}
+
+impl StructuredOutput for WorkerOutput {
+    fn tool_name() -> &'static str {
+        "handoff"
+    }
+
+    fn tool_description() -> &'static str {
+        "Emit your implementation output as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this once when you're done (or when you need to signal a dependency/split/clarification). All fields are optional — include only the ones relevant to your outcome."
+    }
+
+    fn schema() -> ObjectSchema {
+        ObjectSchema::new()
+            .property(
+                "mr_title",
+                SchemaField::string(
+                    "Short MR title (max 8-10 words). Focus on WHAT, not HOW. No markdown.",
+                ),
+            )
+            .property(
+                "mr_description",
+                SchemaField::string(
+                    "Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections.",
+                ),
+            )
+            .property(
+                "changes_summary",
+                SchemaField::string(
+                    "A concise sentence summarizing the substance of changes made (for commit messages).",
+                ),
+            )
+            .property(
+                "depends_on_issue",
+                SchemaField::integer(
+                    "IID of a dependency issue that must close before this work can proceed. Set when the issue is hard-blocked on another open issue.",
+                ),
+            )
+            .property(
+                "needs_split",
+                SchemaField::string("Reason the issue needs splitting into smaller issues."),
+            )
+            .property(
+                "needs_clarification",
+                SchemaField::string("What information is needed from a human to proceed."),
+            )
+            .property(
+                "cannot_implement",
+                SchemaField::boolean(
+                    "Set to true when the issue cannot be implemented (too broad, unclear, blocked).",
+                ),
+            )
+            .property(
+                "cannot_resolve",
+                SchemaField::boolean(
+                    "Set to true when reviewer feedback cannot be resolved autonomously.",
+                ),
+            )
+            .property(
+                "reason",
+                SchemaField::string(
+                    "Explanation for cannot_implement, cannot_resolve, or no-code-changes.",
+                ),
+            )
+            .property(
+                "public_comment",
+                SchemaField::string(
+                    "Human-facing GitLab comment text (separate from MR description).",
+                ),
+            )
+            .property(
+                "mark_discussions_resolved",
+                SchemaField::boolean(
+                    "Whether to mark open review discussions as resolved after your reply.",
+                ),
+            )
+            .property(
+                "post_plain_comment",
+                SchemaField::boolean("Whether to post a new plain MR comment (non-resolvable)."),
+            )
+            .property(
+                "existing_mr_iid",
+                SchemaField::integer(
+                    "IID of an existing open MR that already implements this issue (discovered during work). Set this instead of creating a new MR when you find the issue is already implemented by an existing MR. The system will track it as this issue's MR.",
+                ),
+            )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +223,6 @@ struct ActiveIssue {
 struct AgentState {
     project_name: String,
     agent_id: String,
-    working_dir: String,
     sessions_dir: String,
 
     git_repo: GitRepo,
@@ -151,10 +234,13 @@ impl AgentState {
         Path::new(&self.sessions_dir).join(format!("{}_issue_{}.json", &self.agent_id, issue_iid))
     }
 
+    fn session_store(&self, issue_iid: u64) -> crate::core::state::StateStore<SessionFile> {
+        crate::core::state::StateStore::new(self.session_file_path(issue_iid))
+    }
+
     fn load_session(&self, issue_iid: u64) -> Option<SessionFile> {
-        let path = self.session_file_path(issue_iid);
-        let content = fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&content).ok()
+        // Session corruption has historically been treated as a missing session.
+        self.session_store(issue_iid).load().ok().flatten()
     }
 
     fn load_implementation_summary(&self, issue_number: u64) -> String {
@@ -167,8 +253,8 @@ impl AgentState {
     }
 
     fn cleanup_session(&self, issue_iid: u64) {
-        let path = self.session_file_path(issue_iid);
-        if fs::remove_file(&path).is_ok() {
+        let store = self.session_store(issue_iid);
+        if store.path().exists() && store.remove().is_ok() {
             info!(
                 "{}: Cleaned up session file for issue #{}",
                 &self.agent_id, issue_iid
@@ -184,9 +270,9 @@ impl AgentState {
             implementation_summary: None,
         };
 
-        let path = self.session_file_path(issue_iid);
-        let json = serde_json::to_string_pretty(&session)?;
-        fs::write(&path, json).context("Failed to write session file")?;
+        self.session_store(issue_iid)
+            .save(&session)
+            .context("Failed to write session file")?;
         Ok(())
     }
 
@@ -198,9 +284,9 @@ impl AgentState {
             implementation_summary: Some(summary.to_string()),
         };
 
-        let path = self.session_file_path(issue_iid);
-        let json = serde_json::to_string_pretty(&session)?;
-        fs::write(&path, json).context("Failed to write session file")?;
+        self.session_store(issue_iid)
+            .save(&session)
+            .context("Failed to write session file")?;
         Ok(())
     }
 
@@ -305,24 +391,29 @@ impl CoreAgent for WorkerAgent {
         "worker"
     }
 
-    fn model(&self) -> &AgentModel {
-        &self.model
+    fn agent_id(&self) -> &str {
+        &self.state.agent_id
     }
 
-    fn banner(_config: &Config, banner: &mut Banner) {
-        if let Some(repo) = settings::settings().gitlab_repo() {
-            banner.set_once("repo", repo);
-        }
+    fn shutdown(&self) -> &Arc<AtomicBool> {
+        self.model.shutdown()
+    }
+
+    fn banner(config: &Config, banner: &mut Banner) {
+        gitlab_banner(config, banner);
+    }
+
+    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+        super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        WorkerAgentSettings::from_raw(&section.raw)?;
+        Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
-        vec![PeriodicTaskSpec {
-            id: "gitlab_poll",
-            interval: Duration::from_secs(self.config.poll_interval_secs),
-            jitter: JitterPolicy::BeforeEachCycle,
-            jitter_max_ms: 5000,
-            autostart: true,
-        }]
+        vec![PeriodicTaskSpec::polling(
+            "gitlab_poll",
+            Duration::from_secs(self.config.poll_interval_secs),
+        )]
     }
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
@@ -331,59 +422,39 @@ impl CoreAgent for WorkerAgent {
                 let scope = crate::agents::scope_label_filter(&self.scope_label);
                 let model = &self.model;
                 let shutdown = Arc::clone(model.shutdown());
-                if let Err(e) = worker_cycle(&self.state, model, &mut self.active, &shutdown, scope)
-                    && !shutdown.load(Ordering::SeqCst)
-                {
-                    error!("{}: Cycle error: {}", self.state.agent_id, e);
-                }
-                Ok(())
+                worker_cycle(&self.state, model, &mut self.active, &shutdown, scope)
             }
             _ => Ok(()),
         }
     }
 
     fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let gitlab_repo = require_gitlab_repo()?;
         let section = ctx
             .workflow
             .config
             .agent("worker")
             .context("[agent.worker] section required")?;
         let settings = WorkerAgentSettings::from_raw(&section.raw)?;
-        let project_name = extract_project_name(&gitlab_repo)?;
-        let agent_id = format!("worker-{}", ctx.instance_id);
-        ensure_agent_repo(
-            &ctx.workflow.base_dir,
-            &gitlab_repo,
-            &project_name,
-            &agent_id,
-        )?;
-        let working_dir = work_dir(&ctx.workflow.base_dir, &project_name, &agent_id);
-        let sessions_dir = sessions_dir(&ctx.workflow.base_dir, &project_name);
-        let git_repo = GitRepo::new(working_dir.clone());
-        let glab = GitLabClient::new(working_dir.clone(), &gitlab_repo)?;
+        let runtime = GitLabAgentBootstrap::new(
+            &ctx,
+            "worker",
+            ModelPreferences {
+                structured_output_tools: Some(vec![WorkerOutput::tool_definition()]),
+                ..ModelPreferences::default()
+            },
+        )
+        .build()?;
         let state = AgentState {
-            project_name,
-            agent_id: agent_id.clone(),
-            working_dir: working_dir.clone(),
-            sessions_dir,
-            git_repo,
-            glab,
+            project_name: runtime.project_name,
+            agent_id: runtime.agent_id,
+            sessions_dir: runtime.sessions_dir,
+            git_repo: runtime.git_repo,
+            glab: runtime.gitlab,
         };
         let config = WorkerConfig {
             poll_interval_secs: settings.poll_interval_secs,
         };
-        let model = AgentModel::connect(
-            &ctx,
-            "worker",
-            state.working_dir.clone(),
-            ModelPreferences {
-                structured_output_tools: Some(vec![handoff_tool_definition()]),
-                ..ModelPreferences::default()
-            },
-        )?;
-        let agent_settings = settings::settings();
-        let scope = agent_settings.scope_label_filter();
+        let scope = crate::agents::scope_label_filter(&runtime.scope_label);
         let mut active =
             try_resume_session(&state, scope).or_else(|| find_claimed_issue(&state, scope));
         active = clear_resumed_issue_if_ignored(&state, active, scope);
@@ -402,9 +473,9 @@ impl CoreAgent for WorkerAgent {
         }
         Ok(Self {
             state,
-            model,
+            model: runtime.model,
             config,
-            scope_label: agent_settings.scope_label.clone(),
+            scope_label: runtime.scope_label,
             active,
         })
     }
@@ -1332,7 +1403,7 @@ fn process_issue(
         build_implementation_prompt(state, issue, &gl_comments)?
     };
 
-    let agent_output = match model.complete(
+    let agent_output = match model.complete_typed::<WorkerOutput>(
         &prompt,
         &InvokeOptions {
             cancel_check: Some(worker_issue_cancel_check(state.glab.clone(), issue.iid)),
@@ -1343,7 +1414,7 @@ fn process_issue(
             )),
         },
     ) {
-        Ok(output) => apply_worker_handoff(output),
+        Ok(output) => output,
         Err(e) if handle_worker_issue_processing_cancelled(state, issue.iid, &e) => {
             return Ok(None);
         }
@@ -1356,7 +1427,7 @@ fn process_issue(
 
     // The model found an existing open MR that already implements this issue.
     // Track it in worker state instead of creating a new MR.
-    if let Some(mr_iid) = extract_existing_mr_iid(&agent_output) {
+    if let Some(mr_iid) = extract_existing_mr_iid(&agent_output.output) {
         if let Ok(mr) = state.glab.get_merge_request(mr_iid) {
             if mr.state == "opened" {
                 info!(
@@ -1390,17 +1461,17 @@ fn process_issue(
         }
     }
 
-    if output_signals_cannot_implement(&agent_output) {
-        let reason = if output_needs_split(&agent_output) {
+    if output_signals_cannot_implement(&agent_output.output) {
+        let reason = if output_needs_split(&agent_output.output) {
             warn!("Issue #{} is too broad, needs splitting", issue.iid);
-            let split_reason = extract_split_reason(&agent_output);
+            let split_reason = extract_split_reason(&agent_output.output);
             format!(
                 "This issue needs to be split into smaller, focused issues:\n\n{}",
                 split_reason
             )
         } else {
             warn!("Issue #{} needs clarification", issue.iid);
-            extract_clarification(&agent_output)
+            extract_clarification(&agent_output.output)
         };
         state.glab.add_issue_comment(issue.iid, &reason)?;
 
@@ -1443,7 +1514,7 @@ fn process_issue(
     // created — the work can't proceed until the dependency closes. When
     // the dependency issue closes, the worker resume-path strips the label
     // and the issue becomes claimable again.
-    if let Some(dep_issue_iid) = extract_depends_on_issue(&agent_output) {
+    if let Some(dep_issue_iid) = extract_depends_on_issue(&agent_output.output) {
         let dep_closed = state
             .glab
             .get_issue(dep_issue_iid)
@@ -1488,7 +1559,7 @@ fn process_issue(
     // the branch diverges from the base at all.
     state.git_repo.add_all()?;
 
-    let mr_title = extract_mr_title(&agent_output, &issue.title);
+    let mr_title = extract_mr_title(&agent_output.output, &issue.title);
 
     if state.git_repo.has_staged_changes()? {
         let commit_message = build_commit_message(&mr_title, issue.iid);
@@ -1507,7 +1578,7 @@ fn process_issue(
     let mr_description = format!(
         "Closes #{}\n\n{}",
         issue.iid,
-        extract_mr_description(&agent_output)
+        extract_mr_description(&agent_output.output)
     );
 
     let mr_iid = state.glab.create_merge_request(
@@ -1530,7 +1601,7 @@ fn process_issue(
         );
     }
 
-    let impl_summary = extract_mr_description(&agent_output);
+    let impl_summary = extract_mr_description(&agent_output.output);
     state.save_session_with_summary(issue.iid, mr_iid, &impl_summary)?;
 
     Ok(Some(mr_iid))
@@ -1745,33 +1816,26 @@ INSTRUCTIONS:
 10. Ensure changes align with both the original requirements and reviewer feedback
 11. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
    a) Adjust your implementation to reduce changed lines — simplify, remove unnecessary changes, trim scope
-   b) If you cannot reasonably reduce the size, respond with CANNOT_RESOLVE so the issue is rejected and the problem is reported back
+   b) If you cannot reasonably reduce the size, set `cannot_resolve` to true in the `handoff` tool so the issue is rejected and the problem is reported back
    Do NOT try to split the issue yourself — that is handled by the PMO agent, not you.
-12. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), respond with:
-   CANNOT_RESOLVE
-   REASON: <explain concisely why this cannot be resolved autonomously and what input is needed>
+12. If you determine that the feedback cannot be resolved without additional human input (e.g. the requirements are ambiguous, the reviewer is asking for something outside the scope of the issue, or the necessary information is missing), set `cannot_resolve` to true and put the concise explanation and needed input in `reason`.
 13. If the reviewer asked you to fix the MR title or description, include updated versions in your `handoff` tool call (`mr_title` and `mr_description` fields). Do NOT change the title just because you made another follow-up commit; keep it stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
-14. After addressing feedback, provide a summary:
-   CHANGES_SUMMARY: <A concise sentence summarizing the substance of the changes made — this will be used as the git commit message, so it must convey the main idea of what was changed>
+14. After addressing feedback, put a concise sentence summarizing the substance of the changes in the `changes_summary` field. This will be used as the git commit message, so it must convey the main idea of what changed.
    The summary must reflect the actual source/MR metadata changes you made in this run. Do not mention a reviewer concern as fixed unless the final diff or MR metadata actually changed to address it.
-15. For any human-facing GitLab comment/reply text, include a stable block:
-   PUBLIC_COMMENT_BEGIN
-   <only the final comment text to post publicly; no progress updates, no tool/log output>
-   PUBLIC_COMMENT_END
+15. Put any human-facing GitLab comment/reply text in the `public_comment` field of the `handoff` tool. Include only the final comment text to post publicly; no progress updates or tool/log output.
    Keep this public reply concise. Do NOT include a `Validation:` section, test/lint command lists, passed/failed command output, or unrelated repository backlog notes.
-   The public reply must exactly match the committed changes from this run. Mention only feedback items you actually resolved in code or MR metadata. If you did not change code/metadata for an item, say so with MARK_DISCUSSIONS_RESOLVED: no instead of implying it was fixed.
+   The public reply must exactly match the committed changes from this run. Mention only feedback items you actually resolved in code or MR metadata. If you did not change code/metadata for an item, set `mark_discussions_resolved` to false instead of implying it was fixed.
 16. Control whether GitLab should mark open review discussions as resolved after your reply:
-   - `MARK_DISCUSSIONS_RESOLVED: yes` — only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
-   - For merge-conflict feedback: use `yes` only after you committed and pushed a branch that merges cleanly with `origin/{}` with no conflict markers left. If conflicts remain, use `no`.
-   - `MARK_DISCUSSIONS_RESOLVED: yes` is also correct when you verified that no code change is needed because the branch already satisfies the reviewer request. In that case, PUBLIC_COMMENT must explain the existing behavior specifically instead of saying only "no changes needed".
-   - `MARK_DISCUSSIONS_RESOLVED: no` — when your reply does not resolve the comment (e.g. partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
-   - If you omit this line: the system assumes `yes` only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set `MARK_DISCUSSIONS_RESOLVED: yes` explicitly when the feedback is resolved.
+   - Set `mark_discussions_resolved` to true only when you have actually fixed what the reviewer asked for (code and/or MR title/description updates they requested), so the thread can be considered addressed.
+   - For merge-conflict feedback: use true only after you committed and pushed a branch that merges cleanly with `origin/{}` with no conflict markers left. If conflicts remain, use false.
+   - True is also correct when you verified that no code change is needed because the branch already satisfies the reviewer request. In that case, `public_comment` must explain the existing behavior specifically instead of saying only "no changes needed".
+   - Set it to false when your reply does not resolve the comment (e.g. partial progress, disagreement, or anything that still needs the reviewer). The system will still post your reply on each thread but will **not** mark discussions resolved.
+   - If you omit this field, the system assumes true only when it detects branch changes: new commits (including rebases) on the MR branch or the remote branch tip moved. For title/description-only fixes, set it to true explicitly when the feedback is resolved.
    - Plain MR comments cannot be marked resolved.
 17. Control whether GitLab should post a new normal MR comment for plain, non-resolvable MR comments:
-   - The system will NOT post normal MR comments for plain MR comments unless you explicitly include `POST_PLAIN_COMMENT: yes`.
-   - Use `POST_PLAIN_COMMENT: yes` only when a new public reply is necessary for a plain MR comment. Include PUBLIC_COMMENT with the exact comment body to post.
-   - If a plain MR comment needs no public reply, or if your response would only repeat that no further changes were needed, omit `POST_PLAIN_COMMENT` or set `POST_PLAIN_COMMENT: no`.
-18. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR_DESCRIPTION, MR_TITLE, PUBLIC_COMMENT, or any GitLab field.
+   - Set `post_plain_comment` to true only when a new public reply is necessary for a plain MR comment, and put the exact comment body in `public_comment`.
+   - If a plain MR comment needs no public reply, or if your response would only repeat that no further changes were needed, omit `post_plain_comment` or set it to false.
+18. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into `mr_description`, `mr_title`, `public_comment`, or any GitLab field.
 
 Proceed with addressing the feedback autonomously. Do not ask for any user input.
 "#,
@@ -1804,7 +1868,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
             "{}: Worker agent addressing MR !{} feedback for issue #{}",
             &state.agent_id, latest_mr.iid, issue_iid
         );
-        let output = match model.complete(
+        let output = match model.complete_typed::<WorkerOutput>(
             &prompt,
             &InvokeOptions {
                 cancel_check: Some(worker_issue_cancel_check(state.glab.clone(), issue_iid)),
@@ -1815,7 +1879,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
                 )),
             },
         ) {
-            Ok(output) => apply_worker_handoff(output),
+            Ok(output) => output,
             Err(e) if handle_worker_issue_processing_cancelled(state, issue_iid, &e) => {
                 return Ok(false);
             }
@@ -1831,7 +1895,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
             "{}: Worker agent addressing MR !{} feedback",
             &state.agent_id, latest_mr.iid
         );
-        let output = model.complete(
+        let output = model.complete_typed::<WorkerOutput>(
             &prompt,
             &InvokeOptions {
                 cancel_check: None,
@@ -1842,7 +1906,6 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
                 )),
             },
         )?;
-        let output = apply_worker_handoff(output);
         info!(
             "{}: Worker agent finished MR !{} feedback",
             &state.agent_id, latest_mr.iid
@@ -1850,8 +1913,8 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         output
     };
 
-    if output_signals_cannot_resolve(&agent_output) {
-        let reason = extract_cannot_resolve_reason(&agent_output);
+    if output_signals_cannot_resolve(&agent_output.output) {
+        let reason = extract_cannot_resolve_reason(&agent_output.output);
         warn!(
             "MR !{} cannot be resolved autonomously: {}",
             latest_mr.iid, reason
@@ -1873,12 +1936,11 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         return Ok(true);
     }
 
-    // If the agent provided updated MR_TITLE / MR_DESCRIPTION that differ from
-    // the current MR metadata (e.g. the reviewer asked for a better title),
-    // update the MR. With the `handoff` tool, the model always provides
-    // mr_title/mr_description — only write when something actually changed.
-    let new_title = extract_explicit_mr_title(&agent_output);
-    let new_desc = extract_explicit_mr_description(&agent_output);
+    // If the agent provided an updated mr_title / mr_description that differs
+    // from the current MR metadata (e.g. the reviewer asked for a better
+    // title), update the MR. Only write when something actually changed.
+    let new_title = extract_explicit_mr_title(&agent_output.output);
+    let new_desc = extract_mr_description(&agent_output.output);
     let title_changed = new_title.as_deref().is_some_and(|t| t != latest_mr.title);
     let desc_changed = new_desc != "Implementation completed." && new_desc != latest_mr.description;
     if title_changed || desc_changed {
@@ -1926,7 +1988,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         has_new_changes = state.git_repo.has_changes_since(&pre_agent_sha)?;
     } else if has_new_changes {
         state.git_repo.add_all()?;
-        let summary_for_commit = extract_changes_summary(&agent_output);
+        let summary_for_commit = extract_changes_summary(&agent_output.output);
         if state.git_repo.has_staged_changes()? {
             let commit_msg = build_commit_message(&summary_for_commit, issue_number.unwrap_or(0));
             state.git_repo.commit(&commit_msg)?;
@@ -2037,7 +2099,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         unresolved_ids
     };
 
-    let should_post_plain_comment = should_post_plain_comment(&agent_output);
+    let should_post_plain_comment = should_post_plain_comment(&agent_output.output);
     let needs_reply_body =
         !ids_to_resolve.is_empty() || (!plain_comments.is_empty() && should_post_plain_comment);
 
@@ -2050,10 +2112,10 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     }
 
     let reply_body = if needs_reply_body {
-        let reply_raw = if let Some(block) = extract_worker_public_comment(&agent_output) {
+        let reply_raw = if let Some(block) = extract_worker_public_comment(&agent_output.output) {
             block
         } else if let Some(reply) = build_feedback_resolution_reply(
-            &agent_output,
+            &agent_output.output,
             has_new_changes,
             diff_highlights.as_deref(),
         ) {
@@ -2069,11 +2131,11 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         None
     };
     let resolve_discussions = feedback_discussions_may_be_resolved(
-        &agent_output,
+        &agent_output.output,
         implicit_resolve_discussions,
         conflicts_unresolved,
     );
-    if conflicts_unresolved && parse_mark_discussions_resolved(&agent_output) == Some(true) {
+    if conflicts_unresolved && parse_mark_discussions_resolved(&agent_output.output) == Some(true) {
         warn!(
             "MR !{}: ignoring agent request to mark discussions resolved while merge conflicts remain",
             latest_mr.iid
@@ -2081,7 +2143,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     }
     if !resolve_discussions && !ids_to_resolve.is_empty() {
         info!(
-            "MR !{}: posting feedback replies without resolving discussions (MARK_DISCUSSIONS_RESOLVED: no and no implicit resolving actions)",
+            "MR !{}: posting feedback replies without resolving discussions (no mark_discussions_resolved signal and no implicit resolving actions)",
             latest_mr.iid
         );
     }
@@ -2617,49 +2679,30 @@ fn abandon_mr(
     Ok(())
 }
 
-fn output_signals_cannot_implement(agent_output: &AgentHandoff) -> bool {
-    agent_output
-        .decision
-        .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("cannot_implement"))
-        || agent_output.response.contains("CANNOT_IMPLEMENT")
+fn output_signals_cannot_implement(agent_output: &WorkerOutput) -> bool {
+    agent_output.cannot_implement
 }
 
-fn output_signals_cannot_resolve(agent_output: &AgentHandoff) -> bool {
-    agent_output
-        .decision
-        .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("cannot_resolve"))
-        || agent_output.response.contains("CANNOT_RESOLVE")
+fn output_signals_cannot_resolve(agent_output: &WorkerOutput) -> bool {
+    agent_output.cannot_resolve
 }
 
-fn output_needs_split(agent_output: &AgentHandoff) -> bool {
-    handoff_output(agent_output)
-        .and_then(|ho| ho.get("needs_split").and_then(serde_json::Value::as_str))
+fn output_needs_split(agent_output: &WorkerOutput) -> bool {
+    agent_output
+        .needs_split
+        .as_deref()
         .is_some_and(|s| !s.trim().is_empty())
-        || agent_output
-            .decision
-            .as_deref()
-            .is_some_and(|d| d.eq_ignore_ascii_case("needs_split"))
-        || agent_output.response.contains("NEEDS_SPLIT")
 }
 
-fn extract_cannot_resolve_reason(agent_output: &AgentHandoff) -> String {
+fn extract_cannot_resolve_reason(agent_output: &WorkerOutput) -> String {
     if let Some(block) = extract_worker_public_comment(agent_output) {
         return block;
     }
     if let Some(reason) = &agent_output.reason {
         let trimmed = reason.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return strip_internal_markers(trimmed);
         }
-    }
-    if let Some(pos) = agent_output.response.find("REASON:") {
-        let reason = &agent_output.response[pos + 7..];
-        if let Some(end) = reason.find('\n') {
-            return reason[..end].trim().to_string();
-        }
-        return reason.trim().to_string();
     }
     "The implementation cannot proceed without additional human input.".to_string()
 }
@@ -2679,24 +2722,12 @@ fn build_commit_message(title: &str, issue_iid: u64) -> String {
     }
 }
 
-fn extract_changes_summary(agent_output: &AgentHandoff) -> String {
-    if let Some(s) = handoff_output(agent_output).and_then(|ho| {
-        ho.get("changes_summary")
-            .and_then(serde_json::Value::as_str)
-    }) {
+fn extract_changes_summary(agent_output: &WorkerOutput) -> String {
+    if let Some(s) = agent_output.changes_summary.as_deref() {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             return strip_markdown_formatting(trimmed);
         }
-    }
-    if let Some(pos) = agent_output.response.find("CHANGES_SUMMARY:") {
-        let raw = &agent_output.response[pos + 16..];
-        let line = if let Some(end) = raw.find('\n') {
-            raw[..end].trim()
-        } else {
-            raw.trim()
-        };
-        return strip_markdown_formatting(line);
     }
     "Changes made to address reviewer feedback.".to_string()
 }
@@ -2704,10 +2735,6 @@ fn extract_changes_summary(agent_output: &AgentHandoff) -> String {
 /// Strips leading `Resolved without code changes:` / `Addressed feedback:` from the posted reply.
 /// If there is no substantive text after that prefix, returns the original string unchanged.
 fn strip_worker_reply_boilerplate(text: &str) -> String {
-    if let Some(block) = extract_public_comment_block(text) {
-        return block;
-    }
-
     fn strip_diff_highlights_block(s: &str) -> String {
         let mut out: Vec<&str> = Vec::new();
         for line in s.lines() {
@@ -2752,59 +2779,17 @@ fn strip_worker_reply_boilerplate(text: &str) -> String {
     }
 }
 
-/// Parses `MARK_DISCUSSIONS_RESOLVED: yes|no` from the agent response (case-insensitive value).
-fn parse_mark_discussions_resolved(agent_output: &AgentHandoff) -> Option<bool> {
-    // Structured field first (from the `handoff` tool).
-    if let Some(ho) = handoff_output(agent_output)
-        && let Some(v) = ho
-            .get("mark_discussions_resolved")
-            .and_then(serde_json::Value::as_bool)
-    {
-        return Some(v);
-    }
-    // Fallback: text marker `MARK_DISCUSSIONS_RESOLVED: yes/no`.
-    const KEY: &str = "mark_discussions_resolved:";
-    for line in agent_output.response.lines() {
-        let lower = line.to_lowercase();
-        if let Some(idx) = lower.find(KEY) {
-            let val = line[idx + KEY.len()..].trim();
-            let v = val.to_lowercase();
-            if matches!(v.as_str(), "yes" | "true" | "1") {
-                return Some(true);
-            }
-            if matches!(v.as_str(), "no" | "false" | "0") {
-                return Some(false);
-            }
-        }
-    }
-    None
+fn parse_mark_discussions_resolved(agent_output: &WorkerOutput) -> Option<bool> {
+    agent_output.mark_discussions_resolved
 }
 
-fn should_post_plain_comment(agent_output: &AgentHandoff) -> bool {
-    // Structured field first (from the `handoff` tool).
-    if let Some(ho) = handoff_output(agent_output)
-        && let Some(v) = ho
-            .get("post_plain_comment")
-            .and_then(serde_json::Value::as_bool)
-    {
-        return v;
-    }
-    // Fallback: text marker `POST_PLAIN_COMMENT: yes/no`.
-    const KEY: &str = "post_plain_comment:";
-    for line in agent_output.response.lines() {
-        let lower = line.to_lowercase();
-        if let Some(idx) = lower.find(KEY) {
-            let val = line[idx + KEY.len()..].trim();
-            let v = val.to_lowercase();
-            return matches!(v.as_str(), "yes" | "true" | "1");
-        }
-    }
-    false
+fn should_post_plain_comment(agent_output: &WorkerOutput) -> bool {
+    agent_output.post_plain_comment
 }
 
 /// Whether to call GitLab `resolve` on discussions after posting the worker reply.
 fn should_resolve_mr_feedback_discussions(
-    agent_output: &AgentHandoff,
+    agent_output: &WorkerOutput,
     implicit_from_actions: bool,
 ) -> bool {
     parse_mark_discussions_resolved(agent_output).unwrap_or(implicit_from_actions)
@@ -2822,7 +2807,7 @@ fn merge_request_surface_changed(
 }
 
 fn build_feedback_resolution_reply(
-    agent_output: &AgentHandoff,
+    agent_output: &WorkerOutput,
     has_new_changes: bool,
     diff_highlights: Option<&str>,
 ) -> Option<String> {
@@ -3106,7 +3091,7 @@ fn build_merge_conflict_status_section(
 }
 
 fn feedback_discussions_may_be_resolved(
-    agent_output: &AgentHandoff,
+    agent_output: &WorkerOutput,
     implicit_from_actions: bool,
     conflicts_unresolved: bool,
 ) -> bool {
@@ -3116,44 +3101,20 @@ fn feedback_discussions_may_be_resolved(
     should_resolve_mr_feedback_discussions(agent_output, implicit_from_actions)
 }
 
-fn extract_no_change_resolution_reason(agent_output: &AgentHandoff) -> Option<String> {
+/// The reason to post for a "resolved without code changes" reply: the
+/// `reason` field if the model explained itself, otherwise `changes_summary`
+/// (the model sometimes describes a no-op resolution there instead).
+fn extract_no_change_resolution_reason(agent_output: &WorkerOutput) -> Option<String> {
     if let Some(reason) = &agent_output.reason {
         let trimmed = reason.trim();
         if !trimmed.is_empty() {
-            return Some(strip_markdown_formatting(trimmed));
+            return Some(strip_markdown_formatting(&strip_internal_markers(trimmed)));
         }
     }
-    if let Some(pos) = agent_output.response.find("REASON:") {
-        let raw = &agent_output.response[pos + 7..];
-        let line = if let Some(end) = raw.find('\n') {
-            raw[..end].trim()
-        } else {
-            raw.trim()
-        };
-        let cleaned = strip_markdown_formatting(line);
-        if !cleaned.is_empty() {
-            return Some(cleaned);
-        }
-    }
-    if let Some(s) = handoff_output(agent_output).and_then(|ho| {
-        ho.get("changes_summary")
-            .and_then(serde_json::Value::as_str)
-    }) {
+    if let Some(s) = &agent_output.changes_summary {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
-            return Some(strip_markdown_formatting(trimmed));
-        }
-    }
-    if let Some(pos) = agent_output.response.find("CHANGES_SUMMARY:") {
-        let raw = &agent_output.response[pos + 16..];
-        let line = if let Some(end) = raw.find('\n') {
-            raw[..end].trim()
-        } else {
-            raw.trim()
-        };
-        let cleaned = strip_markdown_formatting(line);
-        if !cleaned.is_empty() {
-            return Some(cleaned);
+            return Some(strip_markdown_formatting(&strip_internal_markers(trimmed)));
         }
     }
     None
@@ -3240,18 +3201,10 @@ INSTRUCTIONS:
 5. If non-test code exceeds ~500 lines or total exceeds ~1500 lines:
    - Evaluate if the feature can be split into smaller, independent pieces
    - If you are VERY SURE it CANNOT be split and MUST be implemented as one unit, proceed with implementation
-   - Otherwise, respond with:
-     CANNOT_IMPLEMENT
-     NEEDS_SPLIT: <explain the estimated line count and how to split into smaller issues>
-6. If the issue is unclear or missing critical information that makes implementation impossible, respond with:
-   CANNOT_IMPLEMENT
-   NEEDS_CLARIFICATION: <explain what information is needed and why>
-7. If the issue requires large unrelated feature work, respond with:
-   CANNOT_IMPLEMENT
-   NEEDS_SPLIT: <explain how to split the issue>
-8. If at any point you determine the issue simply cannot be implemented without additional human input that you cannot infer or assume (e.g. missing API credentials, undocumented external system dependencies, contradictory requirements), respond with:
-   CANNOT_IMPLEMENT
-   NEEDS_CLARIFICATION: <explain precisely what input is needed and why you cannot proceed>
+   - Otherwise, call `handoff` with `cannot_implement: true` and `needs_split: <explain the estimated line count and how to split into smaller issues>`
+6. If the issue is unclear or missing critical information that makes implementation impossible, call `handoff` with `cannot_implement: true` and `needs_clarification: <explain what information is needed and why>`
+7. If the issue requires large unrelated feature work, call `handoff` with `cannot_implement: true` and `needs_split: <explain how to split the issue>`
+8. If at any point you determine the issue simply cannot be implemented without additional human input that you cannot infer or assume (e.g. missing API credentials, undocumented external system dependencies, contradictory requirements), call `handoff` with `cannot_implement: true` and `needs_clarification: <explain precisely what input is needed and why you cannot proceed>`
 IMPORTANT — When in doubt, REJECT:
 - If you are unsure how to implement the issue, REJECT it. Do not guess or produce speculative code.
 - If you believe the implementation would be huge or complex beyond what a single focused MR should contain, REJECT it.
@@ -3329,18 +3282,10 @@ INSTRUCTIONS:
 6. If non-test code exceeds ~500 lines or total exceeds ~1500 lines:
    - Evaluate if the remaining work can be split into smaller, independent pieces
    - If you are VERY SURE it CANNOT be split and MUST be completed as one unit, proceed with implementation
-   - Otherwise, respond with:
-     CANNOT_IMPLEMENT
-     NEEDS_SPLIT: <explain the estimated line count and how to split into smaller issues>
-7. If the issue is unclear or missing critical information that makes implementation impossible, respond with:
-   CANNOT_IMPLEMENT
-   NEEDS_CLARIFICATION: <explain what information is needed and why>
-8. If the issue requires large unrelated feature work, respond with:
-   CANNOT_IMPLEMENT
-   NEEDS_SPLIT: <explain how to split the issue>
-9. If at any point you determine the remaining work simply cannot be completed without additional human input that you cannot infer or assume, respond with:
-   CANNOT_IMPLEMENT
-   NEEDS_CLARIFICATION: <explain precisely what input is needed and why you cannot proceed>
+   - Otherwise, call `handoff` with `cannot_implement: true` and `needs_split: <explain the estimated line count and how to split into smaller issues>`
+7. If the issue is unclear or missing critical information that makes implementation impossible, call `handoff` with `cannot_implement: true` and `needs_clarification: <explain what information is needed and why>`
+8. If the issue requires large unrelated feature work, call `handoff` with `cannot_implement: true` and `needs_split: <explain how to split the issue>`
+9. If at any point you determine the remaining work simply cannot be completed without additional human input that you cannot infer or assume, call `handoff` with `cannot_implement: true` and `needs_clarification: <explain precisely what input is needed and why you cannot proceed>`
 IMPORTANT — When in doubt, REJECT:
 - If you are unsure how to implement the remaining work, REJECT it. Do not guess or produce speculative code.
 - If you believe the total implementation would be huge or complex beyond what a single focused MR should contain, REJECT it.
@@ -3382,13 +3327,13 @@ fn get_common_requirements() -> &'static str {
 NO WORKAROUNDS — STRICTLY PROHIBITED:
 - NEVER apply a workaround, hack, or shortcut to make code "work" without addressing the root cause.
 - The ONLY exception is an explicit instruction in a code comment or doc comment within the existing codebase that says to use a specific approach. In that case, follow the comment's instruction exactly.
-- If the correct fix is unclear or too large, REJECT the issue (CANNOT_IMPLEMENT) rather than shipping a workaround.
+- If the correct fix is unclear or too large, REJECT the issue (call `handoff` with `cannot_implement: true`) rather than shipping a workaround.
 
 RESOURCE AWARENESS — MANDATORY:
 - Before committing to an implementation approach, evaluate its resource footprint: memory, CPU, disk I/O, file descriptors, and goroutine/thread usage. An approach that has the potential to exhaust machine resources is UNACCEPTABLE, even if it produces correct output.
 - Specifically avoid: unbounded buffering (loading entire files/datasets into memory), O(n^2) or worse algorithms on large inputs, spawning unbounded goroutines/threads without a semaphore, holding large data in memory across iterations, redundant re-reads of large files, or creating temp files without cleanup.
-- If the correct, resource-safe implementation is too large for a single MR, REJECT with NEEDS_SPLIT and explain the resource concern.
-- If you are unsure whether your approach is resource-safe under production-scale inputs, REJECT with CANNOT_IMPLEMENT and explain the concern. Do not ship code that might OOM, hang, or exhaust file descriptors on real data."#
+- If the correct, resource-safe implementation is too large for a single MR, REJECT via `handoff` with `needs_split` and explain the resource concern.
+- If you are unsure whether your approach is resource-safe under production-scale inputs, REJECT via `handoff` with `cannot_implement: true` and explain the concern. Do not ship code that might OOM, hang, or exhaust file descriptors on real data."#
 }
 
 fn get_evidence_bound_scope_bullets() -> &'static str {
@@ -3430,12 +3375,8 @@ fn get_scope_rules(is_continuation: bool) -> String {
 - If non-test code changes would be substantially larger than ~500 lines, or total changes larger than ~1500 lines:
   * First, carefully evaluate if the feature can be split into smaller, independent pieces
   * If you are VERY SURE the feature CANNOT be split and MUST be {} as one atomic unit, you may proceed
-  * Otherwise, respond with:
-    CANNOT_IMPLEMENT
-    NEEDS_SPLIT: <explain the estimated line count and how to split into smaller issues>
-- If implementing the issue requires a large feature integration that is mainly unrelated to the task, respond with:
-  CANNOT_IMPLEMENT
-  NEEDS_SPLIT: <explain why the issue is too broad and how to split it>"#,
+  * Otherwise, call `handoff` with `cannot_implement: true` and `needs_split: <explain the estimated line count and how to split into smaller issues>`
+- If implementing the issue requires a large feature integration that is mainly unrelated to the task, call `handoff` with `cannot_implement: true` and `needs_split: <explain why the issue is too broad and how to split it>`"#,
         get_evidence_bound_scope_bullets(),
         line_context,
         if is_continuation {
@@ -3447,7 +3388,7 @@ fn get_scope_rules(is_continuation: bool) -> String {
 }
 
 fn get_output_format() -> &'static str {
-    r#"MANDATORY OUTPUT — call the `handoff` tool with your output fields. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response.
+    r#"MANDATORY OUTPUT — call the `handoff` tool with your output fields. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call `handoff` exactly once when you're done.
 
 Call `handoff` with the fields relevant to your outcome:
 
@@ -3465,36 +3406,9 @@ Call `handoff` with the fields relevant to your outcome:
 - `post_plain_comment` (boolean): Whether to post a new plain MR comment.
 - `existing_mr_iid` (integer): IID of an existing open MR that already implements this issue. Set this when you discover the issue is already implemented by an existing MR, instead of creating a new MR. The system will track it as this issue's MR.
 
-All fields are optional — include only the ones relevant to your outcome. Call `handoff` exactly once when you're done.
+All fields are optional — include only the ones relevant to your outcome.
 
-TEXT MARKER FALLBACK — if for any reason you cannot call the `handoff` tool, you may use these text markers instead (the system parses them as a fallback):
-
-MR_TITLE: <title>
-MR_DESCRIPTION:
-## Goal
-<goal>
-## Implementation
-<approach>
-## Testing
-<testing>
-
-Stable alternative:
-MR_TITLE_BEGIN
-<title text>
-MR_TITLE_END
-MR_DESCRIPTION_BEGIN
-<full markdown description text>
-MR_DESCRIPTION_END
-
-DEPENDS_ON_ISSUE: #<N>
-
-PUBLIC_COMMENT_BEGIN
-<final public comment only>
-PUBLIC_COMMENT_END
-
-The `handoff` tool is preferred — use text markers only as a last resort.
-
-Do NOT put PUBLIC_COMMENT text inside mr_description — the MR description must be plain documentation (goal, implementation, testing); reply text belongs in the `public_comment` field or a separate PUBLIC_COMMENT block.
+Do NOT put public-comment text inside `mr_description` — the MR description must be plain documentation (goal, implementation, testing); reply text belongs in the `public_comment` field.
 
 NOTES.MD (agent-maintained in the repo — edit before you finish **only if** you earn real bullets):
 - Open or create notes.md at the repository root. Append **0–3** new "- " lines this run (often **0**). Each line is **one** short sentence capturing a **genuine surprise, near-mistake, or emotional friction** from the run — something you almost got wrong or that wasted time — expressed so a stranger learns the *habit of noticing*, not the *contents of this MR*.
@@ -3514,198 +3428,57 @@ BAD STYLE (examples of rubbish — do not imitate):
 - In-repo code tours (paths, classes, long semicolon chains).
 - "Timeless" bullets that are really your MR summary: composable naming over literals, property vs field assumptions, stub heavy imports, or environment wiring — unless each line names a **non-obvious failure mode you personally hit** in **one** concrete clause (still without paths or symbol names).
 
-Stay concise; no secrets. That file is committed with your other changes. Never paste or quote any text from notes.md into MR_TITLE, MR_DESCRIPTION, PUBLIC_COMMENT, or anywhere on GitLab — those surfaces are for humans/reviewers only."#
+Stay concise; no secrets. That file is committed with your other changes. Never paste or quote any text from notes.md into `mr_title`, `mr_description`, `public_comment`, or anywhere on GitLab — those surfaces are for humans/reviewers only."#
 }
 
-fn extract_split_reason(agent_output: &AgentHandoff) -> String {
+fn extract_split_reason(agent_output: &WorkerOutput) -> String {
     if let Some(block) = extract_worker_public_comment(agent_output) {
         return block;
     }
-    if let Some(reason) = handoff_output(agent_output)
-        .and_then(|ho| ho.get("needs_split").and_then(serde_json::Value::as_str))
-    {
+    if let Some(reason) = &agent_output.needs_split {
         let trimmed = reason.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return strip_internal_markers(trimmed);
         }
-    }
-    if let Some(pos) = agent_output.response.find("NEEDS_SPLIT:") {
-        let reason = &agent_output.response[pos + 12..];
-        return reason.trim().to_string();
     }
     "This issue is too broad and requires large unrelated feature work. Please split it into smaller, focused issues with detailed descriptions.".to_string()
 }
 
-fn extract_clarification(agent_output: &AgentHandoff) -> String {
+fn extract_clarification(agent_output: &WorkerOutput) -> String {
     if let Some(block) = extract_worker_public_comment(agent_output) {
         return block;
     }
     if let Some(clarification) = &agent_output.needs_clarification {
         let trimmed = clarification.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return strip_internal_markers(trimmed);
         }
-    }
-    if let Some(pos) = agent_output.response.find("NEEDS_CLARIFICATION:") {
-        let clarification = &agent_output.response[pos + 20..];
-        if let Some(end) = clarification.find('\n') {
-            return clarification[..end].trim().to_string();
-        }
-        return clarification.trim().to_string();
     }
     "This issue needs clarification. Please provide more details.".to_string()
 }
 
-/// Get a reference to the `handoff` tool's captured JSON from
-/// `agent_output.structured_outputs`, or `None` if the tool wasn't called.
-fn handoff_output(agent_output: &AgentHandoff) -> Option<&serde_json::Value> {
-    agent_output
-        .structured_outputs
-        .as_ref()
-        .and_then(|s| s.get("handoff"))
+/// Extract the worker's public comment text from the `handoff` tool's
+/// `public_comment` field. Stray internal markers are stripped as
+/// defense-in-depth before this text reaches a GitLab surface.
+fn extract_worker_public_comment(agent_output: &WorkerOutput) -> Option<String> {
+    let s = agent_output.public_comment.as_deref()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(strip_internal_markers(s))
 }
 
-/// Extract the worker's public comment text. Checks the `handoff` tool's
-/// `public_comment` field first, then falls back to the `PUBLIC_COMMENT_BEGIN…
-/// END` text marker.
-fn extract_worker_public_comment(agent_output: &AgentHandoff) -> Option<String> {
-    if let Some(ho) = handoff_output(agent_output)
-        && let Some(s) = ho.get("public_comment").and_then(serde_json::Value::as_str)
-    {
-        let t = s.trim();
-        if !t.is_empty() {
-            return Some(t.to_string());
-        }
-    }
-    extract_public_comment_block(&agent_output.response)
-}
-
-/// Apply the structured JSON the model emitted via the `handoff` tool,
-/// populating the shared `AgentHandoff` fields that the worker and other
-/// agents read (`decision`, `reason`, `needs_clarification`,
-/// `depends_on_issue`). Worker-specific fields (`mr_title`, `mr_description`,
-/// `changes_summary`, `needs_split`, `public_comment`, etc.) are read directly
-/// from `structured_outputs["handoff"]` by the worker's own extractors — they
-/// don't live on `AgentHandoff`.
-fn apply_worker_handoff(mut handoff: AgentHandoff) -> AgentHandoff {
-    let Some(ho) = handoff_output(&handoff).cloned() else {
-        return handoff;
-    };
-
-    if let Some(s) = ho
-        .get("needs_clarification")
-        .and_then(serde_json::Value::as_str)
-    {
-        let t = s.trim();
-        if !t.is_empty() {
-            handoff.needs_clarification = Some(t.to_string());
-        }
-    }
-    if let Some(s) = ho.get("reason").and_then(serde_json::Value::as_str) {
-        let t = s.trim();
-        if !t.is_empty() {
-            handoff.reason = Some(t.to_string());
-        }
-    }
-    if let Some(n) = ho
-        .get("depends_on_issue")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|n| *n > 0)
-    {
-        handoff.depends_on_issue = Some(n);
-    }
-    if ho
-        .get("cannot_implement")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        handoff.decision = Some("cannot_implement".to_string());
-    }
-    if ho
-        .get("cannot_resolve")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        handoff.decision = Some("cannot_resolve".to_string());
-    }
-
-    handoff
-}
-
-/// Extract a dependency issue IID from the agent's output. Checks the
-/// structured `depends_on_issue` field first (populated by `apply_worker_handoff`),
-/// then falls back to the `DEPENDS_ON_ISSUE:` text marker and prose patterns.
-fn extract_depends_on_issue(agent_output: &AgentHandoff) -> Option<u64> {
-    // Structured field first (populated by `apply_worker_handoff` from the
-    // `handoff` tool's `depends_on_issue` field).
-    if let Some(n) = agent_output.depends_on_issue {
-        return Some(n);
-    }
-
-    let response = &agent_output.response;
-
-    // Fallback: explicit marker `DEPENDS_ON_ISSUE: #N`.
-    if let Some(pos) = response.find("DEPENDS_ON_ISSUE:") {
-        let rest = &response[pos + "DEPENDS_ON_ISSUE:".len()..];
-        let rest = rest.trim_start();
-        let rest = rest.strip_prefix('#').unwrap_or(rest);
-        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(n) = num.parse::<u64>() {
-            return Some(n);
-        }
-    }
-
-    // Fallback: prose declarations like "blocked on #727", "depends on #727",
-    // "cannot proceed until #727 is closed". The model often describes the
-    // dependency without using the explicit marker, so scan for issue
-    // references preceded by dependency keywords.
-    extract_depends_on_issue_from_prose(response)
+/// Extract a dependency issue IID from the `handoff` tool's
+/// `depends_on_issue` field. `0` (and negative/absent values) mean "no
+/// dependency".
+fn extract_depends_on_issue(agent_output: &WorkerOutput) -> Option<u64> {
+    agent_output.depends_on_issue.filter(|n| *n > 0)
 }
 
 /// Extract `existing_mr_iid` from the `handoff` tool output.
 /// Returns `Some(iid)` only when the field is a positive integer.
-fn extract_existing_mr_iid(agent_output: &AgentHandoff) -> Option<u64> {
-    handoff_output(agent_output)?
-        .get("existing_mr_iid")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|n| *n > 0)
-}
-
-/// Scan prose for dependency phrases followed by `#<N>` issue references.
-/// Matches patterns like "blocked on #727", "depends on #727",
-/// "cannot proceed until #727", "waiting on #727", "blocked by #727".
-fn extract_depends_on_issue_from_prose(text: &str) -> Option<u64> {
-    let lower = text.to_lowercase();
-    let keywords = [
-        "blocked on",
-        "blocked by",
-        "depends on",
-        "waiting on",
-        "waiting for",
-        "cannot proceed until",
-        "cannot start until",
-        "hard-blocked on",
-        "blocked until",
-    ];
-    for kw in keywords {
-        let mut search_from = 0;
-        while let Some(pos) = lower[search_from..].find(kw) {
-            let abs = search_from + pos + kw.len();
-            let rest = &text[abs..];
-            // Skip whitespace, then expect '#'.
-            let rest = rest.trim_start();
-            if let Some(rest) = rest.strip_prefix('#') {
-                let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(n) = num.parse::<u64>()
-                    && n > 0
-                {
-                    return Some(n);
-                }
-            }
-            search_from = abs;
-        }
-    }
-    None
+fn extract_existing_mr_iid(agent_output: &WorkerOutput) -> Option<u64> {
+    agent_output.existing_mr_iid.filter(|n| *n > 0)
 }
 
 /// Prefix for labels that park an issue until a dependency issue is closed.
@@ -3730,112 +3503,32 @@ fn extract_waiting_on_issue_iid(labels: &[String]) -> Option<u64> {
 /// didn't provide one. The issue title is always meaningful and specific to
 /// the work, so it's a far better default than a placeholder that produces
 /// a stream of indistinguishable MRs.
-fn extract_mr_title(agent_output: &AgentHandoff, issue_title: &str) -> String {
-    // Structured field first (from the `handoff` tool).
-    if let Some(s) = handoff_output(agent_output)
-        .and_then(|ho| ho.get("mr_title").and_then(serde_json::Value::as_str))
-    {
+fn extract_mr_title(agent_output: &WorkerOutput, issue_title: &str) -> String {
+    if let Some(s) = agent_output.mr_title.as_deref() {
         let cleaned = strip_markdown_formatting(s.trim());
         if !cleaned.is_empty() {
             return cleaned;
         }
     }
-    if let Some(block) =
-        extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
-    {
-        let cleaned = strip_markdown_formatting(block.trim());
-        if !cleaned.is_empty() {
-            return cleaned;
-        }
-    }
-    // Try exact marker first
-    if let Some(pos) = agent_output.response.find("MR_TITLE:") {
-        let title_section = &agent_output.response[pos + 9..];
-        let raw = if let Some(end) = title_section.find('\n') {
-            title_section[..end].trim()
-        } else {
-            title_section.trim()
-        };
-        let cleaned = strip_markdown_formatting(raw);
-        if !cleaned.is_empty() {
-            return cleaned;
-        }
-    }
-
-    // Try common variations the agent might use
-    for marker in &["Title:", "TITLE:", "## Title", "Commit message:"] {
-        if let Some(pos) = agent_output.response.find(marker) {
-            let section = &agent_output.response[pos + marker.len()..];
-            let raw = if let Some(end) = section.find('\n') {
-                section[..end].trim()
-            } else {
-                section.trim()
-            };
-            let cleaned = strip_markdown_formatting(raw);
-            if !cleaned.is_empty() && cleaned.len() > 5 {
-                return cleaned;
-            }
-        }
-    }
-
-    // Last resort: use the CHANGES_SUMMARY if present
-    if let Some(pos) = agent_output.response.find("CHANGES_SUMMARY:") {
-        let section = &agent_output.response[pos + 16..];
-        let raw = if let Some(end) = section.find('\n') {
-            section[..end].trim()
-        } else {
-            section.trim()
-        };
-        let cleaned = strip_markdown_formatting(raw);
-        if !cleaned.is_empty() {
-            return cleaned;
-        }
-    }
-
-    // No title extracted from the agent output — fall back to the issue title,
-    // which is always specific to the work. Never use a generic placeholder.
+    // No title provided by the agent — fall back to the issue title, which
+    // is always specific to the work. Never use a generic placeholder.
     issue_title.to_string()
 }
 
 /// Extract an explicit MR title the agent emitted (for metadata updates on
 /// follow-up turns). Returns `None` when the agent didn't provide one, so the
 /// caller can distinguish "no title provided" from "title provided". Unlike
-/// [`extract_mr_title`], this does NOT fall back to CHANGES_SUMMARY or the
-/// issue title — a metadata update should only overwrite the title when the
-/// agent explicitly said to. Reads from the `handoff` tool's `mr_title` field
-/// first, then falls back to text markers (`MR_TITLE_BEGIN…END`, `MR_TITLE:`).
-fn extract_explicit_mr_title(agent_output: &AgentHandoff) -> Option<String> {
-    // Structured field first (from the `handoff` tool).
-    if let Some(s) = handoff_output(agent_output)
-        .and_then(|ho| ho.get("mr_title").and_then(serde_json::Value::as_str))
-    {
-        let cleaned = strip_markdown_formatting(s.trim());
-        if !cleaned.is_empty() {
-            return Some(cleaned);
-        }
+/// [`extract_mr_title`], this does NOT fall back to the issue title — a
+/// metadata update should only overwrite the title when the agent explicitly
+/// said to.
+fn extract_explicit_mr_title(agent_output: &WorkerOutput) -> Option<String> {
+    let s = agent_output.mr_title.as_deref()?;
+    let cleaned = strip_markdown_formatting(s.trim());
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
     }
-    // Text marker fallbacks.
-    if let Some(block) =
-        extract_block_between_markers(&agent_output.response, "MR_TITLE_BEGIN", "MR_TITLE_END")
-    {
-        let cleaned = strip_markdown_formatting(block.trim());
-        if !cleaned.is_empty() {
-            return Some(cleaned);
-        }
-    }
-    if let Some(pos) = agent_output.response.find("MR_TITLE:") {
-        let title_section = &agent_output.response[pos + 9..];
-        let raw = if let Some(end) = title_section.find('\n') {
-            title_section[..end].trim()
-        } else {
-            title_section.trim()
-        };
-        let cleaned = strip_markdown_formatting(raw);
-        if !cleaned.is_empty() {
-            return Some(cleaned);
-        }
-    }
-    None
 }
 
 fn strip_markdown_formatting(s: &str) -> String {
@@ -3848,19 +3541,9 @@ fn strip_markdown_formatting(s: &str) -> String {
     result.to_string()
 }
 
-fn extract_block_between_markers(text: &str, begin: &str, end: &str) -> Option<String> {
-    let start = text.find(begin)?;
-    let body_start = start + begin.len();
-    let rest = &text[body_start..];
-    let end_rel = rest.find(end)?;
-    let body = rest[..end_rel].trim();
-    if body.is_empty() {
-        None
-    } else {
-        Some(body.to_string())
-    }
-}
-
+/// Defense-in-depth cleanup for `mr_description` text: strips any stray
+/// public-comment blocks and internal field-name-looking lines the model
+/// might echo into the description despite the typed contract.
 fn sanitize_mr_description_text(s: &str) -> String {
     let stripped = strip_public_comment_blocks(s);
     let filtered: Vec<&str> = stripped
@@ -3875,78 +3558,11 @@ fn sanitize_mr_description_text(s: &str) -> String {
     filtered.join("\n").trim().to_string()
 }
 
-fn extract_mr_description(agent_output: &AgentHandoff) -> String {
-    // Structured field first (from the `handoff` tool).
-    if let Some(s) = handoff_output(agent_output)
-        .and_then(|ho| ho.get("mr_description").and_then(serde_json::Value::as_str))
-    {
+/// Extract the MR description the agent emitted via the `handoff` tool's
+/// `mr_description` field, falling back to a generic placeholder when absent.
+fn extract_mr_description(agent_output: &WorkerOutput) -> String {
+    if let Some(s) = agent_output.mr_description.as_deref() {
         let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return sanitize_mr_description_text(trimmed);
-        }
-    }
-    if let Some(block) = extract_block_between_markers(
-        &agent_output.response,
-        "MR_DESCRIPTION_BEGIN",
-        "MR_DESCRIPTION_END",
-    ) {
-        return sanitize_mr_description_text(&block);
-    }
-    if let Some(pos) = agent_output.response.find("MR_DESCRIPTION:") {
-        let desc_section = &agent_output.response[pos + 15..];
-        let trimmed = desc_section.trim();
-        if !trimmed.is_empty() {
-            return sanitize_mr_description_text(trimmed);
-        }
-    }
-
-    if let Some(pos) = agent_output.response.find("IMPLEMENTATION_SUMMARY:") {
-        let summary = &agent_output.response[pos + 23..];
-        let trimmed = summary.trim();
-        if !trimmed.is_empty() {
-            return sanitize_mr_description_text(&format!("## Implementation\n\n{}", trimmed));
-        }
-    }
-
-    // Try to extract the last substantial paragraph as a summary
-    let lines: Vec<&str> = agent_output.response.lines().collect();
-    let last_chunk: Vec<&str> = lines
-        .iter()
-        .rev()
-        .take(20)
-        .copied()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    if !last_chunk.is_empty() {
-        return sanitize_mr_description_text(&format!("## Summary\n\n{}", last_chunk.join("\n")));
-    }
-
-    "Implementation completed.".to_string()
-}
-
-fn extract_explicit_mr_description(agent_output: &AgentHandoff) -> String {
-    // Structured field first (from the `handoff` tool).
-    if let Some(s) = handoff_output(agent_output)
-        .and_then(|ho| ho.get("mr_description").and_then(serde_json::Value::as_str))
-    {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return sanitize_mr_description_text(trimmed);
-        }
-    }
-    if let Some(block) = extract_block_between_markers(
-        &agent_output.response,
-        "MR_DESCRIPTION_BEGIN",
-        "MR_DESCRIPTION_END",
-    ) {
-        return sanitize_mr_description_text(&block);
-    }
-    if let Some(pos) = agent_output.response.find("MR_DESCRIPTION:") {
-        let desc_section = &agent_output.response[pos + 15..];
-        let trimmed = desc_section.trim();
         if !trimmed.is_empty() {
             return sanitize_mr_description_text(trimmed);
         }
@@ -3957,6 +3573,197 @@ fn extract_explicit_mr_description(agent_output: &AgentHandoff) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_output_tool_definition_has_no_required_fields() {
+        let tool = WorkerOutput::tool_definition();
+        assert_eq!(tool.name, "handoff");
+        assert!(tool.parameters.required.is_empty());
+        assert_eq!(tool.parameters.properties.len(), 13);
+    }
+
+    #[test]
+    fn worker_output_deserializes_empty_object() {
+        let output: WorkerOutput = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!output.cannot_implement);
+        assert!(!output.cannot_resolve);
+        assert!(output.mr_title.is_none());
+        assert!(output.depends_on_issue.is_none());
+    }
+
+    #[test]
+    fn worker_output_tolerates_string_ids_and_booleans() {
+        let output: WorkerOutput = serde_json::from_value(serde_json::json!({
+            "depends_on_issue": "#7",
+            "existing_mr_iid": "!12",
+            "mark_discussions_resolved": "true"
+        }))
+        .unwrap();
+        assert_eq!(output.depends_on_issue, Some(7));
+        assert_eq!(output.existing_mr_iid, Some(12));
+        assert_eq!(output.mark_discussions_resolved, Some(true));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_top_level_settings_before_spawn() {
+        let config = Config::from_toml_str(
+            r#"
+            gitlab_repo = 42
+            [agent.worker]
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let section = config.agent("worker").unwrap();
+
+        let error = WorkerAgent::validate_config(&config, section).unwrap_err();
+
+        assert!(format!("{error:#}").contains("Failed to parse agent settings"));
+    }
+
+    #[test]
+    fn worker_output_deserializes_full_payload() {
+        let output: WorkerOutput = serde_json::from_value(serde_json::json!({
+            "mr_title": "Add feature",
+            "mr_description": "## Goal\nDo it",
+            "changes_summary": "Added the feature",
+            "depends_on_issue": 7,
+            "needs_split": "too large",
+            "needs_clarification": "what auth scheme?",
+            "cannot_implement": true,
+            "cannot_resolve": false,
+            "reason": "blocked",
+            "public_comment": "Thanks!",
+            "mark_discussions_resolved": true,
+            "post_plain_comment": true,
+            "existing_mr_iid": 9
+        }))
+        .unwrap();
+        assert_eq!(output.mr_title, Some("Add feature".to_string()));
+        assert_eq!(output.depends_on_issue, Some(7));
+        assert!(output.cannot_implement);
+        assert!(!output.cannot_resolve);
+        assert_eq!(output.existing_mr_iid, Some(9));
+        assert_eq!(output.mark_discussions_resolved, Some(true));
+        assert!(output.post_plain_comment);
+    }
+
+    #[test]
+    fn worker_output_rejects_wrong_type_for_boolean_field() {
+        let err = serde_json::from_value::<WorkerOutput>(serde_json::json!({
+            "cannot_implement": "yes"
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot_implement") || err.is_data());
+    }
+
+    #[test]
+    fn output_signals_cannot_implement_reads_typed_flag() {
+        let out = WorkerOutput {
+            cannot_implement: true,
+            ..Default::default()
+        };
+        assert!(output_signals_cannot_implement(&out));
+        assert!(!output_signals_cannot_implement(&WorkerOutput::default()));
+    }
+
+    #[test]
+    fn output_signals_cannot_resolve_reads_typed_flag() {
+        let out = WorkerOutput {
+            cannot_resolve: true,
+            ..Default::default()
+        };
+        assert!(output_signals_cannot_resolve(&out));
+        assert!(!output_signals_cannot_resolve(&WorkerOutput::default()));
+    }
+
+    #[test]
+    fn output_needs_split_true_only_when_reason_non_empty() {
+        assert!(!output_needs_split(&WorkerOutput::default()));
+        assert!(!output_needs_split(&WorkerOutput {
+            needs_split: Some("   ".to_string()),
+            ..Default::default()
+        }));
+        assert!(output_needs_split(&WorkerOutput {
+            needs_split: Some("too large".to_string()),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn extract_cannot_resolve_reason_prefers_public_comment_then_reason_then_default() {
+        let with_comment = WorkerOutput {
+            public_comment: Some("Explained to the reviewer.".to_string()),
+            reason: Some("internal reason".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_cannot_resolve_reason(&with_comment),
+            "Explained to the reviewer."
+        );
+
+        let with_reason_only = WorkerOutput {
+            reason: Some("Missing credentials.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_cannot_resolve_reason(&with_reason_only),
+            "Missing credentials."
+        );
+
+        assert_eq!(
+            extract_cannot_resolve_reason(&WorkerOutput::default()),
+            "The implementation cannot proceed without additional human input."
+        );
+    }
+
+    #[test]
+    fn extract_split_reason_prefers_public_comment_then_needs_split_then_default() {
+        let out = WorkerOutput {
+            needs_split: Some("split reason".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(extract_split_reason(&out), "split reason");
+        assert!(extract_split_reason(&WorkerOutput::default()).contains("too broad"));
+    }
+
+    #[test]
+    fn extract_clarification_prefers_public_comment_then_needs_clarification_then_default() {
+        let out = WorkerOutput {
+            needs_clarification: Some("what auth scheme?".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(extract_clarification(&out), "what auth scheme?");
+        assert!(extract_clarification(&WorkerOutput::default()).contains("clarification"));
+    }
+
+    #[test]
+    fn extract_worker_public_comment_strips_stray_internal_markers() {
+        let out = WorkerOutput {
+            public_comment: Some(
+                "PUBLIC_COMMENT_BEGIN\nHidden.\nPUBLIC_COMMENT_END\nVisible.".to_string(),
+            ),
+            ..Default::default()
+        };
+        let comment = extract_worker_public_comment(&out).unwrap();
+        assert!(!comment.contains("PUBLIC_COMMENT_BEGIN"));
+        assert!(comment.contains("Visible."));
+    }
+
+    #[test]
+    fn extract_worker_public_comment_returns_none_when_absent_or_blank() {
+        assert_eq!(
+            extract_worker_public_comment(&WorkerOutput::default()),
+            None
+        );
+        assert_eq!(
+            extract_worker_public_comment(&WorkerOutput {
+                public_comment: Some("   ".to_string()),
+                ..Default::default()
+            }),
+            None
+        );
+    }
 
     #[test]
     fn worker_issue_context_includes_comments_section() {
@@ -4141,30 +3948,15 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_explicit_mr_title_does_not_fall_back_to_changes_summary() {
-        let output = AgentHandoff {
-            response: "CHANGES_SUMMARY: Fix reviewer follow-up lint issue.".to_string(),
-            ..Default::default()
-        };
-        // extract_explicit_mr_title returns None when no MR_TITLE marker is
-        // present (it must not pick up CHANGES_SUMMARY).
+    fn extract_explicit_mr_title_returns_none_when_field_absent() {
+        let output = WorkerOutput::default();
         assert_eq!(extract_explicit_mr_title(&output), None);
-        // extract_mr_title falls back to CHANGES_SUMMARY, then to the issue
-        // title when no marker and no CHANGES_SUMMARY are present.
-        assert_eq!(
-            extract_mr_title(&output, "Issue title"),
-            "Fix reviewer follow-up lint issue."
-        );
     }
 
     #[test]
     fn extract_explicit_mr_title_reads_handoff_structured_field() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "handoff": {
-                    "mr_title": "Add comment chunk truncation docs"
-                }
-            })),
+        let output = WorkerOutput {
+            mr_title: Some("Add comment chunk truncation docs".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -4174,13 +3966,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_mr_title_falls_back_to_issue_title_when_no_marker() {
-        // When the agent emits neither MR_TITLE nor CHANGES_SUMMARY, the MR
-        // title falls back to the issue title — never a generic placeholder.
-        let output = AgentHandoff {
-            response: "I made some changes.".to_string(),
-            ..Default::default()
-        };
+    fn extract_mr_title_falls_back_to_issue_title_when_absent() {
+        // When the agent doesn't set mr_title, the MR title falls back to
+        // the issue title — never a generic placeholder.
+        let output = WorkerOutput::default();
         assert_eq!(
             extract_mr_title(&output, "Add login rate limiting"),
             "Add login rate limiting"
@@ -4189,8 +3978,8 @@ mod tests {
 
     #[test]
     fn test_build_feedback_resolution_reply_includes_reason_without_code_changes() {
-        let output = AgentHandoff {
-            response: "REASON: Existing validation already covered this case.".to_string(),
+        let output = WorkerOutput {
+            reason: Some("Existing validation already covered this case.".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -4204,8 +3993,8 @@ mod tests {
 
     #[test]
     fn test_build_feedback_resolution_reply_uses_changes_summary_when_changes_exist() {
-        let output = AgentHandoff {
-            response: "CHANGES_SUMMARY: Add missing null check in parser.".to_string(),
+        let output = WorkerOutput {
+            changes_summary: Some("Add missing null check in parser.".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -4216,8 +4005,8 @@ mod tests {
 
     #[test]
     fn test_build_feedback_resolution_reply_includes_diff_highlights() {
-        let output = AgentHandoff {
-            response: "CHANGES_SUMMARY: Tighten input validation.".to_string(),
+        let output = WorkerOutput {
+            changes_summary: Some("Tighten input validation.".to_string()),
             ..Default::default()
         };
         let diff = "- src/validation.rs\n- 1 file changed, 4 insertions(+)";
@@ -4229,17 +4018,14 @@ mod tests {
 
     #[test]
     fn build_feedback_resolution_reply_requires_reason_without_code_changes() {
-        let output = AgentHandoff {
-            response: "I'll inspect the reviewer feedback first.".to_string(),
-            ..Default::default()
-        };
+        let output = WorkerOutput::default();
         assert_eq!(build_feedback_resolution_reply(&output, false, None), None);
     }
 
     #[test]
     fn feedback_discussions_may_be_resolved_blocks_while_conflicts_remain() {
-        let out = AgentHandoff {
-            response: "MARK_DISCUSSIONS_RESOLVED: yes\n".to_string(),
+        let out = WorkerOutput {
+            mark_discussions_resolved: Some(true),
             ..Default::default()
         };
         assert!(!feedback_discussions_may_be_resolved(&out, true, true));
@@ -4316,67 +4102,75 @@ mod tests {
     }
 
     #[test]
-    fn strip_worker_reply_boilerplate_uses_public_comment_block() {
-        let input = "Addressed feedback:\n\nPUBLIC_COMMENT_BEGIN\nFinal reviewer reply.\nPUBLIC_COMMENT_END";
-        assert_eq!(
-            strip_worker_reply_boilerplate(input),
-            "Final reviewer reply."
-        );
-    }
-
-    #[test]
     fn should_resolve_mr_feedback_discussions_defaults_follow_implicit_actions() {
-        let out = AgentHandoff::default();
+        let out = WorkerOutput::default();
         assert!(!should_resolve_mr_feedback_discussions(&out, false));
         assert!(should_resolve_mr_feedback_discussions(&out, true));
     }
 
     #[test]
-    fn mark_discussions_resolved_parsed_from_response() {
-        let out_no = AgentHandoff {
-            response: "MARK_DISCUSSIONS_RESOLVED: no\n".to_string(),
+    fn mark_discussions_resolved_reads_structured_field() {
+        let out_no = WorkerOutput {
+            mark_discussions_resolved: Some(false),
             ..Default::default()
         };
         assert!(!should_resolve_mr_feedback_discussions(&out_no, true));
-        let out_yes = AgentHandoff {
-            response: "mark_discussions_resolved: YES\n".to_string(),
+        let out_yes = WorkerOutput {
+            mark_discussions_resolved: Some(true),
             ..Default::default()
         };
         assert!(should_resolve_mr_feedback_discussions(&out_yes, false));
     }
 
     #[test]
-    fn plain_comment_posting_requires_explicit_marker() {
-        let out_default = AgentHandoff {
-            response: "PUBLIC_COMMENT_BEGIN\nNo further changes were needed.\nPUBLIC_COMMENT_END"
-                .to_string(),
+    fn plain_comment_posting_requires_explicit_field() {
+        let out_default = WorkerOutput {
+            public_comment: Some("No further changes were needed.".to_string()),
             ..Default::default()
         };
         assert!(!should_post_plain_comment(&out_default));
 
-        let out_no = AgentHandoff {
-            response: "POST_PLAIN_COMMENT: no\nPUBLIC_COMMENT_BEGIN\nNo further changes were needed.\nPUBLIC_COMMENT_END".to_string(),
+        let out_no = WorkerOutput {
+            post_plain_comment: false,
+            public_comment: Some("No further changes were needed.".to_string()),
             ..Default::default()
         };
         assert!(!should_post_plain_comment(&out_no));
 
-        let out_yes = AgentHandoff {
-            response: "post_plain_comment: YES\nPUBLIC_COMMENT_BEGIN\nPosted by request.\nPUBLIC_COMMENT_END".to_string(),
+        let out_yes = WorkerOutput {
+            post_plain_comment: true,
+            public_comment: Some("Posted by request.".to_string()),
             ..Default::default()
         };
         assert!(should_post_plain_comment(&out_yes));
     }
 
     #[test]
-    fn no_change_reply_text_requires_structured_reason_marker() {
-        let out = AgentHandoff {
-            response: "No new code changes were needed in this run. The branch already satisfies the requested behavior.".to_string(),
+    fn no_change_reply_requires_explicit_resolve_field() {
+        let out = WorkerOutput {
+            public_comment: Some("No new code changes were needed in this run.".to_string()),
             ..Default::default()
         };
+        assert!(!should_resolve_mr_feedback_discussions(&out, false));
+
+        let explicit = WorkerOutput {
+            mark_discussions_resolved: Some(true),
+            public_comment: Some("No new code changes were needed in this run.".to_string()),
+            ..Default::default()
+        };
+        assert!(should_resolve_mr_feedback_discussions(&explicit, false));
+    }
+
+    #[test]
+    fn no_change_reply_text_requires_structured_reason_field() {
+        let out = WorkerOutput::default();
         assert_eq!(build_feedback_resolution_reply(&out, false, None), None);
 
-        let explicit = AgentHandoff {
-            response: "REASON: No new code changes were needed in this run. The branch already satisfies the requested behavior.".to_string(),
+        let explicit = WorkerOutput {
+            reason: Some(
+                "No new code changes were needed in this run. The branch already satisfies the requested behavior."
+                    .to_string(),
+            ),
             ..Default::default()
         };
         assert_eq!(
@@ -4386,25 +4180,35 @@ mod tests {
     }
 
     #[test]
-    fn extract_no_change_resolution_reason_ignores_freeform_planning_text() {
-        let out = AgentHandoff {
-            response: "I'll help you address the reviewer feedback.\nLet me inspect files first."
-                .to_string(),
-            ..Default::default()
-        };
+    fn extract_no_change_resolution_reason_returns_none_when_absent() {
+        let out = WorkerOutput::default();
         assert_eq!(extract_no_change_resolution_reason(&out), None);
     }
 
     #[test]
-    fn extract_no_change_resolution_reason_prefers_structured_reason_marker() {
-        let out = AgentHandoff {
-            response: "Some analysis\nREASON: Property deletion already removes stored data on schema update."
-                .to_string(),
+    fn extract_no_change_resolution_reason_prefers_reason_over_changes_summary() {
+        let out = WorkerOutput {
+            reason: Some(
+                "Property deletion already removes stored data on schema update.".to_string(),
+            ),
+            changes_summary: Some("unrelated summary".to_string()),
             ..Default::default()
         };
         assert_eq!(
             extract_no_change_resolution_reason(&out),
             Some("Property deletion already removes stored data on schema update.".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_no_change_resolution_reason_falls_back_to_changes_summary() {
+        let out = WorkerOutput {
+            changes_summary: Some("Resolved via metadata update only.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_no_change_resolution_reason(&out),
+            Some("Resolved via metadata update only.".to_string())
         );
     }
 
@@ -4432,13 +4236,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_mr_description_filters_control_markers() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "handoff": {
-                    "mr_description": "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\nPOST_PLAIN_COMMENT: yes\n## Testing\ncargo test"
-                }
-            })),
+    fn extract_mr_description_strips_control_marker_lines() {
+        let output = WorkerOutput {
+            mr_description: Some(
+                "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\nPOST_PLAIN_COMMENT: yes\n## Testing\ncargo test"
+                    .to_string(),
+            ),
             ..Default::default()
         };
         let desc = extract_mr_description(&output);
@@ -4451,12 +4254,11 @@ mod tests {
 
     #[test]
     fn extract_mr_description_strips_public_comment_blocks() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "handoff": {
-                    "mr_description": "## Goal\npytest coverage.\nPUBLIC_COMMENT_BEGIN\nThanks for the review.\nPUBLIC_COMMENT_END\n## Testing\nuv run pytest"
-                }
-            })),
+        let output = WorkerOutput {
+            mr_description: Some(
+                "## Goal\npytest coverage.\nPUBLIC_COMMENT_BEGIN\nThanks for the review.\nPUBLIC_COMMENT_END\n## Testing\nuv run pytest"
+                    .to_string(),
+            ),
             ..Default::default()
         };
         let desc = extract_mr_description(&output);
@@ -4467,20 +4269,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_explicit_mr_description_filters_control_markers() {
-        let output = AgentHandoff {
-            response:
-                "MR_DESCRIPTION:\nSummary line\nCHANGES_SUMMARY: x\nMARK_DISCUSSIONS_RESOLVED: yes\n"
-                    .to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_explicit_mr_description(&output), "Summary line");
+    fn extract_mr_description_defaults_when_field_absent() {
+        let output = WorkerOutput::default();
+        assert_eq!(extract_mr_description(&output), "Implementation completed.");
     }
 
     #[test]
-    fn extract_mr_title_prefers_block_markers() {
-        let output = AgentHandoff {
-            response: "MR_TITLE_BEGIN\nStable title\nMR_TITLE_END\nMR_TITLE: fallback".to_string(),
+    fn extract_mr_title_reads_structured_field() {
+        let output = WorkerOutput {
+            mr_title: Some("Stable title".to_string()),
             ..Default::default()
         };
         assert_eq!(extract_mr_title(&output, "Issue title"), "Stable title");
@@ -4491,62 +4288,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_mr_description_prefers_block_markers() {
-        let output = AgentHandoff {
-            response:
-                "MR_DESCRIPTION_BEGIN\n## Goal\nA\nCHANGES_SUMMARY: noisy\nMR_DESCRIPTION_END\nMR_DESCRIPTION:\nB"
-                    .to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_mr_description(&output), "## Goal\nA");
-        assert_eq!(extract_explicit_mr_description(&output), "## Goal\nA");
-    }
-
-    #[test]
-    fn extract_depends_on_issue_parses_single_iid() {
-        let out = AgentHandoff {
-            response: "DEPENDS_ON_ISSUE: #42".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(42));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_parses_hashless_iid() {
-        let out = AgentHandoff {
-            response: "DEPENDS_ON_ISSUE: 42".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(42));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_takes_first_of_multiple() {
-        let out = AgentHandoff {
-            response: "DEPENDS_ON_ISSUE: #42, #43".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(42));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_parses_embedded_in_prose() {
-        // The model often embeds the marker in a sentence rather than on its
-        // own line, e.g. "Parked via DEPENDS_ON_ISSUE: #727 so this
-        // auto-resumes once #727 merges." The parser must extract 727, not
-        // fail on the trailing prose.
-        let out = AgentHandoff {
-            response: "Parked via DEPENDS_ON_ISSUE: #727 so this auto-resumes once #727 merges."
-                .to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(727));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_parses_no_space_after_colon() {
-        let out = AgentHandoff {
-            response: "DEPENDS_ON_ISSUE:#42".to_string(),
+    fn extract_depends_on_issue_reads_structured_field() {
+        let out = WorkerOutput {
+            depends_on_issue: Some(42),
             ..Default::default()
         };
         assert_eq!(extract_depends_on_issue(&out), Some(42));
@@ -4554,72 +4298,14 @@ mod tests {
 
     #[test]
     fn extract_depends_on_issue_returns_none_when_absent() {
-        let out = AgentHandoff {
-            response: "MR_TITLE: something\nMR_DESCRIPTION: done".to_string(),
-            ..Default::default()
-        };
+        let out = WorkerOutput::default();
         assert_eq!(extract_depends_on_issue(&out), None);
     }
 
     #[test]
-    fn extract_depends_on_issue_returns_none_for_garbage() {
-        let out = AgentHandoff {
-            response: "DEPENDS_ON_ISSUE: #abc".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), None);
-    }
-
-    #[test]
-    fn extract_depends_on_issue_fallback_blocked_on() {
-        let out = AgentHandoff {
-            response: "Issue #733 is hard-blocked on #727 and cannot be started yet.".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(727));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_fallback_depends_on() {
-        let out = AgentHandoff {
-            response: "This work depends on #727 which is not yet closed.".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(727));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_fallback_cannot_proceed_until() {
-        let out = AgentHandoff {
-            response: "I cannot proceed until #727 is closed; it cannot compile.".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(727));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_fallback_blocked_by() {
-        let out = AgentHandoff {
-            response: "Implementation is blocked by #47 and needs its API.".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(47));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_fallback_waiting_on() {
-        let out = AgentHandoff {
-            response: "Parked — waiting on #99 to merge first.".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(extract_depends_on_issue(&out), Some(99));
-    }
-
-    #[test]
-    fn extract_depends_on_issue_prose_fallback_ignores_unrelated_issue_refs() {
-        // "See #42 for context" should NOT trigger — no dependency keyword.
-        let out = AgentHandoff {
-            response: "See #42 for background. The work is done.".to_string(),
+    fn extract_depends_on_issue_returns_none_for_zero() {
+        let out = WorkerOutput {
+            depends_on_issue: Some(0),
             ..Default::default()
         };
         assert_eq!(extract_depends_on_issue(&out), None);
@@ -4708,10 +4394,8 @@ mod tests {
 
     #[test]
     fn extract_existing_mr_iid_reads_structured_field() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "handoff": { "existing_mr_iid": 42 }
-            })),
+        let handoff = WorkerOutput {
+            existing_mr_iid: Some(42),
             ..Default::default()
         };
         assert_eq!(extract_existing_mr_iid(&handoff), Some(42));
@@ -4719,10 +4403,8 @@ mod tests {
 
     #[test]
     fn extract_existing_mr_iid_returns_none_when_absent() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "handoff": { "mr_title": "Fix bug" }
-            })),
+        let handoff = WorkerOutput {
+            mr_title: Some("Fix bug".to_string()),
             ..Default::default()
         };
         assert_eq!(extract_existing_mr_iid(&handoff), None);
@@ -4730,18 +4412,16 @@ mod tests {
 
     #[test]
     fn extract_existing_mr_iid_returns_none_for_zero_or_negative() {
-        let handoff = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "handoff": { "existing_mr_iid": 0 }
-            })),
+        let handoff = WorkerOutput {
+            existing_mr_iid: Some(0),
             ..Default::default()
         };
         assert_eq!(extract_existing_mr_iid(&handoff), None);
     }
 
     #[test]
-    fn extract_existing_mr_iid_returns_none_when_no_structured_outputs() {
-        let handoff = AgentHandoff::default();
+    fn extract_existing_mr_iid_returns_none_when_default() {
+        let handoff = WorkerOutput::default();
         assert_eq!(extract_existing_mr_iid(&handoff), None);
     }
 }

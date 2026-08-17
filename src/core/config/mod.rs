@@ -13,17 +13,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use toml::Value;
 use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    raw: Value,
     agents: HashMap<String, AgentSection>,
     acp_clients: HashMap<String, AcpClientProfile>,
 }
 
 impl Config {
-    pub fn load_with_content(path: Option<&str>) -> Result<(Self, String)> {
+    pub fn load(path: Option<&str>) -> Result<Self> {
         let config_path = if let Some(p) = path {
             PathBuf::from(p)
         } else {
@@ -35,17 +37,11 @@ impl Config {
                 "No config file found at {}, using empty config",
                 config_path.display()
             );
-            return Ok((
-                Config {
-                    agents: HashMap::new(),
-                    acp_clients: HashMap::new(),
-                },
-                String::new(),
-            ));
+            return Self::from_toml_str("");
         }
 
         let content = fs::read_to_string(&config_path).context("Failed to read config file")?;
-        Ok((Self::from_toml_str(&content)?, content))
+        Self::from_toml_str(&content)
     }
 
     pub fn from_toml_str(content: &str) -> Result<Self> {
@@ -60,6 +56,7 @@ impl Config {
         );
 
         Ok(Config {
+            raw: root,
             agents,
             acp_clients,
         })
@@ -88,6 +85,14 @@ impl Config {
 
     pub fn agent(&self, name: &str) -> Option<&AgentSection> {
         self.agents.get(name)
+    }
+
+    /// Deserialize configuration from the already-parsed top-level TOML value.
+    pub fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
+        self.raw
+            .clone()
+            .try_into()
+            .context("Failed to deserialize top-level config")
     }
 
     /// Resolve the ACP executable/args, subprocess env, and model for an agent role.
@@ -144,6 +149,35 @@ mod tests {
         let names: Vec<_> = cfg.agent_names().collect();
         assert_eq!(names, vec!["alpha"]);
         assert!(cfg.agent("beta").is_none());
+    }
+
+    #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+    struct TopLevelFixture {
+        repository: String,
+        #[serde(default)]
+        scope: String,
+    }
+
+    #[test]
+    fn injects_top_level_settings_from_single_parsed_value() {
+        let cfg = Config::from_toml_str(
+            r#"
+            repository = "group/project"
+            scope = "potlatch"
+
+            [agent.worker]
+            instances = 1
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.deserialize::<TopLevelFixture>().unwrap(),
+            TopLevelFixture {
+                repository: "group/project".to_string(),
+                scope: "potlatch".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub(crate) struct AgentRegistration {
     pub name: &'static str,
     pub spawn: fn(WorkflowContext, instance_id: usize) -> Result<()>,
     pub banner: fn(&Config, &mut Banner),
-    pub validate_config: fn(&AgentSection) -> Result<()>,
+    pub validate_config: fn(&Config, &AgentSection) -> Result<()>,
 }
 
 pub struct AgentRegistry {
@@ -56,7 +56,7 @@ impl Default for AgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::agent::{AgentModel, CoreAgent};
+    use crate::core::agent::CoreAgent;
     use crate::core::config::Config;
 
     struct AlphaAgentForTest;
@@ -68,11 +68,15 @@ mod tests {
             "alpha"
         }
 
-        fn model(&self) -> &AgentModel {
+        fn agent_id(&self) -> &str {
             unreachable!("test agent is never run")
         }
 
-        fn validate_config(section: &AgentSection) -> Result<()> {
+        fn shutdown(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
+            unreachable!("test agent is never run")
+        }
+
+        fn validate_config(_config: &Config, section: &AgentSection) -> Result<()> {
             if section.core.instances > 1 {
                 anyhow::bail!("alpha supports at most one instance");
             }
@@ -131,7 +135,7 @@ mod tests {
         reg.register_agent::<AlphaAgentForTest>();
         let registration = reg.find("alpha").unwrap();
 
-        let err = (registration.validate_config)(cfg.agent("alpha").unwrap()).unwrap_err();
+        let err = (registration.validate_config)(&cfg, cfg.agent("alpha").unwrap()).unwrap_err();
         assert!(err.to_string().contains("at most one instance"));
     }
 }
