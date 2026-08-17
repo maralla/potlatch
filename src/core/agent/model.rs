@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::{error, fmt};
 
 use anyhow::{Context, Result};
 use tracing::{debug, warn};
@@ -34,6 +35,19 @@ pub struct TypedCompletion<T> {
     pub response: String,
     pub output: T,
 }
+
+#[derive(Debug)]
+struct StructuredOutputRetriesExhausted {
+    message: String,
+}
+
+impl fmt::Display for StructuredOutputRetriesExhausted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl error::Error for StructuredOutputRetriesExhausted {}
 
 /// Agent-facing model API. Engine construction is internal to core.
 pub struct AgentModel {
@@ -111,12 +125,7 @@ impl AgentModel {
 
         let tools = [T::tool_definition()];
         let initial = self.engine.invoke(prompt, options, &tools)?.handoff;
-        let completion =
-            resolve_structured_output::<T>(&self.agent_id, initial, |repair_prompt| {
-                self.engine
-                    .invoke_in_session(repair_prompt, options)
-                    .map(|response| response.handoff)
-            })?;
+        let completion = self.resolve_typed_in_session::<T>(initial, options)?;
 
         let narration = completion.response.trim();
         if !narration.is_empty() {
@@ -127,6 +136,42 @@ impl AgentModel {
             );
         }
         Ok(completion)
+    }
+
+    /// Continue the current task session and decode another structured result
+    /// using the contract already registered by [`Self::complete_typed`].
+    /// Worker uses this to nudge an implementation that returned no usable
+    /// result or made no code changes without discarding its session context.
+    pub fn continue_typed<T: StructuredOutput>(
+        &self,
+        prompt: &str,
+        options: &InvokeOptions,
+    ) -> Result<TypedCompletion<T>> {
+        let activity_label = options
+            .activity_label
+            .clone()
+            .unwrap_or_else(|| self.agent_id.clone());
+        let _activity = self.activity.start(activity_label);
+        let initial = self.engine.invoke_in_session(prompt, options)?.handoff;
+        self.resolve_typed_in_session::<T>(initial, options)
+    }
+
+    /// Whether a typed completion exhausted its in-session correction turns.
+    /// Transport, cancellation, and task errors intentionally return false.
+    pub fn structured_output_retries_exhausted(error: &anyhow::Error) -> bool {
+        error.is::<StructuredOutputRetriesExhausted>()
+    }
+
+    fn resolve_typed_in_session<T: StructuredOutput>(
+        &self,
+        initial: AgentHandoff,
+        options: &InvokeOptions,
+    ) -> Result<TypedCompletion<T>> {
+        resolve_structured_output::<T>(&self.agent_id, initial, |repair_prompt| {
+            self.engine
+                .invoke_in_session(repair_prompt, options)
+                .map(|response| response.handoff)
+        })
     }
 
     /// Set the capability provider (called by the agent at construction).
@@ -267,12 +312,14 @@ fn resolve_structured_output<T: StructuredOutput>(
 
         if attempt >= MAX_STRUCTURED_OUTPUT_REPAIRS {
             let preview: String = handoff.response.chars().take(800).collect();
-            anyhow::bail!(
-                "{agent_id}: `{tool_name}` structured output still invalid after \
-                 {MAX_STRUCTURED_OUTPUT_REPAIRS} correction attempt(s) — {correction}; \
-                 last response preview: {preview:?}",
-                correction = error.correction(tool_name),
-            );
+            return Err(anyhow::Error::new(StructuredOutputRetriesExhausted {
+                message: format!(
+                    "{agent_id}: `{tool_name}` structured output still invalid after \
+                     {MAX_STRUCTURED_OUTPUT_REPAIRS} correction attempt(s) — {correction}; \
+                     last response preview: {preview:?}",
+                    correction = error.correction(tool_name),
+                ),
+            }));
         }
 
         attempt += 1;
@@ -469,7 +516,9 @@ mod tests {
     fn every_repair_attempt_is_actually_sent_before_giving_up() {
         let bad = || handoff_with_tool("sample_tool", json!({"decision": "maybe"}));
         let (result, prompts) = resolve_with_script(bad(), vec![bad(), bad(), bad()]);
-        let error = result.unwrap_err().to_string();
+        let error = result.unwrap_err();
+        assert!(AgentModel::structured_output_retries_exhausted(&error));
+        let error = error.to_string();
         assert_eq!(prompts.len(), MAX_STRUCTURED_OUTPUT_REPAIRS as usize);
         for (index, prompt) in prompts.iter().enumerate() {
             assert!(

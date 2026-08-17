@@ -38,6 +38,14 @@ const WORKER_PENDING_LABEL: &str = "pending";
 const WORKER_REVIEW_ONLY_LABEL: &str = "review-only";
 /// ACP runtime message when `cancel_check` returns true.
 const WORKER_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
+const WORKER_MISSING_OUTPUT_NUDGE: &str = "Continue this implementation in the current session. \
+Your previous turns did not produce the required structured result. Do not restart or merely \
+explain the task: finish the work, then submit the result using the backend-provided structured \
+output format.";
+const WORKER_NO_CHANGES_NUDGE: &str = "Continue this implementation in the current session. \
+Your previous result claimed completion, but the repository has no code changes for this issue. \
+Inspect the current workspace, make the required implementation and tests, then submit an updated \
+structured result. Do not merely repeat the previous answer.";
 
 /// The name of the structured-output tool both worker contracts use. An
 /// implementation run and a feedback run are different tasks with different
@@ -2691,6 +2699,9 @@ enum ImplAction {
     InvokeImplementationModel {
         prompt: String,
     },
+    /// Continue the same model session after a nominally successful handoff
+    /// produced no repository changes.
+    NudgeImplementationModel,
     StageAll,
     Commit {
         message: String,
@@ -2795,6 +2806,7 @@ enum ImplStage {
     ObserveIssueComments,
     BuildPrompt,
     InvokeModel,
+    NudgeModelAfterNoChanges,
     ObserveExistingMrState(u64),
     ResetForExistingMr(u64),
     ObserveDefaultForExistingMr(u64),
@@ -2946,6 +2958,9 @@ impl<'a> ImplementationMachine<'a> {
             ImplStage::InvokeModel => ImplStep::Act(ImplAction::InvokeImplementationModel {
                 prompt: self.prompt.clone(),
             }),
+            ImplStage::NudgeModelAfterNoChanges => {
+                ImplStep::Act(ImplAction::NudgeImplementationModel)
+            }
             ImplStage::ObserveExistingMrState(mr_iid) => {
                 ImplStep::Observe(ImplQuery::MergeRequestState { mr_iid })
             }
@@ -3129,10 +3144,11 @@ impl<'a> ImplementationMachine<'a> {
             (ImplStage::ObserveDiffBeforePush, ImplFact::DiffAgainstDefault(has_diff)) => {
                 if !has_diff {
                     warn!(
-                        "Issue #{}: agent produced no code changes, retrying",
+                        "Issue #{}: agent produced no code changes, nudging the current session",
                         self.issue.iid
                     );
-                    anyhow::bail!("{}", no_code_changes_retry_error_message(self.issue.iid));
+                    self.stage = ImplStage::NudgeModelAfterNoChanges;
+                    return Ok(());
                 }
                 self.stage = ImplStage::PushBranch;
             }
@@ -3235,7 +3251,10 @@ impl<'a> ImplementationMachine<'a> {
                 self.prompt = prompt;
                 self.stage = ImplStage::InvokeModel;
             }
-            (ImplStage::InvokeModel, ImplOutcome::Model(result)) => {
+            (
+                ImplStage::InvokeModel | ImplStage::NudgeModelAfterNoChanges,
+                ImplOutcome::Model(result),
+            ) => {
                 self.stage = match result {
                     ImplModelResult::Cancelled => ImplStage::Finish,
                     ImplModelResult::Output(output) => {
@@ -3431,6 +3450,55 @@ struct LiveImplementationPort<'a> {
     scope_label: Option<&'a str>,
 }
 
+impl LiveImplementationPort<'_> {
+    fn invoke_implementation_model(&self, initial_prompt: Option<&str>) -> Result<ImplModelResult> {
+        let issue_iid = self.issue.iid;
+        let options = InvokeOptions {
+            cancel_check: Some(worker_issue_cancel_check(
+                self.state.glab.clone(),
+                issue_iid,
+            )),
+            follow_up_poll: None,
+            activity_label: Some(format!(
+                "{} implementing issue #{}",
+                self.state.agent_id, issue_iid
+            )),
+        };
+        let mut completion = match initial_prompt {
+            Some(prompt) => self
+                .model
+                .complete_typed::<WorkerImplementationOutput>(prompt, &options),
+            None => self
+                .model
+                .continue_typed::<WorkerImplementationOutput>(WORKER_NO_CHANGES_NUDGE, &options),
+        };
+
+        loop {
+            match completion {
+                Ok(completion) => {
+                    return Ok(ImplModelResult::Output(Box::new(completion.output)));
+                }
+                Err(error)
+                    if handle_worker_issue_processing_cancelled(self.state, issue_iid, &error) =>
+                {
+                    return Ok(ImplModelResult::Cancelled);
+                }
+                Err(error) if AgentModel::structured_output_retries_exhausted(&error) => {
+                    warn!(
+                        "{}: issue #{} still has no valid structured result; nudging the current session",
+                        self.state.agent_id, issue_iid
+                    );
+                    completion = self.model.continue_typed::<WorkerImplementationOutput>(
+                        WORKER_MISSING_OUTPUT_NUDGE,
+                        &options,
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 impl ImplementationPort for LiveImplementationPort<'_> {
     fn closes_linked_mr(&self) -> Option<ClosesLinkedMr> {
         closes_keyword_mr_status(self.state.glab, self.issue.iid)
@@ -3591,29 +3659,15 @@ impl ImplementationPort for LiveImplementationPort<'_> {
                 }
             }
             ImplAction::InvokeImplementationModel { prompt } => {
-                match self.model.complete_typed::<WorkerImplementationOutput>(
-                    prompt,
-                    &InvokeOptions {
-                        cancel_check: Some(worker_issue_cancel_check(
-                            state.glab.clone(),
-                            issue_iid,
-                        )),
-                        follow_up_poll: None,
-                        activity_label: Some(format!(
-                            "{} implementing issue #{}",
-                            state.agent_id, issue_iid
-                        )),
-                    },
-                ) {
-                    Ok(completion) => {
-                        ImplOutcome::Model(ImplModelResult::Output(Box::new(completion.output)))
-                    }
-                    Err(e) if handle_worker_issue_processing_cancelled(state, issue_iid, &e) => {
-                        ImplOutcome::Model(ImplModelResult::Cancelled)
-                    }
-                    Err(e) => ImplOutcome::Failed(e),
+                match self.invoke_implementation_model(Some(prompt)) {
+                    Ok(result) => ImplOutcome::Model(result),
+                    Err(error) => ImplOutcome::Failed(error),
                 }
             }
+            ImplAction::NudgeImplementationModel => match self.invoke_implementation_model(None) {
+                Ok(result) => ImplOutcome::Model(result),
+                Err(error) => ImplOutcome::Failed(error),
+            },
             ImplAction::StageAll => match state.git_repo.add_all() {
                 Ok(()) => ImplOutcome::Done,
                 Err(e) => ImplOutcome::Failed(e),
@@ -5425,13 +5479,6 @@ fn extract_issue_number_from_branch(branch_name: &str) -> Result<u64> {
     }
 }
 
-fn no_code_changes_retry_error_message(issue_iid: u64) -> String {
-    format!(
-        "Worker produced no code changes for issue #{}; retrying without marking action-required",
-        issue_iid
-    )
-}
-
 fn load_issue_context(gitlab: &GitLabClient, issue_number: u64) -> Result<String> {
     match gitlab.get_issue(issue_number) {
         Ok(issue) => Ok(format!(
@@ -7109,15 +7156,6 @@ mod tests {
     #[test]
     fn extract_issue_number_from_branch_for_mr_source() {
         assert_eq!(extract_issue_number_from_branch("issue-42").unwrap(), 42);
-    }
-
-    #[test]
-    fn no_code_changes_retry_message_stays_internal() {
-        let message = no_code_changes_retry_error_message(42);
-        assert!(message.contains("retrying"));
-        assert!(message.contains("without marking action-required"));
-        assert!(!message.contains("may need more detail"));
-        assert!(!message.contains("different approach"));
     }
 
     #[test]
@@ -8806,7 +8844,8 @@ mod tests {
                 ImplAction::BuildPrompt { continuation, .. } => {
                     ImplOutcome::Prompt(format!("prompt(continuation={continuation})"))
                 }
-                ImplAction::InvokeImplementationModel { .. } => {
+                ImplAction::InvokeImplementationModel { .. }
+                | ImplAction::NudgeImplementationModel => {
                     ImplOutcome::Model(if self.model_cancelled {
                         ImplModelResult::Cancelled
                     } else {
@@ -9241,15 +9280,24 @@ mod tests {
     }
 
     #[test]
-    fn implementation_fails_the_run_when_the_agent_produced_no_code_changes() {
-        let mut port = FakeImplPort::new().with_diff_answers(&[false]);
+    fn implementation_nudges_the_same_session_when_the_agent_produced_no_code_changes() {
+        let mut port = FakeImplPort::new()
+            .nothing_staged()
+            .with_diff_answers(&[false, true]);
         let run = run_implementation(&mut port, None);
 
-        let error = run
-            .result
-            .expect_err("a run without code changes must be retried");
-        assert!(error.to_string().contains("no code changes"), "{error}");
-        // The branch is still recorded, so the cycle cleans it up.
+        assert_eq!(run.result.unwrap(), Some(12));
+        assert!(
+            run.trace
+                .contains(&i_act(ImplAction::NudgeImplementationModel))
+        );
+        assert_eq!(
+            run.trace
+                .iter()
+                .filter(|step| { matches!(step, ImplStep::Observe(ImplQuery::DiffAgainstDefault)) })
+                .count(),
+            2
+        );
         assert_eq!(run.branch, Some("issue-7".to_string()));
     }
 
