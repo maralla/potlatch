@@ -620,9 +620,12 @@ fn is_transient_llm_error(err: &anyhow::Error) -> bool {
 
 /// Fake LLM client for testing — returns scripted responses in sequence.
 #[cfg(test)]
+type ChatCallback = Box<dyn Fn(&[Value]) + Send + Sync>;
+
+#[cfg(test)]
 pub struct FakeChatClient {
     responses: std::sync::Mutex<Vec<ChatResponse>>,
-    on_chat: Option<Box<dyn Fn(&[Value]) + Send + Sync>>,
+    on_chat: Option<ChatCallback>,
 }
 
 #[cfg(test)]

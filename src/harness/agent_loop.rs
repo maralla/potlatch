@@ -1060,7 +1060,7 @@ mod tests {
         // The first LLM call should contain both the original prompt and the
         // injected message.
         let captured = captured_messages.lock().unwrap();
-        assert!(captured.len() >= 1);
+        assert!(!captured.is_empty());
         let first_call = &captured[0];
         let all_text: String = first_call
             .iter()

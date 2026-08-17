@@ -11,95 +11,221 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient};
-use crate::agents::settings;
 use crate::agents::workspace::{
-    ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
+    GitLabAgentBootstrap, gitlab_banner, validate_instance_id, validate_max_instances,
 };
-use crate::core::agent::{AgentHandoff, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::agent::{InvokeOptions, ObjectSchema, SchemaField, StructuredOutput};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
+use crate::core::periodic::PeriodicTaskSpec;
 
 pub(crate) const NAME: &str = "qa";
 const MAX_INSTANCES: usize = 1;
 
 const QA_LABEL: &str = crate::agents::labels::QA;
 const DO_NOT_IMPLEMENT_LABEL: &str = crate::agents::labels::DO_NOT_IMPLEMENT;
-const QA_FINDINGS_BEGIN: &str = "QA_FINDINGS_BEGIN";
-const QA_FINDINGS_END: &str = "QA_FINDINGS_END";
-const QA_CLARIFICATION_BEGIN: &str = "QA_CLARIFICATION_BEGIN";
-const QA_CLARIFICATION_END: &str = "QA_CLARIFICATION_END";
 
-/// The QA agent's structured-output tool definition. Passed to the harness
-/// via `session/new` so the harness registers a generic `StructuredOutputTool`
-/// named `qa_report`. The model calls it with its findings and clarification
-/// questions as structured JSON instead of emitting text markers.
-fn qa_tool_definition() -> serde_json::Value {
-    serde_json::json!({
-        "name": "qa_report",
-        "description": "Emit your QA test findings and clarification questions as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response. Call this exactly once with your results.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "findings": {
-                    "description": "Test findings (bugs). Empty array if no bugs found.",
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {
-                                "description": "Short actionable title for the finding.",
-                                "type": "string"
-                            },
-                            "description": {
-                                "description": "Detailed description with steps to reproduce, expected vs actual behavior, and impact.",
-                                "type": "string"
-                            },
-                            "severity": {
-                                "description": "Severity: \"critical\", \"high\", \"medium\", or \"low\".",
-                                "type": "string",
-                                "enum": ["critical", "high", "medium", "low"]
-                            },
-                            "file": {
-                                "description": "Source file and line number if known (e.g. \"src/path/to/file.rs:123\"). Omit if unknown.",
-                                "type": "string"
-                            }
-                        },
-                        "required": ["title", "description", "severity"]
-                    }
-                },
-                "clarifications": {
-                    "description": "Clarification questions for humans. Empty array if none.",
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": {
-                                "description": "The clarification question.",
-                                "type": "string"
-                            },
-                            "context": {
-                                "description": "Context explaining why the question is needed.",
-                                "type": "string"
-                            }
-                        },
-                        "required": ["question", "context"]
-                    }
-                }
-            },
-            "required": ["findings"]
+/// A finding's severity, as the model reports it via the `qa_report` tool.
+/// Unknown or missing values default to `Low`, preserving the pre-typed
+/// behavior of treating unrecognized severity as non-blocking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Severity {
+    Critical,
+    High,
+    Medium,
+    #[default]
+    Low,
+}
+
+impl<'de> Deserialize<'de> for Severity {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.trim().to_ascii_lowercase().as_str() {
+            "critical" => Self::Critical,
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            _ => Self::Low,
+        })
+    }
+}
+
+impl Severity {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Severity::Critical => "critical",
+            Severity::High => "high",
+            Severity::Medium => "medium",
+            Severity::Low => "low",
         }
-    })
+    }
+
+    fn is_non_trivial(&self) -> bool {
+        !matches!(self, Severity::Low)
+    }
+
+    fn priority(&self) -> u8 {
+        match self {
+            Severity::Critical => 1,
+            Severity::High => 2,
+            Severity::Medium | Severity::Low => 3,
+        }
+    }
+}
+
+/// One finding as the model described it via the `qa_report` tool's
+/// `findings` array, before the empty-title/description defensive filtering
+/// in [`normalize_qa_findings`] is applied.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawQaFinding {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    severity: Severity,
+    #[serde(default)]
+    file: String,
+}
+
+/// One clarification question as the model described it via the
+/// `qa_report` tool's `clarifications` array, before the empty-question
+/// filtering in [`normalize_clarifications`] is applied.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawClarification {
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    context: String,
+}
+
+/// The QA agent's typed structured-output contract. The model calls the
+/// `qa_report` tool with its findings and clarification questions; core
+/// deserializes the captured JSON into this type (see
+/// [`AgentModel::complete_typed`]).
+#[derive(Debug, Clone, Deserialize)]
+struct QaOutput {
+    #[serde(default)]
+    findings: Vec<RawQaFinding>,
+    #[serde(default)]
+    clarifications: Vec<RawClarification>,
+}
+
+impl StructuredOutput for QaOutput {
+    fn tool_name() -> &'static str {
+        "qa_report"
+    }
+
+    fn tool_description() -> &'static str {
+        "Emit your QA test findings and clarification questions as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your results."
+    }
+
+    fn schema() -> ObjectSchema {
+        ObjectSchema::new()
+            .property(
+                "findings",
+                SchemaField::array(
+                    "Test findings (bugs). Empty array if no bugs found.",
+                    SchemaField::object(
+                        ObjectSchema::new()
+                            .property(
+                                "title",
+                                SchemaField::string("Short actionable title for the finding."),
+                            )
+                            .property(
+                                "description",
+                                SchemaField::string(
+                                    "Detailed description with steps to reproduce, expected vs actual behavior, and impact.",
+                                ),
+                            )
+                            .property(
+                                "severity",
+                                SchemaField::string_enum(
+                                    "Severity: \"critical\", \"high\", \"medium\", or \"low\".",
+                                    &["critical", "high", "medium", "low"],
+                                ),
+                            )
+                            .property(
+                                "file",
+                                SchemaField::string(
+                                    "Source file and line number if known (e.g. \"src/path/to/file.rs:123\"). Omit if unknown.",
+                                ),
+                            )
+                            .required("title")
+                            .required("description")
+                            .required("severity"),
+                    ),
+                ),
+            )
+            .property(
+                "clarifications",
+                SchemaField::array(
+                    "Clarification questions for humans. Empty array if none.",
+                    SchemaField::object(
+                        ObjectSchema::new()
+                            .property("question", SchemaField::string("The clarification question."))
+                            .property(
+                                "context",
+                                SchemaField::string("Context explaining why the question is needed."),
+                            )
+                            .required("question")
+                            .required("context"),
+                    ),
+                ),
+            )
+            .required("findings")
+    }
+}
+
+/// Drop findings with an empty title or description (the model occasionally
+/// emits a placeholder entry).
+fn normalize_qa_findings(raw: Vec<RawQaFinding>) -> Vec<QaFinding> {
+    raw.into_iter()
+        .filter_map(|f| {
+            let title = f.title.trim().to_string();
+            if title.is_empty() {
+                return None;
+            }
+            let description = f.description.trim().to_string();
+            if description.is_empty() {
+                return None;
+            }
+            Some(QaFinding {
+                title,
+                description,
+                severity: f.severity,
+                file: f.file,
+            })
+        })
+        .collect()
+}
+
+/// Drop clarifications with an empty question.
+fn normalize_clarifications(raw: Vec<RawClarification>) -> Vec<ClarificationQuestion> {
+    raw.into_iter()
+        .filter_map(|c| {
+            let question = c.question.trim().to_string();
+            if question.is_empty() {
+                return None;
+            }
+            Some(ClarificationQuestion {
+                question,
+                context: c.context,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -198,16 +324,15 @@ struct ShaHistory(HashMap<String, String>);
 // Parsed output types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct QaFinding {
     title: String,
     description: String,
-    severity: String,
-    #[serde(default)]
+    severity: Severity,
     file: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct ClarificationQuestion {
     question: String,
     context: String,
@@ -224,111 +349,79 @@ impl CoreAgent for QaAgent {
         NAME
     }
 
-    fn model(&self) -> &AgentModel {
-        &self.model
+    fn agent_id(&self) -> &str {
+        &self.state.agent_id
     }
 
-    fn banner(_config: &Config, banner: &mut Banner) {
-        if let Some(repo) = settings::settings().gitlab_repo() {
-            banner.set_once("repo", repo);
-        }
+    fn shutdown(&self) -> &Arc<AtomicBool> {
+        self.model.shutdown()
     }
 
-    fn validate_config(section: &crate::core::config::AgentSection) -> Result<()> {
-        validate_instance_count(section.core.instances)?;
+    fn banner(config: &Config, banner: &mut Banner) {
+        gitlab_banner(config, banner);
+    }
+
+    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+        super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        validate_max_instances(NAME, section.core.instances, MAX_INSTANCES)?;
         QaAgentSettings::from_raw(&section.raw)?;
         Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
-        vec![PeriodicTaskSpec {
-            id: "qa_poll",
-            interval: Duration::from_secs(self.config.poll_interval_secs),
-            jitter: JitterPolicy::BeforeEachCycle,
-            jitter_max_ms: 5000,
-            autostart: true,
-        }]
+        vec![PeriodicTaskSpec::polling(
+            "qa_poll",
+            Duration::from_secs(self.config.poll_interval_secs),
+        )]
     }
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "qa_poll" => {
                 let scope = crate::agents::scope_label_filter(&self.scope_label);
-                let shutdown = Arc::clone(self.model.shutdown());
-                if let Err(e) = qa_cycle(&self.state, &self.config, &self.model, scope)
-                    && !shutdown.load(Ordering::SeqCst)
-                {
-                    error!("{}: QA cycle error: {}", self.state.agent_id, e);
-                }
-                Ok(())
+                qa_cycle(&self.state, &self.config, &self.model, scope)
             }
             _ => Ok(()),
         }
     }
 
     fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let gitlab_repo = require_gitlab_repo()?;
         let section = ctx
             .workflow
             .config
             .agent(NAME)
             .context("[agent.qa] section required")?;
-        validate_instance_count(section.core.instances)?;
-        ensure!(
-            ctx.instance_id < MAX_INSTANCES,
-            "[agent.qa] invalid instance id {} (only instance 0 is supported)",
-            ctx.instance_id
-        );
+        validate_max_instances(NAME, section.core.instances, MAX_INSTANCES)?;
+        validate_instance_id(NAME, ctx.instance_id, MAX_INSTANCES)?;
         let agent_settings = QaAgentSettings::from_raw(&section.raw)?;
-        let project_name = extract_project_name(&gitlab_repo)?;
-        let agent_id = format!("qa-{}", ctx.instance_id);
-        ensure_agent_repo(
-            &ctx.workflow.base_dir,
-            &gitlab_repo,
-            &project_name,
-            &agent_id,
-        )?;
-        let working_dir = work_dir(&ctx.workflow.base_dir, &project_name, &agent_id);
-        let sessions = sessions_dir(&ctx.workflow.base_dir, &project_name);
-        let git_repo = GitRepo::new(working_dir.clone());
+        let runtime = GitLabAgentBootstrap::new(
+            &ctx,
+            NAME,
+            ModelPreferences {
+                structured_output_tools: Some(vec![QaOutput::tool_definition()]),
+                ..ModelPreferences::default()
+            },
+        )
+        .build()?;
         let state = AgentState {
-            agent_id: agent_id.clone(),
-            sessions_dir: sessions.clone(),
-            git_repo,
-            glab: GitLabClient::new(working_dir.clone(), &gitlab_repo)?,
+            agent_id: runtime.agent_id,
+            sessions_dir: runtime.sessions_dir,
+            git_repo: runtime.git_repo,
+            glab: runtime.gitlab,
         };
         let config = QaConfig {
             poll_interval_secs: agent_settings.poll_interval_secs,
             branches: agent_settings.branches,
         };
-        let model = AgentModel::connect(
-            &ctx,
-            "qa",
-            working_dir,
-            ModelPreferences {
-                structured_output_tools: Some(vec![qa_tool_definition()]),
-                ..ModelPreferences::default()
-            },
-        )?;
-        let global = settings::settings();
         Ok(Self {
             state,
-            model,
+            model: runtime.model,
             config,
-            scope_label: global.scope_label.clone(),
+            scope_label: runtime.scope_label,
         })
     }
 
     fn on_shutdown(&mut self) {}
-}
-
-pub(crate) fn validate_instance_count(instances: usize) -> Result<()> {
-    if instances > MAX_INSTANCES {
-        bail!(
-            "[agent.qa] supports at most one instance (instances must be 0 or 1, got {instances})"
-        );
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +534,7 @@ fn qa_cycle(
         },
     );
 
-    let agent_output = model.complete(
+    let completion = model.complete_typed::<QaOutput>(
         &prompt,
         &InvokeOptions {
             activity_label: Some(format!("{} QA analysis on {}", state.agent_id, branch)),
@@ -455,8 +548,8 @@ fn qa_cycle(
 
     // --- Parse outputs ---
 
-    let findings = extract_qa_findings(&agent_output);
-    let clarification_questions = extract_qa_clarifications(&agent_output);
+    let findings = normalize_qa_findings(completion.output.findings);
+    let clarification_questions = normalize_clarifications(completion.output.clarifications);
 
     // --- Close answered clarification issues ---
     // A clarification issue carries QA + DO_NOT_IMPLEMENT; if a non-potlatch user
@@ -527,7 +620,7 @@ fn qa_cycle(
     let scope = scope_label;
     let mut created_count = 0;
     for finding in &findings {
-        if !is_non_trivial_finding(&finding.severity) {
+        if !finding.severity.is_non_trivial() {
             info!(
                 "{}: Skipping low-severity finding: {}",
                 state.agent_id, finding.title
@@ -544,7 +637,7 @@ fn qa_cycle(
 
         let description = format!(
             "**Severity:** {}\n**File:** {}\n**Branch:** {}\n**Commit:** {}\n\n{}\n\n---\n*Found by QA agent on {}*",
-            finding.severity,
+            finding.severity.as_str(),
             if finding.file.is_empty() {
                 "n/a".to_string()
             } else {
@@ -558,7 +651,7 @@ fn qa_cycle(
 
         match state.glab.create_issue(&finding.title, &description) {
             Ok(issue_iid) => {
-                let priority = severity_to_priority(&finding.severity);
+                let priority = finding.severity.priority();
                 let _ = state
                     .glab
                     .add_issue_label(issue_iid, &gitlab::priority_label(priority));
@@ -590,27 +683,12 @@ fn qa_cycle(
 
     // --- Update SHA history ---
     //
-    // Record the current commit as tested ONLY when the run actually performed
-    // testing — i.e. it emitted findings (including an empty findings array,
-    // which means "tested, no bugs found"). When the run produced only
-    // clarification questions, the commit was NOT tested: the model couldn't
-    // proceed without an answer. Recording the SHA here would make the next
-    // cycle skip this commit entirely, so the feature would never get tested
-    // once the clarification is answered. Skip the SHA update in that case so
-    // the next cycle re-tests the same commit.
-    let had_findings_block =
-        agent_output.response.contains(QA_FINDINGS_BEGIN) || qa_output(&agent_output).is_some();
-    let is_clarification_only =
-        !clarification_questions.is_empty() && !had_findings_block && findings.is_empty();
-    if is_clarification_only {
-        info!(
-            "{}: Skipping SHA history update for {} — run produced only clarification questions, commit not yet tested",
-            state.agent_id, cur_sha
-        );
-    } else {
-        sha_history.0.insert(branch.to_string(), cur_sha.clone());
-        save_sha_history(state, &sha_history);
-    }
+    // The `qa_report` tool call is mandatory (enforced by `complete_typed`),
+    // so every successful run means the model called it — with an empty
+    // `findings` array at minimum — and is therefore considered tested, even
+    // if it also asked clarification questions.
+    sha_history.0.insert(branch.to_string(), cur_sha.clone());
+    save_sha_history(state, &sha_history);
 
     Ok(())
 }
@@ -756,154 +834,22 @@ fn is_potlatch_author(author: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn load_sha_history(state: &AgentState) -> ShaHistory {
-    let path = state.sha_history_path();
-    match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => ShaHistory::default(),
-    }
-}
-
-fn save_sha_history(state: &AgentState, history: &ShaHistory) {
-    let path = state.sha_history_path();
-    match serde_json::to_string_pretty(history) {
-        Ok(json) => {
-            if let Err(e) = fs::write(&path, json) {
-                warn!("Failed to save SHA history: {}", e);
-            }
-        }
-        Err(e) => warn!("Failed to serialize SHA history: {}", e),
-    }
-}
-
-// ---------------------------------------------------------------------------
-
-/// Get a reference to the `qa_report` tool's captured JSON from
-/// `agent_output.structured_outputs`, or `None` if the tool wasn't called.
-fn qa_output(agent_output: &AgentHandoff) -> Option<&serde_json::Value> {
-    agent_output
-        .structured_outputs
-        .as_ref()
-        .and_then(|s| s.get("qa_report"))
-}
-
-fn extract_qa_findings(agent_output: &AgentHandoff) -> Vec<QaFinding> {
-    // Structured output first (from the `qa_report` tool).
-    if let Some(report) = qa_output(agent_output)
-        && let Some(findings) = report.get("findings").and_then(|v| v.as_array())
-    {
-        let parsed: Vec<QaFinding> = findings
-            .iter()
-            .filter_map(|item| {
-                let title = item.get("title").and_then(|v| v.as_str())?.to_string();
-                if title.is_empty() {
-                    return None;
-                }
-                let description = item
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if description.is_empty() {
-                    return None;
-                }
-                let severity = item
-                    .get("severity")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("low")
-                    .to_string();
-                let file = item
-                    .get("file")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Some(QaFinding {
-                    title,
-                    description,
-                    severity,
-                    file,
-                })
-            })
-            .collect();
-        return parsed;
-    }
-
-    // Fallback: text markers.
-    extract_json_block(&agent_output.response, QA_FINDINGS_BEGIN, QA_FINDINGS_END)
+    // Missing, unreadable, and corrupt history have historically reset QA history.
+    crate::core::state::StateStore::new(state.sha_history_path())
+        .load()
+        .ok()
+        .flatten()
         .unwrap_or_default()
 }
 
-/// Extract clarification questions from structured output first, then text markers.
-fn extract_qa_clarifications(agent_output: &AgentHandoff) -> Vec<ClarificationQuestion> {
-    // Structured output first (from the `qa_report` tool).
-    if let Some(report) = qa_output(agent_output)
-        && let Some(clarifications) = report.get("clarifications").and_then(|v| v.as_array())
-    {
-        let parsed: Vec<ClarificationQuestion> = clarifications
-            .iter()
-            .filter_map(|item| {
-                let question = item.get("question").and_then(|v| v.as_str())?.to_string();
-                if question.is_empty() {
-                    return None;
-                }
-                let context = item
-                    .get("context")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Some(ClarificationQuestion { question, context })
-            })
-            .collect();
-        return parsed;
-    }
-
-    // Fallback: text markers.
-    extract_json_block(
-        &agent_output.response,
-        QA_CLARIFICATION_BEGIN,
-        QA_CLARIFICATION_END,
-    )
-    .unwrap_or_default()
-}
-
-fn extract_json_block<T: serde::de::DeserializeOwned>(
-    response: &str,
-    begin: &str,
-    end: &str,
-) -> Option<Vec<T>> {
-    let begin_pos = response.find(begin)?;
-    let after_begin = &response[begin_pos + begin.len()..];
-    let end_pos = after_begin.find(end)?;
-    let json_text = after_begin[..end_pos].trim();
-    if json_text.is_empty() {
-        return Some(Vec::new());
-    }
-    match serde_json::from_str::<Vec<T>>(json_text) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            warn!("Failed to parse JSON block between {begin}/{end}: {e}");
-            None
-        }
+fn save_sha_history(state: &AgentState, history: &ShaHistory) {
+    let store = crate::core::state::StateStore::new(state.sha_history_path());
+    if let Err(e) = store.save(history) {
+        warn!("Failed to save SHA history: {}", e);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Severity helpers
-// ---------------------------------------------------------------------------
-
-fn is_non_trivial_finding(severity: &str) -> bool {
-    matches!(
-        severity.to_lowercase().as_str(),
-        "critical" | "high" | "medium"
-    )
-}
-
-fn severity_to_priority(severity: &str) -> u8 {
-    match severity.to_lowercase().as_str() {
-        "critical" => 1,
-        "high" => 2,
-        _ => 3,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Prompt builder
@@ -984,8 +930,8 @@ Use `git log --oneline -5` and the changed files above to identify which user-fa
 
 1. **Read the QA issues file and your knowledge files first.** Before any other action, read `{qa_issues_path}` with `read` (`outside_cwd: true`) to gather acceptance criteria and testing instructions for the functions in scope. Also read your knowledge files under `{knowledge_dir}/` to recall your functionality map and test plan.
 2. **Never fetch GitLab yourself.** Do not call `glab`, `fetch`, or any tool to read issues/MRs/commits from GitLab. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` and the full open-issue listing into `{open_issues_path}` — read those files.
-3. **Never report a duplicate finding.** Before emitting a finding in `QA_FINDINGS`, read `{open_issues_path}` and check whether an open issue already describes the same problem (by the QA agent, another agent, or a human). If it does, do not report that finding — the issue is already tracked. Compare by the underlying problem, not just exact-title match: a finding about "login returns 500 on empty password" duplicates an issue titled "Auth API crashes on malformed input" even though the wording differs. Only report a finding if no open issue covers the same root cause.
-4. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your `QA_FINDINGS` and `QA_CLARIFICATION` output blocks.
+3. **Never report a duplicate finding.** Before including a finding in the `qa_report` tool call, read `{open_issues_path}` and check whether an open issue already describes the same problem (by the QA agent, another agent, or a human). If it does, do not report that finding — the issue is already tracked. Compare by the underlying problem, not just exact-title match: a finding about "login returns 500 on empty password" duplicates an issue titled "Auth API crashes on malformed input" even though the wording differs. Only report a finding if no open issue covers the same root cause.
+4. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your `qa_report` tool call's `findings` and `clarifications`.
 5. **Never modify the working directory.** Do not use `write` or `edit` to create, modify, or delete anything inside the checked-out repo. Do not run `cd`, `git checkout`, `git commit`, or any command that mutates the repo tree.
 6. **Never run unit tests, build commands, or liveness/ops endpoints.** Do not run `cargo test`, `go test`, `go build`, `go vet`, `pytest`, `npm test`, or similar — these are the developer's responsibility and redundant for end-user testing; build commands also write artifacts into the repo. Do not test ops/liveness/health endpoints (`/ping`, `/monitor`, `/health`, `/metrics`, `/ready`, etc.) unless a QA-labeled issue explicitly asks you to — they are not functionality and testing them is noise. Allowed commands: `curl`/`python3` against real functionality APIs, invoking an already-built CLI binary the way a user would, and `python3` to run your own test scripts.
 
@@ -1005,27 +951,11 @@ Report genuine bugs, security vulnerabilities, race conditions, correctness issu
 
 ## Output Format
 
-Call the `qa_report` tool with your results. The tool has two fields:
+Call the `qa_report` tool exactly once with your results — this tool call is the only output channel Potlatch reads; there is no text-based fallback. The tool has two fields:
 - `findings` (required): a JSON array of objects with `title`, `description`, `severity` (critical/high/medium/low), and optional `file` (e.g. "src/path/to/file.rs:123"). Empty array if no bugs found.
 - `clarifications` (optional): a JSON array of objects with `question` and `context`. Omit or use empty array if no clarification needed.
 
-Only critical, high, and medium findings will be created as GitLab issues; low-severity findings are logged but not tracked. The `file` field is optional — leave it empty when the finding is observed externally and you cannot tie it to a specific source location. Findings and clarification questions may both be emitted in the same run.
-
-TEXT MARKER FALLBACK — if for any reason you cannot call the `qa_report` tool, you may use these text markers instead:
-
-{QA_FINDINGS_BEGIN}
-[
-  {{"title": "Short title", "description": "Detailed description with reproduction steps and observed vs expected behavior", "severity": "critical", "file": "src/path/to/file.rs:123"}}
-]
-{QA_FINDINGS_END}
-
-{QA_CLARIFICATION_BEGIN}
-[
-  {{"question": "Short question title", "context": "Detailed question with background"}}
-]
-{QA_CLARIFICATION_END}
-
-If no findings, return an empty array. If no clarification is needed, omit the clarification block or return an empty array."##
+Only critical, high, and medium findings will be created as GitLab issues; low-severity findings are logged but not tracked. The `file` field is optional — leave it empty when the finding is observed externally and you cannot tie it to a specific source location. Findings and clarification questions may both be emitted in the same run."##
     )
 }
 
@@ -1063,123 +993,106 @@ mod tests {
         assert!(QaAgentSettings::from_raw(&raw).is_err());
     }
 
-    // --- Findings extraction ---
+    // --- QaOutput deserialization ---
 
     #[test]
-    fn extract_qa_findings_parses_json() {
-        let out = AgentHandoff {
-            response: format!(
-                "Some analysis\n{begin}\n[\n  {{\"title\": \"SQL injection in query.rs\", \"description\": \"User input is not sanitized\", \"severity\": \"critical\", \"file\": \"src/query.rs:42\"}}\n]\n{end}\nDone",
-                begin = QA_FINDINGS_BEGIN,
-                end = QA_FINDINGS_END
-            ),
-            ..Default::default()
-        };
-        let findings = extract_qa_findings(&out);
+    fn qa_output_deserializes_findings_and_clarifications() {
+        let output: QaOutput = serde_json::from_value(serde_json::json!({
+            "findings": [
+                {
+                    "title": "SQL injection in query.rs",
+                    "description": "User input is not sanitized",
+                    "severity": "critical",
+                    "file": "src/query.rs:42"
+                }
+            ],
+            "clarifications": [
+                {"question": "What framework?", "context": "Need to know the test framework"}
+            ]
+        }))
+        .unwrap();
+        let findings = normalize_qa_findings(output.findings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].title, "SQL injection in query.rs");
-        assert_eq!(findings[0].severity, "critical");
+        assert_eq!(findings[0].severity, Severity::Critical);
         assert_eq!(findings[0].file, "src/query.rs:42");
+
+        let clarifications = normalize_clarifications(output.clarifications);
+        assert_eq!(clarifications.len(), 1);
+        assert_eq!(clarifications[0].question, "What framework?");
+        assert!(clarifications[0].context.contains("test framework"));
     }
 
     #[test]
-    fn extract_qa_findings_returns_empty_when_absent() {
-        let out = AgentHandoff {
-            response: "No findings markers here".to_string(),
-            ..Default::default()
-        };
-        assert!(extract_qa_findings(&out).is_empty());
+    fn qa_output_defaults_to_empty_when_fields_absent() {
+        let output: QaOutput = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(output.findings.is_empty());
+        assert!(output.clarifications.is_empty());
     }
 
     #[test]
-    fn extract_qa_findings_handles_malformed_json() {
-        let out = AgentHandoff {
-            response: format!(
-                "{}\n[not valid json]\n{}",
-                QA_FINDINGS_BEGIN, QA_FINDINGS_END
-            ),
-            ..Default::default()
-        };
-        assert!(extract_qa_findings(&out).is_empty());
+    fn qa_output_normalizes_case_and_defaults_unknown_severity_to_low() {
+        let output = serde_json::from_value::<QaOutput>(serde_json::json!({
+            "findings": [
+                {"title": "Bug", "description": "d", "severity": "HIGH"},
+                {"title": "Odd", "description": "d", "severity": "apocalyptic"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(output.findings[0].severity, Severity::High);
+        assert_eq!(output.findings[1].severity, Severity::Low);
     }
 
     #[test]
-    fn extract_qa_findings_parses_multiple() {
-        let out = AgentHandoff {
-            response: format!(
-                "{begin}\n[\n  {{\"title\": \"Bug A\", \"description\": \"d1\", \"severity\": \"high\", \"file\": \"a.rs:1\"}},\n  {{\"title\": \"Bug B\", \"description\": \"d2\", \"severity\": \"medium\", \"file\": \"b.rs:2\"}}\n]\n{end}",
-                begin = QA_FINDINGS_BEGIN,
-                end = QA_FINDINGS_END
-            ),
-            ..Default::default()
-        };
-        let findings = extract_qa_findings(&out);
-        assert_eq!(findings.len(), 2);
-        assert_eq!(findings[1].title, "Bug B");
-    }
-
-    #[test]
-    fn extract_qa_findings_handles_missing_file_field() {
-        let out = AgentHandoff {
-            response: format!(
-                "{begin}\n[{{\"title\": \"Bug\", \"description\": \"d\", \"severity\": \"high\"}}]\n{end}",
-                begin = QA_FINDINGS_BEGIN,
-                end = QA_FINDINGS_END
-            ),
-            ..Default::default()
-        };
-        let findings = extract_qa_findings(&out);
+    fn normalize_qa_findings_skips_empty_title_or_description() {
+        let raw = vec![
+            RawQaFinding {
+                title: "".into(),
+                description: "no title".into(),
+                ..Default::default()
+            },
+            RawQaFinding {
+                title: "No desc".into(),
+                description: "".into(),
+                ..Default::default()
+            },
+            RawQaFinding {
+                title: "Bug A".into(),
+                description: "d1".into(),
+                severity: Severity::High,
+                file: "a.rs:1".into(),
+            },
+        ];
+        let findings = normalize_qa_findings(raw);
         assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "Bug A");
+    }
+
+    #[test]
+    fn normalize_qa_findings_defaults_missing_severity_to_low() {
+        let raw = vec![RawQaFinding {
+            title: "Bug".into(),
+            description: "d".into(),
+            ..Default::default()
+        }];
+        let findings = normalize_qa_findings(raw);
+        assert_eq!(findings[0].severity, Severity::Low);
         assert_eq!(findings[0].file, "");
     }
 
-    // --- Clarification extraction ---
-
     #[test]
-    fn extract_clarification_questions_parses_json() {
-        let out = AgentHandoff {
-            response: format!(
-                "{begin}\n[{{\"question\": \"What framework?\", \"context\": \"Need to know the test framework\"}}]\n{end}",
-                begin = QA_CLARIFICATION_BEGIN,
-                end = QA_CLARIFICATION_END
-            ),
-            ..Default::default()
-        };
-        let questions: Vec<ClarificationQuestion> =
-            extract_json_block(&out.response, QA_CLARIFICATION_BEGIN, QA_CLARIFICATION_END)
-                .unwrap_or_default();
-        assert_eq!(questions.len(), 1);
-        assert_eq!(questions[0].question, "What framework?");
-        assert!(questions[0].context.contains("test framework"));
-    }
-
-    #[test]
-    fn extract_clarification_questions_returns_empty_when_absent() {
-        let out = AgentHandoff {
-            response: "no clarification markers".to_string(),
-            ..Default::default()
-        };
-        let questions: Vec<ClarificationQuestion> =
-            extract_json_block(&out.response, QA_CLARIFICATION_BEGIN, QA_CLARIFICATION_END)
-                .unwrap_or_default();
-        assert!(questions.is_empty());
-    }
-
-    #[test]
-    fn extract_clarification_questions_alongside_findings() {
-        let out = AgentHandoff {
-            response: format!(
-                "{find_begin}\n[]\n{find_end}\n{clar_begin}\n[{{\"question\": \"Which DB?\", \"context\": \"Need to know the database to write migration tests\"}}]\n{clar_end}",
-                find_begin = QA_FINDINGS_BEGIN,
-                find_end = QA_FINDINGS_END,
-                clar_begin = QA_CLARIFICATION_BEGIN,
-                clar_end = QA_CLARIFICATION_END
-            ),
-            ..Default::default()
-        };
-        let questions: Vec<ClarificationQuestion> =
-            extract_json_block(&out.response, QA_CLARIFICATION_BEGIN, QA_CLARIFICATION_END)
-                .unwrap_or_default();
+    fn normalize_clarifications_skips_empty_question() {
+        let raw = vec![
+            RawClarification {
+                question: "".into(),
+                context: "no question".into(),
+            },
+            RawClarification {
+                question: "Which DB?".into(),
+                context: "Need to know the database to write migration tests".into(),
+            },
+        ];
+        let questions = normalize_clarifications(raw);
         assert_eq!(questions.len(), 1);
         assert_eq!(questions[0].question, "Which DB?");
         assert!(questions[0].context.contains("migration tests"));
@@ -1188,28 +1101,19 @@ mod tests {
     // --- Severity helpers ---
 
     #[test]
-    fn is_non_trivial_finding_filters_low_severity() {
-        assert!(is_non_trivial_finding("critical"));
-        assert!(is_non_trivial_finding("high"));
-        assert!(is_non_trivial_finding("medium"));
-        assert!(!is_non_trivial_finding("low"));
-        assert!(!is_non_trivial_finding("info"));
+    fn severity_is_non_trivial_filters_low() {
+        assert!(Severity::Critical.is_non_trivial());
+        assert!(Severity::High.is_non_trivial());
+        assert!(Severity::Medium.is_non_trivial());
+        assert!(!Severity::Low.is_non_trivial());
     }
 
     #[test]
-    fn is_non_trivial_finding_is_case_insensitive() {
-        assert!(is_non_trivial_finding("Critical"));
-        assert!(is_non_trivial_finding("HIGH"));
-        assert!(!is_non_trivial_finding("Low"));
-    }
-
-    #[test]
-    fn severity_to_priority_maps_correctly() {
-        assert_eq!(severity_to_priority("critical"), 1);
-        assert_eq!(severity_to_priority("high"), 2);
-        assert_eq!(severity_to_priority("medium"), 3);
-        assert_eq!(severity_to_priority("low"), 3);
-        assert_eq!(severity_to_priority("unknown"), 3);
+    fn severity_priority_maps_correctly() {
+        assert_eq!(Severity::Critical.priority(), 1);
+        assert_eq!(Severity::High.priority(), 2);
+        assert_eq!(Severity::Medium.priority(), 3);
+        assert_eq!(Severity::Low.priority(), 3);
     }
 
     // --- SHA history ---
@@ -1308,10 +1212,14 @@ mod tests {
         assert!(prompt.contains("abc123"));
         assert!(prompt.contains("def456"));
         assert!(prompt.contains("src/main.rs"));
-        // Output blocks.
-        assert!(prompt.contains(QA_FINDINGS_BEGIN));
-        assert!(prompt.contains(QA_CLARIFICATION_BEGIN));
-        // Removed blocks must be absent.
+        // The `qa_report` tool is the only output channel.
+        assert!(prompt.contains("Call the `qa_report` tool"));
+        assert!(prompt.contains("findings"));
+        assert!(prompt.contains("clarifications"));
+        // No text-marker fallback or removed blocks.
+        assert!(!prompt.contains("TEXT MARKER FALLBACK"));
+        assert!(!prompt.contains("QA_FINDINGS_BEGIN"));
+        assert!(!prompt.contains("QA_CLARIFICATION_BEGIN"));
         assert!(!prompt.contains("QA_TEST_SCRIPTS_BEGIN"));
         assert!(!prompt.contains("QA_CONTEXT_BEGIN"));
         assert!(!prompt.contains("QA_TEST_CASES_BEGIN"));
@@ -1343,83 +1251,35 @@ mod tests {
     }
 
     #[test]
-    fn extract_qa_findings_reads_structured_output() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "qa_report": {
-                    "findings": [
-                        {
-                            "title": "Search returns 500 on empty query",
-                            "description": "GET /search?q= returns 500 instead of 400",
-                            "severity": "high",
-                            "file": "src/handler.go:42"
-                        },
-                        {
-                            "title": "Memory leak in cache",
-                            "description": "Cache grows unbounded",
-                            "severity": "medium"
-                        }
-                    ]
+    fn qa_output_deserializes_multiple_findings_via_tool_definition_schema() {
+        // Exercises the full round trip through `QaOutput::tool_definition()`'s
+        // schema shape, not just ad hoc JSON.
+        let tool = QaOutput::tool_definition();
+        assert_eq!(tool.name, "qa_report");
+
+        let output: QaOutput = serde_json::from_value(serde_json::json!({
+            "findings": [
+                {
+                    "title": "Search returns 500 on empty query",
+                    "description": "GET /search?q= returns 500 instead of 400",
+                    "severity": "high",
+                    "file": "src/handler.go:42"
+                },
+                {
+                    "title": "Memory leak in cache",
+                    "description": "Cache grows unbounded",
+                    "severity": "medium"
                 }
-            })),
-            ..AgentHandoff::default()
-        };
-        let findings = extract_qa_findings(&output);
+            ]
+        }))
+        .unwrap();
+        let findings = normalize_qa_findings(output.findings);
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].title, "Search returns 500 on empty query");
-        assert_eq!(findings[0].severity, "high");
+        assert_eq!(findings[0].severity, Severity::High);
         assert_eq!(findings[0].file, "src/handler.go:42");
         assert_eq!(findings[1].title, "Memory leak in cache");
-        assert_eq!(findings[1].severity, "medium");
+        assert_eq!(findings[1].severity, Severity::Medium);
         assert_eq!(findings[1].file, "");
-    }
-
-    #[test]
-    fn extract_qa_findings_structured_empty_array() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "qa_report": {
-                    "findings": []
-                }
-            })),
-            ..AgentHandoff::default()
-        };
-        let findings = extract_qa_findings(&output);
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn extract_qa_clarifications_reads_structured_output() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "qa_report": {
-                    "findings": [],
-                    "clarifications": [
-                        {
-                            "question": "Which auth method for the API?",
-                            "context": "The docs mention both JWT and API key"
-                        }
-                    ]
-                }
-            })),
-            ..AgentHandoff::default()
-        };
-        let clarifications = extract_qa_clarifications(&output);
-        assert_eq!(clarifications.len(), 1);
-        assert_eq!(clarifications[0].question, "Which auth method for the API?");
-        assert!(clarifications[0].context.contains("JWT"));
-    }
-
-    #[test]
-    fn extract_qa_findings_falls_back_to_text_when_no_structured() {
-        let output = AgentHandoff {
-            response: format!(
-                "{QA_FINDINGS_BEGIN}\n[{{\"title\":\"Bug X\",\"description\":\"d\",\"severity\":\"critical\",\"file\":\"\"}}]\n{QA_FINDINGS_END}"
-            ),
-            ..AgentHandoff::default()
-        };
-        let findings = extract_qa_findings(&output);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].title, "Bug X");
     }
 }

@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 
-use super::retry::with_backoff_retries;
+use crate::core::retry::with_backoff_retries;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, LazyLock};
 use tracing::{debug, info};
 
 pub const PRIORITY_LABEL_PREFIX: &str = "priority::";
@@ -154,6 +155,7 @@ pub struct GitLabClient {
     repo_path: String,
     host: String,
     project_id: u64,
+    shutdown: Arc<AtomicBool>,
 }
 
 fn parse_gitlab_repo(repo_url: &str) -> Result<(String, String)> {
@@ -181,7 +183,7 @@ fn parse_gitlab_repo(repo_url: &str) -> Result<(String, String)> {
     anyhow::bail!("unsupported gitlab_repo URL scheme: {repo_url}");
 }
 
-fn resolve_project_id(host: &str, project_path: &str) -> Result<u64> {
+fn resolve_project_id(host: &str, project_path: &str, shutdown: &AtomicBool) -> Result<u64> {
     let search_term = project_path.rsplit('/').next().unwrap_or(project_path);
     let endpoint = format!(
         "projects?search={}&membership=true&simple=true&per_page=50",
@@ -193,6 +195,7 @@ fn resolve_project_id(host: &str, project_path: &str) -> Result<u64> {
     // to resolve the same project id would kill agent startup nondeterministically.
     // Wrap it in the same transient-retry policy every other glab call uses.
     let output = with_backoff_retries(
+        shutdown,
         &format!("resolve GitLab project id for {project_path} on {host}"),
         || {
             let output = Command::new("glab")
@@ -249,14 +252,15 @@ fn compact_cli_output(text: &str) -> String {
 }
 
 impl GitLabClient {
-    pub fn new(repo_path: String, gitlab_repo: &str) -> Result<Self> {
+    pub fn new(repo_path: String, gitlab_repo: &str, shutdown: Arc<AtomicBool>) -> Result<Self> {
         let (host, project_path) = parse_gitlab_repo(gitlab_repo)?;
-        let project_id = resolve_project_id(&host, &project_path)?;
+        let project_id = resolve_project_id(&host, &project_path, &shutdown)?;
         configure_repo_glab(&repo_path, &host)?;
         Ok(Self {
             repo_path,
             host,
             project_id,
+            shutdown,
         })
     }
 
@@ -269,7 +273,7 @@ impl GitLabClient {
     }
 
     fn run_api(&self, endpoint: &str, extra_args: &[&str]) -> Result<std::process::Output> {
-        with_backoff_retries(&format!("glab api GET {endpoint}"), || {
+        with_backoff_retries(&self.shutdown, &format!("glab api GET {endpoint}"), || {
             let output = self.run_api_once(endpoint, extra_args)?;
             if !output.status.success() {
                 anyhow::bail!(
@@ -402,7 +406,9 @@ impl GitLabClient {
     }
 
     pub fn list_issues(&self) -> Result<Vec<Issue>> {
-        with_backoff_retries("listing open issues", || self.list_issues_pages())
+        with_backoff_retries(&self.shutdown, "listing open issues", || {
+            self.list_issues_pages()
+        })
     }
 
     fn list_issues_pages(&self) -> Result<Vec<Issue>> {
@@ -690,9 +696,11 @@ impl GitLabClient {
     }
 
     fn fetch_discussions(&self, iid: u64) -> Result<Vec<serde_json::Value>> {
-        with_backoff_retries(&format!("fetching MR !{iid} discussions"), || {
-            self.fetch_discussions_pages(iid)
-        })
+        with_backoff_retries(
+            &self.shutdown,
+            &format!("fetching MR !{iid} discussions"),
+            || self.fetch_discussions_pages(iid),
+        )
     }
 
     fn fetch_discussions_pages(&self, iid: u64) -> Result<Vec<serde_json::Value>> {
@@ -988,9 +996,11 @@ impl GitLabClient {
 
     /// Like [`Self::add_mr_label`], but retries indefinitely with capped exponential backoff.
     pub fn add_mr_label_with_retries(&self, iid: u64, label: &str) -> Result<()> {
-        with_backoff_retries(&format!("adding label {label:?} to MR !{iid}"), || {
-            self.add_mr_label(iid, label)
-        })
+        with_backoff_retries(
+            &self.shutdown,
+            &format!("adding label {label:?} to MR !{iid}"),
+            || self.add_mr_label(iid, label),
+        )
     }
 
     pub fn remove_mr_label(&self, iid: u64, label: &str) -> Result<()> {

@@ -115,6 +115,16 @@ pub fn activity(label: impl Into<String>) -> ActivityGuard {
     }
 }
 
+/// Terminal-backed activity reporter used by the CLI workflow.
+#[derive(Default)]
+pub struct UiActivityReporter;
+
+impl crate::core::activity::ActivityReporter for UiActivityReporter {
+    fn start(&self, label: String) -> Box<dyn crate::core::activity::ActivityToken> {
+        Box::new(activity(label))
+    }
+}
+
 /// Install the Potlatch terminal log formatter.
 pub fn init() {
     let use_color = io::stdout().is_terminal();

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 
+use crate::core::activity::SharedActivityReporter;
 use crate::core::agent::CoreAgent;
 use crate::core::banner::Banner;
 use crate::core::config::Config;
@@ -15,6 +16,7 @@ pub struct WorkflowContext {
     pub config: Arc<Config>,
     pub base_dir: String,
     pub shutdown: Arc<AtomicBool>,
+    pub activity: SharedActivityReporter,
 }
 
 /// Spawn inputs passed from workflow into a [`CoreAgent`] implementation.
@@ -29,6 +31,7 @@ impl WorkflowContext {
             config: Arc::clone(&self.config),
             base_dir: self.base_dir.clone(),
             shutdown: Arc::clone(&self.shutdown),
+            activity: Arc::clone(&self.activity),
         }
     }
 }
@@ -52,6 +55,68 @@ where
         workflow,
         instance_id,
     })
+}
+
+#[derive(Clone)]
+struct AgentSpawnPlan {
+    agent_name: String,
+    instance_id: usize,
+    spawn: fn(WorkflowContext, instance_id: usize) -> Result<()>,
+}
+
+fn plan_agent_spawns(config: &Config, registry: &AgentRegistry) -> Result<Vec<AgentSpawnPlan>> {
+    let mut agent_names: Vec<_> = config.agent_names().collect();
+    agent_names.sort_unstable();
+    let mut plan = Vec::new();
+
+    for agent_name in agent_names {
+        let section = config
+            .agent(agent_name)
+            .with_context(|| format!("missing agent section [agent.{agent_name}]"))?;
+        if section.core.instances == 0 {
+            continue;
+        }
+
+        let registration = registry.find(agent_name).with_context(|| {
+            format!("no registration for configured agent [agent.{agent_name}]")
+        })?;
+        (registration.validate_config)(config, section)
+            .with_context(|| format!("invalid config for [agent.{agent_name}]"))?;
+        config
+            .resolve_acp_spawn(section)
+            .with_context(|| format!("invalid core config for [agent.{agent_name}]"))?;
+
+        for instance_id in 0..section.core.instances {
+            plan.push(AgentSpawnPlan {
+                agent_name: agent_name.to_string(),
+                instance_id,
+                spawn: registration.spawn,
+            });
+        }
+    }
+
+    Ok(plan)
+}
+
+fn execute_spawn_plan(
+    ctx: &WorkflowContext,
+    plan: Vec<AgentSpawnPlan>,
+) -> Vec<std::thread::JoinHandle<()>> {
+    plan.into_iter()
+        .map(|planned| {
+            let spawn_ctx = ctx.clone_for_spawn();
+            std::thread::spawn(move || {
+                if let Err(e) = (planned.spawn)(spawn_ctx, planned.instance_id) {
+                    tracing::error!(
+                        "Agent {}-{} failed to start: {}",
+                        planned.agent_name,
+                        planned.instance_id,
+                        e
+                    );
+                }
+            })
+        })
+        .collect()
 }
 
 pub fn build_startup_banner(
@@ -88,6 +153,7 @@ pub struct Workflow {
     config: Config,
     config_path: String,
     registry: AgentRegistry,
+    activity: SharedActivityReporter,
 }
 
 impl Workflow {
@@ -96,7 +162,14 @@ impl Workflow {
             config,
             config_path: config_path.into(),
             registry: AgentRegistry::new(),
+            activity: Arc::new(crate::core::activity::NoopActivityReporter),
         }
+    }
+
+    /// Install the activity reporter propagated to every spawned agent.
+    pub fn with_activity_reporter(mut self, activity: SharedActivityReporter) -> Self {
+        self.activity = activity;
+        self
     }
 
     pub fn register_agent<A>(&mut self)
@@ -112,6 +185,7 @@ impl Workflow {
     }
 
     pub fn run(self) -> Result<()> {
+        let spawn_plan = plan_agent_spawns(&self.config, &self.registry)?;
         let base_dir = std::env::current_dir()
             .context("Failed to get current directory")?
             .to_string_lossy()
@@ -122,6 +196,7 @@ impl Workflow {
             config: Arc::new(self.config),
             base_dir,
             shutdown: Arc::clone(&shutdown),
+            activity: Arc::clone(&self.activity),
         };
 
         prepare_shutdown_handlers(&ctx)?;
@@ -129,41 +204,7 @@ impl Workflow {
         let banner = build_startup_banner(&ctx.config, &self.registry, &self.config_path);
         crate::ui::print_banner(&banner);
 
-        let mut agent_names: Vec<String> = ctx.config.agent_names().map(str::to_string).collect();
-        agent_names.sort();
-
-        let mut handles = Vec::new();
-
-        for agent_name in agent_names {
-            let section = ctx
-                .config
-                .agent(&agent_name)
-                .with_context(|| format!("missing agent section [agent.{agent_name}]"))?;
-            if section.core.instances == 0 {
-                continue;
-            }
-            let registration = self.registry.find(&agent_name).with_context(|| {
-                format!("no registration for configured agent [agent.{agent_name}]")
-            })?;
-            (registration.validate_config)(section)
-                .with_context(|| format!("invalid config for [agent.{agent_name}]"))?;
-
-            for instance_id in 0..section.core.instances {
-                let spawn_ctx = ctx.clone_for_spawn();
-                let spawn = registration.spawn;
-                let agent_name_log = agent_name.clone();
-                handles.push(std::thread::spawn(move || {
-                    if let Err(e) = spawn(spawn_ctx, instance_id) {
-                        tracing::error!(
-                            "Agent {}-{} failed to start: {}",
-                            agent_name_log,
-                            instance_id,
-                            e
-                        );
-                    }
-                }));
-            }
-        }
+        let mut handles = execute_spawn_plan(&ctx, spawn_plan);
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -197,11 +238,11 @@ impl Workflow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::agent::AgentModel;
     use anyhow::Result;
 
     struct AlphaAgent;
     struct BetaAgent;
+    struct InvalidAgent;
 
     impl CoreAgent for AlphaAgent {
         type SpawnContext = AgentSpawnContext;
@@ -210,7 +251,11 @@ mod tests {
             "alpha"
         }
 
-        fn model(&self) -> &AgentModel {
+        fn agent_id(&self) -> &str {
+            unreachable!("test agent is never run")
+        }
+
+        fn shutdown(&self) -> &Arc<AtomicBool> {
             unreachable!("test agent is never run")
         }
 
@@ -236,7 +281,11 @@ mod tests {
             "beta"
         }
 
-        fn model(&self) -> &AgentModel {
+        fn agent_id(&self) -> &str {
+            unreachable!("test agent is never run")
+        }
+
+        fn shutdown(&self) -> &Arc<AtomicBool> {
             unreachable!("test agent is never run")
         }
 
@@ -250,6 +299,39 @@ mod tests {
 
         fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
             Ok(Self)
+        }
+
+        fn on_shutdown(&mut self) {}
+    }
+
+    impl CoreAgent for InvalidAgent {
+        type SpawnContext = AgentSpawnContext;
+
+        fn name() -> &'static str {
+            "invalid"
+        }
+
+        fn agent_id(&self) -> &str {
+            unreachable!("test agent is never run")
+        }
+
+        fn shutdown(&self) -> &Arc<AtomicBool> {
+            unreachable!("test agent is never run")
+        }
+
+        fn validate_config(
+            _config: &Config,
+            _section: &crate::core::config::AgentSection,
+        ) -> Result<()> {
+            anyhow::bail!("deliberately invalid")
+        }
+
+        fn run_periodic_task(&mut self, _task_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
+            unreachable!("invalid config must prevent construction")
         }
 
         fn on_shutdown(&mut self) {}
@@ -283,6 +365,124 @@ mod tests {
                 ("repo", "first"),
                 ("agents", "alpha, beta"),
             ]
+        );
+    }
+
+    #[test]
+    fn spawn_plan_is_sorted_and_expands_instances_deterministically() {
+        let config = Config::from_toml_str(
+            r#"
+            [agent.beta]
+            instances = 2
+            [agent.alpha]
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let mut registry = AgentRegistry::new();
+        registry.register_agent::<AlphaAgent>();
+        registry.register_agent::<BetaAgent>();
+
+        let plan = plan_agent_spawns(&config, &registry).unwrap();
+        let entries: Vec<_> = plan
+            .iter()
+            .map(|planned| (planned.agent_name.as_str(), planned.instance_id))
+            .collect();
+
+        assert_eq!(entries, vec![("alpha", 0), ("beta", 0), ("beta", 1)]);
+    }
+
+    #[test]
+    fn spawn_plan_skips_disabled_agents_without_requiring_registration() {
+        let config = Config::from_toml_str(
+            r#"
+            [agent.alpha]
+            instances = 1
+            [agent.unregistered]
+            instances = 0
+            "#,
+        )
+        .unwrap();
+        let mut registry = AgentRegistry::new();
+        registry.register_agent::<AlphaAgent>();
+
+        let plan = plan_agent_spawns(&config, &registry).unwrap();
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].agent_name, "alpha");
+    }
+
+    #[test]
+    fn spawn_plan_rejects_all_registration_errors_before_execution() {
+        let config = Config::from_toml_str(
+            r#"
+            [agent.alpha]
+            instances = 1
+            [agent.unregistered]
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let mut registry = AgentRegistry::new();
+        registry.register_agent::<AlphaAgent>();
+
+        let error = plan_agent_spawns(&config, &registry).err().unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no registration for configured agent [agent.unregistered]")
+        );
+    }
+
+    #[test]
+    fn spawn_plan_runs_agent_validation_before_execution() {
+        let config = Config::from_toml_str(
+            r#"
+            [agent.invalid]
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let mut registry = AgentRegistry::new();
+        registry.register_agent::<InvalidAgent>();
+
+        let error = plan_agent_spawns(&config, &registry).err().unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid config for [agent.invalid]")
+        );
+        assert!(
+            format!("{error:#}").contains("deliberately invalid"),
+            "validation cause should be preserved"
+        );
+    }
+
+    #[test]
+    fn spawn_plan_validates_shared_core_config_before_execution() {
+        let config = Config::from_toml_str(
+            r#"
+            [agent.alpha]
+            instances = 1
+            acp_client = "missing"
+            "#,
+        )
+        .unwrap();
+        let mut registry = AgentRegistry::new();
+        registry.register_agent::<AlphaAgent>();
+
+        let error = plan_agent_spawns(&config, &registry).err().unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid core config for [agent.alpha]")
+        );
+        assert!(
+            format!("{error:#}").contains("unknown acp_client `missing`"),
+            "core validation cause should be preserved"
         );
     }
 }

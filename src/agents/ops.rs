@@ -7,70 +7,126 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::agents::gitlab::{self, GitLabClient};
-use crate::agents::settings;
 use crate::agents::ssh_util::{shell_single_quote, validate_remote_path, validate_ssh_identity};
 use crate::agents::workspace::{
-    ensure_agent_repo, extract_project_name, require_gitlab_repo, sessions_dir, work_dir,
+    GitLabAgentBootstrap, gitlab_banner, validate_instance_id, validate_max_instances,
 };
 use crate::agents::write_task_context_file;
-use crate::core::agent::{AgentHandoff, InvokeOptions};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::agent::{InvokeOptions, ObjectSchema, SchemaField, StructuredOutput};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
+use crate::core::periodic::PeriodicTaskSpec;
 
 pub(crate) const NAME: &str = "ops";
 const MAX_INSTANCES: usize = 1;
 
-const OPS_ISSUES_BEGIN: &str = "OPS_ISSUES_BEGIN";
-const OPS_ISSUES_END: &str = "OPS_ISSUES_END";
-
-/// The ops agent's structured-output tool definition. Passed to the harness
-/// via `session/new` so the harness registers a generic `StructuredOutputTool`
-/// named `ops_report`. The model calls it with its log analysis findings as
-/// structured JSON instead of emitting text markers.
-fn ops_tool_definition() -> serde_json::Value {
-    serde_json::json!({
-        "name": "ops_report",
-        "description": "Emit your log analysis findings as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not text markers in your response. Call this exactly once with your findings.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "issues": {
-                    "description": "New actionable issues found in the logs. Empty array if nothing new.",
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {
-                                "description": "Short actionable issue title.",
-                                "type": "string"
-                            },
-                            "description": {
-                                "description": "Markdown body with log evidence, likely code area, impact, and suggested remediation.",
-                                "type": "string"
-                            },
-                            "priority": {
-                                "description": "Priority: 1 (critical/blocking), 2 (high), 3 (normal).",
-                                "type": "integer",
-                                "enum": [1, 2, 3]
-                            },
-                            "log_line": {
-                                "description": "Exact representative log line from the session file.",
-                                "type": "string"
-                            }
-                        },
-                        "required": ["title", "description", "log_line"]
-                    }
-                }
-            },
-            "required": ["issues"]
-        }
-    })
+/// One issue proposal as the model described it via the `ops_report` tool's
+/// `issues` array, before the empty-field defensive filtering in
+/// [`normalize_ops_issues`] is applied.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawOpsIssue {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    priority: Option<u64>,
+    #[serde(default, alias = "sample_line")]
+    log_line: String,
 }
+
+/// The ops agent's typed structured-output contract. The model calls the
+/// `ops_report` tool with its log analysis findings; core deserializes the
+/// captured JSON into this type (see [`AgentModel::complete_typed`]).
+#[derive(Debug, Clone, Deserialize)]
+struct OpsOutput {
+    #[serde(default)]
+    issues: Vec<RawOpsIssue>,
+}
+
+impl StructuredOutput for OpsOutput {
+    fn tool_name() -> &'static str {
+        "ops_report"
+    }
+
+    fn tool_description() -> &'static str {
+        "Emit your log analysis findings as structured JSON. This is the primary output channel — Potlatch reads the tool's JSON, not your streamed text. Call this exactly once with your findings."
+    }
+
+    fn schema() -> ObjectSchema {
+        ObjectSchema::new()
+            .property(
+                "issues",
+                SchemaField::array(
+                    "New actionable issues found in the logs. Empty array if nothing new.",
+                    SchemaField::object(
+                        ObjectSchema::new()
+                            .property("title", SchemaField::string("Short actionable issue title."))
+                            .property(
+                                "description",
+                                SchemaField::string(
+                                    "Markdown body with log evidence, likely code area, impact, and suggested remediation.",
+                                ),
+                            )
+                            .property(
+                                "priority",
+                                SchemaField::integer_enum(
+                                    "Priority: 1 (critical/blocking), 2 (high), 3 (normal).",
+                                    &[1, 2, 3],
+                                ),
+                            )
+                            .property(
+                                "log_line",
+                                SchemaField::string(
+                                    "Exact representative log line from the session file.",
+                                ),
+                            )
+                            .required("title")
+                            .required("description")
+                            .required("log_line"),
+                    ),
+                ),
+            )
+            .required("issues")
+    }
+}
+
+/// Drop issue proposals with an empty title, description, or log line (the
+/// model occasionally emits a placeholder entry), and clamp `priority` to
+/// the valid 1..=3 range instead of erroring on an out-of-range value.
+fn normalize_ops_issues(raw: Vec<RawOpsIssue>) -> Vec<OpsIssueProposal> {
+    raw.into_iter()
+        .filter_map(|item| {
+            let title = item.title.trim().to_string();
+            if title.is_empty() {
+                return None;
+            }
+            let description = item.description.trim().to_string();
+            if description.is_empty() {
+                return None;
+            }
+            let log_line = item.log_line.trim().to_string();
+            if log_line.is_empty() {
+                return None;
+            }
+            let priority = item
+                .priority
+                .filter(|priority| (1..=3).contains(priority))
+                .map(|priority| priority as u8);
+            Some(OpsIssueProposal {
+                title,
+                description,
+                priority,
+                log_line,
+            })
+        })
+        .collect()
+}
+
 const LOG_WINDOW_HOURS: i64 = 2;
 const MAX_TAIL_LINES: u32 = 100_000;
 const MAX_SCRAPE_FILES_KEPT: usize = 10;
@@ -231,30 +287,30 @@ impl CoreAgent for OpsAgent {
         NAME
     }
 
-    fn model(&self) -> &AgentModel {
-        &self.model
+    fn agent_id(&self) -> &str {
+        &self.state.agent_id
     }
 
-    fn banner(_config: &Config, banner: &mut Banner) {
-        if let Some(repo) = settings::settings().gitlab_repo() {
-            banner.set_once("repo", repo);
-        }
+    fn shutdown(&self) -> &Arc<AtomicBool> {
+        self.model.shutdown()
     }
 
-    fn validate_config(section: &crate::core::config::AgentSection) -> Result<()> {
-        validate_instance_count(section.core.instances)?;
+    fn banner(config: &Config, banner: &mut Banner) {
+        gitlab_banner(config, banner);
+    }
+
+    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+        super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        validate_max_instances(NAME, section.core.instances, MAX_INSTANCES)?;
         OpsAgentSettings::from_raw(&section.raw)?;
         Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
-        vec![PeriodicTaskSpec {
-            id: "log_scrape",
-            interval: Duration::from_secs(self.config.poll_interval_secs),
-            jitter: JitterPolicy::BeforeEachCycle,
-            jitter_max_ms: 5000,
-            autostart: true,
-        }]
+        vec![PeriodicTaskSpec::polling(
+            "log_scrape",
+            Duration::from_secs(self.config.poll_interval_secs),
+        )]
     }
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
@@ -263,50 +319,40 @@ impl CoreAgent for OpsAgent {
                 let scope = crate::agents::scope_label_filter(&self.scope_label);
                 let model = &self.model;
                 let shutdown = Arc::clone(model.shutdown());
-                if let Err(e) = ops_cycle(
+                ops_cycle(
                     &self.state,
                     &self.config,
                     &self.gitlab,
                     model,
                     Arc::clone(&shutdown),
                     scope,
-                ) && !shutdown.load(Ordering::SeqCst)
-                {
-                    error!("{}: Cycle error: {}", self.state.agent_id, e);
-                }
-                Ok(())
+                )
             }
             _ => Ok(()),
         }
     }
 
     fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let gitlab_repo = require_gitlab_repo()?;
         let section = ctx
             .workflow
             .config
             .agent(NAME)
             .context("[agent.ops] section required")?;
-        validate_instance_count(section.core.instances)?;
-        ensure!(
-            ctx.instance_id < MAX_INSTANCES,
-            "[agent.ops] invalid instance id {} (only instance 0 is supported)",
-            ctx.instance_id
-        );
+        validate_max_instances(NAME, section.core.instances, MAX_INSTANCES)?;
+        validate_instance_id(NAME, ctx.instance_id, MAX_INSTANCES)?;
         let agent_settings = OpsAgentSettings::from_raw(&section.raw)?;
-        let project_name = extract_project_name(&gitlab_repo)?;
-        let agent_id = format!("ops-{}", ctx.instance_id);
-        ensure_agent_repo(
-            &ctx.workflow.base_dir,
-            &gitlab_repo,
-            &project_name,
-            &agent_id,
-        )?;
-        let working_dir = work_dir(&ctx.workflow.base_dir, &project_name, &agent_id);
-        let sessions_dir = sessions_dir(&ctx.workflow.base_dir, &project_name);
+        let runtime = GitLabAgentBootstrap::new(
+            &ctx,
+            NAME,
+            ModelPreferences {
+                structured_output_tools: Some(vec![OpsOutput::tool_definition()]),
+                ..ModelPreferences::default()
+            },
+        )
+        .build()?;
         let state = AgentState {
-            sessions_dir,
-            agent_id: agent_id.clone(),
+            sessions_dir: runtime.sessions_dir,
+            agent_id: runtime.agent_id,
         };
         state.ensure_sessions_dir()?;
         let config = OpsConfig {
@@ -317,36 +363,16 @@ impl CoreAgent for OpsAgent {
                 .map(OpsLogSourceSettings::into_source)
                 .collect(),
         };
-        let gitlab = GitLabClient::new(working_dir.clone(), &gitlab_repo)?;
-        let model = AgentModel::connect(
-            &ctx,
-            "ops",
-            working_dir,
-            ModelPreferences {
-                structured_output_tools: Some(vec![ops_tool_definition()]),
-                ..ModelPreferences::default()
-            },
-        )?;
-        let global = settings::settings();
         Ok(Self {
             state,
-            gitlab,
-            model,
+            gitlab: runtime.gitlab,
+            model: runtime.model,
             config,
-            scope_label: global.scope_label.clone(),
+            scope_label: runtime.scope_label,
         })
     }
 
     fn on_shutdown(&mut self) {}
-}
-
-pub(crate) fn validate_instance_count(instances: usize) -> Result<()> {
-    if instances > MAX_INSTANCES {
-        bail!(
-            "[agent.ops] supports at most one instance (instances must be 0 or 1, got {instances})"
-        );
-    }
-    Ok(())
 }
 
 fn ops_cycle(
@@ -429,7 +455,7 @@ fn ops_cycle(
     let history_path = absolute_path(&state.history_path())?;
 
     let prompt = build_analysis_prompt(&analysis_path, &history_path, &gitlab_context_path);
-    let agent_output = model.complete(
+    let completion = model.complete_typed::<OpsOutput>(
         &prompt,
         &InvokeOptions {
             activity_label: Some(format!("{} analyzing logs", state.agent_id)),
@@ -437,15 +463,7 @@ fn ops_cycle(
         },
     )?;
 
-    if !agent_output.has_final_result_text && agent_output.response.trim().is_empty() {
-        warn!(
-            "{}: Model returned no usable analysis output",
-            state.agent_id
-        );
-        return Ok(());
-    }
-
-    let proposals = extract_ops_issues(&agent_output);
+    let proposals = normalize_ops_issues(completion.output.issues);
     if proposals.is_empty() {
         info!(
             "{}: No new actionable errors found in log window",
@@ -536,20 +554,7 @@ Use the project codebase to map log errors to likely code paths, root causes, an
 
 For each NEW distinct problem that is not already covered, propose one GitLab issue.
 
-Call the `ops_report` tool with your findings. The tool's `issues` field is a JSON array of objects with `title`, `description`, `priority` (1-3), and `log_line`. Return an empty array if there are no new actionable errors. This is the primary output channel — Potlatch reads the tool's JSON, not text markers.
-
-TEXT MARKER FALLBACK — if for any reason you cannot call the `ops_report` tool, you may use this format instead:
-
-{begin}
-[
-  {{
-    "title": "Short actionable issue title",
-    "description": "Markdown body with log evidence, likely code area, impact, and suggested remediation",
-    "priority": 1,
-    "log_line": "exact representative log line from the session file"
-  }}
-]
-{end}
+Call the `ops_report` tool exactly once with your findings — this tool call is the only output channel Potlatch reads; there is no text-based fallback. The tool's `issues` field is a JSON array of objects with `title`, `description`, `priority` (1-3), and `log_line`. Return an empty array if there are no new actionable errors.
 
 Rules:
 - Return an empty JSON array [] if there are no NEW actionable errors.
@@ -561,8 +566,6 @@ Rules:
         log_path = log_path,
         history_path = history_path,
         gitlab_context_path = gitlab_context_path,
-        begin = OPS_ISSUES_BEGIN,
-        end = OPS_ISSUES_END,
     )
 }
 
@@ -690,26 +693,19 @@ fn append_mr_context(
 }
 
 fn load_history(path: &Path) -> Result<OpsIssueHistory> {
-    if !path.exists() {
-        return Ok(OpsIssueHistory::default());
+    let store = crate::core::state::StateStore::new(path);
+    if path.exists() {
+        let content = fs::read(path)
+            .with_context(|| format!("Failed to read issue history at {}", path.display()))?;
+        if content.iter().all(u8::is_ascii_whitespace) {
+            return Ok(OpsIssueHistory::default());
+        }
     }
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read issue history at {}", path.display()))?;
-    if content.trim().is_empty() {
-        return Ok(OpsIssueHistory::default());
-    }
-    serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse issue history JSON at {}", path.display()))
+    Ok(store.load()?.unwrap_or_default())
 }
 
 fn save_history(path: &Path, history: &OpsIssueHistory) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("Failed to create issue history directory")?;
-    }
-    let json =
-        serde_json::to_string_pretty(history).context("Failed to serialize issue history")?;
-    fs::write(path, json).with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+    crate::core::state::StateStore::new(path).save(history)
 }
 
 fn fetch_remote_log_tail(ssh_user: &str, ssh_host: &str, log_path: &str) -> Result<String> {
@@ -797,130 +793,6 @@ fn filter_log_to_time_window(log: &str, now: DateTime<Utc>) -> (String, bool) {
     }
 
     (kept.join("\n"), true)
-}
-
-fn extract_ops_issues_block(text: &str) -> Option<String> {
-    let start = text.find(OPS_ISSUES_BEGIN)?;
-    let body_start = start + OPS_ISSUES_BEGIN.len();
-    let rest = &text[body_start..];
-    let end_rel = rest.find(OPS_ISSUES_END)?;
-    let body = rest[..end_rel].trim();
-    if body.is_empty() {
-        None
-    } else {
-        Some(body.to_string())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct OpsIssueRaw {
-    title: String,
-    description: String,
-    priority: Option<u8>,
-    #[serde(default, alias = "sample_line")]
-    log_line: String,
-}
-
-fn parse_ops_issues_json(json: &str) -> Vec<OpsIssueProposal> {
-    let parsed: Vec<OpsIssueRaw> = match serde_json::from_str(json) {
-        Ok(items) => items,
-        Err(e) => {
-            warn!("Failed to parse OPS issues JSON: {e}");
-            return Vec::new();
-        }
-    };
-
-    parsed
-        .into_iter()
-        .filter_map(|item| {
-            let title = item.title.trim();
-            if title.is_empty() {
-                return None;
-            }
-            Some(OpsIssueProposal {
-                title: title.to_string(),
-                description: item.description.trim().to_string(),
-                priority: item.priority,
-                log_line: item.log_line.trim().to_string(),
-            })
-        })
-        .collect()
-}
-
-/// Get a reference to the `ops_report` tool's captured JSON from
-/// `agent_output.structured_outputs`, or `None` if the tool wasn't called.
-fn ops_output(agent_output: &AgentHandoff) -> Option<&serde_json::Value> {
-    agent_output
-        .structured_outputs
-        .as_ref()
-        .and_then(|s| s.get("ops_report"))
-}
-
-/// Parse issue proposals directly from the `ops_report` structured output.
-fn extract_ops_issues_from_structured(
-    agent_output: &AgentHandoff,
-) -> Option<Vec<OpsIssueProposal>> {
-    let report = ops_output(agent_output)?;
-    let issues = report.get("issues").and_then(|v| v.as_array())?;
-    let proposals: Vec<OpsIssueProposal> = issues
-        .iter()
-        .filter_map(|item| {
-            let title = item.get("title").and_then(|v| v.as_str())?.trim();
-            if title.is_empty() {
-                return None;
-            }
-            let description = item
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if description.is_empty() {
-                return None;
-            }
-            let log_line = item
-                .get("log_line")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if log_line.is_empty() {
-                return None;
-            }
-            let priority = item
-                .get("priority")
-                .and_then(|v| v.as_u64())
-                .filter(|p| (1..=3).contains(p))
-                .map(|p| p as u8);
-            Some(OpsIssueProposal {
-                title: title.to_string(),
-                description,
-                priority,
-                log_line,
-            })
-        })
-        .collect();
-    Some(proposals)
-}
-
-fn extract_ops_issues(agent_output: &AgentHandoff) -> Vec<OpsIssueProposal> {
-    // Structured output first (from the `ops_report` tool).
-    if let Some(proposals) = extract_ops_issues_from_structured(agent_output) {
-        return proposals;
-    }
-
-    // Fallback: text markers.
-    let text = if !agent_output.response.trim().is_empty() {
-        agent_output.response.as_str()
-    } else {
-        agent_output.instructions.as_deref().unwrap_or("")
-    };
-
-    if let Some(block) = extract_ops_issues_block(text) {
-        return parse_ops_issues_json(&block);
-    }
-
-    parse_ops_issues_json(text.trim())
 }
 
 fn prune_old_scrape_files(state: &AgentState, keep: usize) -> Result<()> {
@@ -1096,18 +968,18 @@ mod tests {
     }
 
     #[test]
-    fn extract_ops_issues_reads_block() {
-        let output = AgentHandoff {
-            response: format!(
-                "analysis\n{OPS_ISSUES_BEGIN}\n[{{\"title\":\"Fix DB timeout\",\"description\":\"details\",\"priority\":2,\"log_line\":\"ERROR timeout\"}}]\n{OPS_ISSUES_END}\n"
-            ),
-            has_final_result_text: true,
-            ..AgentHandoff::default()
-        };
-        let issues = extract_ops_issues(&output);
+    fn ops_output_deserializes_issue() {
+        let output: OpsOutput = serde_json::from_value(serde_json::json!({
+            "issues": [
+                {"title": "Fix DB timeout", "description": "details", "priority": 2, "log_line": "ERROR timeout"}
+            ]
+        }))
+        .unwrap();
+        let issues = normalize_ops_issues(output.issues);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "Fix DB timeout");
         assert_eq!(issues[0].log_line, "ERROR timeout");
+        assert_eq!(issues[0].priority, Some(2));
     }
 
     #[test]
@@ -1157,36 +1029,31 @@ mod tests {
 
     #[test]
     fn validate_instance_count_allows_zero_or_one() {
-        assert!(validate_instance_count(0).is_ok());
-        assert!(validate_instance_count(1).is_ok());
-        assert!(validate_instance_count(2).is_err());
+        assert!(validate_max_instances(NAME, 0, MAX_INSTANCES).is_ok());
+        assert!(validate_max_instances(NAME, 1, MAX_INSTANCES).is_ok());
+        assert!(validate_max_instances(NAME, 2, MAX_INSTANCES).is_err());
     }
 
     #[test]
-    fn extract_ops_issues_reads_structured_output() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "ops_report": {
-                    "issues": [
-                        {
-                            "title": "Fix DB timeout",
-                            "description": "The DB connection pool is exhausted",
-                            "priority": 1,
-                            "log_line": "ERROR timeout connecting to DB"
-                        },
-                        {
-                            "title": "Fix memory leak",
-                            "description": "Goroutine leak in worker",
-                            "priority": 2,
-                            "log_line": "panic: goroutine leak detected"
-                        }
-                    ]
+    fn ops_output_deserializes_multiple_issues() {
+        let output: OpsOutput = serde_json::from_value(serde_json::json!({
+            "issues": [
+                {
+                    "title": "Fix DB timeout",
+                    "description": "The DB connection pool is exhausted",
+                    "priority": 1,
+                    "log_line": "ERROR timeout connecting to DB"
+                },
+                {
+                    "title": "Fix memory leak",
+                    "description": "Goroutine leak in worker",
+                    "priority": 2,
+                    "log_line": "panic: goroutine leak detected"
                 }
-            })),
-            has_final_result_text: true,
-            ..AgentHandoff::default()
-        };
-        let issues = extract_ops_issues(&output);
+            ]
+        }))
+        .unwrap();
+        let issues = normalize_ops_issues(output.issues);
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0].title, "Fix DB timeout");
         assert_eq!(issues[0].priority, Some(1));
@@ -1195,30 +1062,34 @@ mod tests {
     }
 
     #[test]
-    fn extract_ops_issues_structured_empty_array() {
-        let output = AgentHandoff {
-            structured_outputs: Some(serde_json::json!({
-                "ops_report": {
-                    "issues": []
-                }
-            })),
-            has_final_result_text: true,
-            ..AgentHandoff::default()
-        };
-        let issues = extract_ops_issues(&output);
-        assert!(issues.is_empty());
+    fn ops_output_defaults_to_empty_issues() {
+        let output: OpsOutput = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(output.issues.is_empty());
     }
 
     #[test]
-    fn extract_ops_issues_falls_back_to_text_when_no_structured() {
-        let output = AgentHandoff {
-            response: format!(
-                "{OPS_ISSUES_BEGIN}\n[{{\"title\":\"Fix X\",\"description\":\"d\",\"priority\":3,\"log_line\":\"ERR\"}}]\n{OPS_ISSUES_END}"
-            ),
-            has_final_result_text: true,
-            ..AgentHandoff::default()
-        };
-        let issues = extract_ops_issues(&output);
+    fn normalize_ops_issues_skips_empty_fields() {
+        let raw = vec![
+            RawOpsIssue {
+                title: "".into(),
+                description: "d".into(),
+                log_line: "ERR".into(),
+                ..Default::default()
+            },
+            RawOpsIssue {
+                title: "No log line".into(),
+                description: "d".into(),
+                log_line: "".into(),
+                ..Default::default()
+            },
+            RawOpsIssue {
+                title: "Fix X".into(),
+                description: "d".into(),
+                log_line: "ERR".into(),
+                priority: Some(3),
+            },
+        ];
+        let issues = normalize_ops_issues(raw);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "Fix X");
     }
