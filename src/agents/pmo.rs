@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fs;
 use std::path;
 use std::sync::Arc;
@@ -17,9 +16,7 @@ use crate::agents::gitlab::{self, GitLabClient, Issue, IssueThreadNote};
 use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
 use crate::core::agent::schema::tagged;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
-use crate::core::agent::{
-    InvokeOptions, ObjectSchema, OneOfSchema, Schema, StructuredOutput, compat,
-};
+use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::model::acp::capabilities::{AskAnswer, AskQuestion, CapabilityProvider};
@@ -205,118 +202,85 @@ impl<'de> Deserialize<'de> for PmoOutput {
     }
 }
 
-impl StructuredOutput for PmoOutput {
-    fn tool_name() -> &'static str {
-        "plan"
-    }
-
-    fn tool_description() -> &'static str {
-        "The PMO triage result for an issue the worker could not complete."
-    }
-
-    fn schema() -> Schema {
-        Schema::one_of(
-            OneOfSchema::new(
-                "decision",
-                "Your triage decision. Pick exactly one and send only that decision's fields.",
-            )
-            .variant(
-                "guide_worker",
-                "The issue is workable as-is; the worker just needs one focused instruction.",
-                ObjectSchema::new().required_property(
-                    "instructions",
-                    Schema::string(
-                        "3-5 sentences, one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable.",
-                    ),
+structured_output! {
+    impl PmoOutput {
+        tool_name: "plan";
+        tool_description: "The PMO triage result for an issue the worker could not complete.";
+        schema: one_of(
+            "decision",
+            "Your triage decision. Pick exactly one and send only that decision's fields.",
+            {
+                "guide_worker" => (
+                    "The issue is workable as-is; the worker just needs one focused instruction.",
+                    object({
+                        required instructions: string(
+                            "3-5 sentences, one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable."
+                        ),
+                    })
                 ),
-            )
-            .variant(
-                "split",
-                "The issue is too broad and must become several smaller issues.",
-                ObjectSchema::new().required_property(
-                    "sub_issues",
-                    Schema::array(
-                        "The sub-issues to create, in the order they should be worked.",
-                        Schema::object(
-                            ObjectSchema::new()
-                                .describe("One sub-issue to create.")
-                                .required_property(
-                                    "title",
-                                    Schema::string("Concise sub-issue title."),
-                                )
-                                .required_property(
-                                    "description",
-                                    Schema::string(
-                                        "Scope and acceptance criteria. If this sub-issue depends on another, reference it by title.",
-                                    ),
-                                )
-                                .property(
-                                    "priority",
-                                    Schema::integer_enum(
-                                        "Priority: 1 (critical/blocking), 2 (high/depended-on), 3 (normal/independent).",
-                                        &[1, 2, 3],
-                                    ),
-                                )
-                                .property(
-                                    "depends_on",
-                                    Schema::integer(
-                                        "1-based index of another sub-issue this one depends on (omit or 0 if none).",
-                                    ),
+                "split" => (
+                    "The issue is too broad and must become several smaller issues.",
+                    object({
+                        required sub_issues: array(
+                            "The sub-issues to create, in the order they should be worked.",
+                            object("One sub-issue to create.", {
+                                required title: string("Concise sub-issue title."),
+                                required description: string(
+                                    "Scope and acceptance criteria. If this sub-issue depends on another, reference it by title."
                                 ),
+                                optional priority: integer_enum(
+                                    "Priority: 1 (critical/blocking), 2 (high/depended-on), 3 (normal/independent).",
+                                    &[1, 2, 3]
+                                ),
+                                optional depends_on: integer(
+                                    "1-based index of another sub-issue this one depends on (omit or 0 if none)."
+                                ),
+                            })
                         ),
-                    ),
+                    })
                 ),
-            )
-            .variant(
-                "already_done",
-                "The codebase already satisfies the issue, so it should be closed.",
-                ObjectSchema::new().required_property(
-                    "reason",
-                    Schema::string("Why the codebase already satisfies the issue."),
-                ),
-            )
-            .variant(
-                "needs_clarification",
-                "A human must answer something before the work can be scoped.",
-                ObjectSchema::new()
-                    .required_property(
-                        "question",
-                        Schema::string(
-                            "Specific questions for a human. Posted as a GitLab comment.",
+                "already_done" => (
+                    "The codebase already satisfies the issue, so it should be closed.",
+                    object({
+                        required reason: string(
+                            "Why the codebase already satisfies the issue."
                         ),
-                    )
-                    .property(
-                        "plan_text",
-                        Schema::string(
-                            "Your current best plan for this issue. The system will update the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version.",
-                        ),
-                    ),
-            )
-            .variant(
-                "wait_for_dependency",
-                "The issue is blocked by another open issue and must be parked.",
-                ObjectSchema::new().required_property(
-                    "dependency_issue_iid",
-                    Schema::integer(
-                        "The IID (number) of the existing open issue this issue depends on and must wait for. Must be a positive integer.",
-                    ),
+                    })
                 ),
-            ),
-        )
-    }
-
+                "needs_clarification" => (
+                    "A human must answer something before the work can be scoped.",
+                    object({
+                        required question: string(
+                            "Specific questions for a human. Posted as a GitLab comment."
+                        ),
+                        optional plan_text: string(
+                            "Your current best plan for this issue. The system will update the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version."
+                        ),
+                    })
+                ),
+                "wait_for_dependency" => (
+                    "The issue is blocked by another open issue and must be parked.",
+                    object({
+                        required dependency_issue_iid: integer(
+                            "The IID (number) of the existing open issue this issue depends on and must wait for. Must be a positive integer."
+                        ),
+                    })
+                ),
+            }
+        );
     /// Tolerated: a decision spelled with different case, the dependency IID
     /// under one of its legacy names or sent as `"#727"`, and a sub-issue
     /// priority outside 1-3 (dropped, so the sub-issue inherits the parent's).
-    fn normalize(value: &mut Value) {
-        compat::normalize_tag(value, "decision");
-        for alias in DEPENDENCY_IID_ALIASES {
-            compat::rename_property(value, alias, "dependency_issue_iid");
+        normalize(value) {
+            compat::normalize_tag(value, "decision");
+            for alias in DEPENDENCY_IID_ALIASES {
+                compat::rename_property(value, alias, "dependency_issue_iid");
+            }
+            compat::normalize_iid(value, "dependency_issue_iid");
+            compat::each_in_array(value, "sub_issues", |sub_issue| {
+                compat::drop_integer_outside(sub_issue, "priority", &[1, 2, 3]);
+            });
         }
-        compat::normalize_iid(value, "dependency_issue_iid");
-        compat::each_in_array(value, "sub_issues", |sub_issue| {
-            compat::drop_integer_outside(sub_issue, "priority", &[1, 2, 3]);
-        });
     }
 }
 

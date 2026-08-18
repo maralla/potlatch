@@ -13,9 +13,7 @@ use crate::agents::gitlab::{self, GitLabClient, Issue, MergeRequest};
 use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
 use crate::core::agent::schema::tagged;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
-use crate::core::agent::{
-    InvokeOptions, ObjectSchema, OneOfSchema, Schema, StructuredOutput, compat,
-};
+use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::periodic::PeriodicTaskSpec;
@@ -81,55 +79,40 @@ impl<'de> Deserialize<'de> for ReviewerOutput {
     }
 }
 
-impl StructuredOutput for ReviewerOutput {
-    fn tool_name() -> &'static str {
-        "review"
-    }
-
-    fn tool_description() -> &'static str {
-        "The final merge-request review decision. Approval summaries must stay on one line."
-    }
-
-    fn schema() -> Schema {
-        Schema::one_of(
-            OneOfSchema::new(
-                "decision",
-                "Your review decision. Pick exactly one and send only that decision's fields.",
-            )
-            .variant(
-                "approve",
-                "The merge request is ready to merge as-is.",
-                ObjectSchema::new().property(
-                    "summary",
-                    Schema::string(
-                        "Optional one-line note. The posted GitLab comment is always just 'LGTM', so this is only for the log.",
-                    ),
+structured_output! {
+    impl ReviewerOutput {
+        tool_name: "review";
+        tool_description: "The final merge-request review decision. Approval summaries must stay on one line.";
+        schema: one_of(
+            "decision",
+            "Your review decision. Pick exactly one and send only that decision's fields.",
+            {
+                "approve" => (
+                    "The merge request is ready to merge as-is.",
+                    object({
+                        optional summary: string(
+                            "Optional one-line note. The posted GitLab comment is always just 'LGTM', so this is only for the log."
+                        ),
+                    })
                 ),
-            )
-            .variant(
-                "request_changes",
-                "The merge request needs work before it can merge.",
-                ObjectSchema::new()
-                    .required_property(
-                        "feedback",
-                        Schema::string(
-                            "Specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads.",
+                "request_changes" => (
+                    "The merge request needs work before it can merge.",
+                    object({
+                        required feedback: string(
+                            "Specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads."
                         ),
-                    )
-                    .property(
-                        "public_comment",
-                        Schema::string(
-                            "Human-facing GitLab comment text (separate from feedback). Use for explanations, context, or recommendations that don't require code changes.",
+                        optional public_comment: string(
+                            "Human-facing GitLab comment text (separate from feedback). Use for explanations, context, or recommendations that don't require code changes."
                         ),
-                    ),
-            ),
-        )
-    }
-
+                    })
+                ),
+            }
+        );
     /// Tolerated: a decision spelled with different case or padding
     /// (`"APPROVE"`, `" approve "`).
-    fn normalize(value: &mut serde_json::Value) {
-        compat::normalize_tag(value, "decision");
+        normalize(value) {
+            compat::normalize_tag(value, "decision");
+        }
     }
 }
 
