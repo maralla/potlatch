@@ -17,7 +17,6 @@ use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::cycle::Step;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 
@@ -359,10 +358,9 @@ impl CoreAgent for OpsAgent {
 // Ops role port
 // ---------------------------------------------------------------------------
 
-/// Immutable snapshot of one configured log source, as the ops machine's
-/// decisions see it. Role-local on purpose: the machine never holds the
-/// live [`OpsConfig`], only the fields one scrape needs, and it can never
-/// mutate what it observed.
+/// Immutable snapshot of one configured log source as the ops cycle sees it.
+/// Role-local on purpose: the cycle receives only the fields one scrape needs
+/// and cannot mutate the configured source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogSourceObservation {
     ssh_user: String,
@@ -400,103 +398,27 @@ struct CycleClock {
     now: DateTime<Utc>,
 }
 
-/// One question the ops machine asks before it decides anything. Every read
-/// the cycle performs is one of these, so a recorded trace shows the
-/// observations in the order the machine needed them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OpsQuery {
-    ShutdownRequested,
-    CycleClock,
-    RemoteLogTail { source: LogSourceObservation },
-    IssueHistory,
-    HistoryFilePath,
-}
-
-/// The answer to one [`OpsQuery`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OpsFact {
-    ShutdownRequested(bool),
-    CycleClock(CycleClock),
-    RemoteLogTail(String),
-    IssueHistory(OpsIssueHistory),
-    HistoryFilePath(String),
-}
-
-/// A single side effect (or the single model invocation) the ops machine asks
-/// the port to perform. Every variant is one step: the machine never hands
-/// over a batch, so the recorded order of these *is* the ops role's mutation
-/// order — including the per-proposal create → priority → scope ordering and
-/// the one final history save.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OpsAction {
-    /// File preparation: gather the open issues and merge requests the model
-    /// dedups against into this cycle's context file.
-    WriteGitLabContextFile {
-        unix_ts: u64,
-    },
-    WriteScrapeFile {
-        unix_ts: u64,
-        window_log: String,
-    },
-    PruneScrapeFiles,
-    /// Create the history file if this is the first cycle that ever ran; a
-    /// no-op once it exists, so an existing history is never overwritten.
-    EnsureHistoryFile(OpsIssueHistory),
-    /// File preparation: the model's primary analysis input.
-    WriteAnalysisFile {
-        unix_ts: u64,
-        window_log: String,
-    },
-    InvokeAnalysisModel {
-        prompt: String,
-    },
-    CreateIssue {
-        title: String,
-        description: String,
-    },
-    /// Best effort, exactly like the `let Err(e) = …` warn it replaces.
-    AddPriorityLabel {
-        issue_iid: u64,
-        priority: u8,
-    },
-    /// Best effort, same as above.
-    AddScopeLabel {
-        issue_iid: u64,
-    },
-    /// The cycle's single history write, after every issue it managed to
-    /// create has been appended.
-    SaveHistory(OpsIssueHistory),
-}
-
-/// What the port reports back after executing one [`OpsAction`].
-enum OpsOutcome {
-    /// The action completed and has nothing to report.
-    Done,
-    /// The action failed. Whether that aborts the cycle or is merely logged
-    /// is decided by the stage that asked for it, mirroring which call sites
-    /// used `?` and which were wrapped in a `match`.
-    Failed(anyhow::Error),
-    ContextFileWritten(String),
-    AnalysisFileWritten(String),
-    Analyzed(Vec<RawOpsIssue>),
-    IssueCreated(u64),
-}
-
-/// The narrow surface the ops cycle needs. Object-safe and role-local: it is
-/// the ops role's own observe/execute vocabulary, not a stand-in for the
-/// GitLab API, ssh, the filesystem, or the model backend (see
-/// [`crate::agents::claim::ClaimPort`] for the same reasoning at claim
+/// The narrow typed surface the ops cycle needs. It is role-local rather than
+/// a stand-in for the GitLab API, ssh, the filesystem, or the model backend
+/// (see [`crate::agents::claim::ClaimPort`] for the same reasoning at claim
 /// granularity).
 trait OpsPort {
     fn shutdown_requested(&self) -> bool;
     fn cycle_clock(&self) -> CycleClock;
     fn remote_log_tail(&self, source: &LogSourceObservation) -> Result<String>;
+    fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String>;
+    fn write_scrape_file(&mut self, unix_ts: u64, window_log: &str) -> Result<()>;
+    fn prune_scrape_files(&mut self) -> Result<()>;
     fn issue_history(&self) -> Result<OpsIssueHistory>;
+    fn ensure_history_file(&mut self, history: &OpsIssueHistory) -> Result<()>;
+    fn write_analysis_file(&mut self, unix_ts: u64, window_log: &str) -> Result<String>;
     fn history_file_path(&self) -> Result<String>;
-    fn execute(&mut self, action: &OpsAction) -> OpsOutcome;
+    fn invoke_analysis_model(&mut self, prompt: &str) -> Result<Vec<RawOpsIssue>>;
+    fn create_issue(&mut self, title: &str, description: &str) -> Result<u64>;
+    fn add_priority_label(&mut self, issue_iid: u64, priority: u8) -> Result<()>;
+    fn add_scope_label(&mut self, issue_iid: u64) -> Result<()>;
+    fn save_history(&mut self, history: &OpsIssueHistory) -> Result<()>;
 }
-
-type OpsStep = Step<OpsQuery, OpsAction>;
 
 // ---------------------------------------------------------------------------
 // Pure ops decisions
@@ -524,416 +446,107 @@ fn history_entry(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Ops state machine
-// ---------------------------------------------------------------------------
-
-/// Where the ops cycle is. Each variant names the single next observation,
-/// action, or pure transition, so [`OpsMachine::next_step`] is a function of
-/// this plus what the machine already learned — never of the world.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OpsStage {
-    ShutdownBeforeCycle,
-    ObserveClock,
-    WriteGitLabContext,
-    ShutdownAfterContext,
-    NextLogSource,
-    ObserveLogTail,
-    ShutdownAfterLogTail,
-    WriteScrapeFile,
-    PruneScrapeFiles,
-    ObserveHistory,
-    EnsureHistoryFile,
-    WriteAnalysisFile,
-    ObserveHistoryPath,
-    InvokeAnalysisModel,
-    NextProposal,
-    CreateProposalIssue,
-    AddProposalPriorityLabel,
-    AddProposalScopeLabel,
-    SaveHistory,
-    Finish,
-}
-
-/// The ops role's orchestration state. Holds only plain data — no GitLab
-/// client, no ssh command, no model — so every decision it makes is a pure
-/// function of what it has observed so far.
-struct OpsMachine<'a> {
-    agent_id: &'a str,
+fn run_ops_cycle(
+    agent_id: &str,
+    sources: &[OpsLogSource],
     has_scope_label: bool,
-    stage: OpsStage,
-    sources: std::collections::VecDeque<LogSourceObservation>,
-    source: Option<LogSourceObservation>,
-    clock: Option<CycleClock>,
-    raw_tail: String,
-    window_sections: Vec<String>,
-    window_log: String,
-    gitlab_context_path: String,
-    analysis_path: String,
-    history_path: String,
-    history: OpsIssueHistory,
-    proposals: std::collections::VecDeque<OpsIssueProposal>,
-    proposal: Option<OpsIssueProposal>,
-    created_iid: Option<u64>,
-    created: usize,
-}
+    port: &mut dyn OpsPort,
+) -> Result<()> {
+    if port.shutdown_requested() {
+        return Ok(());
+    }
+    let clock = port.cycle_clock();
 
-impl<'a> OpsMachine<'a> {
-    fn new(agent_id: &'a str, sources: &[OpsLogSource], has_scope_label: bool) -> Self {
-        Self {
-            agent_id,
-            has_scope_label,
-            stage: OpsStage::ShutdownBeforeCycle,
-            sources: sources
-                .iter()
-                .map(LogSourceObservation::from_source)
-                .collect(),
-            source: None,
-            clock: None,
-            raw_tail: String::new(),
-            window_sections: Vec::new(),
-            window_log: String::new(),
-            gitlab_context_path: String::new(),
-            analysis_path: String::new(),
-            history_path: String::new(),
-            history: OpsIssueHistory::default(),
-            proposals: std::collections::VecDeque::new(),
-            proposal: None,
-            created_iid: None,
-            created: 0,
+    info!("{agent_id}: Fetching GitLab issues and merge requests for deduplication context");
+    let gitlab_context_path = port.write_gitlab_context_file(clock.unix_ts)?;
+    if port.shutdown_requested() {
+        return Ok(());
+    }
+
+    let mut window_sections = Vec::new();
+    for configured_source in sources {
+        let source = LogSourceObservation::from_source(configured_source);
+        info!(
+            "{agent_id}: Fetching last {}h of logs from {}",
+            LOG_WINDOW_HOURS,
+            source.target()
+        );
+        let raw_tail = port.remote_log_tail(&source)?;
+        if port.shutdown_requested() {
+            return Ok(());
+        }
+
+        let (window_log, parsed_timestamps) = filter_log_to_time_window(&raw_tail, clock.now);
+        if !parsed_timestamps {
+            warn!(
+                "{agent_id}: Could not parse timestamps in remote log tail for {}; using full tail for analysis",
+                source.target()
+            );
+        }
+        if !window_log.trim().is_empty() {
+            window_sections.push(source.section(&window_log));
         }
     }
 
-    fn clock(&self) -> CycleClock {
-        self.clock
-            .expect("cycle stages run only after the clock is observed")
+    let window_log = window_sections.join("\n\n");
+    if !window_is_analyzable(&window_log) {
+        info!(
+            "{agent_id}: Log window too small to analyze ({} bytes)",
+            window_log.trim().len()
+        );
+        return Ok(());
     }
 
-    fn source(&self) -> &LogSourceObservation {
-        self.source
-            .as_ref()
-            .expect("a log source is set before it is scraped")
+    port.write_scrape_file(clock.unix_ts, &window_log)?;
+    port.prune_scrape_files()?;
+    let mut history = port.issue_history()?;
+    port.ensure_history_file(&history)?;
+    let analysis_path = port.write_analysis_file(clock.unix_ts, &window_log)?;
+    let history_path = port.history_file_path()?;
+    let prompt = build_analysis_prompt(&analysis_path, &history_path, &gitlab_context_path);
+    let proposals = normalize_ops_issues(port.invoke_analysis_model(&prompt)?);
+    if proposals.is_empty() {
+        info!("{agent_id}: No new actionable errors found in log window");
+        return Ok(());
     }
 
-    fn proposal(&self) -> &OpsIssueProposal {
-        self.proposal
-            .as_ref()
-            .expect("a proposal is set before it is filed")
-    }
-
-    fn created_iid(&self) -> u64 {
-        self.created_iid
-            .expect("labels are only applied after the issue was created")
-    }
-
-    /// The single next thing to do. Pure: it only resolves stages that need
-    /// no port interaction (the log window join, the analyzability gate, the
-    /// per-proposal label decisions) before handing back an observation or an
-    /// action.
-    fn next_step(&mut self) -> OpsStep {
-        loop {
-            match &self.stage {
-                OpsStage::ShutdownBeforeCycle
-                | OpsStage::ShutdownAfterContext
-                | OpsStage::ShutdownAfterLogTail => {
-                    return OpsStep::Observe(OpsQuery::ShutdownRequested);
-                }
-                OpsStage::ObserveClock => return OpsStep::Observe(OpsQuery::CycleClock),
-                OpsStage::WriteGitLabContext => {
-                    info!(
-                        "{}: Fetching GitLab issues and merge requests for deduplication context",
-                        self.agent_id
-                    );
-                    return OpsStep::Act(OpsAction::WriteGitLabContextFile {
-                        unix_ts: self.clock().unix_ts,
-                    });
-                }
-                OpsStage::NextLogSource => match self.sources.pop_front() {
-                    Some(source) => {
-                        self.source = Some(source);
-                        self.stage = OpsStage::ObserveLogTail;
-                    }
-                    None => {
-                        self.window_log = self.window_sections.join("\n\n");
-                        if window_is_analyzable(&self.window_log) {
-                            self.stage = OpsStage::WriteScrapeFile;
-                        } else {
-                            info!(
-                                "{}: Log window too small to analyze ({} bytes)",
-                                self.agent_id,
-                                self.window_log.trim().len()
-                            );
-                            self.stage = OpsStage::Finish;
-                        }
-                    }
-                },
-                OpsStage::ObserveLogTail => {
-                    let source = self.source().clone();
-                    info!(
-                        "{}: Fetching last {}h of logs from {}",
-                        self.agent_id,
-                        LOG_WINDOW_HOURS,
-                        source.target()
-                    );
-                    return OpsStep::Observe(OpsQuery::RemoteLogTail { source });
-                }
-                OpsStage::WriteScrapeFile => {
-                    return OpsStep::Act(OpsAction::WriteScrapeFile {
-                        unix_ts: self.clock().unix_ts,
-                        window_log: self.window_log.clone(),
-                    });
-                }
-                OpsStage::PruneScrapeFiles => return OpsStep::Act(OpsAction::PruneScrapeFiles),
-                OpsStage::ObserveHistory => return OpsStep::Observe(OpsQuery::IssueHistory),
-                OpsStage::EnsureHistoryFile => {
-                    return OpsStep::Act(OpsAction::EnsureHistoryFile(self.history.clone()));
-                }
-                OpsStage::WriteAnalysisFile => {
-                    return OpsStep::Act(OpsAction::WriteAnalysisFile {
-                        unix_ts: self.clock().unix_ts,
-                        window_log: self.window_log.clone(),
-                    });
-                }
-                OpsStage::ObserveHistoryPath => {
-                    return OpsStep::Observe(OpsQuery::HistoryFilePath);
-                }
-                OpsStage::InvokeAnalysisModel => {
-                    return OpsStep::Act(OpsAction::InvokeAnalysisModel {
-                        prompt: build_analysis_prompt(
-                            &self.analysis_path,
-                            &self.history_path,
-                            &self.gitlab_context_path,
-                        ),
-                    });
-                }
-                OpsStage::NextProposal => match self.proposals.pop_front() {
-                    Some(proposal) => {
-                        self.proposal = Some(proposal);
-                        self.created_iid = None;
-                        self.stage = OpsStage::CreateProposalIssue;
-                    }
-                    None => {
-                        self.stage = if self.created > 0 {
-                            OpsStage::SaveHistory
-                        } else {
-                            OpsStage::Finish
-                        };
-                    }
-                },
-                OpsStage::CreateProposalIssue => {
-                    let proposal = self.proposal();
-                    return OpsStep::Act(OpsAction::CreateIssue {
-                        title: proposal.title.clone(),
-                        description: proposal.description.clone(),
-                    });
-                }
-                OpsStage::AddProposalPriorityLabel => match self.proposal().priority {
-                    Some(priority) => {
-                        return OpsStep::Act(OpsAction::AddPriorityLabel {
-                            issue_iid: self.created_iid(),
-                            priority,
-                        });
-                    }
-                    None => self.stage = OpsStage::AddProposalScopeLabel,
-                },
-                OpsStage::AddProposalScopeLabel => {
-                    if !self.has_scope_label {
-                        self.stage = OpsStage::NextProposal;
-                        continue;
-                    }
-                    return OpsStep::Act(OpsAction::AddScopeLabel {
-                        issue_iid: self.created_iid(),
-                    });
-                }
-                OpsStage::SaveHistory => {
-                    return OpsStep::Act(OpsAction::SaveHistory(self.history.clone()));
-                }
-                OpsStage::Finish => return OpsStep::Finish,
-            }
-        }
-    }
-
-    /// Feed back the answer to the observation the machine just asked for.
-    /// `Err` here means the cycle itself fails, exactly where the original
-    /// code used `?` on a read.
-    fn apply_fact(&mut self, fact: Result<OpsFact>) -> Result<()> {
-        match (&self.stage, fact) {
-            (OpsStage::ShutdownBeforeCycle, Ok(OpsFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    OpsStage::Finish
-                } else {
-                    OpsStage::ObserveClock
-                };
-            }
-            (OpsStage::ObserveClock, Ok(OpsFact::CycleClock(clock))) => {
-                self.clock = Some(clock);
-                self.stage = OpsStage::WriteGitLabContext;
-            }
-            (OpsStage::ShutdownAfterContext, Ok(OpsFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    OpsStage::Finish
-                } else {
-                    OpsStage::NextLogSource
-                };
-            }
-            (OpsStage::ObserveLogTail, Ok(OpsFact::RemoteLogTail(raw))) => {
-                self.raw_tail = raw;
-                self.stage = OpsStage::ShutdownAfterLogTail;
-            }
-            (OpsStage::ShutdownAfterLogTail, Ok(OpsFact::ShutdownRequested(stop))) => {
-                if stop {
-                    self.stage = OpsStage::Finish;
-                } else {
-                    let now = self.clock().now;
-                    let (window_log, parsed_timestamps) =
-                        filter_log_to_time_window(&self.raw_tail, now);
-                    if !parsed_timestamps {
-                        warn!(
-                            "{}: Could not parse timestamps in remote log tail for {}; using full tail for analysis",
-                            self.agent_id,
-                            self.source().target()
-                        );
-                    }
-                    if !window_log.trim().is_empty() {
-                        self.window_sections
-                            .push(self.source().section(&window_log));
-                    }
-                    self.stage = OpsStage::NextLogSource;
-                }
-            }
-            (OpsStage::ObserveHistory, Ok(OpsFact::IssueHistory(history))) => {
-                self.history = history;
-                self.stage = OpsStage::EnsureHistoryFile;
-            }
-            (OpsStage::ObserveHistoryPath, Ok(OpsFact::HistoryFilePath(path))) => {
-                self.history_path = path;
-                self.stage = OpsStage::InvokeAnalysisModel;
-            }
-            (stage, Ok(fact)) => {
-                anyhow::bail!("ops port answered {stage:?} with {fact:?}");
-            }
-            (_, Err(e)) => return Err(e),
-        }
-        Ok(())
-    }
-
-    /// Feed back the outcome of the action the machine just asked for.
-    fn apply_outcome(&mut self, outcome: OpsOutcome) -> Result<()> {
-        match (&self.stage, outcome) {
-            (OpsStage::WriteGitLabContext, OpsOutcome::ContextFileWritten(path)) => {
-                self.gitlab_context_path = path;
-                self.stage = OpsStage::ShutdownAfterContext;
-            }
-            (OpsStage::WriteScrapeFile, OpsOutcome::Done) => {
-                self.stage = OpsStage::PruneScrapeFiles;
-            }
-            (OpsStage::PruneScrapeFiles, OpsOutcome::Done) => {
-                self.stage = OpsStage::ObserveHistory;
-            }
-            (OpsStage::EnsureHistoryFile, OpsOutcome::Done) => {
-                self.stage = OpsStage::WriteAnalysisFile;
-            }
-            (OpsStage::WriteAnalysisFile, OpsOutcome::AnalysisFileWritten(path)) => {
-                self.analysis_path = path;
-                self.stage = OpsStage::ObserveHistoryPath;
-            }
-            (OpsStage::InvokeAnalysisModel, OpsOutcome::Analyzed(issues)) => {
-                self.proposals = normalize_ops_issues(issues).into();
-                if self.proposals.is_empty() {
-                    info!(
-                        "{}: No new actionable errors found in log window",
-                        self.agent_id
-                    );
-                    self.stage = OpsStage::Finish;
-                } else {
-                    self.stage = OpsStage::NextProposal;
-                }
-            }
-            (OpsStage::CreateProposalIssue, OpsOutcome::IssueCreated(issue_iid)) => {
-                info!(
-                    "{}: Created GitLab issue #{}: {}",
-                    self.agent_id,
-                    issue_iid,
-                    self.proposal().title
-                );
-                self.created_iid = Some(issue_iid);
-                let entry =
-                    history_entry(self.proposal(), issue_iid, &self.clock().now.to_rfc3339());
-                self.history.entries.push(entry);
-                self.created += 1;
-                self.stage = OpsStage::AddProposalPriorityLabel;
-            }
-            // A create that fails is warned about and skipped: no history
-            // entry, and the cycle moves on to the next proposal.
-            (OpsStage::CreateProposalIssue, OpsOutcome::Failed(e)) => {
+    let mut created = 0;
+    for proposal in proposals {
+        let issue_iid = match port.create_issue(&proposal.title, &proposal.description) {
+            Ok(issue_iid) => issue_iid,
+            Err(e) => {
                 warn!(
-                    "{}: Failed to create issue for {}: {}",
-                    self.agent_id,
-                    self.proposal().title,
-                    e
+                    "{agent_id}: Failed to create issue for {}: {e}",
+                    proposal.title
                 );
-                self.stage = OpsStage::NextProposal;
+                continue;
             }
-            (OpsStage::AddProposalPriorityLabel, OpsOutcome::Done) => {
-                self.stage = OpsStage::AddProposalScopeLabel;
-            }
-            (OpsStage::AddProposalPriorityLabel, OpsOutcome::Failed(e)) => {
-                warn!(
-                    "{}: Failed to set priority label on #{}: {}",
-                    self.agent_id,
-                    self.created_iid(),
-                    e
-                );
-                self.stage = OpsStage::AddProposalScopeLabel;
-            }
-            (OpsStage::AddProposalScopeLabel, OpsOutcome::Done) => {
-                self.stage = OpsStage::NextProposal;
-            }
-            (OpsStage::AddProposalScopeLabel, OpsOutcome::Failed(e)) => {
-                warn!(
-                    "{}: Failed to add scope label on #{}: {}",
-                    self.agent_id,
-                    self.created_iid(),
-                    e
-                );
-                self.stage = OpsStage::NextProposal;
-            }
-            (OpsStage::SaveHistory, OpsOutcome::Done) => {
-                info!(
-                    "{}: Created {} new GitLab issue(s) from log analysis",
-                    self.agent_id, self.created
-                );
-                self.stage = OpsStage::Finish;
-            }
-            // Everything else the cycle performed with `?` aborts it.
-            (_, OpsOutcome::Failed(e)) => return Err(e),
-            (stage, _) => {
-                anyhow::bail!("ops port reported an unexpected outcome for {stage:?}");
-            }
+        };
+
+        info!(
+            "{agent_id}: Created GitLab issue #{}: {}",
+            issue_iid, proposal.title
+        );
+        history
+            .entries
+            .push(history_entry(&proposal, issue_iid, &clock.now.to_rfc3339()));
+        created += 1;
+
+        if let Some(priority) = proposal.priority
+            && let Err(e) = port.add_priority_label(issue_iid, priority)
+        {
+            warn!("{agent_id}: Failed to set priority label on #{issue_iid}: {e}");
         }
-        Ok(())
-    }
-}
-
-/// Ask the port one question.
-fn observe_ops(port: &dyn OpsPort, query: &OpsQuery) -> Result<OpsFact> {
-    Ok(match query {
-        OpsQuery::ShutdownRequested => OpsFact::ShutdownRequested(port.shutdown_requested()),
-        OpsQuery::CycleClock => OpsFact::CycleClock(port.cycle_clock()),
-        OpsQuery::RemoteLogTail { source } => OpsFact::RemoteLogTail(port.remote_log_tail(source)?),
-        OpsQuery::IssueHistory => OpsFact::IssueHistory(port.issue_history()?),
-        OpsQuery::HistoryFilePath => OpsFact::HistoryFilePath(port.history_file_path()?),
-    })
-}
-
-fn run_ops_cycle(machine: &mut OpsMachine, port: &mut dyn OpsPort) -> Result<()> {
-    loop {
-        match machine.next_step() {
-            Step::Observe(query) => machine.apply_fact(observe_ops(port, &query))?,
-            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
-            Step::Finish => return Ok(()),
+        if has_scope_label && let Err(e) = port.add_scope_label(issue_iid) {
+            warn!("{agent_id}: Failed to add scope label on #{issue_iid}: {e}");
         }
     }
+
+    if created > 0 {
+        port.save_history(&history)?;
+        info!("{agent_id}: Created {created} new GitLab issue(s) from log analysis");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -948,13 +561,6 @@ struct LiveOpsPort<'a> {
     model: &'a AgentModel,
     shutdown: &'a AtomicBool,
     scope_label: Option<&'a str>,
-}
-
-fn required(result: Result<()>) -> OpsOutcome {
-    match result {
-        Ok(()) => OpsOutcome::Done,
-        Err(e) => OpsOutcome::Failed(e),
-    }
 }
 
 impl OpsPort for LiveOpsPort<'_> {
@@ -976,89 +582,72 @@ impl OpsPort for LiveOpsPort<'_> {
         fetch_remote_log_tail(&source.ssh_user, &source.ssh_host, &source.log_path)
     }
 
+    fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String> {
+        write_gitlab_context_file(self.state, self.gitlab, unix_ts)
+    }
+
+    fn write_scrape_file(&mut self, unix_ts: u64, window_log: &str) -> Result<()> {
+        let scrape_path = self.state.scrape_path(unix_ts);
+        fs::write(&scrape_path, window_log)
+            .with_context(|| format!("Failed to write scrape file {}", scrape_path.display()))
+    }
+
+    fn prune_scrape_files(&mut self) -> Result<()> {
+        prune_old_scrape_files(self.state, MAX_SCRAPE_FILES_KEPT)
+    }
+
     fn issue_history(&self) -> Result<OpsIssueHistory> {
         load_history(&self.state.history_path())
+    }
+
+    fn ensure_history_file(&mut self, history: &OpsIssueHistory) -> Result<()> {
+        ensure_history_file(self.state, history)
+    }
+
+    fn write_analysis_file(&mut self, unix_ts: u64, window_log: &str) -> Result<String> {
+        write_task_context_file(
+            self.state.sessions_dir,
+            &format!("{}-analysis-{unix_ts}.log", self.state.agent_id),
+            window_log,
+        )
     }
 
     fn history_file_path(&self) -> Result<String> {
         absolute_path(&self.state.history_path())
     }
 
-    fn execute(&mut self, action: &OpsAction) -> OpsOutcome {
-        match action {
-            OpsAction::WriteGitLabContextFile { unix_ts } => {
-                match write_gitlab_context_file(self.state, self.gitlab, *unix_ts) {
-                    Ok(path) => OpsOutcome::ContextFileWritten(path),
-                    Err(e) => OpsOutcome::Failed(e),
-                }
-            }
-            OpsAction::WriteScrapeFile {
-                unix_ts,
-                window_log,
-            } => {
-                let scrape_path = self.state.scrape_path(*unix_ts);
-                required(fs::write(&scrape_path, window_log).with_context(|| {
-                    format!("Failed to write scrape file {}", scrape_path.display())
-                }))
-            }
-            OpsAction::PruneScrapeFiles => {
-                required(prune_old_scrape_files(self.state, MAX_SCRAPE_FILES_KEPT))
-            }
-            OpsAction::EnsureHistoryFile(history) => {
-                required(ensure_history_file(self.state, history))
-            }
-            OpsAction::WriteAnalysisFile {
-                unix_ts,
-                window_log,
-            } => {
-                match write_task_context_file(
-                    self.state.sessions_dir,
-                    &format!("{}-analysis-{unix_ts}.log", self.state.agent_id),
-                    window_log,
-                ) {
-                    Ok(path) => OpsOutcome::AnalysisFileWritten(path),
-                    Err(e) => OpsOutcome::Failed(e),
-                }
-            }
-            OpsAction::InvokeAnalysisModel { prompt } => self.invoke_analysis_model(prompt),
-            OpsAction::CreateIssue { title, description } => {
-                match self.gitlab.create_issue(title, description) {
-                    Ok(issue_iid) => OpsOutcome::IssueCreated(issue_iid),
-                    Err(e) => OpsOutcome::Failed(e),
-                }
-            }
-            OpsAction::AddPriorityLabel {
-                issue_iid,
-                priority,
-            } => required(
-                self.gitlab
-                    .add_issue_label(*issue_iid, &gitlab::priority_label(*priority)),
-            ),
-            OpsAction::AddScopeLabel { issue_iid } => {
-                let Some(label) = self.scope_label else {
-                    return OpsOutcome::Done;
-                };
-                required(self.gitlab.add_issue_label(*issue_iid, label))
-            }
-            OpsAction::SaveHistory(history) => {
-                required(save_history(&self.state.history_path(), history))
-            }
+    fn invoke_analysis_model(&mut self, prompt: &str) -> Result<Vec<RawOpsIssue>> {
+        Ok(self
+            .model
+            .complete_typed::<OpsOutput>(
+                prompt,
+                &InvokeOptions {
+                    activity_label: Some(format!("{} analyzing logs", self.state.agent_id)),
+                    ..InvokeOptions::default()
+                },
+            )?
+            .output
+            .issues)
+    }
+
+    fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
+        self.gitlab.create_issue(title, description)
+    }
+
+    fn add_priority_label(&mut self, issue_iid: u64, priority: u8) -> Result<()> {
+        self.gitlab
+            .add_issue_label(issue_iid, &gitlab::priority_label(priority))
+    }
+
+    fn add_scope_label(&mut self, issue_iid: u64) -> Result<()> {
+        match self.scope_label {
+            Some(label) => self.gitlab.add_issue_label(issue_iid, label),
+            None => Ok(()),
         }
     }
-}
 
-impl LiveOpsPort<'_> {
-    fn invoke_analysis_model(&self, prompt: &str) -> OpsOutcome {
-        match self.model.complete_typed::<OpsOutput>(
-            prompt,
-            &InvokeOptions {
-                activity_label: Some(format!("{} analyzing logs", self.state.agent_id)),
-                ..InvokeOptions::default()
-            },
-        ) {
-            Ok(completion) => OpsOutcome::Analyzed(completion.output.issues),
-            Err(e) => OpsOutcome::Failed(e),
-        }
+    fn save_history(&mut self, history: &OpsIssueHistory) -> Result<()> {
+        save_history(&self.state.history_path(), history)
     }
 }
 
@@ -1070,7 +659,6 @@ fn ops_cycle(
     shutdown: Arc<AtomicBool>,
     scope_label: Option<&str>,
 ) -> Result<()> {
-    let mut machine = OpsMachine::new(state.agent_id, &config.log_sources, scope_label.is_some());
     let mut port = LiveOpsPort {
         state,
         gitlab,
@@ -1078,7 +666,12 @@ fn ops_cycle(
         shutdown: shutdown.as_ref(),
         scope_label,
     };
-    run_ops_cycle(&mut machine, &mut port)
+    run_ops_cycle(
+        state.agent_id,
+        &config.log_sources,
+        scope_label.is_some(),
+        &mut port,
+    )
 }
 
 fn build_analysis_prompt(log_path: &str, history_path: &str, gitlab_context_path: &str) -> String {
@@ -1390,11 +983,10 @@ mod tests {
     use std::collections::VecDeque;
 
     // -----------------------------------------------------------------
-    // Ops state machine driven against a recording fake port. Every
-    // observation and mutation the cycle performs lands in one ordered
-    // trace, so a full scrape/analyze/file flow can be replayed — and its
-    // exact mutation order asserted — without ssh, GitLab, the filesystem,
-    // or a model.
+    // Direct ops cycle driven against a recording fake port. Every observation
+    // and mutation lands in one ordered trace, so a full scrape/analyze/file
+    // flow can be replayed — and its exact mutation order asserted — without
+    // ssh, GitLab, the filesystem, or a model.
     // -----------------------------------------------------------------
 
     const TEST_AGENT: &str = "ops-0";
@@ -1425,7 +1017,7 @@ mod tests {
         LogSourceObservation::from_source(&log_source(host))
     }
 
-    /// The joined analysis input the machine assembles for `hosts`, in
+    /// The joined analysis input the cycle assembles for `hosts`, in
     /// configuration order.
     fn expected_window(hosts: &[&str]) -> String {
         hosts
@@ -1444,21 +1036,27 @@ mod tests {
         }
     }
 
-    /// A recording ops port. Answers are scripted per observation kind, and
-    /// failures are injected by naming the step that should fail, so tests
-    /// read as "this world, then this trace".
+    /// A recording ops port. Operation order is kept as plain strings while
+    /// payloads are captured separately for focused assertions.
     struct FakeOpsPort {
-        trace: RefCell<Vec<OpsStep>>,
+        trace: RefCell<Vec<String>>,
         shutdown_answers: RefCell<VecDeque<bool>>,
         clock: CycleClock,
         log_tail: String,
         history: OpsIssueHistory,
         analysis: Vec<RawOpsIssue>,
         next_iid: Cell<u64>,
-        saved_history: RefCell<Option<OpsIssueHistory>>,
-        ensured_history: RefCell<Option<OpsIssueHistory>>,
-        failing_queries: Vec<OpsQuery>,
-        failing_actions: Vec<std::mem::Discriminant<OpsAction>>,
+        remote_log_sources: RefCell<Vec<LogSourceObservation>>,
+        context_timestamps: RefCell<Vec<u64>>,
+        scrape_files: RefCell<Vec<(u64, String)>>,
+        analysis_files: RefCell<Vec<(u64, String)>>,
+        analysis_prompts: RefCell<Vec<String>>,
+        created_issues: RefCell<Vec<(String, String)>>,
+        priority_labels: RefCell<Vec<(u64, u8)>>,
+        scope_labels: RefCell<Vec<u64>>,
+        saved_histories: RefCell<Vec<OpsIssueHistory>>,
+        ensured_histories: RefCell<Vec<OpsIssueHistory>>,
+        failing_operations: Vec<String>,
         failing_issue_titles: Vec<String>,
     }
 
@@ -1472,10 +1070,17 @@ mod tests {
                 history: OpsIssueHistory::default(),
                 analysis,
                 next_iid: Cell::new(100),
-                saved_history: RefCell::new(None),
-                ensured_history: RefCell::new(None),
-                failing_queries: Vec::new(),
-                failing_actions: Vec::new(),
+                remote_log_sources: RefCell::new(Vec::new()),
+                context_timestamps: RefCell::new(Vec::new()),
+                scrape_files: RefCell::new(Vec::new()),
+                analysis_files: RefCell::new(Vec::new()),
+                analysis_prompts: RefCell::new(Vec::new()),
+                created_issues: RefCell::new(Vec::new()),
+                priority_labels: RefCell::new(Vec::new()),
+                scope_labels: RefCell::new(Vec::new()),
+                saved_histories: RefCell::new(Vec::new()),
+                ensured_histories: RefCell::new(Vec::new()),
+                failing_operations: Vec::new(),
                 failing_issue_titles: Vec::new(),
             }
         }
@@ -1495,16 +1100,8 @@ mod tests {
             self
         }
 
-        fn failing_query(mut self, query: OpsQuery) -> Self {
-            self.failing_queries.push(query);
-            self
-        }
-
-        /// Fail one action variant regardless of its payload. Naming the step
-        /// keeps the test readable where the payload is a whole log window or
-        /// a rendered prompt.
-        fn failing_action(mut self, action: &OpsAction) -> Self {
-            self.failing_actions.push(std::mem::discriminant(action));
+        fn failing_operation(mut self, operation: &str) -> Self {
+            self.failing_operations.push(operation.to_string());
             self
         }
 
@@ -1513,14 +1110,18 @@ mod tests {
             self
         }
 
-        fn record(&self, step: OpsStep) {
-            self.trace.borrow_mut().push(step);
+        fn record(&self, operation: &str) {
+            self.trace.borrow_mut().push(operation.to_string());
         }
 
-        fn observe(&self, query: OpsQuery) -> Result<()> {
-            self.record(OpsStep::Observe(query.clone()));
-            if self.failing_queries.contains(&query) {
-                anyhow::bail!("injected failure observing {query:?}");
+        fn perform(&self, operation: &str) -> Result<()> {
+            self.record(operation);
+            if self
+                .failing_operations
+                .iter()
+                .any(|failing| failing == operation)
+            {
+                anyhow::bail!("injected failure performing {operation}");
             }
             Ok(())
         }
@@ -1528,7 +1129,7 @@ mod tests {
 
     impl OpsPort for FakeOpsPort {
         fn shutdown_requested(&self) -> bool {
-            self.record(OpsStep::Observe(OpsQuery::ShutdownRequested));
+            self.record("shutdown_requested");
             self.shutdown_answers
                 .borrow_mut()
                 .pop_front()
@@ -1536,138 +1137,127 @@ mod tests {
         }
 
         fn cycle_clock(&self) -> CycleClock {
-            self.record(OpsStep::Observe(OpsQuery::CycleClock));
+            self.record("cycle_clock");
             self.clock
         }
 
         fn remote_log_tail(&self, source: &LogSourceObservation) -> Result<String> {
-            self.observe(OpsQuery::RemoteLogTail {
-                source: source.clone(),
-            })?;
+            self.perform("remote_log_tail")?;
+            self.remote_log_sources.borrow_mut().push(source.clone());
             Ok(self.log_tail.clone())
         }
 
+        fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String> {
+            self.perform("write_gitlab_context_file")?;
+            self.context_timestamps.borrow_mut().push(unix_ts);
+            Ok(CONTEXT_PATH.to_string())
+        }
+
+        fn write_scrape_file(&mut self, unix_ts: u64, window_log: &str) -> Result<()> {
+            self.perform("write_scrape_file")?;
+            self.scrape_files
+                .borrow_mut()
+                .push((unix_ts, window_log.to_string()));
+            Ok(())
+        }
+
+        fn prune_scrape_files(&mut self) -> Result<()> {
+            self.perform("prune_scrape_files")
+        }
+
         fn issue_history(&self) -> Result<OpsIssueHistory> {
-            self.observe(OpsQuery::IssueHistory)?;
+            self.perform("issue_history")?;
             Ok(self.history.clone())
         }
 
+        fn ensure_history_file(&mut self, history: &OpsIssueHistory) -> Result<()> {
+            self.perform("ensure_history_file")?;
+            self.ensured_histories.borrow_mut().push(history.clone());
+            Ok(())
+        }
+
+        fn write_analysis_file(&mut self, unix_ts: u64, window_log: &str) -> Result<String> {
+            self.perform("write_analysis_file")?;
+            self.analysis_files
+                .borrow_mut()
+                .push((unix_ts, window_log.to_string()));
+            Ok(ANALYSIS_PATH.to_string())
+        }
+
         fn history_file_path(&self) -> Result<String> {
-            self.observe(OpsQuery::HistoryFilePath)?;
+            self.perform("history_file_path")?;
             Ok(HISTORY_PATH.to_string())
         }
 
-        fn execute(&mut self, action: &OpsAction) -> OpsOutcome {
-            self.record(OpsStep::Act(action.clone()));
-            if self
-                .failing_actions
-                .contains(&std::mem::discriminant(action))
-            {
-                return OpsOutcome::Failed(anyhow::anyhow!(
-                    "injected failure executing {action:?}"
-                ));
+        fn invoke_analysis_model(&mut self, prompt: &str) -> Result<Vec<RawOpsIssue>> {
+            self.perform("invoke_analysis_model")?;
+            self.analysis_prompts.borrow_mut().push(prompt.to_string());
+            Ok(self.analysis.clone())
+        }
+
+        fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
+            self.perform("create_issue")?;
+            self.created_issues
+                .borrow_mut()
+                .push((title.to_string(), description.to_string()));
+            if self.failing_issue_titles.iter().any(|t| t == title) {
+                anyhow::bail!("injected failure creating issue {title:?}");
             }
-            match action {
-                OpsAction::WriteGitLabContextFile { .. } => {
-                    OpsOutcome::ContextFileWritten(CONTEXT_PATH.to_string())
-                }
-                OpsAction::WriteAnalysisFile { .. } => {
-                    OpsOutcome::AnalysisFileWritten(ANALYSIS_PATH.to_string())
-                }
-                OpsAction::EnsureHistoryFile(history) => {
-                    *self.ensured_history.borrow_mut() = Some(history.clone());
-                    OpsOutcome::Done
-                }
-                OpsAction::InvokeAnalysisModel { .. } => {
-                    OpsOutcome::Analyzed(self.analysis.clone())
-                }
-                OpsAction::CreateIssue { title, .. } => {
-                    if self.failing_issue_titles.iter().any(|t| t == title) {
-                        return OpsOutcome::Failed(anyhow::anyhow!(
-                            "injected failure creating issue {title:?}"
-                        ));
-                    }
-                    let iid = self.next_iid.get();
-                    self.next_iid.set(iid + 1);
-                    OpsOutcome::IssueCreated(iid)
-                }
-                OpsAction::SaveHistory(history) => {
-                    *self.saved_history.borrow_mut() = Some(history.clone());
-                    OpsOutcome::Done
-                }
-                _ => OpsOutcome::Done,
-            }
+            let iid = self.next_iid.get();
+            self.next_iid.set(iid + 1);
+            Ok(iid)
+        }
+
+        fn add_priority_label(&mut self, issue_iid: u64, priority: u8) -> Result<()> {
+            self.perform("add_priority_label")?;
+            self.priority_labels
+                .borrow_mut()
+                .push((issue_iid, priority));
+            Ok(())
+        }
+
+        fn add_scope_label(&mut self, issue_iid: u64) -> Result<()> {
+            self.perform("add_scope_label")?;
+            self.scope_labels.borrow_mut().push(issue_iid);
+            Ok(())
+        }
+
+        fn save_history(&mut self, history: &OpsIssueHistory) -> Result<()> {
+            self.perform("save_history")?;
+            self.saved_histories.borrow_mut().push(history.clone());
+            Ok(())
         }
     }
 
-    struct FakeRun {
-        result: Result<()>,
-        trace: Vec<OpsStep>,
-        saved_history: Option<OpsIssueHistory>,
-        ensured_history: Option<OpsIssueHistory>,
-    }
-
-    fn run_ops(port: &mut FakeOpsPort, hosts: &[&str], has_scope_label: bool) -> FakeRun {
+    fn run_ops(port: &mut FakeOpsPort, hosts: &[&str], has_scope_label: bool) -> Result<()> {
         let sources: Vec<OpsLogSource> = hosts.iter().copied().map(log_source).collect();
-        let mut machine = OpsMachine::new(TEST_AGENT, &sources, has_scope_label);
-        let result = run_ops_cycle(&mut machine, port);
-        FakeRun {
-            result,
-            trace: port.trace.borrow().clone(),
-            saved_history: port.saved_history.borrow().clone(),
-            ensured_history: port.ensured_history.borrow().clone(),
-        }
+        run_ops_cycle(TEST_AGENT, &sources, has_scope_label, port)
     }
 
-    fn observe(query: OpsQuery) -> OpsStep {
-        OpsStep::Observe(query)
-    }
-
-    fn act(action: OpsAction) -> OpsStep {
-        OpsStep::Act(action)
-    }
-
-    fn shutdown() -> OpsStep {
-        observe(OpsQuery::ShutdownRequested)
-    }
-
-    /// The steps every cycle performs from the first shutdown check through
+    /// The operations every cycle performs from the first shutdown check through
     /// the model invocation, for a single log source whose window is large
     /// enough to analyze.
-    fn steps_up_to_analysis(hosts: &[&str]) -> Vec<OpsStep> {
-        let window = expected_window(hosts);
-        let mut steps = vec![
-            shutdown(),
-            observe(OpsQuery::CycleClock),
-            act(OpsAction::WriteGitLabContextFile {
-                unix_ts: TEST_UNIX_TS,
-            }),
-            shutdown(),
+    fn operations_up_to_analysis(source_count: usize) -> Vec<String> {
+        let mut operations = vec![
+            "shutdown_requested",
+            "cycle_clock",
+            "write_gitlab_context_file",
+            "shutdown_requested",
         ];
-        for host in hosts {
-            steps.push(observe(OpsQuery::RemoteLogTail {
-                source: observation(host),
-            }));
-            steps.push(shutdown());
+        for _ in 0..source_count {
+            operations.push("remote_log_tail");
+            operations.push("shutdown_requested");
         }
-        steps.extend([
-            act(OpsAction::WriteScrapeFile {
-                unix_ts: TEST_UNIX_TS,
-                window_log: window.clone(),
-            }),
-            act(OpsAction::PruneScrapeFiles),
-            observe(OpsQuery::IssueHistory),
-            act(OpsAction::EnsureHistoryFile(OpsIssueHistory::default())),
-            act(OpsAction::WriteAnalysisFile {
-                unix_ts: TEST_UNIX_TS,
-                window_log: window,
-            }),
-            observe(OpsQuery::HistoryFilePath),
-            act(OpsAction::InvokeAnalysisModel {
-                prompt: build_analysis_prompt(ANALYSIS_PATH, HISTORY_PATH, CONTEXT_PATH),
-            }),
+        operations.extend([
+            "write_scrape_file",
+            "prune_scrape_files",
+            "issue_history",
+            "ensure_history_file",
+            "write_analysis_file",
+            "history_file_path",
+            "invoke_analysis_model",
         ]);
-        steps
+        operations.into_iter().map(str::to_string).collect()
     }
 
     fn created_entry(iid: u64, title: &str) -> OpsIssueHistoryEntry {
@@ -1685,105 +1275,126 @@ mod tests {
             proposal("Fix DB timeout", Some(1)),
             proposal("Fix memory leak", None),
         ]);
-        let run = run_ops(&mut port, &["prod-1.example.com"], true);
+        assert!(run_ops(&mut port, &["prod-1.example.com"], true).is_ok());
 
-        assert!(run.result.is_ok());
-        let mut expected = steps_up_to_analysis(&["prod-1.example.com"]);
-        expected.extend([
-            act(OpsAction::CreateIssue {
-                title: "Fix DB timeout".to_string(),
-                description: "Fix DB timeout — log evidence and remediation.".to_string(),
-            }),
-            act(OpsAction::AddPriorityLabel {
-                issue_iid: 100,
-                priority: 1,
-            }),
-            act(OpsAction::AddScopeLabel { issue_iid: 100 }),
-            act(OpsAction::CreateIssue {
-                title: "Fix memory leak".to_string(),
-                description: "Fix memory leak — log evidence and remediation.".to_string(),
-            }),
-            // No priority on this proposal, so the scope label follows the
-            // create directly.
-            act(OpsAction::AddScopeLabel { issue_iid: 101 }),
-            act(OpsAction::SaveHistory(OpsIssueHistory {
+        let mut expected = operations_up_to_analysis(1);
+        expected.extend(
+            [
+                "create_issue",
+                "add_priority_label",
+                "add_scope_label",
+                "create_issue",
+                "add_scope_label",
+                "save_history",
+            ]
+            .map(str::to_string),
+        );
+        assert_eq!(*port.trace.borrow(), expected);
+        assert_eq!(
+            *port.created_issues.borrow(),
+            vec![
+                (
+                    "Fix DB timeout".to_string(),
+                    "Fix DB timeout — log evidence and remediation.".to_string(),
+                ),
+                (
+                    "Fix memory leak".to_string(),
+                    "Fix memory leak — log evidence and remediation.".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(*port.priority_labels.borrow(), vec![(100, 1)]);
+        assert_eq!(*port.scope_labels.borrow(), vec![100, 101]);
+        assert_eq!(
+            *port.saved_histories.borrow(),
+            vec![OpsIssueHistory {
                 entries: vec![
                     created_entry(100, "Fix DB timeout"),
                     created_entry(101, "Fix memory leak"),
                 ],
-            })),
-        ]);
-        assert_eq!(run.trace, expected);
+            }]
+        );
     }
 
     #[test]
     fn ops_cycle_stops_before_any_side_effect_when_shutdown_is_already_requested() {
         let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(1))])
             .with_shutdown_answers(&[true]);
-        let run = run_ops(&mut port, &["prod-1.example.com"], true);
-
-        assert!(run.result.is_ok());
-        assert_eq!(run.trace, vec![shutdown()]);
+        assert!(run_ops(&mut port, &["prod-1.example.com"], true).is_ok());
+        assert_eq!(*port.trace.borrow(), vec!["shutdown_requested"]);
     }
 
     #[test]
     fn ops_cycle_stops_after_the_context_file_when_shutdown_is_requested() {
         let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(1))])
             .with_shutdown_answers(&[false, true]);
-        let run = run_ops(&mut port, &["prod-1.example.com"], true);
-
-        assert!(run.result.is_ok());
+        assert!(run_ops(&mut port, &["prod-1.example.com"], true).is_ok());
         assert_eq!(
-            run.trace,
+            *port.trace.borrow(),
             vec![
-                shutdown(),
-                observe(OpsQuery::CycleClock),
-                act(OpsAction::WriteGitLabContextFile {
-                    unix_ts: TEST_UNIX_TS
-                }),
-                shutdown(),
+                "shutdown_requested",
+                "cycle_clock",
+                "write_gitlab_context_file",
+                "shutdown_requested",
             ]
         );
+        assert_eq!(*port.context_timestamps.borrow(), vec![TEST_UNIX_TS]);
     }
 
     #[test]
     fn ops_cycle_stops_after_a_log_tail_without_writing_a_scrape_file_when_shutdown_is_requested() {
         let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(1))])
             .with_shutdown_answers(&[false, false, true]);
-        let run = run_ops(&mut port, &["prod-1.example.com"], true);
-
-        assert!(run.result.is_ok());
+        assert!(run_ops(&mut port, &["prod-1.example.com"], true).is_ok());
         assert_eq!(
-            run.trace,
+            *port.trace.borrow(),
             vec![
-                shutdown(),
-                observe(OpsQuery::CycleClock),
-                act(OpsAction::WriteGitLabContextFile {
-                    unix_ts: TEST_UNIX_TS
-                }),
-                shutdown(),
-                observe(OpsQuery::RemoteLogTail {
-                    source: observation("prod-1.example.com"),
-                }),
-                shutdown(),
+                "shutdown_requested",
+                "cycle_clock",
+                "write_gitlab_context_file",
+                "shutdown_requested",
+                "remote_log_tail",
+                "shutdown_requested",
             ]
         );
+        assert_eq!(
+            *port.remote_log_sources.borrow(),
+            vec![observation("prod-1.example.com")]
+        );
+        assert!(port.scrape_files.borrow().is_empty());
     }
 
     #[test]
     fn ops_cycle_scrapes_every_configured_source_in_configuration_order() {
         let mut port = FakeOpsPort::new(Vec::new());
         let hosts = ["prod-1.example.com", "prod-2.example.com"];
-        let run = run_ops(&mut port, &hosts, true);
-
-        assert!(run.result.is_ok());
+        assert!(run_ops(&mut port, &hosts, true).is_ok());
         // Both sources are scraped before anything is written, and the two
         // windows are joined in configuration order.
-        assert_eq!(run.trace, steps_up_to_analysis(&hosts));
-        assert!(run.trace.contains(&act(OpsAction::WriteScrapeFile {
-            unix_ts: TEST_UNIX_TS,
-            window_log: expected_window(&hosts),
-        })));
+        assert_eq!(*port.trace.borrow(), operations_up_to_analysis(hosts.len()));
+        assert_eq!(
+            *port.remote_log_sources.borrow(),
+            vec![
+                observation("prod-1.example.com"),
+                observation("prod-2.example.com"),
+            ]
+        );
+        assert_eq!(
+            *port.scrape_files.borrow(),
+            vec![(TEST_UNIX_TS, expected_window(&hosts))]
+        );
+        assert_eq!(
+            *port.analysis_files.borrow(),
+            vec![(TEST_UNIX_TS, expected_window(&hosts))]
+        );
+        assert_eq!(
+            *port.analysis_prompts.borrow(),
+            vec![build_analysis_prompt(
+                ANALYSIS_PATH,
+                HISTORY_PATH,
+                CONTEXT_PATH
+            )]
+        );
     }
 
     #[test]
@@ -1792,35 +1403,27 @@ mod tests {
         // section and the joined window stays empty.
         let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(1))])
             .with_log_tail("2026-06-15 09:00:00 ERROR long-settled failure");
-        let run = run_ops(&mut port, &["prod-1.example.com"], true);
-
-        assert!(run.result.is_ok());
+        assert!(run_ops(&mut port, &["prod-1.example.com"], true).is_ok());
         assert_eq!(
-            run.trace,
+            *port.trace.borrow(),
             vec![
-                shutdown(),
-                observe(OpsQuery::CycleClock),
-                act(OpsAction::WriteGitLabContextFile {
-                    unix_ts: TEST_UNIX_TS
-                }),
-                shutdown(),
-                observe(OpsQuery::RemoteLogTail {
-                    source: observation("prod-1.example.com"),
-                }),
-                shutdown(),
+                "shutdown_requested",
+                "cycle_clock",
+                "write_gitlab_context_file",
+                "shutdown_requested",
+                "remote_log_tail",
+                "shutdown_requested",
             ]
         );
-        assert!(run.saved_history.is_none());
+        assert!(port.saved_histories.borrow().is_empty());
     }
 
     #[test]
     fn ops_cycle_saves_no_history_when_the_model_reports_no_issues() {
         let mut port = FakeOpsPort::new(Vec::new());
-        let run = run_ops(&mut port, &["prod-1.example.com"], true);
-
-        assert!(run.result.is_ok());
-        assert_eq!(run.trace, steps_up_to_analysis(&["prod-1.example.com"]));
-        assert!(run.saved_history.is_none());
+        assert!(run_ops(&mut port, &["prod-1.example.com"], true).is_ok());
+        assert_eq!(*port.trace.borrow(), operations_up_to_analysis(1));
+        assert!(port.saved_histories.borrow().is_empty());
     }
 
     #[test]
@@ -1830,25 +1433,24 @@ mod tests {
         };
         let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(2))])
             .with_history(existing.clone());
-        let run = run_ops(&mut port, &["prod-1.example.com"], true);
-
-        assert!(run.result.is_ok());
+        assert!(run_ops(&mut port, &["prod-1.example.com"], true).is_ok());
         // The history the model's context file is guaranteed to exist for is
         // the one loaded from disk, before this cycle appended anything.
-        assert_eq!(run.ensured_history, Some(existing));
+        assert_eq!(*port.ensured_histories.borrow(), vec![existing]);
         assert_eq!(
-            run.saved_history,
-            Some(OpsIssueHistory {
+            *port.saved_histories.borrow(),
+            vec![OpsIssueHistory {
                 entries: vec![
                     created_entry(7, "Previously filed"),
                     created_entry(100, "Fix DB timeout"),
                 ],
-            })
+            }]
         );
         assert_eq!(
-            run.trace
+            port.trace
+                .borrow()
                 .iter()
-                .filter(|step| matches!(step, OpsStep::Act(OpsAction::SaveHistory(_))))
+                .filter(|operation| operation.as_str() == "save_history")
                 .count(),
             1
         );
@@ -1861,114 +1463,101 @@ mod tests {
             proposal("Fix memory leak", Some(2)),
         ])
         .failing_issue("Doomed");
-        let run = run_ops(&mut port, &["prod-1.example.com"], true);
-
-        assert!(run.result.is_ok());
-        let mut expected = steps_up_to_analysis(&["prod-1.example.com"]);
-        expected.extend([
-            act(OpsAction::CreateIssue {
-                title: "Doomed".to_string(),
-                description: "Doomed — log evidence and remediation.".to_string(),
-            }),
-            // No label steps for the failed create; the cycle moves straight
-            // to the next proposal.
-            act(OpsAction::CreateIssue {
-                title: "Fix memory leak".to_string(),
-                description: "Fix memory leak — log evidence and remediation.".to_string(),
-            }),
-            act(OpsAction::AddPriorityLabel {
-                issue_iid: 100,
-                priority: 2,
-            }),
-            act(OpsAction::AddScopeLabel { issue_iid: 100 }),
-            act(OpsAction::SaveHistory(OpsIssueHistory {
+        assert!(run_ops(&mut port, &["prod-1.example.com"], true).is_ok());
+        let mut expected = operations_up_to_analysis(1);
+        expected.extend(
+            [
+                "create_issue",
+                "create_issue",
+                "add_priority_label",
+                "add_scope_label",
+                "save_history",
+            ]
+            .map(str::to_string),
+        );
+        assert_eq!(*port.trace.borrow(), expected);
+        assert_eq!(
+            *port.created_issues.borrow(),
+            vec![
+                (
+                    "Doomed".to_string(),
+                    "Doomed — log evidence and remediation.".to_string(),
+                ),
+                (
+                    "Fix memory leak".to_string(),
+                    "Fix memory leak — log evidence and remediation.".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(*port.priority_labels.borrow(), vec![(100, 2)]);
+        assert_eq!(*port.scope_labels.borrow(), vec![100]);
+        assert_eq!(
+            *port.saved_histories.borrow(),
+            vec![OpsIssueHistory {
                 entries: vec![created_entry(100, "Fix memory leak")],
-            })),
-        ]);
-        assert_eq!(run.trace, expected);
+            }]
+        );
     }
 
     #[test]
     fn ops_cycle_records_a_created_issue_even_when_both_label_writes_fail() {
         let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(1))])
-            .failing_action(&OpsAction::AddPriorityLabel {
-                issue_iid: 0,
-                priority: 0,
-            })
-            .failing_action(&OpsAction::AddScopeLabel { issue_iid: 0 });
-        let run = run_ops(&mut port, &["prod-1.example.com"], true);
+            .failing_operation("add_priority_label")
+            .failing_operation("add_scope_label");
+        let result = run_ops(&mut port, &["prod-1.example.com"], true);
 
         // Labels are best effort: the issue exists, so it is recorded and the
         // history is still saved.
-        assert!(run.result.is_ok());
+        assert!(result.is_ok());
         assert_eq!(
-            run.saved_history,
-            Some(OpsIssueHistory {
+            *port.saved_histories.borrow(),
+            vec![OpsIssueHistory {
                 entries: vec![created_entry(100, "Fix DB timeout")],
-            })
+            }]
         );
     }
 
     #[test]
     fn ops_cycle_omits_the_scope_label_when_no_scope_label_is_configured() {
         let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(1))]);
-        let run = run_ops(&mut port, &["prod-1.example.com"], false);
-
-        assert!(run.result.is_ok());
+        assert!(run_ops(&mut port, &["prod-1.example.com"], false).is_ok());
         assert!(
-            !run.trace
+            !port
+                .trace
+                .borrow()
                 .iter()
-                .any(|step| matches!(step, OpsStep::Act(OpsAction::AddScopeLabel { .. }))),
+                .any(|operation| operation == "add_scope_label"),
             "{:?}",
-            run.trace
+            port.trace.borrow()
         );
+        assert!(port.scope_labels.borrow().is_empty());
     }
 
     #[test]
     fn ops_cycle_aborts_when_a_required_write_fails() {
         for failing in [
-            OpsAction::WriteGitLabContextFile { unix_ts: 0 },
-            OpsAction::WriteScrapeFile {
-                unix_ts: 0,
-                window_log: String::new(),
-            },
-            OpsAction::PruneScrapeFiles,
-            OpsAction::EnsureHistoryFile(OpsIssueHistory::default()),
-            OpsAction::WriteAnalysisFile {
-                unix_ts: 0,
-                window_log: String::new(),
-            },
-            OpsAction::InvokeAnalysisModel {
-                prompt: String::new(),
-            },
-            OpsAction::SaveHistory(OpsIssueHistory::default()),
+            "write_gitlab_context_file",
+            "write_scrape_file",
+            "prune_scrape_files",
+            "ensure_history_file",
+            "write_analysis_file",
+            "invoke_analysis_model",
+            "save_history",
         ] {
             let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(1))])
-                .failing_action(&failing);
-            let run = run_ops(&mut port, &["prod-1.example.com"], true);
-            assert!(
-                run.result.is_err(),
-                "expected {failing:?} to abort the cycle"
-            );
+                .failing_operation(failing);
+            let result = run_ops(&mut port, &["prod-1.example.com"], true);
+            assert!(result.is_err(), "expected {failing} to abort the cycle");
         }
     }
 
     #[test]
     fn ops_cycle_aborts_when_a_required_read_fails() {
-        for failing in [
-            OpsQuery::RemoteLogTail {
-                source: observation("prod-1.example.com"),
-            },
-            OpsQuery::IssueHistory,
-            OpsQuery::HistoryFilePath,
-        ] {
+        for failing in ["remote_log_tail", "issue_history", "history_file_path"] {
             let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(1))])
-                .failing_query(failing.clone());
-            let run = run_ops(&mut port, &["prod-1.example.com"], true);
-            assert!(
-                run.result.is_err(),
-                "expected {failing:?} to abort the cycle"
-            );
+                .failing_operation(failing);
+            let result = run_ops(&mut port, &["prod-1.example.com"], true);
+            assert!(result.is_err(), "expected {failing} to abort the cycle");
         }
     }
 
