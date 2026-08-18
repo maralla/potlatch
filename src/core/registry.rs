@@ -1,9 +1,9 @@
 use anyhow::Result;
 
-use crate::core::agent::CoreAgent;
+use crate::core::agent::{CoreAgent, validate_agent_config};
 use crate::core::banner::Banner;
 use crate::core::config::{AgentSection, Config};
-use crate::core::workflow::{AgentSpawnContext, WorkflowContext, spawn_core_agent};
+use crate::core::workflow::{WorkflowContext, spawn_core_agent};
 
 pub(crate) struct AgentRegistration {
     pub name: &'static str,
@@ -25,13 +25,13 @@ impl AgentRegistry {
 
     pub fn register_agent<A>(&mut self)
     where
-        A: CoreAgent<SpawnContext = AgentSpawnContext> + 'static,
+        A: CoreAgent + 'static,
     {
         self.registrations.push(AgentRegistration {
             name: A::name(),
             spawn: spawn_core_agent::<A>,
             banner: A::banner,
-            validate_config: A::validate_config,
+            validate_config: validate_agent_config::<A>,
         });
     }
 
@@ -61,8 +61,15 @@ mod tests {
 
     struct AlphaAgentForTest;
 
+    #[derive(serde::Deserialize)]
+    struct AlphaSettings {
+        #[serde(default)]
+        _enabled: bool,
+    }
+
     impl CoreAgent for AlphaAgentForTest {
-        type SpawnContext = AgentSpawnContext;
+        type Settings = AlphaSettings;
+        const MAX_INSTANCES: Option<usize> = Some(1);
 
         fn name() -> &'static str {
             "alpha"
@@ -72,18 +79,11 @@ mod tests {
             unreachable!("test agent is never run")
         }
 
-        fn validate_config(_config: &Config, section: &AgentSection) -> Result<()> {
-            if section.core.instances > 1 {
-                anyhow::bail!("alpha supports at most one instance");
-            }
-            Ok(())
-        }
-
         fn run_periodic_task(&mut self, _task_id: &str) -> Result<()> {
             Ok(())
         }
 
-        fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
+        fn build(_ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
             Ok(Self)
         }
 
@@ -132,6 +132,24 @@ mod tests {
         let registration = reg.find("alpha").unwrap();
 
         let err = (registration.validate_config)(&cfg, cfg.agent("alpha").unwrap()).unwrap_err();
-        assert!(err.to_string().contains("at most one instance"));
+        assert!(err.to_string().contains("at most 1 instance"));
+    }
+
+    #[test]
+    fn registration_dispatches_typed_settings_deserialization() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [agent.alpha]
+            instances = 1
+            _enabled = "not-a-bool"
+            "#,
+        )
+        .unwrap();
+        let mut reg = AgentRegistry::new();
+        reg.register_agent::<AlphaAgentForTest>();
+        let registration = reg.find("alpha").unwrap();
+
+        let err = (registration.validate_config)(&cfg, cfg.agent("alpha").unwrap()).unwrap_err();
+        assert!(format!("{err:#}").contains("invalid type"));
     }
 }

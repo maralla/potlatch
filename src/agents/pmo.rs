@@ -328,7 +328,7 @@ struct PmoConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct PmoAgentSettings {
+pub(crate) struct PmoAgentSettings {
     #[serde(default = "default_pmo_poll_interval")]
     poll_interval_secs: u64,
     #[serde(default)]
@@ -343,14 +343,6 @@ fn default_pmo_poll_interval() -> u64 {
 
 fn default_ask_gitlab_timeout_secs() -> u64 {
     600
-}
-
-impl PmoAgentSettings {
-    fn from_raw(raw: &toml::Value) -> Result<Self> {
-        raw.clone()
-            .try_into()
-            .context("pmo agent settings from config")
-    }
 }
 
 /// A borrowing view over the [`GitLabAgentRuntime`] identity/path fields
@@ -425,7 +417,7 @@ pub(crate) struct PmoAgent {
 }
 
 impl CoreAgent for PmoAgent {
-    type SpawnContext = crate::core::workflow::AgentSpawnContext;
+    type Settings = PmoAgentSettings;
 
     fn name() -> &'static str {
         "pmo"
@@ -439,9 +431,12 @@ impl CoreAgent for PmoAgent {
         gitlab_banner(config, banner);
     }
 
-    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+    fn validate_settings(
+        config: &Config,
+        _section: &crate::core::config::AgentSection,
+        _settings: &Self::Settings,
+    ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
-        PmoAgentSettings::from_raw(&section.raw)?;
         Ok(())
     }
 
@@ -474,15 +469,9 @@ impl CoreAgent for PmoAgent {
         }
     }
 
-    fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let section = ctx
-            .workflow
-            .config
-            .agent("pmo")
-            .context("[agent.pmo] section required")?;
-        let settings = PmoAgentSettings::from_raw(&section.raw)?;
-        let runtime =
-            GitLabAgentBootstrap::new(&ctx, "pmo", ModelPreferences::default()).build()?;
+    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+        let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
+        let settings = ctx.settings;
         let config = PmoConfig {
             poll_interval_secs: settings.poll_interval_secs,
             ask_via_gitlab: settings.ask_via_gitlab,

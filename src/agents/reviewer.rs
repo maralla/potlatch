@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -140,7 +140,7 @@ struct ReviewerConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ReviewerAgentSettings {
+pub(crate) struct ReviewerAgentSettings {
     #[serde(default = "default_reviewer_poll_interval")]
     poll_interval_secs: u64,
     #[serde(default = "default_merge_when_approved")]
@@ -155,14 +155,6 @@ fn default_merge_when_approved() -> bool {
     true
 }
 
-impl ReviewerAgentSettings {
-    fn from_raw(raw: &toml::Value) -> Result<Self> {
-        raw.clone()
-            .try_into()
-            .context("reviewer agent settings from config")
-    }
-}
-
 pub(crate) struct ReviewerAgent {
     runtime: GitLabAgentRuntime,
     config: ReviewerConfig,
@@ -171,7 +163,7 @@ pub(crate) struct ReviewerAgent {
 }
 
 impl CoreAgent for ReviewerAgent {
-    type SpawnContext = crate::core::workflow::AgentSpawnContext;
+    type Settings = ReviewerAgentSettings;
 
     fn name() -> &'static str {
         "reviewer"
@@ -185,9 +177,12 @@ impl CoreAgent for ReviewerAgent {
         gitlab_banner(config, banner);
     }
 
-    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+    fn validate_settings(
+        config: &Config,
+        _section: &crate::core::config::AgentSection,
+        _settings: &Self::Settings,
+    ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
-        ReviewerAgentSettings::from_raw(&section.raw)?;
         Ok(())
     }
 
@@ -223,19 +218,13 @@ impl CoreAgent for ReviewerAgent {
         }
     }
 
-    fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let section = ctx
-            .workflow
-            .config
-            .agent("reviewer")
-            .context("[agent.reviewer] section required")?;
-        let settings = ReviewerAgentSettings::from_raw(&section.raw)?;
+    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+        let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
+        let settings = ctx.settings;
         let config = ReviewerConfig {
             poll_interval_secs: settings.poll_interval_secs,
             merge_when_approved: settings.merge_when_approved,
         };
-        let runtime =
-            GitLabAgentBootstrap::new(&ctx, "reviewer", ModelPreferences::default()).build()?;
         let scope = crate::agents::scope_label_filter(&runtime.scope_label);
         let claimed_mr = find_claimed_mr(&runtime.agent_id, &runtime.gitlab, scope);
         Ok(Self {

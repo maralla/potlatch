@@ -40,19 +40,13 @@ pub struct GitLabAgentRuntime {
 /// Builds the common runtime resources for a configured GitLab agent role.
 pub struct GitLabAgentBootstrap<'a> {
     ctx: &'a AgentSpawnContext,
-    role: &'static str,
     model_preferences: ModelPreferences,
 }
 
 impl<'a> GitLabAgentBootstrap<'a> {
-    pub fn new(
-        ctx: &'a AgentSpawnContext,
-        role: &'static str,
-        model_preferences: ModelPreferences,
-    ) -> Self {
+    pub fn new(ctx: &'a AgentSpawnContext, model_preferences: ModelPreferences) -> Self {
         Self {
             ctx,
-            role,
             model_preferences,
         }
     }
@@ -61,12 +55,12 @@ impl<'a> GitLabAgentBootstrap<'a> {
         self.ctx
             .workflow
             .config
-            .agent(self.role)
-            .with_context(|| format!("[agent.{}] section required", self.role))?;
+            .agent(self.ctx.agent_name)
+            .with_context(|| format!("[agent.{}] section required", self.ctx.agent_name))?;
         let settings = AgentSettings::from_config(&self.ctx.workflow.config)?;
         let gitlab_repo = settings.require_gitlab_repo()?.to_string();
         let project_name = extract_project_name(&gitlab_repo)?;
-        let agent_id = agent_instance_id(self.role, self.ctx.instance_id);
+        let agent_id = self.ctx.runtime.agent_id().to_string();
         ensure_agent_repo(
             &self.ctx.workflow.base_dir,
             &gitlab_repo,
@@ -83,12 +77,7 @@ impl<'a> GitLabAgentBootstrap<'a> {
             &gitlab_repo,
             Arc::clone(&self.ctx.workflow.shutdown),
         )?;
-        let model = AgentModel::connect(
-            self.ctx,
-            self.role,
-            working_dir.clone(),
-            self.model_preferences,
-        )?;
+        let model = AgentModel::connect(self.ctx, working_dir.clone(), self.model_preferences)?;
 
         Ok(GitLabAgentRuntime {
             agent_id,
@@ -110,27 +99,6 @@ pub fn gitlab_banner(config: &Config, banner: &mut Banner) {
     {
         banner.set_once("repo", repo);
     }
-}
-
-pub fn validate_max_instances(role: &str, instances: usize, max: usize) -> Result<()> {
-    anyhow::ensure!(
-        instances <= max,
-        "[agent.{role}] supports at most {max} instance(s) (got {instances})"
-    );
-    Ok(())
-}
-
-pub fn validate_instance_id(role: &str, instance_id: usize, max: usize) -> Result<()> {
-    anyhow::ensure!(
-        instance_id < max,
-        "[agent.{role}] invalid instance id {instance_id} (maximum is {})",
-        max.saturating_sub(1)
-    );
-    Ok(())
-}
-
-pub fn agent_instance_id(role: &str, instance_id: usize) -> String {
-    format!("{role}-{instance_id}")
 }
 
 pub fn agent_dir(base_dir: &str, project_name: &str, agent_id: &str) -> String {
@@ -216,25 +184,15 @@ mod tests {
     }
 
     #[test]
-    fn resolves_identity_and_workspace_paths() {
-        let agent_id = agent_instance_id("worker", 2);
-        assert_eq!(agent_id, "worker-2");
+    fn resolves_workspace_paths_from_core_identity() {
+        let agent_id = "worker-2";
         assert_eq!(
-            agent_dir("/srv/potlatch", "project", &agent_id),
+            agent_dir("/srv/potlatch", "project", agent_id),
             "/srv/potlatch/project-worker-2"
         );
         assert_eq!(
-            work_dir("/srv/potlatch", "project", &agent_id),
+            work_dir("/srv/potlatch", "project", agent_id),
             "/srv/potlatch/project-worker-2/project"
         );
-    }
-
-    #[test]
-    fn validates_shared_instance_limits() {
-        assert!(validate_max_instances("qa", 0, 1).is_ok());
-        assert!(validate_max_instances("qa", 1, 1).is_ok());
-        assert!(validate_max_instances("qa", 2, 1).is_err());
-        assert!(validate_instance_id("qa", 0, 1).is_ok());
-        assert!(validate_instance_id("qa", 1, 1).is_err());
     }
 }

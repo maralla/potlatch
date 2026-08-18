@@ -19,10 +19,7 @@ use tracing::{debug, warn};
 
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient};
-use crate::agents::workspace::{
-    GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner, validate_instance_id,
-    validate_max_instances,
-};
+use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, ObjectSchema, Schema, StructuredOutput, compat};
 use crate::core::banner::Banner;
@@ -244,7 +241,7 @@ struct QaConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct QaAgentSettings {
+pub(crate) struct QaAgentSettings {
     #[serde(default = "default_qa_poll_interval")]
     poll_interval_secs: u64,
     #[serde(default = "default_branches")]
@@ -360,7 +357,8 @@ struct ClarificationQuestion {
 // ---------------------------------------------------------------------------
 
 impl CoreAgent for QaAgent {
-    type SpawnContext = crate::core::workflow::AgentSpawnContext;
+    type Settings = QaAgentSettings;
+    const MAX_INSTANCES: Option<usize> = Some(MAX_INSTANCES);
 
     fn name() -> &'static str {
         NAME
@@ -374,10 +372,19 @@ impl CoreAgent for QaAgent {
         gitlab_banner(config, banner);
     }
 
-    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+    fn parse_settings(
+        _config: &Config,
+        section: &crate::core::config::AgentSection,
+    ) -> Result<Self::Settings> {
+        QaAgentSettings::from_raw(&section.raw)
+    }
+
+    fn validate_settings(
+        config: &Config,
+        _section: &crate::core::config::AgentSection,
+        _settings: &Self::Settings,
+    ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
-        validate_max_instances(NAME, section.core.instances, MAX_INSTANCES)?;
-        QaAgentSettings::from_raw(&section.raw)?;
         Ok(())
     }
 
@@ -399,16 +406,9 @@ impl CoreAgent for QaAgent {
         }
     }
 
-    fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let section = ctx
-            .workflow
-            .config
-            .agent(NAME)
-            .context("[agent.qa] section required")?;
-        validate_max_instances(NAME, section.core.instances, MAX_INSTANCES)?;
-        validate_instance_id(NAME, ctx.instance_id, MAX_INSTANCES)?;
-        let agent_settings = QaAgentSettings::from_raw(&section.raw)?;
-        let runtime = GitLabAgentBootstrap::new(&ctx, NAME, ModelPreferences::default()).build()?;
+    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+        let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
+        let agent_settings = ctx.settings;
         let config = QaConfig {
             poll_interval_secs: agent_settings.poll_interval_secs,
             branches: agent_settings.branches,

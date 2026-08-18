@@ -141,7 +141,7 @@ mod tests {
     }
 
     impl CoreAgent for SchedulerAgent {
-        type SpawnContext = ();
+        type Settings = toml::Value;
 
         fn name() -> &'static str {
             "scheduler-test"
@@ -167,7 +167,7 @@ mod tests {
             }
         }
 
-        fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
+        fn build(_ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
             unreachable!("scheduler tests construct the agent directly")
         }
 

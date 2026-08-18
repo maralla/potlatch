@@ -11,10 +11,7 @@ use tracing::{info, warn};
 
 use crate::agents::gitlab::{self, GitLabClient};
 use crate::agents::ssh_util::{shell_single_quote, validate_remote_path, validate_ssh_identity};
-use crate::agents::workspace::{
-    GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner, validate_instance_id,
-    validate_max_instances,
-};
+use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
 use crate::agents::write_task_context_file;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, ObjectSchema, Schema, StructuredOutput, compat};
@@ -163,7 +160,7 @@ struct OpsLogSource {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct OpsAgentSettings {
+pub(crate) struct OpsAgentSettings {
     #[serde(default = "default_ops_poll_interval")]
     poll_interval_secs: u64,
     ssh_user: Option<String>,
@@ -307,7 +304,8 @@ pub(crate) struct OpsAgent {
 }
 
 impl CoreAgent for OpsAgent {
-    type SpawnContext = crate::core::workflow::AgentSpawnContext;
+    type Settings = OpsAgentSettings;
+    const MAX_INSTANCES: Option<usize> = Some(MAX_INSTANCES);
 
     fn name() -> &'static str {
         NAME
@@ -321,10 +319,19 @@ impl CoreAgent for OpsAgent {
         gitlab_banner(config, banner);
     }
 
-    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+    fn parse_settings(
+        _config: &Config,
+        section: &crate::core::config::AgentSection,
+    ) -> Result<Self::Settings> {
+        OpsAgentSettings::from_raw(&section.raw)
+    }
+
+    fn validate_settings(
+        config: &Config,
+        _section: &crate::core::config::AgentSection,
+        _settings: &Self::Settings,
+    ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
-        validate_max_instances(NAME, section.core.instances, MAX_INSTANCES)?;
-        OpsAgentSettings::from_raw(&section.raw)?;
         Ok(())
     }
 
@@ -355,17 +362,10 @@ impl CoreAgent for OpsAgent {
         }
     }
 
-    fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let section = ctx
-            .workflow
-            .config
-            .agent(NAME)
-            .context("[agent.ops] section required")?;
-        validate_max_instances(NAME, section.core.instances, MAX_INSTANCES)?;
-        validate_instance_id(NAME, ctx.instance_id, MAX_INSTANCES)?;
-        let agent_settings = OpsAgentSettings::from_raw(&section.raw)?;
-        let runtime = GitLabAgentBootstrap::new(&ctx, NAME, ModelPreferences::default()).build()?;
+    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+        let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         AgentState::from_runtime(&runtime).ensure_sessions_dir()?;
+        let agent_settings = ctx.settings;
         let config = OpsConfig {
             poll_interval_secs: agent_settings.poll_interval_secs,
             log_sources: agent_settings
@@ -2426,13 +2426,6 @@ mod tests {
         assert!(!prompt.contains("output contract"));
         assert!(!prompt.contains("tool's `issues` field"));
         assert!(!prompt.contains("JSON array of objects"));
-    }
-
-    #[test]
-    fn validate_instance_count_allows_zero_or_one() {
-        assert!(validate_max_instances(NAME, 0, MAX_INSTANCES).is_ok());
-        assert!(validate_max_instances(NAME, 1, MAX_INSTANCES).is_ok());
-        assert!(validate_max_instances(NAME, 2, MAX_INSTANCES).is_err());
     }
 
     #[test]

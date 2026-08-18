@@ -32,7 +32,7 @@ use crate::core::workflow::{AgentSpawnContext, WorkflowContext};
 /// of the process.
 pub(crate) fn supervise<A>(workflow: WorkflowContext, instance_id: usize) -> Result<()>
 where
-    A: CoreAgent<SpawnContext = AgentSpawnContext>,
+    A: CoreAgent,
 {
     let agent_id = format!("{}-{instance_id}", A::name());
     let shutdown = Arc::clone(&workflow.shutdown);
@@ -48,6 +48,7 @@ where
         move || {
             let ctx = AgentSpawnContext {
                 workflow: workflow.clone_for_spawn(),
+                agent_name: A::name(),
                 instance_id,
                 runtime: attempt_runtime.clone(),
             };
@@ -395,7 +396,7 @@ mod tests {
     static SELF_STOPPING_ON_SHUTDOWN_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     impl CoreAgent for SelfStoppingAgent {
-        type SpawnContext = AgentSpawnContext;
+        type Settings = toml::Value;
 
         fn name() -> &'static str {
             "self-stopping-supervisor-test"
@@ -422,10 +423,10 @@ mod tests {
             Ok(())
         }
 
-        fn from_spawn(ctx: Self::SpawnContext) -> Result<Self> {
+        fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
             SELF_STOPPING_FROM_SPAWN_CALLS.fetch_add(1, Ordering::SeqCst);
             Ok(Self {
-                runtime: ctx.runtime,
+                runtime: ctx.runtime.clone(),
             })
         }
 
@@ -443,7 +444,15 @@ mod tests {
 
         fn workflow_with(shutdown: Arc<AtomicBool>) -> WorkflowContext {
             WorkflowContext {
-                config: Arc::new(Config::from_toml_str("").unwrap()),
+                config: Arc::new(
+                    Config::from_toml_str(
+                        r#"
+                        [agent.self-stopping-supervisor-test]
+                        instances = 2
+                        "#,
+                    )
+                    .unwrap(),
+                ),
                 base_dir: std::env::temp_dir().to_string_lossy().into_owned(),
                 shutdown,
                 activity: Arc::new(NoopActivityReporter),
