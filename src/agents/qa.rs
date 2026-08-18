@@ -26,6 +26,7 @@ use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
+use crate::core::cycle::Step;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 
@@ -519,12 +520,7 @@ trait QaPort {
     fn execute(&mut self, action: &QaAction) -> QaOutcome;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum QaStep {
-    Observe(QaQuery),
-    Act(QaAction),
-    Finish,
-}
+type QaStep = Step<QaQuery, QaAction>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QaStage {
@@ -1018,15 +1014,12 @@ fn observe_qa(port: &dyn QaPort, query: &QaQuery) -> Result<QaFact> {
     })
 }
 
-fn drive_qa(machine: &mut QaMachine, port: &mut dyn QaPort) -> Result<()> {
+fn run_qa_cycle(machine: &mut QaMachine, port: &mut dyn QaPort) -> Result<()> {
     loop {
         match machine.next_step() {
-            QaStep::Observe(query) => machine.apply_fact(observe_qa(port, &query))?,
-            QaStep::Act(action) => {
-                let outcome = port.execute(&action);
-                machine.apply_outcome(outcome)?;
-            }
-            QaStep::Finish => return Ok(()),
+            Step::Observe(query) => machine.apply_fact(observe_qa(port, &query))?,
+            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
+            Step::Finish => return Ok(()),
         }
     }
 }
@@ -1184,7 +1177,7 @@ fn qa_cycle(
         model,
         scope_label,
     };
-    drive_qa(&mut machine, &mut port)
+    run_qa_cycle(&mut machine, &mut port)
 }
 
 fn clarification_description(question: &ClarificationQuestion) -> String {
@@ -1648,7 +1641,7 @@ mod tests {
                 test_scripts_dir: "/sessions/scripts",
             },
         );
-        drive_qa(&mut machine, port)
+        run_qa_cycle(&mut machine, port)
     }
 
     #[test]
@@ -1802,7 +1795,7 @@ mod tests {
                 test_scripts_dir: "/t",
             },
         );
-        drive_qa(&mut machine, &mut port).unwrap();
+        run_qa_cycle(&mut machine, &mut port).unwrap();
         let trace = port.trace.borrow();
         assert!(trace.windows(3).any(|steps| steps
             == [

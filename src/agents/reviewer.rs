@@ -16,6 +16,7 @@ use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
+use crate::core::cycle::Step;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 
@@ -440,13 +441,7 @@ trait ReviewerPort {
     fn execute(&mut self, action: &ReviewerAction) -> ReviewerOutcome;
 }
 
-/// One turn of the driver loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReviewerStep {
-    Observe(ReviewerQuery),
-    Act(ReviewerAction),
-    Finish,
-}
+type ReviewerStep = Step<ReviewerQuery, ReviewerAction>;
 
 // ---------------------------------------------------------------------------
 // Pure reviewer decisions
@@ -1254,20 +1249,12 @@ fn observe_reviewer(port: &dyn ReviewerPort, query: &ReviewerQuery) -> Result<Re
     })
 }
 
-/// Run the reviewer machine to completion: observe, decide one step,
-/// execute it, feed the result back.
-fn drive_reviewer(machine: &mut ReviewerMachine, port: &mut dyn ReviewerPort) -> Result<()> {
+fn run_reviewer_cycle(machine: &mut ReviewerMachine, port: &mut dyn ReviewerPort) -> Result<()> {
     loop {
         match machine.next_step() {
-            ReviewerStep::Observe(query) => {
-                let fact = observe_reviewer(port, &query);
-                machine.apply_fact(fact)?;
-            }
-            ReviewerStep::Act(action) => {
-                let outcome = port.execute(&action);
-                machine.apply_outcome(outcome)?;
-            }
-            ReviewerStep::Finish => return Ok(()),
+            Step::Observe(query) => machine.apply_fact(observe_reviewer(port, &query))?,
+            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
+            Step::Finish => return Ok(()),
         }
     }
 }
@@ -1500,7 +1487,7 @@ fn reviewer_cycle(
         shutdown,
         scope_label,
     };
-    let result = drive_reviewer(&mut machine, &mut port);
+    let result = run_reviewer_cycle(&mut machine, &mut port);
     if let Some(mr_iid) = machine.merged_mr_iid() {
         merged_mrs.insert(mr_iid);
     }
@@ -2160,7 +2147,7 @@ mod tests {
         let held = port.held_claim;
         let mut machine =
             ReviewerMachine::new(TEST_AGENT, None, merge_when_approved).with_held_claim(held);
-        let result = drive_reviewer(&mut machine, port);
+        let result = run_reviewer_cycle(&mut machine, port);
         FakeRun {
             result,
             trace: port.trace.borrow().clone(),

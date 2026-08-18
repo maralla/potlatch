@@ -2,6 +2,7 @@ pub mod activity;
 pub mod agent;
 pub mod banner;
 pub mod config;
+pub mod cycle;
 pub mod model;
 pub mod periodic;
 pub mod registry;
