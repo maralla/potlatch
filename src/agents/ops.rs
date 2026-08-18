@@ -17,6 +17,7 @@ use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
+use crate::core::cycle::Step;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 
@@ -495,13 +496,7 @@ trait OpsPort {
     fn execute(&mut self, action: &OpsAction) -> OpsOutcome;
 }
 
-/// One turn of the driver loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OpsStep {
-    Observe(OpsQuery),
-    Act(OpsAction),
-    Finish,
-}
+type OpsStep = Step<OpsQuery, OpsAction>;
 
 // ---------------------------------------------------------------------------
 // Pure ops decisions
@@ -931,20 +926,12 @@ fn observe_ops(port: &dyn OpsPort, query: &OpsQuery) -> Result<OpsFact> {
     })
 }
 
-/// Run the ops machine to completion: observe, decide one action, execute it,
-/// feed the outcome back.
-fn drive_ops(machine: &mut OpsMachine, port: &mut dyn OpsPort) -> Result<()> {
+fn run_ops_cycle(machine: &mut OpsMachine, port: &mut dyn OpsPort) -> Result<()> {
     loop {
         match machine.next_step() {
-            OpsStep::Observe(query) => {
-                let fact = observe_ops(port, &query);
-                machine.apply_fact(fact)?;
-            }
-            OpsStep::Act(action) => {
-                let outcome = port.execute(&action);
-                machine.apply_outcome(outcome)?;
-            }
-            OpsStep::Finish => return Ok(()),
+            Step::Observe(query) => machine.apply_fact(observe_ops(port, &query))?,
+            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
+            Step::Finish => return Ok(()),
         }
     }
 }
@@ -1091,7 +1078,7 @@ fn ops_cycle(
         shutdown: shutdown.as_ref(),
         scope_label,
     };
-    drive_ops(&mut machine, &mut port)
+    run_ops_cycle(&mut machine, &mut port)
 }
 
 fn build_analysis_prompt(log_path: &str, history_path: &str, gitlab_context_path: &str) -> String {
@@ -1623,7 +1610,7 @@ mod tests {
     fn run_ops(port: &mut FakeOpsPort, hosts: &[&str], has_scope_label: bool) -> FakeRun {
         let sources: Vec<OpsLogSource> = hosts.iter().copied().map(log_source).collect();
         let mut machine = OpsMachine::new(TEST_AGENT, &sources, has_scope_label);
-        let result = drive_ops(&mut machine, port);
+        let result = run_ops_cycle(&mut machine, port);
         FakeRun {
             result,
             trace: port.trace.borrow().clone(),

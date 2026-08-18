@@ -25,6 +25,7 @@ use crate::core::agent::{
 };
 use crate::core::banner::Banner;
 use crate::core::config::Config;
+use crate::core::cycle::Step;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 
@@ -926,13 +927,7 @@ trait WorkerRoutingPort {
     fn execute(&mut self, action: &WorkerAction) -> WorkerOutcome;
 }
 
-/// One turn of the routing driver loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerStep {
-    Observe(WorkerQuery),
-    Act(WorkerAction),
-    Finish,
-}
+type WorkerStep = Step<WorkerQuery, WorkerAction>;
 
 // ---------------------------------------------------------------------------
 // Pure routing decisions
@@ -2045,23 +2040,15 @@ fn observe_worker(port: &dyn WorkerRoutingPort, query: &WorkerQuery) -> Result<W
     })
 }
 
-/// Run the worker's routing machine to completion: observe, decide one
-/// step, execute it, feed the result back.
-fn drive_worker_routing(
+fn run_worker_routing_cycle(
     machine: &mut WorkerRoutingMachine,
     port: &mut dyn WorkerRoutingPort,
 ) -> Result<()> {
     loop {
         match machine.next_step() {
-            WorkerStep::Observe(query) => {
-                let fact = observe_worker(port, &query);
-                machine.apply_fact(fact)?;
-            }
-            WorkerStep::Act(action) => {
-                let outcome = port.execute(&action);
-                machine.apply_outcome(outcome)?;
-            }
-            WorkerStep::Finish => return Ok(()),
+            Step::Observe(query) => machine.apply_fact(observe_worker(port, &query))?,
+            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
+            Step::Finish => return Ok(()),
         }
     }
 }
@@ -2276,7 +2263,7 @@ fn worker_cycle(
         scope_label,
         candidate_lease: None,
     };
-    let result = drive_worker_routing(&mut machine, &mut port);
+    let result = run_worker_routing_cycle(&mut machine, &mut port);
     *active = machine.active.take();
     result
 }
@@ -2731,13 +2718,7 @@ trait ImplementationPort {
     fn execute(&mut self, action: &ImplAction) -> ImplOutcome;
 }
 
-/// One turn of the implementation driver loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ImplStep {
-    Observe(ImplQuery),
-    Act(ImplAction),
-    Finish,
-}
+type ImplStep = Step<ImplQuery, ImplAction>;
 
 /// Where an implementation run is. The variants spell out the fixed order:
 /// adopt an existing merge request if there is one, then prepare the
@@ -3390,23 +3371,18 @@ fn observe_implementation(
     })
 }
 
-/// Run one implementation to completion: observe, decide one step, execute
-/// it, feed the result back.
-fn drive_implementation(
+fn run_implementation_cycle(
     machine: &mut ImplementationMachine,
     port: &mut dyn ImplementationPort,
 ) -> Result<()> {
     loop {
         match machine.next_step() {
-            ImplStep::Observe(query) => {
+            Step::Observe(query) => {
                 let fact = observe_implementation(port, &query, machine);
                 machine.apply_fact(fact)?;
             }
-            ImplStep::Act(action) => {
-                let outcome = port.execute(&action);
-                machine.apply_outcome(outcome)?;
-            }
-            ImplStep::Finish => return Ok(()),
+            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
+            Step::Finish => return Ok(()),
         }
     }
 }
@@ -3703,7 +3679,7 @@ fn process_issue(
         issue,
         scope_label,
     };
-    let result = drive_implementation(&mut machine, &mut port);
+    let result = run_implementation_cycle(&mut machine, &mut port);
     current.mr_iid = machine.tracked_mr;
     current.mr_created = machine.mr_created;
     current.branch_name = machine.left_branch.clone();
@@ -4127,7 +4103,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         source_branch: latest_mr.source_branch.clone(),
         target_branch: latest_mr.target_branch.clone(),
     };
-    drive_feedback(&mut machine, &mut port)?;
+    run_feedback_cycle(&mut machine, &mut port)?;
 
     Ok(false)
 }
@@ -4324,13 +4300,7 @@ trait FeedbackTailPort {
     fn execute(&mut self, action: &FeedbackAction) -> FeedbackOutcome;
 }
 
-/// One turn of the feedback driver loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FeedbackStep {
-    Observe(FeedbackQuery),
-    Act(FeedbackAction),
-    Finish,
-}
+type FeedbackStep = Step<FeedbackQuery, FeedbackAction>;
 
 /// Where the feedback progression is. The stage names spell out the
 /// required order: metadata, then commit/push, then the conflict recheck,
@@ -4838,20 +4808,18 @@ fn observe_feedback(
     })
 }
 
-/// Run the feedback progression to completion: observe, decide one step,
-/// execute it, feed the result back.
-fn drive_feedback(machine: &mut FeedbackMachine, port: &mut dyn FeedbackTailPort) -> Result<()> {
+fn run_feedback_cycle(
+    machine: &mut FeedbackMachine,
+    port: &mut dyn FeedbackTailPort,
+) -> Result<()> {
     loop {
         match machine.next_step() {
-            FeedbackStep::Observe(query) => {
+            Step::Observe(query) => {
                 let fact = observe_feedback(port, &query, &machine.input);
                 machine.apply_fact(fact)?;
             }
-            FeedbackStep::Act(action) => {
-                let outcome = port.execute(&action);
-                machine.apply_outcome(outcome)?;
-            }
-            FeedbackStep::Finish => return Ok(()),
+            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
+            Step::Finish => return Ok(()),
         }
     }
 }
@@ -7898,7 +7866,7 @@ mod tests {
 
     fn run_worker_routing(port: &mut FakeWorkerPort, active: Option<ActiveIssue>) -> FakeWorkerRun {
         let mut machine = WorkerRoutingMachine::new(ROUTING_AGENT, None, active);
-        let result = drive_worker_routing(&mut machine, port);
+        let result = run_worker_routing_cycle(&mut machine, port);
         FakeWorkerRun {
             result,
             trace: port.trace.borrow().clone(),
@@ -8600,7 +8568,7 @@ mod tests {
         };
         let mut machine =
             WorkerRoutingMachine::new(ROUTING_AGENT, None, Some(active_without_mr(7)));
-        let result = drive_worker_routing(&mut machine, &mut port);
+        let result = run_worker_routing_cycle(&mut machine, &mut port);
 
         assert!(result.is_ok());
         assert_eq!(
@@ -8840,7 +8808,7 @@ mod tests {
     fn run_implementation(port: &mut FakeImplPort, scope_label: Option<&str>) -> FakeImplRun {
         let mut machine =
             ImplementationMachine::new(ROUTING_AGENT, scope_label, issue_observation(7, &[]));
-        let result = drive_implementation(&mut machine, port);
+        let result = run_implementation_cycle(&mut machine, port);
         FakeImplRun {
             result: result.map(|()| machine.tracked_mr),
             trace: port.trace.borrow().clone(),
@@ -9524,7 +9492,7 @@ mod tests {
         input: FeedbackTailInput,
     ) -> (Result<()>, Vec<FeedbackStep>) {
         let mut machine = FeedbackMachine::new(input);
-        let result = drive_feedback(&mut machine, port);
+        let result = run_feedback_cycle(&mut machine, port);
         (result, port.trace.borrow().clone())
     }
 

@@ -19,6 +19,7 @@ use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
+use crate::core::cycle::Step;
 use crate::core::model::acp::capabilities::{AskAnswer, AskQuestion, CapabilityProvider};
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
@@ -646,12 +647,7 @@ trait PmoPort {
     fn execute(&mut self, action: &PmoAction) -> PmoOutcome;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PmoStep {
-    Observe(PmoQuery),
-    Act(PmoAction),
-    Finish,
-}
+type PmoStep = Step<PmoQuery, PmoAction>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanOrigin {
@@ -1537,15 +1533,12 @@ fn observe_pmo(port: &dyn PmoPort, query: &PmoQuery) -> Result<PmoFact> {
     })
 }
 
-fn drive_pmo(machine: &mut PmoMachine, port: &mut dyn PmoPort) -> Result<()> {
+fn run_pmo_cycle(machine: &mut PmoMachine, port: &mut dyn PmoPort) -> Result<()> {
     loop {
         match machine.next_step() {
-            PmoStep::Observe(query) => machine.apply_fact(observe_pmo(port, &query))?,
-            PmoStep::Act(action) => {
-                let outcome = port.execute(&action);
-                machine.apply_outcome(outcome)?;
-            }
-            PmoStep::Finish => return Ok(()),
+            Step::Observe(query) => machine.apply_fact(observe_pmo(port, &query))?,
+            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
+            Step::Finish => return Ok(()),
         }
     }
 }
@@ -1755,7 +1748,7 @@ fn pmo_cycle(
         shutdown: Arc::clone(&shutdown),
         config: pmo_config,
     };
-    drive_pmo(&mut machine, &mut port)
+    run_pmo_cycle(&mut machine, &mut port)
 }
 
 const STALE_THRESHOLD_SECS: u64 = 3600; // 1 hour
@@ -2863,7 +2856,7 @@ mod tests {
 
     fn run_fake(port: &mut FakePmoPort, held_issue_iid: Option<u64>) -> Result<()> {
         let mut machine = PmoMachine::new("pmo-0", Some("scope::test"), held_issue_iid);
-        drive_pmo(&mut machine, port)
+        run_pmo_cycle(&mut machine, port)
     }
 
     #[test]
