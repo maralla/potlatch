@@ -379,21 +379,13 @@ struct WorkerConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct WorkerAgentSettings {
+pub(crate) struct WorkerAgentSettings {
     #[serde(default = "default_worker_poll_interval")]
     poll_interval_secs: u64,
 }
 
 fn default_worker_poll_interval() -> u64 {
     60
-}
-
-impl WorkerAgentSettings {
-    fn from_raw(raw: &toml::Value) -> Result<Self> {
-        raw.clone()
-            .try_into()
-            .context("worker agent settings from config")
-    }
 }
 
 /// The single issue a worker is pinned to for its full lifecycle.
@@ -594,7 +586,7 @@ pub(crate) struct WorkerAgent {
 }
 
 impl CoreAgent for WorkerAgent {
-    type SpawnContext = crate::core::workflow::AgentSpawnContext;
+    type Settings = WorkerAgentSettings;
 
     fn name() -> &'static str {
         "worker"
@@ -608,9 +600,12 @@ impl CoreAgent for WorkerAgent {
         gitlab_banner(config, banner);
     }
 
-    fn validate_config(config: &Config, section: &crate::core::config::AgentSection) -> Result<()> {
+    fn validate_settings(
+        config: &Config,
+        _section: &crate::core::config::AgentSection,
+        _settings: &Self::Settings,
+    ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
-        WorkerAgentSettings::from_raw(&section.raw)?;
         Ok(())
     }
 
@@ -634,15 +629,9 @@ impl CoreAgent for WorkerAgent {
         }
     }
 
-    fn from_spawn(ctx: crate::core::workflow::AgentSpawnContext) -> Result<Self> {
-        let section = ctx
-            .workflow
-            .config
-            .agent("worker")
-            .context("[agent.worker] section required")?;
-        let settings = WorkerAgentSettings::from_raw(&section.raw)?;
-        let runtime =
-            GitLabAgentBootstrap::new(&ctx, "worker", ModelPreferences::default()).build()?;
+    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+        let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
+        let settings = ctx.settings;
         let config = WorkerConfig {
             poll_interval_secs: settings.poll_interval_secs,
         };
@@ -6959,7 +6948,8 @@ mod tests {
         .unwrap();
         let section = config.agent("worker").unwrap();
 
-        let error = WorkerAgent::validate_config(&config, section).unwrap_err();
+        let error =
+            crate::core::agent::validate_agent_config::<WorkerAgent>(&config, section).unwrap_err();
 
         assert!(format!("{error:#}").contains("Failed to parse agent settings"));
     }

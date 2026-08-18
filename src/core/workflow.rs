@@ -23,11 +23,36 @@ pub struct WorkflowContext {
 /// Spawn inputs passed from workflow into a [`CoreAgent`] implementation.
 pub struct AgentSpawnContext {
     pub workflow: WorkflowContext,
+    /// Registered role name selected by core for this spawn.
+    pub agent_name: &'static str,
     pub instance_id: usize,
     /// The shared runtime for this planned instance, constructed once by
     /// the [`crate::core::supervisor`] and handed to every construction
     /// attempt across restarts.
     pub runtime: AgentRuntime,
+}
+
+/// Spawn inputs after core has resolved and parsed the registered agent's
+/// settings. Agent implementations only compose their role-specific
+/// dependencies from this context; section lookup, parsing, identity, and
+/// instance validation stay in core.
+pub struct AgentBuildContext<S> {
+    spawn: AgentSpawnContext,
+    pub settings: S,
+}
+
+impl<S> AgentBuildContext<S> {
+    pub(crate) fn new(spawn: AgentSpawnContext, settings: S) -> Self {
+        Self { spawn, settings }
+    }
+}
+
+impl<S> std::ops::Deref for AgentBuildContext<S> {
+    type Target = AgentSpawnContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spawn
+    }
 }
 
 impl WorkflowContext {
@@ -56,7 +81,7 @@ fn prepare_shutdown_handlers(ctx: &WorkflowContext) -> Result<()> {
 /// backoff, and panic-recovery behavior.
 pub(crate) fn spawn_core_agent<A>(workflow: WorkflowContext, instance_id: usize) -> Result<()>
 where
-    A: CoreAgent<SpawnContext = AgentSpawnContext>,
+    A: CoreAgent,
 {
     crate::core::supervisor::supervise::<A>(workflow, instance_id)
 }
@@ -181,7 +206,7 @@ impl Workflow {
 
     pub fn register_agent<A>(&mut self)
     where
-        A: CoreAgent<SpawnContext = AgentSpawnContext> + 'static,
+        A: CoreAgent + 'static,
     {
         self.registry.register_agent::<A>();
     }
@@ -252,7 +277,7 @@ mod tests {
     struct InvalidAgent;
 
     impl CoreAgent for AlphaAgent {
-        type SpawnContext = AgentSpawnContext;
+        type Settings = toml::Value;
 
         fn name() -> &'static str {
             "alpha"
@@ -270,7 +295,7 @@ mod tests {
             Ok(())
         }
 
-        fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
+        fn build(_ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
             Ok(Self)
         }
 
@@ -278,7 +303,7 @@ mod tests {
     }
 
     impl CoreAgent for BetaAgent {
-        type SpawnContext = AgentSpawnContext;
+        type Settings = toml::Value;
 
         fn name() -> &'static str {
             "beta"
@@ -296,7 +321,7 @@ mod tests {
             Ok(())
         }
 
-        fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
+        fn build(_ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
             Ok(Self)
         }
 
@@ -304,7 +329,7 @@ mod tests {
     }
 
     impl CoreAgent for InvalidAgent {
-        type SpawnContext = AgentSpawnContext;
+        type Settings = toml::Value;
 
         fn name() -> &'static str {
             "invalid"
@@ -314,9 +339,10 @@ mod tests {
             unreachable!("test agent is never run")
         }
 
-        fn validate_config(
+        fn validate_settings(
             _config: &Config,
             _section: &crate::core::config::AgentSection,
+            _settings: &Self::Settings,
         ) -> Result<()> {
             anyhow::bail!("deliberately invalid")
         }
@@ -325,7 +351,7 @@ mod tests {
             Ok(())
         }
 
-        fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
+        fn build(_ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
             unreachable!("invalid config must prevent construction")
         }
 

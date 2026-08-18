@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 /// Observable lifecycle/health state of one agent instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HealthState {
-    /// Being (re)constructed; `from_spawn` is running or about to run.
+    /// Being (re)constructed; the agent's `build` hook is running or about to run.
     Starting,
     /// Constructed and waiting for the next scheduled cycle.
     Idle,

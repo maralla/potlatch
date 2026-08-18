@@ -61,16 +61,15 @@ impl AgentModel {
     /// Connect a model for a configured agent role at spawn time.
     pub fn connect(
         ctx: &AgentSpawnContext,
-        role: &str,
         repo_path: impl Into<String>,
         prefs: ModelPreferences,
     ) -> Result<Self> {
         let section = ctx
             .workflow
             .config
-            .agent(role)
-            .with_context(|| format!("[agent.{role}] section required"))?;
-        let agent_id = format!("{role}-{}", ctx.instance_id);
+            .agent(ctx.agent_name)
+            .with_context(|| format!("[agent.{}] section required", ctx.agent_name))?;
+        let agent_id = ctx.runtime.agent_id().to_string();
         let shutdown = Arc::clone(&ctx.workflow.shutdown);
         let activity = Arc::clone(&ctx.workflow.activity);
         let engine = spawn_model_engine(

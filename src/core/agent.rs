@@ -9,12 +9,14 @@ pub use schema::{ObjectSchema, OneOfSchema, Schema, StructuredOutput, compat};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 
 use crate::core::banner::Banner;
 use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::{PeriodicTaskSpec, run_periodic_scheduler};
 use crate::core::runtime::AgentRuntime;
+use crate::core::workflow::{AgentBuildContext, AgentSpawnContext};
 
 #[derive(Clone, Default)]
 pub struct InvokeOptions {
@@ -29,13 +31,37 @@ pub struct ModelResponse {
 }
 
 pub trait CoreAgent: Sized {
-    type SpawnContext;
+    /// Role-specific settings parsed from this agent's config section.
+    type Settings: DeserializeOwned;
+
+    /// Optional generic instance limit enforced by core during startup
+    /// validation and every supervised construction attempt.
+    const MAX_INSTANCES: Option<usize> = None;
 
     fn name() -> &'static str;
 
+    /// Parse role settings from the already-resolved agent section.
+    fn parse_settings(_config: &Config, section: &AgentSection) -> Result<Self::Settings> {
+        section
+            .raw
+            .clone()
+            .try_into()
+            .context("deserialize agent settings")
+    }
+
+    /// Validate parsed settings against shared configuration. Domain-specific
+    /// checks remain with the agent layer; core owns invocation and context.
+    fn validate_settings(
+        _config: &Config,
+        _section: &AgentSection,
+        _settings: &Self::Settings,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// The shared runtime backing this instance: identity, the process-wide
     /// shutdown flag, and observable health. Supplied by the supervisor at
-    /// spawn time (via `Self::SpawnContext`) and stored by the
+    /// spawn time through [`AgentBuildContext`] and stored by the
     /// implementation. See [`crate::core::runtime::AgentRuntime`].
     fn runtime(&self) -> &AgentRuntime;
 
@@ -53,17 +79,15 @@ pub trait CoreAgent: Sized {
 
     fn banner(_config: &Config, _banner: &mut Banner) {}
 
-    fn validate_config(_config: &Config, _section: &AgentSection) -> Result<()> {
-        Ok(())
-    }
-
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()>;
 
-    fn from_spawn(ctx: Self::SpawnContext) -> Result<Self>;
+    /// Construct role resources from typed settings and the authoritative
+    /// core spawn context.
+    fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self>;
     fn on_start(&mut self) -> Result<()> {
         Ok(())
     }
-    fn on_shutdown(&mut self);
+    fn on_shutdown(&mut self) {}
 
     fn run(self) -> Result<()> {
         let _badge = crate::ui::AgentBadgeGuard::new(self.agent_id());
@@ -97,9 +121,53 @@ pub trait CoreAgent: Sized {
         result
     }
 
-    fn run_from(ctx: Self::SpawnContext) -> Result<()> {
-        Self::from_spawn(ctx)?.run()
+    fn run_from(ctx: AgentSpawnContext) -> Result<()> {
+        let section = ctx
+            .workflow
+            .config
+            .agent(ctx.agent_name)
+            .with_context(|| format!("[agent.{}] section required", ctx.agent_name))?;
+        anyhow::ensure!(
+            ctx.instance_id < section.core.instances,
+            "[agent.{}] invalid instance id {} (configured instances: {})",
+            Self::name(),
+            ctx.instance_id,
+            section.core.instances,
+        );
+        let settings = prepare_agent_settings::<Self>(&ctx.workflow.config, section)?;
+        let agent_name = ctx.agent_name;
+        Self::build(AgentBuildContext::new(ctx, settings))
+            .with_context(|| format!("build [agent.{agent_name}]"))?
+            .run()
     }
+}
+
+/// Validate one registered agent section through core's fixed pipeline.
+pub(crate) fn validate_agent_config<A: CoreAgent>(
+    config: &Config,
+    section: &AgentSection,
+) -> Result<()> {
+    prepare_agent_settings::<A>(config, section).map(drop)
+}
+
+fn prepare_agent_settings<A: CoreAgent>(
+    config: &Config,
+    section: &AgentSection,
+) -> Result<A::Settings> {
+    if let Some(max) = A::MAX_INSTANCES {
+        anyhow::ensure!(
+            section.core.instances <= max,
+            "[agent.{}] supports at most {} instance(s) (got {})",
+            A::name(),
+            max,
+            section.core.instances,
+        );
+    }
+    let settings = A::parse_settings(config, section)
+        .with_context(|| format!("parse settings for [agent.{}]", A::name()))?;
+    A::validate_settings(config, section, &settings)
+        .with_context(|| format!("validate settings for [agent.{}]", A::name()))?;
+    Ok(settings)
 }
 
 /// See [`CoreAgent::run_with_scheduler`] for the guarantee this provides.
@@ -152,7 +220,7 @@ mod tests {
     }
 
     impl CoreAgent for LifecycleAgent {
-        type SpawnContext = ();
+        type Settings = toml::Value;
 
         fn name() -> &'static str {
             "lifecycle-test"
@@ -166,7 +234,7 @@ mod tests {
             Ok(())
         }
 
-        fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
+        fn build(_ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
             unreachable!("lifecycle tests construct the agent directly")
         }
 
@@ -236,7 +304,7 @@ mod tests {
         }
 
         impl CoreAgent for PanicsOnStart {
-            type SpawnContext = ();
+            type Settings = toml::Value;
 
             fn name() -> &'static str {
                 "panics-on-start-test"
@@ -250,7 +318,7 @@ mod tests {
                 Ok(())
             }
 
-            fn from_spawn(_ctx: Self::SpawnContext) -> Result<Self> {
+            fn build(_ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
                 unreachable!()
             }
 
