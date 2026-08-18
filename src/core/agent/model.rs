@@ -17,7 +17,7 @@ use super::InvokeOptions;
 /// own session before the task fails. Each repair is one extra prompt asking
 /// the model to fix its tool call — the task itself is never restated and the
 /// session is never rotated.
-const MAX_STRUCTURED_OUTPUT_REPAIRS: u32 = 3;
+const MAX_STRUCTURED_OUTPUT_REPAIRS: u32 = 10;
 
 /// Model preferences selected by callers without exposing engine construction.
 /// Structured-output contracts are *not* here: they belong to a single
@@ -272,13 +272,22 @@ fn structured_output_repair_prompt(
     attempt: u32,
     max_attempts: u32,
 ) -> String {
+    let reinforcement = if attempt == max_attempts {
+        "FINAL CORRECTION: every requirement below is mandatory. Another invalid response will fail the task."
+    } else if attempt == 1 {
+        "REQUIRED CORRECTION: fix the rejected structured result before doing anything else."
+    } else {
+        "REINFORCEMENT: your previous correction was still invalid. Follow every requirement below exactly."
+    };
     format!(
-        "Your structured output was not accepted: {correction}.\n\n\
-         Submit a corrected `{tool}` result now using the structured-output format provided by \
-         the backend and arguments that satisfy its schema. \
-         Do not redo the task and do not repeat your previous explanation — this conversation \
-         still has all of it. Send the corrected structured result and nothing else. \
-         (Correction attempt {attempt} of {max_attempts}; after that the task fails.)",
+        "{reinforcement}\n\n\
+         Exact failure: {correction}.\n\n\
+         Call the required `{tool}` tool now with arguments that satisfy its registered schema. \
+         Send arrays and objects as native structured arguments, never as quoted JSON strings. \
+         Do not answer with prose, markdown, or an explanation; a text-only turn will be rejected. \
+         Do not redo the task because this session still contains all prior context. \
+         Submit exactly one corrected `{tool}` result. \
+         (Correction attempt {attempt} of {max_attempts}.)",
         correction = error.correction(tool),
     )
 }
@@ -462,6 +471,8 @@ mod tests {
         assert_eq!(result.unwrap().output, SampleOutput::Approve);
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("without calling the required `sample_tool` tool"));
+        assert!(prompts[0].contains("REQUIRED CORRECTION"));
+        assert!(prompts[0].contains("a text-only turn will be rejected"));
         assert!(prompts[0].contains("Do not redo the task"));
     }
 
@@ -514,7 +525,10 @@ mod tests {
     #[test]
     fn every_repair_attempt_is_actually_sent_before_giving_up() {
         let bad = || handoff_with_tool("sample_tool", json!({"decision": "maybe"}));
-        let (result, prompts) = resolve_with_script(bad(), vec![bad(), bad(), bad()]);
+        let script = std::iter::repeat_with(bad)
+            .take(MAX_STRUCTURED_OUTPUT_REPAIRS as usize)
+            .collect();
+        let (result, prompts) = resolve_with_script(bad(), script);
         let error = result.unwrap_err();
         assert!(AgentModel::structured_output_retries_exhausted(&error));
         let error = error.to_string();
@@ -527,22 +541,36 @@ mod tests {
                 )),
                 "unexpected repair prompt: {prompt}"
             );
+            assert!(prompt.contains("Exact failure:"));
+            assert!(prompt.contains("native structured arguments"));
+            assert!(prompt.contains("Submit exactly one corrected `sample_tool` result"));
         }
+        assert!(prompts[0].contains("REQUIRED CORRECTION"));
+        assert!(prompts[1].contains("REINFORCEMENT"));
+        assert!(
+            prompts
+                .last()
+                .expect("at least one repair")
+                .contains("FINAL CORRECTION")
+        );
         assert!(error.contains("still invalid after"));
     }
 
     #[test]
     fn exhaustion_reports_the_last_failure_not_the_first() {
+        let mut script: Vec<_> = (0..MAX_STRUCTURED_OUTPUT_REPAIRS - 1)
+            .map(|_| handoff_with_tool("sample_tool", json!({"decision": "maybe"})))
+            .collect();
+        script.push(handoff_with_tool(
+            "sample_tool",
+            json!({"decision": "approve", "extra": 1}),
+        ));
         let (result, _prompts) = resolve_with_script(
             AgentHandoff {
                 response: "nothing".into(),
                 structured_outputs: None,
             },
-            vec![
-                handoff_with_tool("sample_tool", json!({"decision": "maybe"})),
-                handoff_with_tool("sample_tool", json!({"decision": "request_changes"})),
-                handoff_with_tool("sample_tool", json!({"decision": "approve", "extra": 1})),
-            ],
+            script,
         );
         let error = result.unwrap_err().to_string();
         assert!(error.contains("$.extra: unexpected property"), "{error}");
