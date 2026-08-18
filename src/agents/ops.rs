@@ -1143,6 +1143,8 @@ For each candidate problem, inspect the current project codebase in your workspa
 
 If the current code appears to already fix or guard against the logged failure, do not propose an issue for it unless the log evidence clearly shows the fixed code path is still failing. Treat those cases as already addressed.
 
+Treat explicit code or doc comments describing a behavior, fallback, limitation, or error-handling path as evidence that the handling is intentional. Do not propose an issue whose requested "fix" would merely reverse or remove that explicitly documented behavior. This applies only to comments that clearly describe the exact path under analysis, not TODOs, guesses, or unrelated commentary.
+
 Use the project codebase to map log errors to likely code paths, root causes, and concrete remediation steps. Do not rely on production host, deployment, or infrastructure details beyond what appears in the log file.
 
 For each NEW distinct problem that is not already covered, propose one GitLab issue.
@@ -1151,6 +1153,7 @@ Rules:
 - Report no issues if there are no NEW actionable errors.
 - Do not propose issues for errors already represented in the history or GitLab context files.
 - Do not propose issues for errors that appear already fixed in the current codebase.
+- Do not propose issues to change behavior that a relevant code or doc comment explicitly identifies as intentional.
 - Titles must be specific and actionable.
 - Descriptions must cite log evidence and relevant code context from the repository.
 "#,
@@ -2416,6 +2419,8 @@ mod tests {
         assert!(prompt.contains("GitLab context"));
         assert!(prompt.contains("inspect the current project codebase"));
         assert!(prompt.contains("already fixed in the current codebase"));
+        assert!(prompt.contains("explicit code or doc comments"));
+        assert!(prompt.contains("handling is intentional"));
         assert!(prompt.contains("Descriptions must cite log evidence and relevant code context"));
         assert!(!prompt.contains("ops_report"));
         assert!(!prompt.contains("output contract"));
