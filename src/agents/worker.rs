@@ -16,10 +16,12 @@ use super::{
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{GitLabClient, Issue};
 use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
+#[cfg(test)]
+use crate::core::agent::StructuredOutput;
 use crate::core::agent::schema::tagged;
 use crate::core::agent::{
-    AgentModel, CoreAgent, InvokeOptions, ModelPreferences, ObjectSchema, OneOfSchema, Schema,
-    StructuredOutput, compat,
+    AgentModel, CoreAgent, InvokeOptions, ModelPreferences, ObjectSchema, Schema, compat,
+    structured_output,
 };
 use crate::core::banner::Banner;
 use crate::core::config::Config;
@@ -235,99 +237,78 @@ fn blocked_properties(schema: ObjectSchema, reason: &str) -> ObjectSchema {
         )
 }
 
-impl StructuredOutput for WorkerImplementationOutput {
-    fn tool_name() -> &'static str {
-        HANDOFF_TOOL
-    }
-
-    fn tool_description() -> &'static str {
-        "The final outcome of this worker implementation run."
-    }
-
-    fn schema() -> Schema {
-        Schema::one_of(
-            OneOfSchema::new(
-                "outcome",
-                "How the implementation run ended. Pick exactly one and send only that outcome's fields.",
-            )
-            .variant(
-                "implemented",
-                "You made the code changes; Potlatch commits, pushes, and opens the merge request.",
-                mr_metadata_properties(ObjectSchema::new()),
-            )
-            .variant(
-                "existing_mr",
-                "You found an already-open merge request that implements this issue; Potlatch tracks it instead of opening a new one.",
-                ObjectSchema::new().required_property(
-                    "existing_mr_iid",
-                    Schema::integer("IID of the existing open merge request."),
+structured_output! {
+    impl WorkerImplementationOutput {
+        tool_name: HANDOFF_TOOL;
+        tool_description: "The final outcome of this worker implementation run.";
+        schema: one_of(
+            "outcome",
+            "How the implementation run ended. Pick exactly one and send only that outcome's fields.",
+            {
+                "implemented" => (
+                    "You made the code changes; Potlatch commits, pushes, and opens the merge request.",
+                    fields(mr_metadata_properties(ObjectSchema::new()))
                 ),
-            )
-            .variant(
-                "wait_dependency",
-                "The work is hard-blocked until another issue closes; Potlatch parks this issue and resumes it automatically.",
-                ObjectSchema::new().required_property(
-                    "depends_on_issue",
-                    Schema::integer(
-                        "IID of the issue that must close before this work can proceed.",
-                    ),
+                "existing_mr" => (
+                    "You found an already-open merge request that implements this issue; Potlatch tracks it instead of opening a new one.",
+                    object({
+                        required existing_mr_iid: integer(
+                            "IID of the existing open merge request."
+                        ),
+                    })
                 ),
-            )
-            .variant(
-                "needs_split",
-                "The issue is too broad for one merge request and must be split first.",
-                blocked_properties(
-                    ObjectSchema::new(),
-                    "The estimated line count and how to split the issue into smaller, focused issues.",
+                "wait_dependency" => (
+                    "The work is hard-blocked until another issue closes; Potlatch parks this issue and resumes it automatically.",
+                    object({
+                        required depends_on_issue: integer(
+                            "IID of the issue that must close before this work can proceed."
+                        ),
+                    })
                 ),
-            )
-            .variant(
-                "needs_clarification",
-                "The issue is missing information you cannot infer; a human must answer before you can proceed.",
-                blocked_properties(
-                    ObjectSchema::new(),
-                    "Precisely what information is needed and why you cannot proceed without it.",
+                "needs_split" => (
+                    "The issue is too broad for one merge request and must be split first.",
+                    fields(blocked_properties(
+                        ObjectSchema::new(),
+                        "The estimated line count and how to split the issue into smaller, focused issues."
+                    ))
                 ),
-            )
-            .variant(
-                "cannot_implement",
-                "The issue cannot be implemented as specified for some other reason (contradictory requirements, no resource-safe approach).",
-                blocked_properties(
-                    ObjectSchema::new(),
-                    "Why the issue cannot be implemented as specified.",
+                "needs_clarification" => (
+                    "The issue is missing information you cannot infer; a human must answer before you can proceed.",
+                    fields(blocked_properties(
+                        ObjectSchema::new(),
+                        "Precisely what information is needed and why you cannot proceed without it."
+                    ))
                 ),
-            ),
-        )
-    }
-
+                "cannot_implement" => (
+                    "The issue cannot be implemented as specified for some other reason (contradictory requirements, no resource-safe approach).",
+                    fields(blocked_properties(
+                        ObjectSchema::new(),
+                        "Why the issue cannot be implemented as specified."
+                    ))
+                ),
+            }
+        );
     /// Tolerated: an outcome spelled with different case or padding, and an
     /// IID sent as `"#7"` / `"!12"` instead of a number.
-    fn normalize(value: &mut serde_json::Value) {
-        compat::normalize_tag(value, "outcome");
-        compat::normalize_iid(value, "existing_mr_iid");
-        compat::normalize_iid(value, "depends_on_issue");
+        normalize(value) {
+            compat::normalize_tag(value, "outcome");
+            compat::normalize_iid(value, "existing_mr_iid");
+            compat::normalize_iid(value, "depends_on_issue");
+        }
     }
 }
 
-impl StructuredOutput for WorkerFeedbackOutput {
-    fn tool_name() -> &'static str {
-        HANDOFF_TOOL
-    }
-
-    fn tool_description() -> &'static str {
-        "The final outcome of this merge-request feedback run."
-    }
-
-    fn schema() -> Schema {
-        Schema::one_of(
-            OneOfSchema::new(
-                "outcome",
-                "How the feedback run ended. Pick exactly one and send only that outcome's fields.",
-            )
-            .variant(
-                "addressed",
-                "You handled the reviewer feedback — in code, in merge request metadata, or by explaining that the branch already satisfies it.",
-                mr_metadata_properties(ObjectSchema::new())
+structured_output! {
+    impl WorkerFeedbackOutput {
+        tool_name: HANDOFF_TOOL;
+        tool_description: "The final outcome of this merge-request feedback run.";
+        schema: one_of(
+            "outcome",
+            "How the feedback run ended. Pick exactly one and send only that outcome's fields.",
+            {
+                "addressed" => (
+                    "You handled the reviewer feedback — in code, in merge request metadata, or by explaining that the branch already satisfies it.",
+                    fields(mr_metadata_properties(ObjectSchema::new())
                     .property(
                         "reason",
                         Schema::string(
@@ -351,25 +332,24 @@ impl StructuredOutput for WorkerFeedbackOutput {
                         Schema::boolean(
                             "Whether to post a new plain (non-resolvable) merge request comment with `public_comment`. True only when a plain MR comment needs a new public reply; omit or use false when no reply is needed or it would only repeat that no changes were necessary.",
                         ),
-                    ),
-            )
-            .variant(
-                "cannot_resolve",
-                "The feedback cannot be resolved autonomously; Potlatch abandons the merge request and reports back.",
-                blocked_properties(
-                    ObjectSchema::new(),
-                    "Why the feedback cannot be resolved and what human input is needed.",
+                    ))
                 ),
-            ),
-        )
-    }
-
+                "cannot_resolve" => (
+                    "The feedback cannot be resolved autonomously; Potlatch abandons the merge request and reports back.",
+                    fields(blocked_properties(
+                        ObjectSchema::new(),
+                        "Why the feedback cannot be resolved and what human input is needed."
+                    ))
+                ),
+            }
+        );
     /// Tolerated: an outcome spelled with different case or padding, and the
     /// comment-control booleans sent as `"true"`/`"false"` strings.
-    fn normalize(value: &mut serde_json::Value) {
-        compat::normalize_tag(value, "outcome");
-        compat::normalize_bool(value, "mark_discussions_resolved");
-        compat::normalize_bool(value, "post_plain_comment");
+        normalize(value) {
+            compat::normalize_tag(value, "outcome");
+            compat::normalize_bool(value, "mark_discussions_resolved");
+            compat::normalize_bool(value, "post_plain_comment");
+        }
     }
 }
 

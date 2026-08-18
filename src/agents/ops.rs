@@ -14,7 +14,7 @@ use crate::agents::ssh_util::{shell_single_quote, validate_remote_path, validate
 use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
 use crate::agents::write_task_context_file;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
-use crate::core::agent::{InvokeOptions, ObjectSchema, Schema, StructuredOutput, compat};
+use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::periodic::PeriodicTaskSpec;
@@ -50,62 +50,36 @@ struct OpsOutput {
     issues: Vec<RawOpsIssue>,
 }
 
-impl StructuredOutput for OpsOutput {
-    fn tool_name() -> &'static str {
-        "ops_report"
-    }
-
-    fn tool_description() -> &'static str {
-        "The new actionable issues found during this log analysis run."
-    }
-
-    fn schema() -> Schema {
-        Schema::object(
-            ObjectSchema::new()
-                .describe("Everything this log analysis run found.")
-                .required_property(
-                    "issues",
-                    Schema::array(
-                        "New actionable issues found in the logs. Empty array if nothing new.",
-                        Schema::object(
-                            ObjectSchema::new()
-                                .describe("One issue to file from the logs.")
-                                .required_property(
-                                    "title",
-                                    Schema::string("Short actionable issue title."),
-                                )
-                                .required_property(
-                                    "description",
-                                    Schema::string(
-                                        "Markdown body with log evidence, likely code area, impact, and suggested remediation.",
-                                    ),
-                                )
-                                .property(
-                                    "priority",
-                                    Schema::integer_enum(
-                                        "Priority: 1 (critical/blocking), 2 (high), 3 (normal).",
-                                        &[1, 2, 3],
-                                    ),
-                                )
-                                .required_property(
-                                    "log_line",
-                                    Schema::string(
-                                        "Exact representative log line from the session file.",
-                                    ),
-                                ),
-                        ),
+structured_output! {
+    impl OpsOutput {
+        tool_name: "ops_report";
+        tool_description: "The new actionable issues found during this log analysis run.";
+        schema: object("Everything this log analysis run found.", {
+            required issues: array(
+                "New actionable issues found in the logs. Empty array if nothing new.",
+                object("One issue to file from the logs.", {
+                    required title: string("Short actionable issue title."),
+                    required description: string(
+                        "Markdown body with log evidence, likely code area, impact, and suggested remediation."
                     ),
-                ),
-        )
-    }
-
+                    optional priority: integer_enum(
+                        "Priority: 1 (critical/blocking), 2 (high), 3 (normal).",
+                        &[1, 2, 3]
+                    ),
+                    required log_line: string(
+                        "Exact representative log line from the session file."
+                    ),
+                })
+            ),
+        });
     /// Tolerated: `sample_line` as a legacy name for `log_line`, and a
     /// priority outside 1-3 (dropped, so the issue is filed unprioritized).
-    fn normalize(value: &mut serde_json::Value) {
-        compat::each_in_array(value, "issues", |issue| {
-            compat::rename_property(issue, "sample_line", "log_line");
-            compat::drop_integer_outside(issue, "priority", &[1, 2, 3]);
-        });
+        normalize(value) {
+            compat::each_in_array(value, "issues", |issue| {
+                compat::rename_property(issue, "sample_line", "log_line");
+                compat::drop_integer_outside(issue, "priority", &[1, 2, 3]);
+            });
+        }
     }
 }
 

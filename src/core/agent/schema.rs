@@ -208,6 +208,145 @@ pub struct StructuredOutputTool {
     pub parameters: Schema,
 }
 
+/// Declare a typed structured-output contract without repeating the schema
+/// builder plumbing. Requiredness stays explicit and the generated value is
+/// the same backend-neutral [`Schema`] used by validation and adapters.
+///
+/// `fields(expression)` is an escape hatch for shared [`ObjectSchema`]
+/// builders. It keeps reusable field groups composable without teaching the
+/// macro about role-specific concepts.
+macro_rules! structured_output {
+    (
+        impl $output:ty {
+            tool_name: $tool_name:expr;
+            tool_description: $tool_description:expr;
+            schema: $schema_kind:ident $schema_args:tt;
+            $(
+                $(#[$normalize_meta:meta])*
+                normalize($value:ident) $normalize:block
+            )?
+        }
+    ) => {
+        impl $crate::core::agent::StructuredOutput for $output {
+            fn tool_name() -> &'static str {
+                $tool_name
+            }
+
+            fn tool_description() -> &'static str {
+                $tool_description
+            }
+
+            fn schema() -> $crate::core::agent::Schema {
+                structured_output!(@schema $schema_kind $schema_args)
+            }
+
+            $(
+                $(#[$normalize_meta])*
+                fn normalize($value: &mut serde_json::Value) $normalize
+            )?
+        }
+    };
+
+    (@schema string($description:expr)) => {
+        $crate::core::agent::Schema::string($description)
+    };
+    (@schema string_enum($description:expr, $values:expr)) => {
+        $crate::core::agent::Schema::string_enum($description, $values)
+    };
+    (@schema integer($description:expr)) => {
+        $crate::core::agent::Schema::integer($description)
+    };
+    (@schema integer_enum($description:expr, $values:expr)) => {
+        $crate::core::agent::Schema::integer_enum($description, $values)
+    };
+    (@schema boolean($description:expr)) => {
+        $crate::core::agent::Schema::boolean($description)
+    };
+    (@schema array($description:expr, $item_kind:ident $item_args:tt)) => {
+        $crate::core::agent::Schema::array(
+            $description,
+            structured_output!(@schema $item_kind $item_args),
+        )
+    };
+    (@schema object({ $($fields:tt)* })) => {
+        $crate::core::agent::Schema::object(
+            structured_output!(@object object({ $($fields)* }))
+        )
+    };
+    (@schema object($description:expr, { $($fields:tt)* })) => {
+        $crate::core::agent::Schema::object(
+            structured_output!(@object object($description, { $($fields)* }))
+        )
+    };
+    (
+        @schema one_of(
+            $discriminator:expr,
+            $description:expr,
+            {
+                $(
+                    $tag:literal => (
+                        $variant_description:expr,
+                        $object_kind:ident $object_args:tt
+                    )
+                ),* $(,)?
+            }
+        )
+    ) => {{
+        let schema = $crate::core::agent::OneOfSchema::new(
+            $discriminator,
+            $description,
+        );
+        $(
+            let schema = schema.variant(
+                $tag,
+                $variant_description,
+                structured_output!(@object $object_kind $object_args),
+            );
+        )*
+        $crate::core::agent::Schema::one_of(schema)
+    }};
+
+    (@object object({ $($fields:tt)* })) => {{
+        let schema = $crate::core::agent::ObjectSchema::new();
+        structured_output!(@fields schema; $($fields)*)
+    }};
+    (@object object($description:expr, { $($fields:tt)* })) => {{
+        let schema = $crate::core::agent::ObjectSchema::new().describe($description);
+        structured_output!(@fields schema; $($fields)*)
+    }};
+    (@object fields($fields:expr)) => {
+        $fields
+    };
+
+    (@fields $schema:ident;) => {
+        $schema
+    };
+    (
+        @fields $schema:ident;
+        required $name:ident: $field_kind:ident $field_args:tt,
+        $($remaining:tt)*
+    ) => {{
+        let $schema = $schema.required_property(
+            stringify!($name),
+            structured_output!(@schema $field_kind $field_args),
+        );
+        structured_output!(@fields $schema; $($remaining)*)
+    }};
+    (
+        @fields $schema:ident;
+        optional $name:ident: $field_kind:ident $field_args:tt,
+        $($remaining:tt)*
+    ) => {{
+        let $schema = $schema.property(
+            stringify!($name),
+            structured_output!(@schema $field_kind $field_args),
+        );
+        structured_output!(@fields $schema; $($remaining)*)
+    }};
+}
+
+pub(crate) use structured_output;
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -879,7 +1018,28 @@ pub mod conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use serde_json::json;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct MacroOutput {
+        title: String,
+        priority: Option<i64>,
+    }
+
+    structured_output! {
+        impl MacroOutput {
+            tool_name: "macro_output";
+            tool_description: "Macro test output.";
+            schema: object("A macro-generated object.", {
+                required title: string("Title."),
+                optional priority: integer_enum("Priority.", &[1, 2, 3]),
+            });
+            normalize(value) {
+                compat::rename_property(value, "name", "title");
+            }
+        }
+    }
 
     fn sample_object() -> ObjectSchema {
         ObjectSchema::new()
@@ -904,6 +1064,31 @@ mod tests {
                     ObjectSchema::new().required_property("feedback", Schema::string("Feedback.")),
                 ),
         )
+    }
+
+    #[test]
+    fn structured_output_macro_generates_metadata_schema_and_normalization() {
+        let tool = MacroOutput::tool_definition();
+        assert_eq!(tool.name, "macro_output");
+        assert_eq!(tool.description, "Macro test output.");
+        assert_eq!(
+            tool.parameters,
+            Schema::object(
+                ObjectSchema::new()
+                    .describe("A macro-generated object.")
+                    .required_property("title", Schema::string("Title."))
+                    .property("priority", Schema::integer_enum("Priority.", &[1, 2, 3])),
+            )
+        );
+
+        let decoded = MacroOutput::decode(json!({"name": "ready", "priority": 2})).unwrap();
+        assert_eq!(
+            decoded,
+            MacroOutput {
+                title: "ready".to_string(),
+                priority: Some(2),
+            }
+        );
     }
 
     #[test]

@@ -20,8 +20,10 @@ use tracing::{debug, warn};
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient};
 use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
+#[cfg(test)]
+use crate::core::agent::StructuredOutput;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
-use crate::core::agent::{InvokeOptions, ObjectSchema, Schema, StructuredOutput, compat};
+use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
 use crate::core::periodic::PeriodicTaskSpec;
@@ -113,81 +115,44 @@ struct QaOutput {
     clarifications: Vec<RawClarification>,
 }
 
-impl StructuredOutput for QaOutput {
-    fn tool_name() -> &'static str {
-        "qa_report"
-    }
-
-    fn tool_description() -> &'static str {
-        "The findings and clarification questions from this QA run."
-    }
-
-    fn schema() -> Schema {
-        Schema::object(
-            ObjectSchema::new()
-                .describe("Everything this QA run found.")
-                .required_property(
-                    "findings",
-                    Schema::array(
-                        "Test findings (bugs). Empty array if no bugs found.",
-                        Schema::object(
-                            ObjectSchema::new()
-                                .describe("One bug this run reproduced.")
-                                .required_property(
-                                    "title",
-                                    Schema::string("Short actionable title for the finding."),
-                                )
-                                .required_property(
-                                    "description",
-                                    Schema::string(
-                                        "Detailed description with steps to reproduce, expected vs actual behavior, and impact.",
-                                    ),
-                                )
-                                .required_property(
-                                    "severity",
-                                    Schema::string_enum(
-                                        "Severity: \"critical\", \"high\", \"medium\", or \"low\".",
-                                        SEVERITIES,
-                                    ),
-                                )
-                                .property(
-                                    "file",
-                                    Schema::string(
-                                        "Source file and line number if known (e.g. \"src/path/to/file.rs:123\"). Omit if unknown.",
-                                    ),
-                                ),
-                        ),
+structured_output! {
+    impl QaOutput {
+        tool_name: "qa_report";
+        tool_description: "The findings and clarification questions from this QA run.";
+        schema: object("Everything this QA run found.", {
+            required findings: array(
+                "Test findings (bugs). Empty array if no bugs found.",
+                object("One bug this run reproduced.", {
+                    required title: string("Short actionable title for the finding."),
+                    required description: string(
+                        "Detailed description with steps to reproduce, expected vs actual behavior, and impact."
                     ),
-                )
-                .property(
-                    "clarifications",
-                    Schema::array(
-                        "Clarification questions for humans. Empty array if none.",
-                        Schema::object(
-                            ObjectSchema::new()
-                                .describe("One question a human has to answer.")
-                                .required_property(
-                                    "question",
-                                    Schema::string("The clarification question."),
-                                )
-                                .required_property(
-                                    "context",
-                                    Schema::string(
-                                        "Context explaining why the question is needed.",
-                                    ),
-                                ),
-                        ),
+                    required severity: string_enum(
+                        "Severity: \"critical\", \"high\", \"medium\", or \"low\".",
+                        SEVERITIES
                     ),
-                ),
-        )
-    }
-
+                    optional file: string(
+                        "Source file and line number if known (e.g. \"src/path/to/file.rs:123\"). Omit if unknown."
+                    ),
+                })
+            ),
+            optional clarifications: array(
+                "Clarification questions for humans. Empty array if none.",
+                object("One question a human has to answer.", {
+                    required question: string("The clarification question."),
+                    required context: string(
+                        "Context explaining why the question is needed."
+                    ),
+                })
+            ),
+        });
     /// Tolerated: a severity the model invented or spelled differently, which
     /// becomes `"low"` so an odd label never blocks a whole QA run.
-    fn normalize(value: &mut serde_json::Value) {
-        compat::each_in_array(value, "findings", |finding| {
-            compat::normalize_enum(finding, "severity", SEVERITIES, "low");
-        });
+        normalize(value) {
+            compat::each_in_array(value, "findings", |finding| {
+                compat::normalize_enum(finding, "severity", SEVERITIES, "low");
+            });
+        }
     }
 }
 

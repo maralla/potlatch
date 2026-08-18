@@ -4,6 +4,7 @@ pub mod schema;
 
 pub use handoff::AgentHandoff;
 pub use model::{AgentModel, ModelPreferences};
+pub(crate) use schema::structured_output;
 pub use schema::{ObjectSchema, OneOfSchema, Schema, StructuredOutput, compat};
 
 use std::sync::Arc;
