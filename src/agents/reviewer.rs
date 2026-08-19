@@ -16,7 +16,6 @@ use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::cycle::Step;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 
@@ -302,47 +301,7 @@ impl DiscussionCounts {
     }
 }
 
-/// One question the reviewer machine asks before it decides anything. Every
-/// read the cycle performs is one of these, so a recorded trace shows the
-/// observations in the order the machine needed them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReviewerQuery {
-    ShutdownRequested,
-    DefaultBranch,
-    MergeRequests,
-    IssuePriorities,
-    UnresolvedDiscussions {
-        mr_iid: u64,
-    },
-    /// Tips of the checked-out source (`HEAD`) and of `origin/<target>`.
-    BranchTips {
-        target_branch: String,
-    },
-    LocalDiff {
-        target_branch: String,
-    },
-}
-
-/// The answer to one [`ReviewerQuery`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReviewerFact {
-    ShutdownRequested(bool),
-    DefaultBranch(String),
-    MergeRequests(Vec<MrObservation>),
-    IssuePriorities(Vec<(u64, u8)>),
-    UnresolvedDiscussions(DiscussionCounts),
-    BranchTips {
-        source_sha: String,
-        target_sha: String,
-    },
-    LocalDiff {
-        diff_stat: String,
-        changed_files: Vec<String>,
-    },
-}
-
-/// Everything the machine has gathered about the MR it claimed, and which
-/// the model invocation needs. Immutable once assembled.
+/// Everything gathered about the MR the reviewer claimed and passes to the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReviewSubject {
     mr: MrObservation,
@@ -352,96 +311,43 @@ struct ReviewSubject {
     changed_files: Vec<String>,
 }
 
-/// A single side effect (or the single model invocation) the reviewer
-/// machine asks the port to perform. Every variant is one step: the machine
-/// never hands over a batch, so the recorded order of these *is* the
-/// reviewer's mutation order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReviewerAction {
-    FetchRemote,
-    /// Best effort, exactly like the bare `let _ = reset_hard()` it replaces.
-    ResetWorktree,
-    CheckoutBranch {
-        branch: String,
-    },
-    /// Scan GitLab for a claim label this reviewer left behind.
-    RecoverClaim,
-    /// Release the claim held from a previous cycle, keeping the lease when
-    /// the release fails so the same claim is retried next cycle.
-    TryReleaseHeldClaim,
-    /// Release the held claim, warning on failure and always dropping it.
-    ReleaseHeldClaim,
-    /// Drop our own stale claim label found on a candidate MR (best effort).
-    ReleaseStaleClaimLabel {
-        mr_iid: u64,
-    },
-    AcquireClaim {
-        mr_iid: u64,
-    },
-    MergeTargetIntoWorktree {
-        target_branch: String,
-    },
-    InvokeReviewModel(Box<ReviewSubject>),
-    PostDiscussion {
-        mr_iid: u64,
-        body: String,
-    },
-    PostResolvedDiscussion {
-        mr_iid: u64,
-        body: String,
-    },
-    AddApprovedLabel {
-        mr_iid: u64,
-    },
-    MergeMergeRequest {
-        mr_iid: u64,
-    },
-}
-
-/// Result of a claim attempt, mirroring [`ClaimAcquireOutcome`] without
-/// carrying the lease itself — the lease lives in the port, which is what
-/// owns claim side effects.
+/// Result of trying to acquire one MR claim. The lease itself remains owned by
+/// the port so it can preserve the cross-cycle release semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimAttempt {
-    Won(u64),
+    Won,
     Lost,
     Interrupted,
 }
 
-/// What the port reports back after executing one [`ReviewerAction`].
-enum ReviewerOutcome {
-    /// The action completed and has nothing to report.
-    Done,
-    /// The action failed. Whether that aborts the cycle or ends the review
-    /// of one MR is decided by the stage that asked for it, mirroring which
-    /// call sites used `?` and which were wrapped in a `match`.
-    Failed(anyhow::Error),
-    ClaimRecovered(Option<u64>),
-    Claim(ClaimAttempt),
-    LocalMerge {
-        clean: bool,
-    },
-    Reviewed(ReviewerOutput),
-}
-
-/// The narrow surface the reviewer cycle needs. Object-safe and role-local:
-/// it is the reviewer's own observe/execute vocabulary, not a stand-in for
-/// the GitLab API, git, or the model backend (see [`super::claim::ClaimPort`]
-/// for the same reasoning at claim granularity).
+/// The narrow, typed surface needed by the reviewer workflows.
 trait ReviewerPort {
     fn shutdown_requested(&self) -> bool;
     fn default_branch(&self) -> Result<String>;
+    fn fetch_remote(&mut self) -> Result<()>;
+    /// Best effort by contract.
+    fn reset_worktree(&mut self);
+    fn checkout_branch(&mut self, branch: &str) -> Result<()>;
+    fn recover_claim(&mut self);
+    /// A failure retains the lease so the next cycle retries the same release.
+    fn try_release_held_claim(&mut self) -> Result<()>;
+    /// Warns on release failure and always drops the lease.
+    fn release_held_claim(&mut self);
+    fn release_stale_claim_label(&mut self, mr_iid: u64);
     fn merge_requests(&self) -> Result<Vec<MrObservation>>;
-    /// Best effort by contract: the cycle sorts by issue priority and
-    /// treats an unavailable issue list as "no priorities known".
+    /// Best effort: unavailable issue priorities are represented by an empty list.
     fn issue_priorities(&self) -> Vec<(u64, u8)>;
     fn unresolved_discussions(&self, mr_iid: u64) -> Result<DiscussionCounts>;
+    fn acquire_claim(&mut self, mr_iid: u64) -> Result<ClaimAttempt>;
     fn branch_tips(&self, target_branch: &str) -> Result<(String, String)>;
+    fn merge_target_into_worktree(&mut self, target_branch: &str) -> Result<bool>;
     fn local_diff(&self, target_branch: &str) -> Result<(String, Vec<String>)>;
-    fn execute(&mut self, action: &ReviewerAction) -> ReviewerOutcome;
+    fn invoke_review_model(&mut self, subject: &ReviewSubject) -> Result<ReviewerOutput>;
+    fn post_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()>;
+    fn post_resolved_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()>;
+    fn add_approved_label(&mut self, mr_iid: u64) -> Result<()>;
+    fn merge_merge_request(&mut self, mr_iid: u64) -> Result<()>;
 }
-
-type ReviewerStep = Step<ReviewerQuery, ReviewerAction>;
 
 // ---------------------------------------------------------------------------
 // Pure reviewer decisions
@@ -557,704 +463,226 @@ fn merge_failed_body(error: &anyhow::Error) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Reviewer state machine
+// Imperative reviewer workflows
 // ---------------------------------------------------------------------------
 
-/// Where the reviewer cycle is. Each variant names the single next
-/// observation, action, or pure transition, so [`ReviewerMachine::next_step`]
-/// is a function of this plus what the machine already learned — never of
-/// the world.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReviewerStage {
-    ObserveDefaultBranch,
-    FetchRemote,
-    ShutdownAfterFetch,
-    ResetWorktree,
-    CheckoutDefaultBranch,
-    RecoverClaimIfUnheld,
-    ReleaseClaimFromPreviousCycle,
-    ObserveMergeRequests,
-    ShutdownAfterMergeRequests,
-    ObserveIssuePriorities,
-    NextCandidate,
-    ShutdownBeforeCandidate,
-    ScreenCandidate,
-    ReleaseStaleClaim,
-    ObserveCandidateDiscussions,
-    AcquireCandidateClaim,
-    ShutdownAfterClaim,
-    ReviewGate,
-    PostGateFeedback(String),
-    ReviewResetWorktree,
-    CheckoutSourceBranch,
-    ObserveBranchTips,
-    MergeTargetIntoWorktree,
-    PostConflictFeedback,
-    CheckoutTargetAfterConflict,
-    ObserveLocalDiff,
-    InvokeReviewModel,
-    CheckoutTargetAfterReview,
-    ApplyReviewDecision,
-    ObserveApprovalDiscussions,
-    MergeMergeRequest,
-    PostMergeFailedFeedback(String),
-    PostApprovalComment,
-    AddApprovedLabel,
-    PostRequestChanges(String),
-    ShutdownAfterReviewError(String),
-    ReleaseClaimAfterReview,
-    Finish,
-}
-
-/// How the review of the claimed MR ended: the three [`ReviewOutcome`]s,
-/// plus the failure the cycle used to catch by matching on the old
-/// `review_merge_request`'s `Err`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewCompletion {
-    Outcome(ReviewOutcome),
-    Failed,
-}
-
-/// The reviewer's orchestration state. Holds only plain data — no GitLab
-/// client, no git repo, no lease — so every decision it makes is a pure
-/// function of what it has observed so far.
-struct ReviewerMachine<'a> {
-    agent_id: &'a str,
-    scope_label: Option<&'a str>,
+fn run_reviewer_cycle(
+    agent_id: &str,
+    scope_label: Option<&str>,
     merge_when_approved: bool,
-    stage: ReviewerStage,
-    default_branch: String,
-    held_claim: Option<u64>,
-    candidates: std::collections::VecDeque<MrObservation>,
-    candidate: Option<MrObservation>,
-    subject: Option<ReviewSubject>,
-    decision: Option<ReviewerOutput>,
-    completion: Option<ReviewCompletion>,
-}
+    port: &mut dyn ReviewerPort,
+) -> Result<Option<u64>> {
+    let default_branch = port.default_branch()?;
+    port.fetch_remote()?;
+    // Shutdown boundary 1: after the remote refresh.
+    if port.shutdown_requested() {
+        return Ok(None);
+    }
 
-impl<'a> ReviewerMachine<'a> {
-    fn new(agent_id: &'a str, scope_label: Option<&'a str>, merge_when_approved: bool) -> Self {
-        Self {
-            agent_id,
-            scope_label,
-            merge_when_approved,
-            stage: ReviewerStage::ObserveDefaultBranch,
-            default_branch: String::new(),
-            held_claim: None,
-            candidates: std::collections::VecDeque::new(),
-            candidate: None,
-            subject: None,
-            decision: None,
-            completion: None,
+    port.reset_worktree();
+    port.checkout_branch(&default_branch)?;
+    port.recover_claim();
+    if let Err(error) = port.try_release_held_claim() {
+        warn!("{agent_id}: Failed to release held claim: {error}, will retry next cycle");
+        return Ok(None);
+    }
+
+    let mut candidates = port.merge_requests()?;
+    // Shutdown boundary 2: after reading merge requests.
+    if port.shutdown_requested() {
+        return Ok(None);
+    }
+    sort_review_candidates(&mut candidates, &port.issue_priorities());
+
+    for mr in candidates {
+        // Shutdown boundary 3: before screening each candidate.
+        if port.shutdown_requested() {
+            return Ok(None);
         }
-    }
-
-    /// Start a cycle already holding a claim from a previous cycle (or from
-    /// startup recovery), so the machine releases it before claiming
-    /// anything new.
-    fn with_held_claim(mut self, mr_iid: Option<u64>) -> Self {
-        self.held_claim = mr_iid;
-        self
-    }
-
-    fn subject(&self) -> &ReviewSubject {
-        self.subject
-            .as_ref()
-            .expect("review stages run only after the subject is assembled")
-    }
-
-    fn reviewed_mr_iid(&self) -> u64 {
-        self.subject().mr.iid
-    }
-
-    /// The MR this cycle merged, if the review ended in a merge — the only
-    /// thing the caller needs from the finished machine.
-    fn merged_mr_iid(&self) -> Option<u64> {
-        matches!(
-            self.completion,
-            Some(ReviewCompletion::Outcome(ReviewOutcome::Merged))
-        )
-        .then(|| self.subject().mr.iid)
-    }
-
-    /// The single next thing to do. Pure: it only resolves stages that need
-    /// no port interaction (skips, sorting, gate decisions) before handing
-    /// back an observation or an action.
-    fn next_step(&mut self) -> ReviewerStep {
-        loop {
-            match &self.stage {
-                ReviewerStage::ObserveDefaultBranch => {
-                    return ReviewerStep::Observe(ReviewerQuery::DefaultBranch);
-                }
-                ReviewerStage::FetchRemote => {
-                    return ReviewerStep::Act(ReviewerAction::FetchRemote);
-                }
-                ReviewerStage::ShutdownAfterFetch
-                | ReviewerStage::ShutdownAfterMergeRequests
-                | ReviewerStage::ShutdownBeforeCandidate
-                | ReviewerStage::ShutdownAfterClaim
-                | ReviewerStage::ShutdownAfterReviewError(_) => {
-                    return ReviewerStep::Observe(ReviewerQuery::ShutdownRequested);
-                }
-                ReviewerStage::ResetWorktree | ReviewerStage::ReviewResetWorktree => {
-                    return ReviewerStep::Act(ReviewerAction::ResetWorktree);
-                }
-                ReviewerStage::CheckoutDefaultBranch => {
-                    return ReviewerStep::Act(ReviewerAction::CheckoutBranch {
-                        branch: self.default_branch.clone(),
-                    });
-                }
-                ReviewerStage::RecoverClaimIfUnheld => {
-                    if self.held_claim.is_some() {
-                        self.stage = ReviewerStage::ReleaseClaimFromPreviousCycle;
-                        continue;
-                    }
-                    return ReviewerStep::Act(ReviewerAction::RecoverClaim);
-                }
-                ReviewerStage::ReleaseClaimFromPreviousCycle => {
-                    if self.held_claim.is_none() {
-                        self.stage = ReviewerStage::ObserveMergeRequests;
-                        continue;
-                    }
-                    return ReviewerStep::Act(ReviewerAction::TryReleaseHeldClaim);
-                }
-                ReviewerStage::ObserveMergeRequests => {
-                    return ReviewerStep::Observe(ReviewerQuery::MergeRequests);
-                }
-                ReviewerStage::ObserveIssuePriorities => {
-                    return ReviewerStep::Observe(ReviewerQuery::IssuePriorities);
-                }
-                ReviewerStage::NextCandidate => match self.candidates.pop_front() {
-                    Some(mr) => {
-                        self.candidate = Some(mr);
-                        self.stage = ReviewerStage::ShutdownBeforeCandidate;
-                    }
-                    None => self.stage = ReviewerStage::Finish,
-                },
-                ReviewerStage::ScreenCandidate => {
-                    let mr = self
-                        .candidate
-                        .clone()
-                        .expect("a candidate is set before it is screened");
-                    match decide_candidate(&mr, self.agent_id, self.scope_label) {
-                        CandidateDecision::Skip => {
-                            if mr.state == "opened"
-                                && mr.in_scope(self.scope_label)
-                                && mr.has_label(REVIEWER_APPROVED_LABEL)
-                            {
-                                debug!(
-                                    "{}: MR !{} already marked {}, skipping",
-                                    self.agent_id, mr.iid, REVIEWER_APPROVED_LABEL
-                                );
-                            } else if claim::is_mr_claimed(&mr.labels) {
-                                debug!(
-                                    "{}: MR !{} already claimed, skipping",
-                                    self.agent_id, mr.iid
-                                );
-                            }
-                            self.stage = ReviewerStage::NextCandidate;
-                        }
-                        CandidateDecision::ReleaseOurStaleClaim => {
-                            warn!(
-                                "{}: MR !{} still has our claim label, releasing before retry",
-                                self.agent_id, mr.iid
-                            );
-                            self.stage = ReviewerStage::ReleaseStaleClaim;
-                        }
-                        CandidateDecision::Screen => {
-                            self.stage = ReviewerStage::ObserveCandidateDiscussions;
-                        }
-                    }
-                }
-                ReviewerStage::ReleaseStaleClaim => {
-                    return ReviewerStep::Act(ReviewerAction::ReleaseStaleClaimLabel {
-                        mr_iid: self.candidate_iid(),
-                    });
-                }
-                ReviewerStage::ObserveCandidateDiscussions => {
-                    return ReviewerStep::Observe(ReviewerQuery::UnresolvedDiscussions {
-                        mr_iid: self.candidate_iid(),
-                    });
-                }
-                ReviewerStage::AcquireCandidateClaim => {
-                    return ReviewerStep::Act(ReviewerAction::AcquireClaim {
-                        mr_iid: self.candidate_iid(),
-                    });
-                }
-                ReviewerStage::ReviewGate => {
-                    let mr = self
-                        .candidate
-                        .clone()
-                        .expect("a candidate is claimed before it is reviewed");
-                    let subject = ReviewSubject {
-                        issue_iid: linked_issue_iid(&mr),
-                        is_need_ai_worker_mr: mr.has_label(NEED_AI_WORKER_LABEL),
-                        diff_stat: String::new(),
-                        changed_files: Vec::new(),
-                        mr,
-                    };
-                    let gate = decide_pre_review_gate(&subject.mr, &subject);
-                    self.subject = Some(subject);
-                    self.stage = match gate {
-                        PreReviewGate::MissingIssueLink => {
-                            warn!(
-                                "MR !{} does not reference any issue, requesting fix",
-                                self.reviewed_mr_iid()
-                            );
-                            ReviewerStage::PostGateFeedback(MISSING_ISSUE_LINK_BODY.to_string())
-                        }
-                        PreReviewGate::BadMetadata(body) => {
-                            warn!(
-                                "MR !{} has a generic or missing title/description, requesting fix",
-                                self.reviewed_mr_iid()
-                            );
-                            ReviewerStage::PostGateFeedback(body)
-                        }
-                        PreReviewGate::Proceed => ReviewerStage::ReviewResetWorktree,
-                    };
-                }
-                ReviewerStage::PostGateFeedback(body)
-                | ReviewerStage::PostRequestChanges(body)
-                | ReviewerStage::PostMergeFailedFeedback(body) => {
-                    return ReviewerStep::Act(ReviewerAction::PostDiscussion {
-                        mr_iid: self.reviewed_mr_iid(),
-                        body: body.clone(),
-                    });
-                }
-                ReviewerStage::CheckoutSourceBranch => {
-                    return ReviewerStep::Act(ReviewerAction::CheckoutBranch {
-                        branch: self.subject().mr.source_branch.clone(),
-                    });
-                }
-                ReviewerStage::ObserveBranchTips => {
-                    return ReviewerStep::Observe(ReviewerQuery::BranchTips {
-                        target_branch: self.subject().mr.target_branch.clone(),
-                    });
-                }
-                ReviewerStage::MergeTargetIntoWorktree => {
-                    return ReviewerStep::Act(ReviewerAction::MergeTargetIntoWorktree {
-                        target_branch: self.subject().mr.target_branch.clone(),
-                    });
-                }
-                ReviewerStage::PostConflictFeedback => {
-                    return ReviewerStep::Act(ReviewerAction::PostDiscussion {
-                        mr_iid: self.reviewed_mr_iid(),
-                        body: merge_conflict_body(&self.subject().mr.target_branch),
-                    });
-                }
-                ReviewerStage::CheckoutTargetAfterConflict
-                | ReviewerStage::CheckoutTargetAfterReview => {
-                    return ReviewerStep::Act(ReviewerAction::CheckoutBranch {
-                        branch: self.subject().mr.target_branch.clone(),
-                    });
-                }
-                ReviewerStage::ObserveLocalDiff => {
-                    return ReviewerStep::Observe(ReviewerQuery::LocalDiff {
-                        target_branch: self.subject().mr.target_branch.clone(),
-                    });
-                }
-                ReviewerStage::InvokeReviewModel => {
-                    return ReviewerStep::Act(ReviewerAction::InvokeReviewModel(Box::new(
-                        self.subject().clone(),
-                    )));
-                }
-                ReviewerStage::ApplyReviewDecision => {
-                    let mr_iid = self.reviewed_mr_iid();
-                    match self
-                        .decision
-                        .take()
-                        .expect("a review decision is recorded before it is applied")
-                    {
-                        ReviewerOutput::Approve { .. } => {
-                            info!("MR !{} approved by reviewer", mr_iid);
-                            self.stage = ReviewerStage::ObserveApprovalDiscussions;
-                        }
-                        ReviewerOutput::RequestChanges {
-                            feedback,
-                            public_comment,
-                        } => {
-                            info!("MR !{} needs changes", mr_iid);
-                            let body =
-                                extract_review_feedback(Some(&feedback), public_comment.as_deref());
-                            self.stage = ReviewerStage::PostRequestChanges(body);
-                        }
-                    }
-                }
-                ReviewerStage::ObserveApprovalDiscussions => {
-                    return ReviewerStep::Observe(ReviewerQuery::UnresolvedDiscussions {
-                        mr_iid: self.reviewed_mr_iid(),
-                    });
-                }
-                ReviewerStage::MergeMergeRequest => {
-                    return ReviewerStep::Act(ReviewerAction::MergeMergeRequest {
-                        mr_iid: self.reviewed_mr_iid(),
-                    });
-                }
-                ReviewerStage::PostApprovalComment => {
-                    return ReviewerStep::Act(ReviewerAction::PostResolvedDiscussion {
-                        mr_iid: self.reviewed_mr_iid(),
-                        body: extract_approval_message(),
-                    });
-                }
-                ReviewerStage::AddApprovedLabel => {
-                    return ReviewerStep::Act(ReviewerAction::AddApprovedLabel {
-                        mr_iid: self.reviewed_mr_iid(),
-                    });
-                }
-                ReviewerStage::ReleaseClaimAfterReview => {
-                    return ReviewerStep::Act(ReviewerAction::ReleaseHeldClaim);
-                }
-                ReviewerStage::Finish => return ReviewerStep::Finish,
-            }
-        }
-    }
-
-    fn candidate_iid(&self) -> u64 {
-        self.candidate
-            .as_ref()
-            .expect("a candidate is set before it is acted on")
-            .iid
-    }
-
-    /// Feed back the answer to the observation the machine just asked for.
-    /// `Err` here means the cycle itself fails, exactly where the original
-    /// code used `?` on a read.
-    fn apply_fact(&mut self, fact: Result<ReviewerFact>) -> Result<()> {
-        match (&self.stage, fact) {
-            (ReviewerStage::ObserveDefaultBranch, Ok(ReviewerFact::DefaultBranch(branch))) => {
-                self.default_branch = branch;
-                self.stage = ReviewerStage::FetchRemote;
-            }
-            (ReviewerStage::ShutdownAfterFetch, Ok(ReviewerFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    ReviewerStage::Finish
-                } else {
-                    ReviewerStage::ResetWorktree
-                };
-            }
-            (ReviewerStage::ObserveMergeRequests, Ok(ReviewerFact::MergeRequests(mrs))) => {
-                self.candidates = mrs.into();
-                self.stage = ReviewerStage::ShutdownAfterMergeRequests;
-            }
-            (
-                ReviewerStage::ShutdownAfterMergeRequests,
-                Ok(ReviewerFact::ShutdownRequested(stop)),
-            ) => {
-                self.stage = if stop {
-                    ReviewerStage::Finish
-                } else {
-                    ReviewerStage::ObserveIssuePriorities
-                };
-            }
-            (ReviewerStage::ObserveIssuePriorities, Ok(ReviewerFact::IssuePriorities(prios))) => {
-                let mut candidates: Vec<MrObservation> =
-                    std::mem::take(&mut self.candidates).into();
-                sort_review_candidates(&mut candidates, &prios);
-                self.candidates = candidates.into();
-                self.stage = ReviewerStage::NextCandidate;
-            }
-            (ReviewerStage::ShutdownBeforeCandidate, Ok(ReviewerFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    ReviewerStage::Finish
-                } else {
-                    ReviewerStage::ScreenCandidate
-                };
-            }
-            (
-                ReviewerStage::ObserveCandidateDiscussions,
-                Ok(ReviewerFact::UnresolvedDiscussions(counts)),
-            ) => {
-                self.stage = if counts.any_unresolved() {
-                    ReviewerStage::NextCandidate
-                } else {
-                    ReviewerStage::AcquireCandidateClaim
-                };
-            }
-            (ReviewerStage::ObserveCandidateDiscussions, Err(e)) => {
-                warn!(
-                    "{}: Could not check discussions for MR !{}: {}, skipping this cycle",
-                    self.agent_id,
-                    self.candidate_iid(),
-                    e
-                );
-                self.stage = ReviewerStage::NextCandidate;
-            }
-            (ReviewerStage::ShutdownAfterClaim, Ok(ReviewerFact::ShutdownRequested(stop))) => {
-                if stop {
-                    self.stage = ReviewerStage::ReleaseClaimAfterReview;
-                } else {
-                    let mr = self
-                        .candidate
-                        .as_ref()
-                        .expect("a candidate is claimed before it is reviewed");
-                    info!("{}: Reviewing MR !{}: {}", self.agent_id, mr.iid, mr.title);
-                    self.stage = ReviewerStage::ReviewGate;
-                }
-            }
-            (
-                ReviewerStage::ObserveBranchTips,
-                Ok(ReviewerFact::BranchTips {
-                    source_sha,
-                    target_sha,
-                }),
-            ) => {
-                let mr = &self.subject().mr;
-                info!(
-                    "MR !{} diff: {} ({}) -> {} ({})",
-                    mr.iid, mr.source_branch, source_sha, mr.target_branch, target_sha
-                );
-                self.stage = ReviewerStage::MergeTargetIntoWorktree;
-            }
-            (
-                ReviewerStage::ObserveLocalDiff,
-                Ok(ReviewerFact::LocalDiff {
-                    diff_stat,
-                    changed_files,
-                }),
-            ) => {
-                let subject = self
-                    .subject
-                    .as_mut()
-                    .expect("review stages run only after the subject is assembled");
-                subject.diff_stat = diff_stat;
-                subject.changed_files = changed_files;
-                self.stage = ReviewerStage::InvokeReviewModel;
-            }
-            (
-                ReviewerStage::ObserveApprovalDiscussions,
-                Ok(ReviewerFact::UnresolvedDiscussions(counts)),
-            ) => {
-                let mr_iid = self.reviewed_mr_iid();
-                self.stage = match plan_approval(counts.any_unresolved(), self.merge_when_approved)
+        match decide_candidate(&mr, agent_id, scope_label) {
+            CandidateDecision::Skip => {
+                if mr.state == "opened"
+                    && mr.in_scope(scope_label)
+                    && mr.has_label(REVIEWER_APPROVED_LABEL)
                 {
-                    ApprovalPlan::SkipMergeUnresolvedDiscussions => {
-                        warn!(
-                            "MR !{} approved but has unresolved discussions, skipping merge",
-                            mr_iid
-                        );
-                        self.complete_review(ReviewCompletion::Outcome(ReviewOutcome::NeedsChanges))
-                    }
-                    ApprovalPlan::AttemptMerge => ReviewerStage::MergeMergeRequest,
-                    ApprovalPlan::ApproveWithoutMerge => ReviewerStage::PostApprovalComment,
-                };
-            }
-            (ReviewerStage::ObserveApprovalDiscussions, Err(e)) => {
-                let mr_iid = self.reviewed_mr_iid();
-                self.stage = self.fail_review(e.context(format!(
-                    "Could not verify discussions are resolved for MR !{mr_iid} before merge"
-                )));
-            }
-            (
-                ReviewerStage::ShutdownAfterReviewError(message),
-                Ok(ReviewerFact::ShutdownRequested(stop)),
-            ) => {
-                if !stop {
-                    error!(
-                        "{}: Failed to review MR !{}: {}",
-                        self.agent_id,
-                        self.reviewed_mr_iid(),
-                        message
+                    debug!(
+                        "{agent_id}: MR !{} already marked {}, skipping",
+                        mr.iid, REVIEWER_APPROVED_LABEL
                     );
+                } else if claim::is_mr_claimed(&mr.labels) {
+                    debug!("{agent_id}: MR !{} already claimed, skipping", mr.iid);
                 }
-                self.stage = ReviewerStage::ReleaseClaimAfterReview;
+                continue;
             }
-            (stage, Ok(fact)) => {
-                anyhow::bail!("reviewer port answered {stage:?} with {fact:?}");
+            CandidateDecision::ReleaseOurStaleClaim => {
+                warn!(
+                    "{agent_id}: MR !{} still has our claim label, releasing before retry",
+                    mr.iid
+                );
+                port.release_stale_claim_label(mr.iid);
             }
-            (_, Err(e)) => return Err(e),
+            CandidateDecision::Screen => {}
         }
-        Ok(())
+
+        match port.unresolved_discussions(mr.iid) {
+            Ok(counts) if counts.any_unresolved() => continue,
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    "{agent_id}: Could not check discussions for MR !{}: {error}, skipping this cycle",
+                    mr.iid
+                );
+                continue;
+            }
+        }
+
+        match port.acquire_claim(mr.iid)? {
+            ClaimAttempt::Lost => {
+                info!("{agent_id}: Failed to claim MR !{}, skipping", mr.iid);
+                continue;
+            }
+            ClaimAttempt::Interrupted => return Ok(None),
+            ClaimAttempt::Won => {}
+        }
+
+        // Exactly one won claim is processed per cycle. Boundary 4 is after
+        // acquisition, and a shutdown here still releases the freshly won claim.
+        if port.shutdown_requested() {
+            port.release_held_claim();
+            return Ok(None);
+        }
+
+        info!("{agent_id}: Reviewing MR !{}: {}", mr.iid, mr.title);
+        let outcome = match review_claimed_merge_request(agent_id, &mr, merge_when_approved, port) {
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                if !port.shutdown_requested() {
+                    error!("{agent_id}: Failed to review MR !{}: {error:#}", mr.iid);
+                }
+                None
+            }
+        };
+
+        match outcome {
+            Some(ReviewOutcome::Merged) => info!("{agent_id}: MR !{} approved and merged", mr.iid),
+            Some(ReviewOutcome::ApprovedWithoutMerge) => info!(
+                "{agent_id}: MR !{} approved without merge, releasing claim",
+                mr.iid
+            ),
+            Some(ReviewOutcome::NeedsChanges) => info!(
+                "{agent_id}: MR !{} reviewed with feedback, releasing claim",
+                mr.iid
+            ),
+            None => {}
+        }
+        port.release_held_claim();
+        return Ok(matches!(outcome, Some(ReviewOutcome::Merged)).then_some(mr.iid));
     }
 
-    /// Feed back the outcome of the action the machine just asked for.
-    fn apply_outcome(&mut self, outcome: ReviewerOutcome) -> Result<()> {
-        match (&self.stage, outcome) {
-            (ReviewerStage::FetchRemote, ReviewerOutcome::Done) => {
-                self.stage = ReviewerStage::ShutdownAfterFetch;
-            }
-            (ReviewerStage::ResetWorktree, ReviewerOutcome::Done) => {
-                self.stage = ReviewerStage::CheckoutDefaultBranch;
-            }
-            (ReviewerStage::CheckoutDefaultBranch, ReviewerOutcome::Done) => {
-                self.stage = ReviewerStage::RecoverClaimIfUnheld;
-            }
-            (ReviewerStage::RecoverClaimIfUnheld, ReviewerOutcome::ClaimRecovered(held)) => {
-                self.held_claim = held;
-                self.stage = ReviewerStage::ReleaseClaimFromPreviousCycle;
-            }
-            (ReviewerStage::ReleaseClaimFromPreviousCycle, ReviewerOutcome::Done) => {
-                self.held_claim = None;
-                self.stage = ReviewerStage::ObserveMergeRequests;
-            }
-            // A failed release keeps the lease so the same claim is retried
-            // next cycle instead of being re-derived from a fresh scan.
-            (ReviewerStage::ReleaseClaimFromPreviousCycle, ReviewerOutcome::Failed(_)) => {
-                self.stage = ReviewerStage::Finish;
-            }
-            (ReviewerStage::ReleaseStaleClaim, ReviewerOutcome::Done) => {
-                self.stage = ReviewerStage::ObserveCandidateDiscussions;
-            }
-            (ReviewerStage::AcquireCandidateClaim, ReviewerOutcome::Claim(attempt)) => {
-                match attempt {
-                    ClaimAttempt::Won(mr_iid) => {
-                        self.held_claim = Some(mr_iid);
-                        self.stage = ReviewerStage::ShutdownAfterClaim;
-                    }
-                    ClaimAttempt::Lost => {
-                        info!(
-                            "{}: Failed to claim MR !{}, skipping",
-                            self.agent_id,
-                            self.candidate_iid()
-                        );
-                        self.stage = ReviewerStage::NextCandidate;
-                    }
-                    ClaimAttempt::Interrupted => self.stage = ReviewerStage::Finish,
-                }
-            }
-            (ReviewerStage::ReviewResetWorktree, ReviewerOutcome::Done) => {
-                self.stage = ReviewerStage::CheckoutSourceBranch;
-            }
-            (ReviewerStage::CheckoutSourceBranch, ReviewerOutcome::Done) => {
-                self.stage = ReviewerStage::ObserveBranchTips;
-            }
-            (ReviewerStage::MergeTargetIntoWorktree, ReviewerOutcome::LocalMerge { clean }) => {
-                if clean {
-                    self.stage = ReviewerStage::ObserveLocalDiff;
-                } else {
-                    let mr = &self.subject().mr;
+    Ok(None)
+}
+
+fn review_claimed_merge_request(
+    agent_id: &str,
+    mr: &MrObservation,
+    merge_when_approved: bool,
+    port: &mut dyn ReviewerPort,
+) -> Result<ReviewOutcome> {
+    let mut subject = ReviewSubject {
+        mr: mr.clone(),
+        issue_iid: linked_issue_iid(mr),
+        is_need_ai_worker_mr: mr.has_label(NEED_AI_WORKER_LABEL),
+        diff_stat: String::new(),
+        changed_files: Vec::new(),
+    };
+    match decide_pre_review_gate(mr, &subject) {
+        PreReviewGate::MissingIssueLink => {
+            warn!(
+                "MR !{} does not reference any issue, requesting fix",
+                mr.iid
+            );
+            port.post_discussion(mr.iid, MISSING_ISSUE_LINK_BODY)?;
+            return Ok(ReviewOutcome::NeedsChanges);
+        }
+        PreReviewGate::BadMetadata(body) => {
+            warn!(
+                "MR !{} has a generic or missing title/description, requesting fix",
+                mr.iid
+            );
+            port.post_discussion(mr.iid, &body)?;
+            return Ok(ReviewOutcome::NeedsChanges);
+        }
+        PreReviewGate::Proceed => {}
+    }
+
+    port.reset_worktree();
+    port.checkout_branch(&mr.source_branch)?;
+    let (source_sha, target_sha) = port.branch_tips(&mr.target_branch)?;
+    info!(
+        "MR !{} diff: {} ({}) -> {} ({})",
+        mr.iid, mr.source_branch, source_sha, mr.target_branch, target_sha
+    );
+
+    if !port.merge_target_into_worktree(&mr.target_branch)? {
+        warn!(
+            "MR !{} has merge conflicts with {}",
+            mr.iid, mr.target_branch
+        );
+        port.post_discussion(mr.iid, &merge_conflict_body(&mr.target_branch))?;
+        port.checkout_branch(&mr.target_branch)?;
+        return Ok(ReviewOutcome::NeedsChanges);
+    }
+
+    (subject.diff_stat, subject.changed_files) = port.local_diff(&mr.target_branch)?;
+    let decision = port.invoke_review_model(&subject)?;
+    info!("{agent_id}: Reviewer agent finished MR !{}", mr.iid);
+    // The model inspects the merged source worktree; restore the target before
+    // posting feedback, approving, or attempting the server-side merge.
+    port.checkout_branch(&mr.target_branch)?;
+
+    match decision {
+        ReviewerOutput::RequestChanges {
+            feedback,
+            public_comment,
+        } => {
+            info!("MR !{} needs changes", mr.iid);
+            let body = extract_review_feedback(Some(&feedback), public_comment.as_deref());
+            port.post_discussion(mr.iid, &body)?;
+            Ok(ReviewOutcome::NeedsChanges)
+        }
+        ReviewerOutput::Approve { .. } => {
+            info!("MR !{} approved by reviewer", mr.iid);
+            let counts = port.unresolved_discussions(mr.iid).map_err(|error| {
+                error.context(format!(
+                    "Could not verify discussions are resolved for MR !{} before merge",
+                    mr.iid
+                ))
+            })?;
+            match plan_approval(counts.any_unresolved(), merge_when_approved) {
+                ApprovalPlan::SkipMergeUnresolvedDiscussions => {
                     warn!(
-                        "MR !{} has merge conflicts with {}",
-                        mr.iid, mr.target_branch
+                        "MR !{} approved but has unresolved discussions, skipping merge",
+                        mr.iid
                     );
-                    self.stage = ReviewerStage::PostConflictFeedback;
+                    Ok(ReviewOutcome::NeedsChanges)
+                }
+                ApprovalPlan::AttemptMerge => match port.merge_merge_request(mr.iid) {
+                    Ok(()) => {
+                        info!("Successfully merged MR !{}", mr.iid);
+                        Ok(ReviewOutcome::Merged)
+                    }
+                    Err(error) => {
+                        warn!("Failed to merge MR !{}: {error}", mr.iid);
+                        port.post_discussion(mr.iid, &merge_failed_body(&error))?;
+                        Ok(ReviewOutcome::NeedsChanges)
+                    }
+                },
+                ApprovalPlan::ApproveWithoutMerge => {
+                    port.post_resolved_discussion(mr.iid, &extract_approval_message())?;
+                    port.add_approved_label(mr.iid)?;
+                    Ok(ReviewOutcome::ApprovedWithoutMerge)
                 }
             }
-            (ReviewerStage::PostConflictFeedback, ReviewerOutcome::Done) => {
-                self.stage = ReviewerStage::CheckoutTargetAfterConflict;
-            }
-            (ReviewerStage::CheckoutTargetAfterConflict, ReviewerOutcome::Done)
-            | (ReviewerStage::PostGateFeedback(_), ReviewerOutcome::Done)
-            | (ReviewerStage::PostRequestChanges(_), ReviewerOutcome::Done)
-            | (ReviewerStage::PostMergeFailedFeedback(_), ReviewerOutcome::Done) => {
-                self.stage =
-                    self.complete_review(ReviewCompletion::Outcome(ReviewOutcome::NeedsChanges));
-            }
-            (ReviewerStage::InvokeReviewModel, ReviewerOutcome::Reviewed(output)) => {
-                info!(
-                    "{}: Reviewer agent finished MR !{}",
-                    self.agent_id,
-                    self.reviewed_mr_iid()
-                );
-                self.decision = Some(output);
-                self.stage = ReviewerStage::CheckoutTargetAfterReview;
-            }
-            (ReviewerStage::CheckoutTargetAfterReview, ReviewerOutcome::Done) => {
-                self.stage = ReviewerStage::ApplyReviewDecision;
-            }
-            (ReviewerStage::MergeMergeRequest, ReviewerOutcome::Done) => {
-                info!("Successfully merged MR !{}", self.reviewed_mr_iid());
-                self.stage = self.complete_review(ReviewCompletion::Outcome(ReviewOutcome::Merged));
-            }
-            (ReviewerStage::MergeMergeRequest, ReviewerOutcome::Failed(e)) => {
-                warn!("Failed to merge MR !{}: {}", self.reviewed_mr_iid(), e);
-                self.stage = ReviewerStage::PostMergeFailedFeedback(merge_failed_body(&e));
-            }
-            (ReviewerStage::PostApprovalComment, ReviewerOutcome::Done) => {
-                self.stage = ReviewerStage::AddApprovedLabel;
-            }
-            (ReviewerStage::AddApprovedLabel, ReviewerOutcome::Done) => {
-                self.stage = self.complete_review(ReviewCompletion::Outcome(
-                    ReviewOutcome::ApprovedWithoutMerge,
-                ));
-            }
-            (ReviewerStage::ReleaseClaimAfterReview, ReviewerOutcome::Done) => {
-                self.held_claim = None;
-                self.stage = ReviewerStage::Finish;
-            }
-            // Reads and writes the cycle itself performed with `?` abort it.
-            (
-                ReviewerStage::FetchRemote
-                | ReviewerStage::CheckoutDefaultBranch
-                | ReviewerStage::AcquireCandidateClaim,
-                ReviewerOutcome::Failed(e),
-            ) => return Err(e),
-            // Anything failing inside the review of one MR ends that review,
-            // just like the `Err` arm of the old `review_merge_request` match.
-            (_, ReviewerOutcome::Failed(e)) => {
-                self.stage = self.fail_review(e);
-            }
-            (stage, _) => {
-                anyhow::bail!("reviewer port reported an unexpected outcome for {stage:?}");
-            }
-        }
-        Ok(())
-    }
-
-    fn complete_review(&mut self, completion: ReviewCompletion) -> ReviewerStage {
-        let mr_iid = self.reviewed_mr_iid();
-        match &completion {
-            ReviewCompletion::Outcome(ReviewOutcome::Merged) => {
-                info!("{}: MR !{} approved and merged", self.agent_id, mr_iid);
-            }
-            ReviewCompletion::Outcome(ReviewOutcome::ApprovedWithoutMerge) => {
-                info!(
-                    "{}: MR !{} approved without merge, releasing claim",
-                    self.agent_id, mr_iid
-                );
-            }
-            ReviewCompletion::Outcome(ReviewOutcome::NeedsChanges) => {
-                info!(
-                    "{}: MR !{} reviewed with feedback, releasing claim",
-                    self.agent_id, mr_iid
-                );
-            }
-            ReviewCompletion::Failed => {}
-        }
-        self.completion = Some(completion);
-        ReviewerStage::ReleaseClaimAfterReview
-    }
-
-    fn fail_review(&mut self, error: anyhow::Error) -> ReviewerStage {
-        self.completion = Some(ReviewCompletion::Failed);
-        ReviewerStage::ShutdownAfterReviewError(format!("{error:#}"))
-    }
-}
-
-/// Ask the port one question.
-fn observe_reviewer(port: &dyn ReviewerPort, query: &ReviewerQuery) -> Result<ReviewerFact> {
-    Ok(match query {
-        ReviewerQuery::ShutdownRequested => {
-            ReviewerFact::ShutdownRequested(port.shutdown_requested())
-        }
-        ReviewerQuery::DefaultBranch => ReviewerFact::DefaultBranch(port.default_branch()?),
-        ReviewerQuery::MergeRequests => ReviewerFact::MergeRequests(port.merge_requests()?),
-        ReviewerQuery::IssuePriorities => ReviewerFact::IssuePriorities(port.issue_priorities()),
-        ReviewerQuery::UnresolvedDiscussions { mr_iid } => {
-            ReviewerFact::UnresolvedDiscussions(port.unresolved_discussions(*mr_iid)?)
-        }
-        ReviewerQuery::BranchTips { target_branch } => {
-            let (source_sha, target_sha) = port.branch_tips(target_branch)?;
-            ReviewerFact::BranchTips {
-                source_sha,
-                target_sha,
-            }
-        }
-        ReviewerQuery::LocalDiff { target_branch } => {
-            let (diff_stat, changed_files) = port.local_diff(target_branch)?;
-            ReviewerFact::LocalDiff {
-                diff_stat,
-                changed_files,
-            }
-        }
-    })
-}
-
-fn run_reviewer_cycle(machine: &mut ReviewerMachine, port: &mut dyn ReviewerPort) -> Result<()> {
-    loop {
-        match machine.next_step() {
-            Step::Observe(query) => machine.apply_fact(observe_reviewer(port, &query))?,
-            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
-            Step::Finish => return Ok(()),
         }
     }
 }
@@ -1263,8 +691,6 @@ fn run_reviewer_cycle(machine: &mut ReviewerMachine, port: &mut dyn ReviewerPort
 // Live reviewer port
 // ---------------------------------------------------------------------------
 
-/// The reviewer port backed by the real runtime: this file's only place
-/// where a reviewer decision meets git, GitLab, or the model.
 struct LiveReviewerPort<'a> {
     agent_id: &'a str,
     project_name: &'a str,
@@ -1277,22 +703,46 @@ struct LiveReviewerPort<'a> {
     scope_label: Option<&'a str>,
 }
 
-fn required(result: Result<()>) -> ReviewerOutcome {
-    match result {
-        Ok(()) => ReviewerOutcome::Done,
-        Err(e) => ReviewerOutcome::Failed(e),
-    }
-}
-
 impl ReviewerPort for LiveReviewerPort<'_> {
     fn shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
     }
-
     fn default_branch(&self) -> Result<String> {
         self.git_repo.get_default_branch()
     }
-
+    fn fetch_remote(&mut self) -> Result<()> {
+        self.git_repo.fetch()
+    }
+    fn reset_worktree(&mut self) {
+        let _ = self.git_repo.reset_hard();
+    }
+    fn checkout_branch(&mut self, branch: &str) -> Result<()> {
+        self.git_repo.checkout_remote_branch(branch)
+    }
+    fn recover_claim(&mut self) {
+        if self.claimed_mr.is_none() {
+            *self.claimed_mr = find_claimed_mr(self.agent_id, self.gitlab, self.scope_label);
+        }
+    }
+    fn try_release_held_claim(&mut self) -> Result<()> {
+        let Some(lease) = self.claimed_mr.as_mut() else {
+            return Ok(());
+        };
+        let iid = lease.resource().iid();
+        info!(
+            "{}: Releasing held claim on MR !{} from previous cycle",
+            self.agent_id, iid
+        );
+        lease.try_release(self.gitlab)?;
+        *self.claimed_mr = None;
+        Ok(())
+    }
+    fn release_held_claim(&mut self) {
+        release_claimed_mr(self.claimed_mr, self.gitlab, self.agent_id);
+    }
+    fn release_stale_claim_label(&mut self, mr_iid: u64) {
+        release_mr_claim_or_warn(self.gitlab, mr_iid, self.agent_id);
+    }
     fn merge_requests(&self) -> Result<Vec<MrObservation>> {
         Ok(self
             .gitlab
@@ -1301,7 +751,6 @@ impl ReviewerPort for LiveReviewerPort<'_> {
             .map(MrObservation::from_merge_request)
             .collect())
     }
-
     fn issue_priorities(&self) -> Vec<(u64, u8)> {
         self.gitlab
             .list_issues()
@@ -1310,12 +759,13 @@ impl ReviewerPort for LiveReviewerPort<'_> {
             .map(|issue| (issue.iid, issue.priority()))
             .collect()
     }
-
     fn unresolved_discussions(&self, mr_iid: u64) -> Result<DiscussionCounts> {
         let (unresolved, total) = self
             .gitlab
             .get_unresolved_discussion_count(mr_iid)
-            .map_err(|e| e.context(format!("Failed to fetch discussions for MR !{mr_iid}")))?;
+            .map_err(|error| {
+                error.context(format!("Failed to fetch discussions for MR !{mr_iid}"))
+            })?;
         if unresolved == 0 && total > 0 {
             info!(
                 "MR !{} all {} discussion(s) resolved, ready for re-review",
@@ -1324,111 +774,39 @@ impl ReviewerPort for LiveReviewerPort<'_> {
         }
         Ok(DiscussionCounts { unresolved, total })
     }
-
-    fn branch_tips(&self, target_branch: &str) -> Result<(String, String)> {
-        let source_sha = self.git_repo.rev_parse("HEAD")?;
-        let target_sha = self
-            .git_repo
-            .rev_parse(&format!("origin/{target_branch}"))?;
-        Ok((source_sha, target_sha))
-    }
-
-    fn local_diff(&self, target_branch: &str) -> Result<(String, Vec<String>)> {
-        let diff_stat = self.git_repo.diff_stat_against(target_branch)?;
-        let changed_files = self.git_repo.changed_files_against(target_branch)?;
-        Ok((diff_stat, changed_files))
-    }
-
-    fn execute(&mut self, action: &ReviewerAction) -> ReviewerOutcome {
-        match action {
-            ReviewerAction::FetchRemote => required(self.git_repo.fetch()),
-            ReviewerAction::ResetWorktree => {
-                let _ = self.git_repo.reset_hard();
-                ReviewerOutcome::Done
+    fn acquire_claim(&mut self, mr_iid: u64) -> Result<ClaimAttempt> {
+        match claim::acquire(
+            self.gitlab,
+            ClaimResource::MergeRequest(mr_iid),
+            self.agent_id,
+            self.shutdown,
+        )? {
+            ClaimAcquireOutcome::Won(lease) => {
+                *self.claimed_mr = Some(lease);
+                Ok(ClaimAttempt::Won)
             }
-            ReviewerAction::CheckoutBranch { branch } => {
-                required(self.git_repo.checkout_remote_branch(branch))
-            }
-            ReviewerAction::RecoverClaim => {
-                *self.claimed_mr = find_claimed_mr(self.agent_id, self.gitlab, self.scope_label);
-                ReviewerOutcome::ClaimRecovered(
-                    self.claimed_mr.as_ref().map(|lease| lease.resource().iid()),
-                )
-            }
-            ReviewerAction::TryReleaseHeldClaim => {
-                let Some(lease) = self.claimed_mr.as_mut() else {
-                    return ReviewerOutcome::Done;
-                };
-                let held_iid = lease.resource().iid();
-                info!(
-                    "{}: Releasing held claim on MR !{} from previous cycle",
-                    self.agent_id, held_iid
-                );
-                match lease.try_release(self.gitlab) {
-                    Ok(()) => {
-                        *self.claimed_mr = None;
-                        ReviewerOutcome::Done
-                    }
-                    Err(e) => {
-                        warn!(
-                            "{}: Failed to release claim on MR !{}: {}, will retry next cycle",
-                            self.agent_id, held_iid, e
-                        );
-                        ReviewerOutcome::Failed(e)
-                    }
-                }
-            }
-            ReviewerAction::ReleaseHeldClaim => {
-                release_claimed_mr(self.claimed_mr, self.gitlab, self.agent_id);
-                ReviewerOutcome::Done
-            }
-            ReviewerAction::ReleaseStaleClaimLabel { mr_iid } => {
-                release_mr_claim_or_warn(self.gitlab, *mr_iid, self.agent_id);
-                ReviewerOutcome::Done
-            }
-            ReviewerAction::AcquireClaim { mr_iid } => {
-                match claim::acquire(
-                    self.gitlab,
-                    ClaimResource::MergeRequest(*mr_iid),
-                    self.agent_id,
-                    self.shutdown,
-                ) {
-                    Ok(ClaimAcquireOutcome::Won(lease)) => {
-                        *self.claimed_mr = Some(lease);
-                        ReviewerOutcome::Claim(ClaimAttempt::Won(*mr_iid))
-                    }
-                    Ok(ClaimAcquireOutcome::Lost) => ReviewerOutcome::Claim(ClaimAttempt::Lost),
-                    Ok(ClaimAcquireOutcome::Interrupted) => {
-                        ReviewerOutcome::Claim(ClaimAttempt::Interrupted)
-                    }
-                    Err(e) => ReviewerOutcome::Failed(e),
-                }
-            }
-            ReviewerAction::MergeTargetIntoWorktree { target_branch } => {
-                match self.git_repo.try_merge(target_branch) {
-                    Ok(clean) => ReviewerOutcome::LocalMerge { clean },
-                    Err(e) => ReviewerOutcome::Failed(e),
-                }
-            }
-            ReviewerAction::InvokeReviewModel(subject) => self.invoke_review_model(subject),
-            ReviewerAction::PostDiscussion { mr_iid, body } => {
-                required(self.gitlab.add_mr_discussion(*mr_iid, body))
-            }
-            ReviewerAction::PostResolvedDiscussion { mr_iid, body } => {
-                required(self.gitlab.add_resolved_mr_discussion(*mr_iid, body))
-            }
-            ReviewerAction::AddApprovedLabel { mr_iid } => required(
-                self.gitlab
-                    .add_mr_label_with_retries(*mr_iid, REVIEWER_APPROVED_LABEL),
-            ),
-            ReviewerAction::MergeMergeRequest { mr_iid } => required(self.gitlab.merge_mr(*mr_iid)),
+            ClaimAcquireOutcome::Lost => Ok(ClaimAttempt::Lost),
+            ClaimAcquireOutcome::Interrupted => Ok(ClaimAttempt::Interrupted),
         }
     }
-}
-
-impl LiveReviewerPort<'_> {
-    fn invoke_review_model(&self, subject: &ReviewSubject) -> ReviewerOutcome {
-        let prompt = match build_review_prompt(ReviewPromptInput {
+    fn branch_tips(&self, target_branch: &str) -> Result<(String, String)> {
+        Ok((
+            self.git_repo.rev_parse("HEAD")?,
+            self.git_repo
+                .rev_parse(&format!("origin/{target_branch}"))?,
+        ))
+    }
+    fn merge_target_into_worktree(&mut self, target_branch: &str) -> Result<bool> {
+        self.git_repo.try_merge(target_branch)
+    }
+    fn local_diff(&self, target_branch: &str) -> Result<(String, Vec<String>)> {
+        Ok((
+            self.git_repo.diff_stat_against(target_branch)?,
+            self.git_repo.changed_files_against(target_branch)?,
+        ))
+    }
+    fn invoke_review_model(&mut self, subject: &ReviewSubject) -> Result<ReviewerOutput> {
+        let prompt = build_review_prompt(ReviewPromptInput {
             project_name: self.project_name,
             gitlab: self.gitlab,
             mr: &subject.mr,
@@ -1437,24 +815,34 @@ impl LiveReviewerPort<'_> {
             issue_iid: subject.issue_iid,
             is_need_ai_worker_mr: subject.is_need_ai_worker_mr,
             sessions_dir: self.sessions_dir,
-        }) {
-            Ok(prompt) => prompt,
-            Err(e) => return ReviewerOutcome::Failed(e),
-        };
-        match self.model.complete_typed::<ReviewerOutput>(
-            &prompt,
-            &InvokeOptions {
-                activity_label: Some(format!(
-                    "{} reviewing MR !{}",
-                    self.model.agent_id(),
-                    subject.mr.iid
-                )),
-                ..InvokeOptions::default()
-            },
-        ) {
-            Ok(completion) => ReviewerOutcome::Reviewed(completion.output),
-            Err(e) => ReviewerOutcome::Failed(e),
-        }
+        })?;
+        Ok(self
+            .model
+            .complete_typed::<ReviewerOutput>(
+                &prompt,
+                &InvokeOptions {
+                    activity_label: Some(format!(
+                        "{} reviewing MR !{}",
+                        self.model.agent_id(),
+                        subject.mr.iid
+                    )),
+                    ..InvokeOptions::default()
+                },
+            )?
+            .output)
+    }
+    fn post_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
+        self.gitlab.add_mr_discussion(mr_iid, body)
+    }
+    fn post_resolved_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
+        self.gitlab.add_resolved_mr_discussion(mr_iid, body)
+    }
+    fn add_approved_label(&mut self, mr_iid: u64) -> Result<()> {
+        self.gitlab
+            .add_mr_label_with_retries(mr_iid, REVIEWER_APPROVED_LABEL)
+    }
+    fn merge_merge_request(&mut self, mr_iid: u64) -> Result<()> {
+        self.gitlab.merge_mr(mr_iid)
     }
 }
 
@@ -1473,9 +861,6 @@ fn reviewer_cycle(
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Result<()> {
-    let held_claim = claimed_mr.as_ref().map(|lease| lease.resource().iid());
-    let mut machine = ReviewerMachine::new(agent_id, scope_label, config.merge_when_approved)
-        .with_held_claim(held_claim);
     let mut port = LiveReviewerPort {
         agent_id,
         project_name,
@@ -1487,11 +872,12 @@ fn reviewer_cycle(
         shutdown,
         scope_label,
     };
-    let result = run_reviewer_cycle(&mut machine, &mut port);
-    if let Some(mr_iid) = machine.merged_mr_iid() {
+    if let Some(mr_iid) =
+        run_reviewer_cycle(agent_id, scope_label, config.merge_when_approved, &mut port)?
+    {
         merged_mrs.insert(mr_iid);
     }
-    result
+    Ok(())
 }
 
 fn release_mr_claim_or_warn(gitlab: &GitLabClient, mr_iid: u64, agent_id: &str) {
@@ -1916,10 +1302,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Reviewer state machine driven against a recording fake port. Every
-    // observation and mutation the cycle performs lands in one ordered
-    // trace, so a full flow can be replayed — and its exact mutation
-    // order asserted — without git, GitLab, or a model.
+    // Imperative reviewer workflows driven through a recording typed port.
+    // Traces are intentionally plain strings; payloads are captured separately.
     // -----------------------------------------------------------------
 
     const TEST_AGENT: &str = "reviewer-1";
@@ -1932,27 +1316,25 @@ mod tests {
             source_branch: format!("issue-{iid}"),
             target_branch: "main".to_string(),
             state: "opened".to_string(),
-            labels: labels.map(|l| l.into_iter().map(String::from).collect()),
+            labels: labels.map(|labels| labels.into_iter().map(String::from).collect()),
         }
     }
 
-    /// A recording reviewer port. Answers are scripted per observation kind
-    /// and failures are injected by naming the exact step that should fail,
-    /// so tests read as "this world, then this trace".
     struct FakeReviewerPort {
-        trace: RefCell<Vec<ReviewerStep>>,
+        trace: RefCell<Vec<String>>,
         shutdown_answers: RefCell<VecDeque<bool>>,
-        default_branch: String,
         merge_requests: Vec<MrObservation>,
         issue_priorities: Vec<(u64, u8)>,
         discussion_counts: RefCell<VecDeque<DiscussionCounts>>,
-        local_merge_clean: bool,
-        review_output: ReviewerOutput,
         claim_attempts: RefCell<VecDeque<ClaimAttempt>>,
+        review_output: ReviewerOutput,
+        local_merge_clean: bool,
         recoverable_claim: Option<u64>,
         held_claim: Option<u64>,
-        failing_queries: Vec<ReviewerQuery>,
-        failing_actions: Vec<ReviewerAction>,
+        failures: Vec<String>,
+        discussions: Vec<(u64, String)>,
+        resolved_discussions: Vec<(u64, String)>,
+        reviewed_subjects: Vec<ReviewSubject>,
     }
 
     impl FakeReviewerPort {
@@ -1960,26 +1342,35 @@ mod tests {
             Self {
                 trace: RefCell::new(Vec::new()),
                 shutdown_answers: RefCell::new(VecDeque::new()),
-                default_branch: "main".to_string(),
                 merge_requests,
                 issue_priorities: Vec::new(),
                 discussion_counts: RefCell::new(VecDeque::new()),
-                local_merge_clean: true,
-                review_output: ReviewerOutput::Approve { summary: None },
                 claim_attempts: RefCell::new(VecDeque::new()),
+                review_output: ReviewerOutput::Approve { summary: None },
+                local_merge_clean: true,
                 recoverable_claim: None,
                 held_claim: None,
-                failing_queries: Vec::new(),
-                failing_actions: Vec::new(),
+                failures: Vec::new(),
+                discussions: Vec::new(),
+                resolved_discussions: Vec::new(),
+                reviewed_subjects: Vec::new(),
             }
         }
 
+        fn trace(&self, entry: impl Into<String>) {
+            self.trace.borrow_mut().push(entry.into());
+        }
+        fn fails(&self, operation: &str) -> Result<()> {
+            if self.failures.iter().any(|failure| failure == operation) {
+                anyhow::bail!("injected failure in {operation}");
+            }
+            Ok(())
+        }
         fn deciding(mut self, output: ReviewerOutput) -> Self {
             self.review_output = output;
             self
         }
-
-        fn with_discussion_counts(self, counts: &[(usize, usize)]) -> Self {
+        fn with_discussions(self, counts: &[(usize, usize)]) -> Self {
             self.discussion_counts.borrow_mut().extend(
                 counts
                     .iter()
@@ -1987,669 +1378,405 @@ mod tests {
             );
             self
         }
-
-        fn with_shutdown_answers(self, answers: &[bool]) -> Self {
+        fn with_shutdowns(self, answers: &[bool]) -> Self {
             self.shutdown_answers.borrow_mut().extend(answers);
             self
         }
-
-        fn with_claim_attempts(self, attempts: &[ClaimAttempt]) -> Self {
+        fn with_claims(self, attempts: &[ClaimAttempt]) -> Self {
             self.claim_attempts.borrow_mut().extend(attempts);
             self
         }
-
         fn with_priorities(mut self, priorities: &[(u64, u8)]) -> Self {
             self.issue_priorities = priorities.to_vec();
             self
         }
-
-        fn conflicting(mut self) -> Self {
-            self.local_merge_clean = false;
+        fn failing(mut self, operation: &str) -> Self {
+            self.failures.push(operation.to_string());
             self
-        }
-
-        fn holding_claim(mut self, mr_iid: u64) -> Self {
-            self.held_claim = Some(mr_iid);
-            self
-        }
-
-        fn recovering_claim(mut self, mr_iid: u64) -> Self {
-            self.recoverable_claim = Some(mr_iid);
-            self
-        }
-
-        fn failing_query(mut self, query: ReviewerQuery) -> Self {
-            self.failing_queries.push(query);
-            self
-        }
-
-        fn failing_action(mut self, action: ReviewerAction) -> Self {
-            self.failing_actions.push(action);
-            self
-        }
-
-        fn record(&self, step: ReviewerStep) {
-            self.trace.borrow_mut().push(step);
-        }
-
-        fn observe(&self, query: ReviewerQuery) -> Result<()> {
-            self.record(ReviewerStep::Observe(query.clone()));
-            if self.failing_queries.contains(&query) {
-                anyhow::bail!("injected failure observing {query:?}");
-            }
-            Ok(())
-        }
-
-        fn next_discussion_counts(&self) -> DiscussionCounts {
-            self.discussion_counts
-                .borrow_mut()
-                .pop_front()
-                .unwrap_or(DiscussionCounts {
-                    unresolved: 0,
-                    total: 0,
-                })
         }
     }
 
     impl ReviewerPort for FakeReviewerPort {
         fn shutdown_requested(&self) -> bool {
-            self.record(ReviewerStep::Observe(ReviewerQuery::ShutdownRequested));
+            self.trace("shutdown");
             self.shutdown_answers
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(false)
         }
-
         fn default_branch(&self) -> Result<String> {
-            self.observe(ReviewerQuery::DefaultBranch)?;
-            Ok(self.default_branch.clone())
+            self.trace("default_branch");
+            Ok("main".into())
         }
-
+        fn fetch_remote(&mut self) -> Result<()> {
+            self.trace("fetch");
+            self.fails("fetch")
+        }
+        fn reset_worktree(&mut self) {
+            self.trace("reset");
+        }
+        fn checkout_branch(&mut self, branch: &str) -> Result<()> {
+            self.trace(format!("checkout:{branch}"));
+            self.fails("checkout")
+        }
+        fn recover_claim(&mut self) {
+            if self.held_claim.is_none() {
+                self.trace("recover_claim");
+                self.held_claim = self.recoverable_claim;
+            }
+        }
+        fn try_release_held_claim(&mut self) -> Result<()> {
+            if self.held_claim.is_none() {
+                return Ok(());
+            }
+            self.trace("release_previous");
+            self.fails("release_previous")?;
+            self.held_claim = None;
+            Ok(())
+        }
+        fn release_held_claim(&mut self) {
+            self.trace("release_final");
+            self.held_claim = None;
+        }
+        fn release_stale_claim_label(&mut self, mr_iid: u64) {
+            self.trace(format!("release_stale:{mr_iid}"));
+        }
         fn merge_requests(&self) -> Result<Vec<MrObservation>> {
-            self.observe(ReviewerQuery::MergeRequests)?;
+            self.trace("merge_requests");
             Ok(self.merge_requests.clone())
         }
-
         fn issue_priorities(&self) -> Vec<(u64, u8)> {
-            self.record(ReviewerStep::Observe(ReviewerQuery::IssuePriorities));
+            self.trace("issue_priorities");
             self.issue_priorities.clone()
         }
-
         fn unresolved_discussions(&self, mr_iid: u64) -> Result<DiscussionCounts> {
-            self.observe(ReviewerQuery::UnresolvedDiscussions { mr_iid })?;
-            Ok(self.next_discussion_counts())
+            self.trace(format!("discussions:{mr_iid}"));
+            self.fails(&format!("discussions:{mr_iid}"))?;
+            Ok(self
+                .discussion_counts
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(DiscussionCounts {
+                    unresolved: 0,
+                    total: 0,
+                }))
         }
-
+        fn acquire_claim(&mut self, mr_iid: u64) -> Result<ClaimAttempt> {
+            self.trace(format!("claim:{mr_iid}"));
+            let attempt = self
+                .claim_attempts
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(ClaimAttempt::Won);
+            if attempt == ClaimAttempt::Won {
+                self.held_claim = Some(mr_iid);
+            }
+            Ok(attempt)
+        }
         fn branch_tips(&self, target_branch: &str) -> Result<(String, String)> {
-            self.observe(ReviewerQuery::BranchTips {
-                target_branch: target_branch.to_string(),
-            })?;
-            Ok(("source-sha".to_string(), "target-sha".to_string()))
+            self.trace(format!("tips:{target_branch}"));
+            Ok(("source-sha".into(), "target-sha".into()))
         }
-
+        fn merge_target_into_worktree(&mut self, target_branch: &str) -> Result<bool> {
+            self.trace(format!("merge_target:{target_branch}"));
+            Ok(self.local_merge_clean)
+        }
         fn local_diff(&self, target_branch: &str) -> Result<(String, Vec<String>)> {
-            self.observe(ReviewerQuery::LocalDiff {
-                target_branch: target_branch.to_string(),
-            })?;
-            Ok((
-                " src/lib.rs | 2 +-".to_string(),
-                vec!["src/lib.rs".to_string()],
-            ))
+            self.trace(format!("diff:{target_branch}"));
+            Ok((" src/lib.rs | 2 +-".into(), vec!["src/lib.rs".into()]))
         }
-
-        fn execute(&mut self, action: &ReviewerAction) -> ReviewerOutcome {
-            self.record(ReviewerStep::Act(action.clone()));
-            if self.failing_actions.contains(action) {
-                return ReviewerOutcome::Failed(anyhow::anyhow!(
-                    "injected failure executing {action:?}"
-                ));
-            }
-            match action {
-                ReviewerAction::RecoverClaim => {
-                    self.held_claim = self.recoverable_claim;
-                    ReviewerOutcome::ClaimRecovered(self.held_claim)
-                }
-                ReviewerAction::TryReleaseHeldClaim | ReviewerAction::ReleaseHeldClaim => {
-                    self.held_claim = None;
-                    ReviewerOutcome::Done
-                }
-                ReviewerAction::AcquireClaim { mr_iid } => {
-                    let attempt = self
-                        .claim_attempts
-                        .borrow_mut()
-                        .pop_front()
-                        .unwrap_or(ClaimAttempt::Won(*mr_iid));
-                    if let ClaimAttempt::Won(iid) = attempt {
-                        self.held_claim = Some(iid);
-                    }
-                    ReviewerOutcome::Claim(attempt)
-                }
-                ReviewerAction::MergeTargetIntoWorktree { .. } => ReviewerOutcome::LocalMerge {
-                    clean: self.local_merge_clean,
-                },
-                ReviewerAction::InvokeReviewModel(_) => {
-                    ReviewerOutcome::Reviewed(self.review_output.clone())
-                }
-                _ => ReviewerOutcome::Done,
-            }
+        fn invoke_review_model(&mut self, subject: &ReviewSubject) -> Result<ReviewerOutput> {
+            self.trace(format!("model:{}", subject.mr.iid));
+            self.reviewed_subjects.push(subject.clone());
+            self.fails("model")?;
+            Ok(self.review_output.clone())
+        }
+        fn post_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
+            self.trace(format!("post:{mr_iid}"));
+            self.discussions.push((mr_iid, body.into()));
+            Ok(())
+        }
+        fn post_resolved_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
+            self.trace(format!("post_resolved:{mr_iid}"));
+            self.resolved_discussions.push((mr_iid, body.into()));
+            Ok(())
+        }
+        fn add_approved_label(&mut self, mr_iid: u64) -> Result<()> {
+            self.trace(format!("label:{mr_iid}"));
+            Ok(())
+        }
+        fn merge_merge_request(&mut self, mr_iid: u64) -> Result<()> {
+            self.trace(format!("merge_mr:{mr_iid}"));
+            self.fails("merge_mr")
         }
     }
 
-    struct FakeRun {
-        result: Result<()>,
-        trace: Vec<ReviewerStep>,
-        completion: Option<ReviewCompletion>,
-        merged: Option<u64>,
-        held_claim: Option<u64>,
+    fn run(port: &mut FakeReviewerPort, merge_when_approved: bool) -> Result<Option<u64>> {
+        run_reviewer_cycle(TEST_AGENT, None, merge_when_approved, port)
     }
 
-    fn run_reviewer(port: &mut FakeReviewerPort, merge_when_approved: bool) -> FakeRun {
-        let held = port.held_claim;
-        let mut machine =
-            ReviewerMachine::new(TEST_AGENT, None, merge_when_approved).with_held_claim(held);
-        let result = run_reviewer_cycle(&mut machine, port);
-        FakeRun {
-            result,
-            trace: port.trace.borrow().clone(),
-            completion: machine.completion,
-            merged: machine
-                .subject
-                .as_ref()
-                .and_then(|_| machine.merged_mr_iid()),
-            held_claim: port.held_claim,
-        }
-    }
-
-    fn observe(query: ReviewerQuery) -> ReviewerStep {
-        ReviewerStep::Observe(query)
-    }
-
-    fn act(action: ReviewerAction) -> ReviewerStep {
-        ReviewerStep::Act(action)
-    }
-
-    fn shutdown() -> ReviewerStep {
-        observe(ReviewerQuery::ShutdownRequested)
-    }
-
-    fn checkout(branch: &str) -> ReviewerStep {
-        act(ReviewerAction::CheckoutBranch {
-            branch: branch.to_string(),
-        })
-    }
-
-    /// The startup steps every cycle performs before it looks at any MR.
-    fn startup_steps() -> Vec<ReviewerStep> {
-        vec![
-            observe(ReviewerQuery::DefaultBranch),
-            act(ReviewerAction::FetchRemote),
-            shutdown(),
-            act(ReviewerAction::ResetWorktree),
-            checkout("main"),
-            act(ReviewerAction::RecoverClaim),
-            observe(ReviewerQuery::MergeRequests),
-            shutdown(),
-            observe(ReviewerQuery::IssuePriorities),
+    fn startup() -> Vec<String> {
+        [
+            "default_branch",
+            "fetch",
+            "shutdown",
+            "reset",
+            "checkout:main",
+            "recover_claim",
+            "merge_requests",
+            "shutdown",
+            "issue_priorities",
         ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
 
-    /// The steps that take a screened candidate all the way to the model's
-    /// decision, for an MR whose local merge is clean.
-    fn steps_up_to_review_decision(iid: u64) -> Vec<ReviewerStep> {
-        vec![
-            shutdown(),
-            observe(ReviewerQuery::UnresolvedDiscussions { mr_iid: iid }),
-            act(ReviewerAction::AcquireClaim { mr_iid: iid }),
-            shutdown(),
-            act(ReviewerAction::ResetWorktree),
-            checkout(&format!("issue-{iid}")),
-            observe(ReviewerQuery::BranchTips {
-                target_branch: "main".to_string(),
-            }),
-            act(ReviewerAction::MergeTargetIntoWorktree {
-                target_branch: "main".to_string(),
-            }),
-            observe(ReviewerQuery::LocalDiff {
-                target_branch: "main".to_string(),
-            }),
-            act(ReviewerAction::InvokeReviewModel(Box::new(ReviewSubject {
-                mr: observation(iid, None),
-                issue_iid: Some(iid),
-                is_need_ai_worker_mr: false,
-                diff_stat: " src/lib.rs | 2 +-".to_string(),
-                changed_files: vec!["src/lib.rs".to_string()],
-            }))),
-            checkout("main"),
+    fn through_model(iid: u64) -> Vec<String> {
+        [
+            "shutdown",
+            &format!("discussions:{iid}"),
+            &format!("claim:{iid}"),
+            "shutdown",
+            "reset",
+            &format!("checkout:issue-{iid}"),
+            "tips:main",
+            "merge_target:main",
+            "diff:main",
+            &format!("model:{iid}"),
+            "checkout:main",
         ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
 
     #[test]
     fn reviewer_cycle_approves_and_merges_one_merge_request_in_order() {
         let mut port = FakeReviewerPort::new(vec![observation(7, None)]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        let mut expected = startup_steps();
-        expected.extend(steps_up_to_review_decision(7));
-        expected.extend([
-            observe(ReviewerQuery::UnresolvedDiscussions { mr_iid: 7 }),
-            act(ReviewerAction::MergeMergeRequest { mr_iid: 7 }),
-            act(ReviewerAction::ReleaseHeldClaim),
-        ]);
-        assert_eq!(run.trace, expected);
-        assert_eq!(
-            run.completion,
-            Some(ReviewCompletion::Outcome(ReviewOutcome::Merged))
-        );
-        assert_eq!(run.merged, Some(7));
-        assert_eq!(run.held_claim, None);
+        assert_eq!(run(&mut port, true).unwrap(), Some(7));
+        let mut expected = startup();
+        expected.extend(through_model(7));
+        expected.extend(["discussions:7", "merge_mr:7", "release_final"].map(String::from));
+        assert_eq!(*port.trace.borrow(), expected);
+        assert_eq!(port.reviewed_subjects[0].diff_stat, " src/lib.rs | 2 +-");
+        assert_eq!(port.held_claim, None);
     }
 
     #[test]
-    fn reviewer_cycle_approves_without_merge_by_posting_lgtm_then_labeling() {
+    fn reviewer_cycle_approves_without_merge_in_post_then_label_order() {
         let mut port = FakeReviewerPort::new(vec![observation(7, None)]);
-        let run = run_reviewer(&mut port, false);
-
-        assert!(run.result.is_ok());
-        let mut expected = startup_steps();
-        expected.extend(steps_up_to_review_decision(7));
-        expected.extend([
-            observe(ReviewerQuery::UnresolvedDiscussions { mr_iid: 7 }),
-            act(ReviewerAction::PostResolvedDiscussion {
-                mr_iid: 7,
-                body: "LGTM".to_string(),
-            }),
-            act(ReviewerAction::AddApprovedLabel { mr_iid: 7 }),
-            act(ReviewerAction::ReleaseHeldClaim),
-        ]);
-        assert_eq!(run.trace, expected);
+        assert_eq!(run(&mut port, false).unwrap(), None);
         assert_eq!(
-            run.completion,
-            Some(ReviewCompletion::Outcome(
-                ReviewOutcome::ApprovedWithoutMerge
-            ))
+            &port.trace.borrow()[port.trace.borrow().len() - 4..],
+            [
+                "discussions:7",
+                "post_resolved:7",
+                "label:7",
+                "release_final"
+            ]
         );
-        assert_eq!(run.merged, None);
+        assert_eq!(port.resolved_discussions, vec![(7, "LGTM".into())]);
     }
 
     #[test]
-    fn reviewer_cycle_skips_the_merge_when_discussions_appear_during_review() {
-        // First count (candidate screening) is clean, the re-check before
-        // merging finds a new unresolved thread.
-        let mut port = FakeReviewerPort::new(vec![observation(7, None)])
-            .with_discussion_counts(&[(0, 0), (1, 1)]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        assert!(
-            !run.trace
-                .contains(&act(ReviewerAction::MergeMergeRequest { mr_iid: 7 }))
-        );
-        assert_eq!(
-            run.trace.last(),
-            Some(&act(ReviewerAction::ReleaseHeldClaim))
-        );
-        assert_eq!(
-            run.completion,
-            Some(ReviewCompletion::Outcome(ReviewOutcome::NeedsChanges))
-        );
+    fn reviewer_cycle_does_not_merge_when_discussions_appear_during_review() {
+        let mut port =
+            FakeReviewerPort::new(vec![observation(7, None)]).with_discussions(&[(0, 0), (1, 1)]);
+        assert_eq!(run(&mut port, true).unwrap(), None);
+        assert!(!port.trace.borrow().contains(&"merge_mr:7".into()));
+        assert_eq!(port.trace.borrow().last().unwrap(), "release_final");
     }
 
     #[test]
-    fn reviewer_cycle_posts_requested_changes_as_one_discussion() {
+    fn reviewer_cycle_posts_requested_changes_and_releases_claim() {
         let mut port = FakeReviewerPort::new(vec![observation(7, None)]).deciding(
             ReviewerOutput::RequestChanges {
-                feedback: "- Add a test for the backoff cap".to_string(),
+                feedback: "- Add a test".into(),
                 public_comment: None,
             },
         );
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        let mut expected = startup_steps();
-        expected.extend(steps_up_to_review_decision(7));
-        expected.extend([
-            act(ReviewerAction::PostDiscussion {
-                mr_iid: 7,
-                body: "- Add a test for the backoff cap".to_string(),
-            }),
-            act(ReviewerAction::ReleaseHeldClaim),
-        ]);
-        assert_eq!(run.trace, expected);
-    }
-
-    #[test]
-    fn reviewer_cycle_rejects_an_mr_without_an_issue_link_before_touching_git() {
-        let mut unlinked = observation(7, None);
-        unlinked.description = "## Goal\nSomething unrelated.".to_string();
-        unlinked.source_branch = "feature-branch".to_string();
-        let mut port = FakeReviewerPort::new(vec![unlinked]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        let mut expected = startup_steps();
-        expected.extend([
-            shutdown(),
-            observe(ReviewerQuery::UnresolvedDiscussions { mr_iid: 7 }),
-            act(ReviewerAction::AcquireClaim { mr_iid: 7 }),
-            shutdown(),
-            act(ReviewerAction::PostDiscussion {
-                mr_iid: 7,
-                body: MISSING_ISSUE_LINK_BODY.to_string(),
-            }),
-            act(ReviewerAction::ReleaseHeldClaim),
-        ]);
-        assert_eq!(run.trace, expected);
-    }
-
-    #[test]
-    fn reviewer_cycle_rejects_a_generic_title_before_invoking_the_model() {
-        let mut generic = observation(7, None);
-        generic.title = "Update".to_string();
-        let mut port = FakeReviewerPort::new(vec![generic]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        let posted = run
-            .trace
-            .iter()
-            .filter_map(|step| match step {
-                ReviewerStep::Act(ReviewerAction::PostDiscussion { body, .. }) => {
-                    Some(body.clone())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(posted.len(), 1);
-        assert!(posted[0].contains("The MR title `Update` is too generic"));
-        assert!(!run.trace.iter().any(|step| matches!(
-            step,
-            ReviewerStep::Act(ReviewerAction::InvokeReviewModel(_))
-        )));
-    }
-
-    #[test]
-    fn reviewer_cycle_reports_conflicts_and_returns_the_worktree_to_the_target() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None)]).conflicting();
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        let mut expected = startup_steps();
-        expected.extend([
-            shutdown(),
-            observe(ReviewerQuery::UnresolvedDiscussions { mr_iid: 7 }),
-            act(ReviewerAction::AcquireClaim { mr_iid: 7 }),
-            shutdown(),
-            act(ReviewerAction::ResetWorktree),
-            checkout("issue-7"),
-            observe(ReviewerQuery::BranchTips {
-                target_branch: "main".to_string(),
-            }),
-            act(ReviewerAction::MergeTargetIntoWorktree {
-                target_branch: "main".to_string(),
-            }),
-            act(ReviewerAction::PostDiscussion {
-                mr_iid: 7,
-                body: merge_conflict_body("main"),
-            }),
-            checkout("main"),
-            act(ReviewerAction::ReleaseHeldClaim),
-        ]);
-        assert_eq!(run.trace, expected);
-    }
-
-    #[test]
-    fn reviewer_cycle_explains_a_failed_merge_on_the_merge_request() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None)])
-            .failing_action(ReviewerAction::MergeMergeRequest { mr_iid: 7 });
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        let tail = &run.trace[run.trace.len() - 3..];
+        assert_eq!(run(&mut port, true).unwrap(), None);
+        assert_eq!(port.discussions, vec![(7, "- Add a test".into())]);
         assert_eq!(
-            tail[0],
-            act(ReviewerAction::MergeMergeRequest { mr_iid: 7 })
-        );
-        match &tail[1] {
-            ReviewerStep::Act(ReviewerAction::PostDiscussion { mr_iid, body }) => {
-                assert_eq!(*mr_iid, 7);
-                assert!(body.starts_with("Code is approved, but automatic merge failed"));
-            }
-            other => panic!("expected a merge-failure discussion, got {other:?}"),
-        }
-        assert_eq!(tail[2], act(ReviewerAction::ReleaseHeldClaim));
-        assert_eq!(
-            run.completion,
-            Some(ReviewCompletion::Outcome(ReviewOutcome::NeedsChanges))
+            &port.trace.borrow()[port.trace.borrow().len() - 2..],
+            ["post:7", "release_final"]
         );
     }
 
     #[test]
-    fn reviewer_cycle_releases_the_claim_when_the_model_fails() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None)]).failing_action(
-            ReviewerAction::InvokeReviewModel(Box::new(ReviewSubject {
-                mr: observation(7, None),
-                issue_iid: Some(7),
-                is_need_ai_worker_mr: false,
-                diff_stat: " src/lib.rs | 2 +-".to_string(),
-                changed_files: vec!["src/lib.rs".to_string()],
-            })),
-        );
-        let run = run_reviewer(&mut port, true);
-
-        // A failed review ends the cycle cleanly: the claim is released and
-        // the poll does not fail, exactly like the old `Err` arm.
-        assert!(run.result.is_ok());
-        assert_eq!(run.completion, Some(ReviewCompletion::Failed));
-        assert_eq!(
-            &run.trace[run.trace.len() - 2..],
-            &[shutdown(), act(ReviewerAction::ReleaseHeldClaim)]
-        );
-        assert_eq!(run.held_claim, None);
-    }
-
-    #[test]
-    fn reviewer_cycle_keeps_a_held_claim_when_releasing_it_fails() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None)])
-            .holding_claim(4)
-            .failing_action(ReviewerAction::TryReleaseHeldClaim);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        assert_eq!(
-            run.trace,
-            vec![
-                observe(ReviewerQuery::DefaultBranch),
-                act(ReviewerAction::FetchRemote),
-                shutdown(),
-                act(ReviewerAction::ResetWorktree),
-                checkout("main"),
-                act(ReviewerAction::TryReleaseHeldClaim),
-            ]
-        );
-        assert_eq!(run.held_claim, Some(4));
-    }
-
-    #[test]
-    fn reviewer_cycle_releases_a_recovered_claim_before_claiming_new_work() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None)]).recovering_claim(4);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        let recover = run
-            .trace
-            .iter()
-            .position(|step| step == &act(ReviewerAction::RecoverClaim))
-            .expect("the cycle scans for an orphaned claim");
-        assert_eq!(
-            run.trace[recover + 1],
-            act(ReviewerAction::TryReleaseHeldClaim)
+    fn reviewer_cycle_handles_conflict_then_checks_out_target() {
+        let mut port = FakeReviewerPort::new(vec![observation(7, None)]);
+        port.local_merge_clean = false;
+        assert_eq!(run(&mut port, true).unwrap(), None);
+        assert!(
+            port.discussions[0]
+                .1
+                .contains("merge conflicts with `main`")
         );
         assert_eq!(
-            run.trace[recover + 2],
-            observe(ReviewerQuery::MergeRequests)
+            &port.trace.borrow()[port.trace.borrow().len() - 3..],
+            ["post:7", "checkout:main", "release_final"]
+        );
+        assert!(port.reviewed_subjects.is_empty());
+    }
+
+    #[test]
+    fn reviewer_cycle_merge_failure_posts_feedback_before_release() {
+        let mut port = FakeReviewerPort::new(vec![observation(7, None)]).failing("merge_mr");
+        assert_eq!(run(&mut port, true).unwrap(), None);
+        assert!(
+            port.discussions[0]
+                .1
+                .starts_with("Code is approved, but automatic merge failed")
+        );
+        assert_eq!(
+            &port.trace.borrow()[port.trace.borrow().len() - 3..],
+            ["merge_mr:7", "post:7", "release_final"]
         );
     }
 
     #[test]
-    fn reviewer_cycle_stops_at_shutdown_right_after_fetching() {
+    fn reviewer_cycle_model_failure_observes_shutdown_then_releases() {
+        let mut port = FakeReviewerPort::new(vec![observation(7, None)]).failing("model");
+        assert_eq!(run(&mut port, true).unwrap(), None);
+        assert_eq!(
+            &port.trace.borrow()[port.trace.borrow().len() - 3..],
+            ["model:7", "shutdown", "release_final"]
+        );
+        assert_eq!(port.held_claim, None);
+    }
+
+    #[test]
+    fn reviewer_cycle_preserves_failed_previous_claim_release() {
         let mut port =
-            FakeReviewerPort::new(vec![observation(7, None)]).with_shutdown_answers(&[true]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
+            FakeReviewerPort::new(vec![observation(7, None)]).failing("release_previous");
+        port.held_claim = Some(4);
+        assert_eq!(run(&mut port, true).unwrap(), None);
         assert_eq!(
-            run.trace,
-            vec![
-                observe(ReviewerQuery::DefaultBranch),
-                act(ReviewerAction::FetchRemote),
-                shutdown(),
+            *port.trace.borrow(),
+            [
+                "default_branch",
+                "fetch",
+                "shutdown",
+                "reset",
+                "checkout:main",
+                "release_previous"
             ]
         );
+        assert_eq!(port.held_claim, Some(4));
     }
 
     #[test]
-    fn reviewer_cycle_releases_the_claim_when_shutdown_lands_after_claiming() {
-        // Shutdown is quiet through the two startup checks and the
-        // per-candidate check, then fires on the check that follows a won
-        // claim.
-        let mut port = FakeReviewerPort::new(vec![observation(7, None)])
-            .with_shutdown_answers(&[false, false, false, true]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        assert_eq!(
-            run.trace.last(),
-            Some(&act(ReviewerAction::ReleaseHeldClaim))
-        );
-        assert!(!run.trace.iter().any(|step| matches!(
-            step,
-            ReviewerStep::Act(ReviewerAction::InvokeReviewModel(_))
-        )));
-        assert_eq!(run.held_claim, None);
-    }
-
-    #[test]
-    fn reviewer_cycle_fails_the_poll_when_a_required_git_step_fails() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None)])
-            .failing_action(ReviewerAction::FetchRemote);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_err());
-        assert_eq!(
-            run.trace,
-            vec![
-                observe(ReviewerQuery::DefaultBranch),
-                act(ReviewerAction::FetchRemote),
-            ]
-        );
-    }
-
-    #[test]
-    fn reviewer_cycle_skips_a_candidate_whose_discussions_cannot_be_read() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None), observation(9, None)])
-            .failing_query(ReviewerQuery::UnresolvedDiscussions { mr_iid: 7 });
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        assert!(
-            !run.trace
-                .contains(&act(ReviewerAction::AcquireClaim { mr_iid: 7 }))
-        );
-        assert!(
-            run.trace
-                .contains(&act(ReviewerAction::AcquireClaim { mr_iid: 9 }))
-        );
-    }
-
-    #[test]
-    fn reviewer_cycle_moves_on_when_a_claim_is_lost_and_stops_when_interrupted() {
-        let mut lost = FakeReviewerPort::new(vec![observation(7, None), observation(9, None)])
-            .with_claim_attempts(&[ClaimAttempt::Lost, ClaimAttempt::Won(9)]);
-        let run = run_reviewer(&mut lost, true);
-        assert!(run.result.is_ok());
-        assert_eq!(run.merged, Some(9));
-
-        let mut interrupted = FakeReviewerPort::new(vec![observation(7, None)])
-            .with_claim_attempts(&[ClaimAttempt::Interrupted]);
-        let run = run_reviewer(&mut interrupted, true);
-        assert!(run.result.is_ok());
-        assert_eq!(
-            run.trace.last(),
-            Some(&act(ReviewerAction::AcquireClaim { mr_iid: 7 }))
-        );
-    }
-
-    #[test]
-    fn reviewer_cycle_reviews_only_the_first_candidate_it_claims() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None), observation(9, None)]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        assert!(
-            !run.trace
-                .contains(&act(ReviewerAction::AcquireClaim { mr_iid: 9 }))
-        );
-    }
-
-    #[test]
-    fn reviewer_cycle_drops_its_own_stale_claim_label_before_screening() {
-        let mine = format!("claimed:{TEST_AGENT}");
-        let mut port = FakeReviewerPort::new(vec![observation(7, Some(vec![mine.as_str()]))]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        let released = run
-            .trace
+    fn reviewer_cycle_releases_recovered_claim_before_listing_work() {
+        let mut port = FakeReviewerPort::new(vec![observation(7, None)]);
+        port.recoverable_claim = Some(4);
+        run(&mut port, true).unwrap();
+        let trace = port.trace.borrow();
+        let recovered = trace
             .iter()
-            .position(|step| step == &act(ReviewerAction::ReleaseStaleClaimLabel { mr_iid: 7 }))
-            .expect("our stale claim label is dropped");
+            .position(|entry| entry == "recover_claim")
+            .unwrap();
         assert_eq!(
-            run.trace[released + 1],
-            observe(ReviewerQuery::UnresolvedDiscussions { mr_iid: 7 })
+            &trace[recovered..recovered + 3],
+            ["recover_claim", "release_previous", "merge_requests"]
         );
     }
 
     #[test]
-    fn reviewer_cycle_skips_approved_and_foreign_claimed_candidates() {
+    fn reviewer_cycle_honors_all_four_shutdown_boundaries() {
+        for stop_at in 0..4 {
+            let mut answers = vec![false; stop_at];
+            answers.push(true);
+            let mut port =
+                FakeReviewerPort::new(vec![observation(7, None)]).with_shutdowns(&answers);
+            run(&mut port, true).unwrap();
+            assert_eq!(
+                port.trace
+                    .borrow()
+                    .iter()
+                    .filter(|entry| *entry == "shutdown")
+                    .count(),
+                stop_at + 1
+            );
+            if stop_at == 3 {
+                assert_eq!(port.trace.borrow().last().unwrap(), "release_final");
+            }
+        }
+    }
+
+    #[test]
+    fn reviewer_cycle_skips_unreadable_candidate_and_claims_at_most_one() {
+        let mut port = FakeReviewerPort::new(vec![observation(7, None), observation(9, None)])
+            .failing("discussions:7");
+        assert_eq!(run(&mut port, true).unwrap(), Some(9));
+        assert!(!port.trace.borrow().contains(&"claim:7".into()));
+        assert_eq!(
+            port.trace
+                .borrow()
+                .iter()
+                .filter(|entry| entry.starts_with("model:"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reviewer_cycle_lost_claim_moves_on_and_interrupted_stops() {
+        let mut lost = FakeReviewerPort::new(vec![observation(7, None), observation(9, None)])
+            .with_claims(&[ClaimAttempt::Lost, ClaimAttempt::Won]);
+        assert_eq!(run(&mut lost, true).unwrap(), Some(9));
+        let mut interrupted = FakeReviewerPort::new(vec![observation(7, None)])
+            .with_claims(&[ClaimAttempt::Interrupted]);
+        assert_eq!(run(&mut interrupted, true).unwrap(), None);
+        assert_eq!(interrupted.trace.borrow().last().unwrap(), "claim:7");
+    }
+
+    #[test]
+    fn reviewer_cycle_filters_sorts_and_releases_own_stale_claim() {
+        let mine = format!("claimed:{TEST_AGENT}");
         let mut port = FakeReviewerPort::new(vec![
             observation(5, Some(vec![REVIEWER_APPROVED_LABEL])),
-            observation(6, Some(vec!["claimed:other-reviewer"])),
-            observation(7, None),
-        ]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        assert_eq!(run.merged, Some(7));
-        for skipped in [5, 6] {
-            assert!(
-                !run.trace.iter().any(|step| step
-                    == &observe(ReviewerQuery::UnresolvedDiscussions { mr_iid: skipped }))
-            );
-        }
-    }
-
-    #[test]
-    fn reviewer_cycle_takes_the_highest_priority_candidate_first() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None), observation(9, None)])
-            .with_priorities(&[(7, 3), (9, 1)]);
-        let run = run_reviewer(&mut port, true);
-
-        assert!(run.result.is_ok());
-        assert_eq!(run.merged, Some(9));
-    }
-
-    #[test]
-    fn reviewer_cycle_takes_a_need_ai_worker_candidate_before_priority() {
-        let mut port = FakeReviewerPort::new(vec![
-            observation(7, None),
-            observation(9, Some(vec![NEED_AI_WORKER_LABEL])),
+            observation(6, Some(vec!["claimed:other"])),
+            observation(7, Some(vec![mine.as_str(), NEED_AI_WORKER_LABEL])),
+            observation(9, None),
         ])
         .with_priorities(&[(7, 1), (9, 3)]);
-        let run = run_reviewer(&mut port, true);
+        assert_eq!(run(&mut port, true).unwrap(), Some(7));
+        assert!(!port.trace.borrow().contains(&"discussions:5".into()));
+        assert!(!port.trace.borrow().contains(&"discussions:6".into()));
+        let trace = port.trace.borrow();
+        let released = trace
+            .iter()
+            .position(|entry| entry == "release_stale:7")
+            .unwrap();
+        assert_eq!(
+            &trace[released..released + 2],
+            ["release_stale:7", "discussions:7"]
+        );
+        assert!(!trace.contains(&"claim:9".into()));
+    }
 
-        assert!(run.result.is_ok());
-        assert_eq!(run.merged, Some(9));
+    #[test]
+    fn reviewer_cycle_rejects_gate_failures_before_git_or_model() {
+        let mut mr = observation(7, None);
+        mr.title = "Update".into();
+        let mut port = FakeReviewerPort::new(vec![mr]);
+        run(&mut port, true).unwrap();
+        assert!(
+            port.discussions[0]
+                .1
+                .contains("title `Update` is too generic")
+        );
+        assert_eq!(
+            port.trace
+                .borrow()
+                .iter()
+                .filter(|entry| *entry == "reset")
+                .count(),
+            1
+        );
+        assert!(port.reviewed_subjects.is_empty());
     }
 
     // -----------------------------------------------------------------

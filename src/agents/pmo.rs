@@ -19,7 +19,6 @@ use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::cycle::Step;
 use crate::core::model::acp::capabilities::{AskAnswer, AskQuestion, CapabilityProvider};
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
@@ -497,10 +496,10 @@ impl CoreAgent for PmoAgent {
 }
 
 // ---------------------------------------------------------------------------
-// PMO role port and pure state machine
+// PMO role port and imperative workflow
 // ---------------------------------------------------------------------------
 
-/// Immutable issue fields used by PMO policy. The machine deliberately does
+/// Immutable issue fields used by PMO policy. The workflow deliberately does
 /// not receive GitLab's mutable/API-facing issue type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PmoIssueObservation {
@@ -545,80 +544,6 @@ impl PmoIssueObservation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PmoQuery {
-    DefaultBranch,
-    ShutdownRequested,
-    PendingSplit,
-    Issue { issue_iid: u64 },
-    Issues,
-    NewHumanComments { issue_iid: u64 },
-    CurrentEpoch,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PmoFact {
-    DefaultBranch(String),
-    ShutdownRequested(bool),
-    PendingSplit(Option<PendingSplit>),
-    Issue(Option<PmoIssueObservation>),
-    Issues(Vec<PmoIssueObservation>),
-    NewHumanComments(bool),
-    CurrentEpoch(u64),
-}
-
-/// One externally visible PMO effect. Each variant is intentionally one
-/// operation; ordering and required/best-effort policy live in the machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PmoAction {
-    FetchRepository,
-    CheckoutDefaultBranch {
-        branch: String,
-    },
-    ResetWorktree,
-    AcquireClaim {
-        issue_iid: u64,
-    },
-    ReleaseClaim,
-    SaveClaimState {
-        issue_iid: u64,
-    },
-    ClearClaimState,
-    PrepareIssueContext {
-        issue: PmoIssueObservation,
-        all_issues: Vec<PmoIssueObservation>,
-    },
-    InvokePlan {
-        issue: PmoIssueObservation,
-        context_path: String,
-    },
-    UpdateIssueDescription {
-        issue_iid: u64,
-        body: String,
-    },
-    AddIssueComment {
-        issue_iid: u64,
-        body: String,
-    },
-    AddIssueLabel {
-        issue_iid: u64,
-        label: String,
-    },
-    RemoveIssueLabel {
-        issue_iid: u64,
-        label: String,
-    },
-    CloseIssue {
-        issue_iid: u64,
-    },
-    SaveSplitCheckpoint(PendingSplit),
-    DeleteSplitCheckpoint,
-    CreateChild {
-        title: String,
-        description: String,
-    },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PmoClaimOutcome {
     Won,
@@ -626,921 +551,403 @@ enum PmoClaimOutcome {
     Interrupted,
 }
 
-enum PmoOutcome {
-    Done,
-    Failed(anyhow::Error),
-    CheckoutFailed,
-    Claim(PmoClaimOutcome),
-    ContextPrepared(String),
-    Planned(PmoOutput),
-    IssueCreated(u64),
-}
-
 trait PmoPort {
     fn default_branch(&self) -> Result<String>;
     fn shutdown_requested(&self) -> bool;
+    fn fetch_repository(&mut self) -> Result<()>;
+    fn checkout_default_branch(&mut self, branch: &str) -> Result<()>;
+    fn reset_worktree(&mut self) -> Result<()>;
     fn pending_split(&self) -> Result<Option<PendingSplit>>;
     fn issue(&self, issue_iid: u64) -> Option<PmoIssueObservation>;
     fn issues(&self) -> Result<Vec<PmoIssueObservation>>;
     fn new_human_comments(&self, issue_iid: u64) -> bool;
     fn current_epoch(&self) -> u64;
-    fn execute(&mut self, action: &PmoAction) -> PmoOutcome;
+    fn acquire_claim(&mut self, issue_iid: u64) -> Result<PmoClaimOutcome>;
+    /// Releases and drops the live lease. Some call sites intentionally ignore failure.
+    fn release_claim(&mut self) -> Result<()>;
+    fn save_claim_state(&mut self, issue_iid: u64);
+    fn clear_claim_state(&mut self);
+    fn prepare_issue_context(
+        &mut self,
+        issue: &PmoIssueObservation,
+        all_issues: &[PmoIssueObservation],
+    ) -> Result<String>;
+    fn invoke_plan(&mut self, issue: &PmoIssueObservation, context_path: &str)
+    -> Result<PmoOutput>;
+    fn update_issue_description(&mut self, issue_iid: u64, body: &str) -> Result<()>;
+    fn add_issue_comment(&mut self, issue_iid: u64, body: &str) -> Result<()>;
+    fn add_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()>;
+    fn remove_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()>;
+    fn close_issue(&mut self, issue_iid: u64) -> Result<()>;
+    fn save_split_checkpoint(&mut self, pending: &PendingSplit) -> Result<()>;
+    fn delete_split_checkpoint(&mut self) -> Result<()>;
+    fn create_child(&mut self, title: &str, description: &str) -> Result<u64>;
 }
-
-type PmoStep = Step<PmoQuery, PmoAction>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlanOrigin {
-    Fresh,
-    Refinement,
+enum DecisionDisposition {
+    ReleaseClaim,
+    KeepClaim,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PmoStage {
-    ObserveDefaultBranch,
-    FetchRepository,
-    CheckoutDefaultBranch,
-    ResetAfterCheckoutFailure,
-    RetryCheckout,
-    ObservePendingSplit,
-    ObserveSplitParent,
-    ObserveSplitIssues,
-    PrepareSplitContext,
-    ObserveHeldIssue,
-    ReleaseInvalidHeldClaim,
-    ClearInvalidHeldState,
-    ObserveRefinementIssues,
-    PrepareRefinementContext,
-    ObserveRefinementComments,
-    PrepareRefinementPlanContext,
-    ObserveIssues,
-    ShutdownAfterIssues,
-    NextCandidate,
-    ShutdownBeforeCandidate,
-    AcquireCandidate,
-    ShutdownAfterClaim,
-    ReleaseInterruptedClaim,
-    SaveClaim,
-    PreparePlanContext,
-    InvokePlan,
-    DecisionAction,
-    BeginSplit,
-    NextChild,
-    CreateChild,
-    LabelChildPriority,
-    LabelChildScope,
-    HoldChild,
-    CheckpointChild,
-    NextDependency,
-    UnholdDependent,
-    LabelDependency,
-    CommentDependency,
-    CommentParentLinks,
-    RemoveParentActionRequired,
-    AddParentProcessed,
-    DeleteCheckpoint,
-    CloseSplitParent,
-    ReleaseCompletedClaim,
-    ClearCompletedState,
-    ShutdownAfterProcessingFailure,
-    ReleaseFailedClaim,
-    ClearFailedState,
-    ShutdownBeforePriorities,
-    NextDefaultPriority,
-    AddDefaultPriority,
-    ShutdownBeforeStale,
-    ObserveMaintenanceEpoch,
-    NextStaleIssue,
-    CommentStaleIssue,
-    CloseStaleIssue,
-    Finish,
+#[derive(Debug)]
+enum PmoDecisionError {
+    Recoverable(anyhow::Error),
+    Immediate(anyhow::Error),
 }
 
-struct PmoMachine<'a> {
-    agent_id: &'a str,
-    scope_label: Option<&'a str>,
-    held_issue_iid: Option<u64>,
-    stage: PmoStage,
-    default_branch: String,
-    pending: Option<PendingSplit>,
-    issues: Vec<PmoIssueObservation>,
-    issue_queue: std::collections::VecDeque<PmoIssueObservation>,
-    issue: Option<PmoIssueObservation>,
-    context_path: String,
-    plan_origin: PlanOrigin,
-    decision_actions: std::collections::VecDeque<(PmoAction, bool)>,
-    current_action_required: bool,
-    child_index: usize,
-    child_iid: Option<u64>,
-    dependency_index: usize,
-    maintenance_queue: std::collections::VecDeque<PmoIssueObservation>,
-    stale_queue: std::collections::VecDeque<PmoIssueObservation>,
-    stale_issue_iid: Option<u64>,
-    now: u64,
-    resumed_split: bool,
-    keep_claim_after_decision: bool,
+fn issue_in_pmo_scope(issue: &PmoIssueObservation, scope_label: Option<&str>) -> bool {
+    scope_label.is_none_or(|label| issue.labels.iter().any(|candidate| candidate == label))
 }
 
-impl<'a> PmoMachine<'a> {
-    fn new(agent_id: &'a str, scope_label: Option<&'a str>, held_issue_iid: Option<u64>) -> Self {
-        Self {
-            agent_id,
-            scope_label,
-            held_issue_iid,
-            stage: PmoStage::ObserveDefaultBranch,
-            default_branch: String::new(),
-            pending: None,
-            issues: Vec::new(),
-            issue_queue: std::collections::VecDeque::new(),
-            issue: None,
-            context_path: String::new(),
-            plan_origin: PlanOrigin::Fresh,
-            decision_actions: std::collections::VecDeque::new(),
-            current_action_required: true,
-            child_index: 0,
-            child_iid: None,
-            dependency_index: 0,
-            maintenance_queue: std::collections::VecDeque::new(),
-            stale_queue: std::collections::VecDeque::new(),
-            stale_issue_iid: None,
-            now: 0,
-            resumed_split: false,
-            keep_claim_after_decision: false,
+fn apply_pmo_decision(
+    issue: &PmoIssueObservation,
+    decision: PmoOutput,
+    scope_label: Option<&str>,
+    port: &mut dyn PmoPort,
+) -> std::result::Result<DecisionDisposition, PmoDecisionError> {
+    let iid = issue.iid;
+    match decision {
+        PmoOutput::NeedsClarification {
+            question,
+            plan_text,
+        } => {
+            if let Some(plan) = plan_text.filter(|text| !text.trim().is_empty()) {
+                let body = strip_internal_markers(plan.trim());
+                if !body.is_empty() {
+                    let _ = port.update_issue_description(iid, &body);
+                }
+            }
+            let question = strip_internal_markers(&clarification_question_or_default(&question));
+            port.add_issue_comment(
+                iid,
+                &format!(
+                    "**PMO needs clarification before proceeding:**\n\n{question}\n\nPlease reply to this comment with the requested information. The PMO will refine the plan based on your feedback. Remove the `pmo-pending` label when you are satisfied with the plan to let the PMO proceed."
+                ),
+            )
+            .map_err(PmoDecisionError::Recoverable)?;
+            port.add_issue_label(iid, labels::PMO_PENDING)
+                .map_err(PmoDecisionError::Recoverable)?;
+            port.save_claim_state(iid);
+            Ok(DecisionDisposition::KeepClaim)
+        }
+        PmoOutput::AlreadyDone { reason } => {
+            let reason = strip_internal_markers(&already_done_reason_or_default(&reason));
+            port.add_issue_comment(
+                iid,
+                &format!("**PMO: Closing — this work is already implemented.**\n\n{reason}"),
+            )
+            .map_err(PmoDecisionError::Recoverable)?;
+            let _ = port.remove_issue_label(iid, ACTION_REQUIRED_LABEL);
+            let _ = port.remove_issue_label(iid, PMO_PROCESSED_LABEL);
+            port.close_issue(iid)
+                .map_err(PmoDecisionError::Recoverable)?;
+            Ok(DecisionDisposition::ReleaseClaim)
+        }
+        PmoOutput::WaitForDependency {
+            dependency_issue_iid,
+        } => {
+            let _ = port.add_issue_label(iid, &format!("waiting-on-issue:#{dependency_issue_iid}"));
+            let _ = port.remove_issue_label(iid, ACTION_REQUIRED_LABEL);
+            let _ = port.remove_issue_label(iid, PMO_PROCESSED_LABEL);
+            port.add_issue_comment(
+                iid,
+                &format!(
+                    "**PMO: Parking — this issue depends on issue #{dependency_issue_iid} which is still open.**\n\nThe worker will skip this issue until #{dependency_issue_iid} is closed, then resume automatically."
+                ),
+            )
+            .map_err(PmoDecisionError::Recoverable)?;
+            Ok(DecisionDisposition::ReleaseClaim)
+        }
+        PmoOutput::GuideWorker { instructions } => {
+            let guidance = strip_internal_markers(&guidance_or_empty(&instructions));
+            if guidance.trim().is_empty() {
+                return Err(PmoDecisionError::Recoverable(anyhow::anyhow!(
+                    "PMO GUIDE_WORKER output for issue #{iid} had no usable guidance; retrying later"
+                )));
+            }
+            port.add_issue_comment(iid, &format_pmo_guidance_comment(&guidance))
+                .map_err(PmoDecisionError::Recoverable)?;
+            port.remove_issue_label(iid, ACTION_REQUIRED_LABEL)
+                .map_err(PmoDecisionError::Recoverable)?;
+            let _ = port.remove_issue_label(iid, PMO_PROCESSED_LABEL);
+            Ok(DecisionDisposition::ReleaseClaim)
+        }
+        PmoOutput::Split { sub_issues } => {
+            let sub_issues = normalize_sub_issues(sub_issues);
+            if sub_issues.is_empty() {
+                return Err(PmoDecisionError::Recoverable(anyhow::anyhow!(
+                    "PMO split output for issue #{iid} was not machine-readable; retrying later"
+                )));
+            }
+            let mut pending = PendingSplit {
+                parent_issue_iid: iid,
+                parent_issue_title: issue.title.clone(),
+                parent_priority: issue.priority(),
+                sub_issues,
+                created_issue_ids: Vec::new(),
+            };
+            port.save_split_checkpoint(&pending)
+                .map_err(PmoDecisionError::Immediate)?;
+            resume_split(&mut pending, scope_label, port).map_err(PmoDecisionError::Immediate)?;
+            Ok(DecisionDisposition::ReleaseClaim)
         }
     }
+}
 
-    fn issue(&self) -> &PmoIssueObservation {
-        self.issue.as_ref().expect("PMO issue stage has an issue")
-    }
+fn process_pmo_issue(
+    issue: &PmoIssueObservation,
+    issues: &[PmoIssueObservation],
+    scope_label: Option<&str>,
+    port: &mut dyn PmoPort,
+) -> std::result::Result<DecisionDisposition, PmoDecisionError> {
+    let path = port
+        .prepare_issue_context(issue, issues)
+        .map_err(PmoDecisionError::Recoverable)?;
+    let decision = port
+        .invoke_plan(issue, &path)
+        .map_err(PmoDecisionError::Recoverable)?;
+    apply_pmo_decision(issue, decision, scope_label, port)
+}
 
-    fn pending(&self) -> &PendingSplit {
-        self.pending
-            .as_ref()
-            .expect("PMO split stage has a checkpoint")
-    }
-
-    fn child(&self) -> &PmoSubIssue {
-        &self.pending().sub_issues[self.child_index]
-    }
-
-    fn child_iid(&self) -> u64 {
-        self.child_iid
-            .expect("child labeling follows successful creation")
-    }
-
-    fn in_scope(&self, issue: &PmoIssueObservation) -> bool {
-        self.scope_label
-            .is_none_or(|label| issue.labels.iter().any(|candidate| candidate == label))
-    }
-
-    fn should_process(&self, issue: &PmoIssueObservation) -> bool {
-        should_process_issue(&issue.as_issue(), self.scope_label)
-    }
-
-    fn next_step(&mut self) -> PmoStep {
-        loop {
-            match self.stage {
-                PmoStage::ObserveDefaultBranch => {
-                    return PmoStep::Observe(PmoQuery::DefaultBranch);
-                }
-                PmoStage::FetchRepository => return PmoStep::Act(PmoAction::FetchRepository),
-                PmoStage::CheckoutDefaultBranch | PmoStage::RetryCheckout => {
-                    return PmoStep::Act(PmoAction::CheckoutDefaultBranch {
-                        branch: self.default_branch.clone(),
-                    });
-                }
-                PmoStage::ResetAfterCheckoutFailure => {
-                    return PmoStep::Act(PmoAction::ResetWorktree);
-                }
-                PmoStage::ObservePendingSplit => {
-                    return PmoStep::Observe(PmoQuery::PendingSplit);
-                }
-                PmoStage::ObserveHeldIssue => {
-                    let iid = self.held_issue_iid.expect("held issue stage has a claim");
-                    return PmoStep::Observe(PmoQuery::Issue { issue_iid: iid });
-                }
-                PmoStage::ObserveSplitParent => {
-                    return PmoStep::Observe(PmoQuery::Issue {
-                        issue_iid: self.pending().parent_issue_iid,
-                    });
-                }
-                PmoStage::ObserveSplitIssues => return PmoStep::Observe(PmoQuery::Issues),
-                PmoStage::ReleaseInvalidHeldClaim
-                | PmoStage::ReleaseInterruptedClaim
-                | PmoStage::ReleaseCompletedClaim
-                | PmoStage::ReleaseFailedClaim => return PmoStep::Act(PmoAction::ReleaseClaim),
-                PmoStage::ClearInvalidHeldState
-                | PmoStage::ClearCompletedState
-                | PmoStage::ClearFailedState => return PmoStep::Act(PmoAction::ClearClaimState),
-                PmoStage::ObserveRefinementIssues | PmoStage::ObserveIssues => {
-                    return PmoStep::Observe(PmoQuery::Issues);
-                }
-                PmoStage::PrepareRefinementContext
-                | PmoStage::PrepareRefinementPlanContext
-                | PmoStage::PreparePlanContext
-                | PmoStage::PrepareSplitContext => {
-                    return PmoStep::Act(PmoAction::PrepareIssueContext {
-                        issue: self.issue().clone(),
-                        all_issues: self.issues.clone(),
-                    });
-                }
-                PmoStage::ObserveRefinementComments => {
-                    return PmoStep::Observe(PmoQuery::NewHumanComments {
-                        issue_iid: self.issue().iid,
-                    });
-                }
-                PmoStage::ShutdownAfterIssues
-                | PmoStage::ShutdownBeforeCandidate
-                | PmoStage::ShutdownAfterClaim
-                | PmoStage::ShutdownAfterProcessingFailure
-                | PmoStage::ShutdownBeforePriorities
-                | PmoStage::ShutdownBeforeStale => {
-                    return PmoStep::Observe(PmoQuery::ShutdownRequested);
-                }
-                PmoStage::NextCandidate => match self.issue_queue.pop_front() {
-                    Some(issue)
-                        if self.should_process(&issue)
-                            && !issue
-                                .labels
-                                .iter()
-                                .any(|label| label.starts_with("claimed:")) =>
-                    {
-                        self.issue = Some(issue);
-                        self.stage = PmoStage::ShutdownBeforeCandidate;
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.maintenance_queue = self.issues.iter().cloned().collect();
-                        self.stage = PmoStage::ShutdownBeforePriorities;
-                    }
-                },
-                PmoStage::AcquireCandidate => {
-                    return PmoStep::Act(PmoAction::AcquireClaim {
-                        issue_iid: self.issue().iid,
-                    });
-                }
-                PmoStage::SaveClaim => {
-                    return PmoStep::Act(PmoAction::SaveClaimState {
-                        issue_iid: self.issue().iid,
-                    });
-                }
-                PmoStage::InvokePlan => {
-                    return PmoStep::Act(PmoAction::InvokePlan {
-                        issue: self.issue().clone(),
-                        context_path: self.context_path.clone(),
-                    });
-                }
-                PmoStage::DecisionAction => match self.decision_actions.front() {
-                    Some((action, required)) => {
-                        self.current_action_required = *required;
-                        return PmoStep::Act(action.clone());
-                    }
-                    None => {
-                        self.stage = if self.keep_claim_after_decision {
-                            PmoStage::Finish
-                        } else {
-                            PmoStage::ReleaseCompletedClaim
-                        };
-                    }
-                },
-                PmoStage::BeginSplit => {
-                    return PmoStep::Act(PmoAction::SaveSplitCheckpoint(self.pending().clone()));
-                }
-                PmoStage::NextChild => {
-                    self.child_index = self.pending().created_issue_ids.len();
-                    if self.child_index < self.pending().sub_issues.len()
-                        && !sub_issue_already_created(self.pending(), self.child_index)
-                    {
-                        self.child_iid = None;
-                        self.stage = PmoStage::CreateChild;
-                    } else {
-                        self.dependency_index = 0;
-                        self.stage = PmoStage::NextDependency;
-                    }
-                }
-                PmoStage::CreateChild => {
-                    let child = self.child();
-                    return PmoStep::Act(PmoAction::CreateChild {
-                        title: if child.title.is_empty() {
-                            self.pending().parent_issue_title.clone()
-                        } else {
-                            child.title.clone()
-                        },
-                        description: child.description.clone(),
-                    });
-                }
-                PmoStage::LabelChildPriority => {
-                    return PmoStep::Act(PmoAction::AddIssueLabel {
-                        issue_iid: self.child_iid(),
-                        label: gitlab::priority_label(
-                            self.child()
-                                .priority
-                                .unwrap_or(self.pending().parent_priority),
-                        ),
-                    });
-                }
-                PmoStage::LabelChildScope => {
-                    let Some(label) = self.scope_label else {
-                        self.stage = PmoStage::HoldChild;
-                        continue;
-                    };
-                    return PmoStep::Act(PmoAction::AddIssueLabel {
-                        issue_iid: self.child_iid(),
-                        label: label.to_string(),
-                    });
-                }
-                PmoStage::HoldChild => {
-                    if self.child().depends_on == 0 {
-                        self.stage = PmoStage::CheckpointChild;
-                        continue;
-                    }
-                    return PmoStep::Act(PmoAction::AddIssueLabel {
-                        issue_iid: self.child_iid(),
-                        label: labels::DO_NOT_IMPLEMENT.to_string(),
-                    });
-                }
-                PmoStage::CheckpointChild => {
-                    let mut checkpoint = self.pending().clone();
-                    checkpoint.created_issue_ids.push(self.child_iid());
-                    return PmoStep::Act(PmoAction::SaveSplitCheckpoint(checkpoint));
-                }
-                PmoStage::NextDependency => {
-                    while self.dependency_index < self.pending().sub_issues.len()
-                        && (self.pending().sub_issues[self.dependency_index].depends_on == 0
-                            || self.pending().sub_issues[self.dependency_index].depends_on
-                                > self.pending().created_issue_ids.len())
-                    {
-                        self.dependency_index += 1;
-                    }
-                    if self.dependency_index < self.pending().sub_issues.len() {
-                        self.stage = PmoStage::UnholdDependent;
-                    } else {
-                        self.stage = PmoStage::CommentParentLinks;
-                    }
-                }
-                PmoStage::UnholdDependent => {
-                    return PmoStep::Act(PmoAction::RemoveIssueLabel {
-                        issue_iid: self.pending().created_issue_ids[self.dependency_index],
-                        label: labels::DO_NOT_IMPLEMENT.to_string(),
-                    });
-                }
-                PmoStage::LabelDependency => {
-                    let dep_index = self.pending().sub_issues[self.dependency_index].depends_on - 1;
-                    return PmoStep::Act(PmoAction::AddIssueLabel {
-                        issue_iid: self.pending().created_issue_ids[self.dependency_index],
-                        label: format!(
-                            "waiting-on-issue:#{}",
-                            self.pending().created_issue_ids[dep_index]
-                        ),
-                    });
-                }
-                PmoStage::CommentDependency => {
-                    let dep_index = self.pending().sub_issues[self.dependency_index].depends_on - 1;
-                    return PmoStep::Act(PmoAction::AddIssueComment {
-                        issue_iid: self.pending().created_issue_ids[self.dependency_index],
-                        body: format!(
-                            "This sub-issue depends on #{} and will become actionable after that issue is closed.",
-                            self.pending().created_issue_ids[dep_index]
-                        ),
-                    });
-                }
-                PmoStage::CommentParentLinks => {
-                    let links = self
-                        .pending()
-                        .created_issue_ids
-                        .iter()
-                        .map(|iid| format!("- #{iid}"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    return PmoStep::Act(PmoAction::AddIssueComment {
-                        issue_iid: self.pending().parent_issue_iid,
-                        body: format!(
-                            "This issue has been split into {} smaller sub-issues by the PMO Agent:\n\n{}\n\nEach sub-issue is designed to stay around ~500 lines of non-test code (~1500 total including tests). Auto-generated code is excluded from these limits.",
-                            self.pending().created_issue_ids.len(),
-                            links
-                        ),
-                    });
-                }
-                PmoStage::RemoveParentActionRequired => {
-                    return PmoStep::Act(PmoAction::RemoveIssueLabel {
-                        issue_iid: self.pending().parent_issue_iid,
-                        label: ACTION_REQUIRED_LABEL.to_string(),
-                    });
-                }
-                PmoStage::AddParentProcessed => {
-                    return PmoStep::Act(PmoAction::AddIssueLabel {
-                        issue_iid: self.pending().parent_issue_iid,
-                        label: PMO_PROCESSED_LABEL.to_string(),
-                    });
-                }
-                PmoStage::DeleteCheckpoint => {
-                    return PmoStep::Act(PmoAction::DeleteSplitCheckpoint);
-                }
-                PmoStage::CloseSplitParent => {
-                    return PmoStep::Act(PmoAction::CloseIssue {
-                        issue_iid: self.pending().parent_issue_iid,
-                    });
-                }
-                PmoStage::NextDefaultPriority => match self.maintenance_queue.pop_front() {
-                    Some(issue)
-                        if issue.state == "opened"
-                            && self.in_scope(&issue)
-                            && !issue
-                                .labels
-                                .iter()
-                                .any(|label| label.starts_with(gitlab::PRIORITY_LABEL_PREFIX)) =>
-                    {
-                        self.stale_issue_iid = Some(issue.iid);
-                        self.stage = PmoStage::AddDefaultPriority;
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.stage = PmoStage::ShutdownBeforeStale;
-                    }
-                },
-                PmoStage::AddDefaultPriority => {
-                    return PmoStep::Act(PmoAction::AddIssueLabel {
-                        issue_iid: self.stale_issue_iid.expect("priority stage has issue"),
-                        label: gitlab::priority_label(gitlab::DEFAULT_PRIORITY),
-                    });
-                }
-                PmoStage::ObserveMaintenanceEpoch => {
-                    return PmoStep::Observe(PmoQuery::CurrentEpoch);
-                }
-                PmoStage::NextStaleIssue => match self.stale_queue.pop_front() {
-                    Some(issue)
-                        if issue.state == "opened"
-                            && self.in_scope(&issue)
-                            && issue
-                                .labels
-                                .iter()
-                                .any(|label| label == PMO_PROCESSED_LABEL)
-                            && issue
-                                .updated_at
-                                .as_deref()
-                                .and_then(parse_iso8601_to_epoch)
-                                .is_some_and(|updated| {
-                                    self.now.saturating_sub(updated) >= STALE_THRESHOLD_SECS
-                                }) =>
-                    {
-                        self.stale_issue_iid = Some(issue.iid);
-                        self.stage = PmoStage::CommentStaleIssue;
-                    }
-                    Some(_) => {}
-                    None => self.stage = PmoStage::Finish,
-                },
-                PmoStage::CommentStaleIssue => {
-                    return PmoStep::Act(PmoAction::AddIssueComment {
-                        issue_iid: self.stale_issue_iid.expect("stale stage has issue"),
-                        body: "Closing this issue — it has been marked as `pmo-processed` for over 1 hour with no further activity.".to_string(),
-                    });
-                }
-                PmoStage::CloseStaleIssue => {
-                    return PmoStep::Act(PmoAction::CloseIssue {
-                        issue_iid: self.stale_issue_iid.expect("stale stage has issue"),
-                    });
-                }
-                PmoStage::Finish => return PmoStep::Finish,
-            }
+fn resume_split(
+    pending: &mut PendingSplit,
+    scope_label: Option<&str>,
+    port: &mut dyn PmoPort,
+) -> Result<()> {
+    while pending.created_issue_ids.len() < pending.sub_issues.len() {
+        let index = pending.created_issue_ids.len();
+        if sub_issue_already_created(pending, index) {
+            break;
         }
-    }
-
-    fn apply_fact(&mut self, fact: Result<PmoFact>) -> Result<()> {
-        match (&self.stage, fact) {
-            (PmoStage::ObserveDefaultBranch, Ok(PmoFact::DefaultBranch(branch))) => {
-                self.default_branch = branch;
-                self.stage = PmoStage::FetchRepository;
-            }
-            (PmoStage::ObservePendingSplit, Ok(PmoFact::PendingSplit(pending))) => {
-                self.pending = pending;
-                if self.pending.is_some() {
-                    self.resumed_split = true;
-                    self.stage = PmoStage::ObserveSplitParent;
-                } else if self.held_issue_iid.is_some() {
-                    self.stage = PmoStage::ObserveHeldIssue;
-                } else {
-                    self.stage = PmoStage::ObserveIssues;
-                }
-            }
-            (PmoStage::ObserveHeldIssue, Ok(PmoFact::Issue(issue))) => match issue {
-                Some(issue)
-                    if self.in_scope(&issue)
-                        && issue.labels.iter().any(|l| l == labels::PMO_PENDING) =>
-                {
-                    self.issue = Some(issue);
-                    self.stage = PmoStage::ObserveRefinementIssues;
-                }
-                _ => self.stage = PmoStage::ReleaseInvalidHeldClaim,
-            },
-            (PmoStage::ObserveSplitParent, Ok(PmoFact::Issue(issue))) => {
-                if let Some(issue) = issue {
-                    self.issue = Some(issue);
-                    self.stage = PmoStage::ObserveSplitIssues;
-                } else {
-                    self.stage = PmoStage::NextChild;
-                }
-            }
-            (PmoStage::ObserveSplitIssues, Ok(PmoFact::Issues(issues))) => {
-                self.issues = issues;
-                self.stage = PmoStage::PrepareSplitContext;
-            }
-            (PmoStage::ObserveRefinementIssues, Ok(PmoFact::Issues(issues))) => {
-                self.issues = issues;
-                self.stage = PmoStage::PrepareRefinementContext;
-            }
-            (PmoStage::ObserveRefinementComments, Ok(PmoFact::NewHumanComments(new))) => {
-                if new {
-                    self.plan_origin = PlanOrigin::Refinement;
-                    self.stage = PmoStage::PrepareRefinementPlanContext;
-                } else {
-                    self.stage = PmoStage::Finish;
-                }
-            }
-            (PmoStage::ObserveIssues, Ok(PmoFact::Issues(issues))) => {
-                self.issues = issues.clone();
-                self.issue_queue = issues.into();
-                self.stage = PmoStage::ShutdownAfterIssues;
-            }
-            (PmoStage::ShutdownAfterIssues, Ok(PmoFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    PmoStage::Finish
-                } else {
-                    PmoStage::NextCandidate
-                }
-            }
-            (PmoStage::ShutdownBeforeCandidate, Ok(PmoFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    PmoStage::Finish
-                } else {
-                    PmoStage::AcquireCandidate
-                }
-            }
-            (PmoStage::ShutdownAfterClaim, Ok(PmoFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    PmoStage::ReleaseInterruptedClaim
-                } else {
-                    PmoStage::SaveClaim
-                };
-            }
-            (PmoStage::ShutdownAfterProcessingFailure, Ok(PmoFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    PmoStage::Finish
-                } else {
-                    PmoStage::ReleaseFailedClaim
-                };
-            }
-            (PmoStage::ShutdownBeforePriorities, Ok(PmoFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    PmoStage::Finish
-                } else {
-                    PmoStage::NextDefaultPriority
-                };
-            }
-            (PmoStage::ShutdownBeforeStale, Ok(PmoFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    PmoStage::Finish
-                } else {
-                    PmoStage::ObserveMaintenanceEpoch
-                };
-            }
-            (PmoStage::ObserveMaintenanceEpoch, Ok(PmoFact::CurrentEpoch(now))) => {
-                self.now = now;
-                self.stale_queue = self.issues.iter().cloned().collect();
-                self.stage = PmoStage::NextStaleIssue;
-            }
-            (stage, Ok(fact)) => anyhow::bail!("PMO port answered {stage:?} with {fact:?}"),
-            (_, Err(error)) => return Err(error),
+        let child = &pending.sub_issues[index];
+        let title = if child.title.is_empty() {
+            &pending.parent_issue_title
+        } else {
+            &child.title
+        };
+        let child_iid = port.create_child(title, &child.description)?;
+        let priority = child.priority.unwrap_or(pending.parent_priority);
+        let _ = port.add_issue_label(child_iid, &gitlab::priority_label(priority));
+        if let Some(label) = scope_label {
+            let _ = port.add_issue_label(child_iid, label);
         }
-        Ok(())
-    }
-
-    fn apply_outcome(&mut self, outcome: PmoOutcome) -> Result<()> {
-        match (&self.stage, outcome) {
-            (PmoStage::FetchRepository, PmoOutcome::Done) => {
-                self.stage = PmoStage::CheckoutDefaultBranch
-            }
-            (PmoStage::CheckoutDefaultBranch, PmoOutcome::Done)
-            | (PmoStage::RetryCheckout, PmoOutcome::Done) => {
-                self.stage = PmoStage::ObservePendingSplit
-            }
-            (PmoStage::CheckoutDefaultBranch, PmoOutcome::CheckoutFailed) => {
-                self.stage = PmoStage::ResetAfterCheckoutFailure
-            }
-            (PmoStage::RetryCheckout, PmoOutcome::CheckoutFailed) => {
-                anyhow::bail!("failed to checkout default branch after resetting worktree")
-            }
-            (PmoStage::ResetAfterCheckoutFailure, PmoOutcome::Done) => {
-                self.stage = PmoStage::RetryCheckout
-            }
-            (PmoStage::ReleaseInvalidHeldClaim, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.held_issue_iid = None;
-                self.stage = PmoStage::ClearInvalidHeldState;
-            }
-            (PmoStage::ClearInvalidHeldState, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::ObserveIssues
-            }
-            (PmoStage::PrepareRefinementContext, PmoOutcome::ContextPrepared(_))
-            | (PmoStage::PrepareRefinementContext, PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::ObserveRefinementComments
-            }
-            (PmoStage::PrepareSplitContext, PmoOutcome::ContextPrepared(_))
-            | (PmoStage::PrepareSplitContext, PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::NextChild
-            }
-            (
-                PmoStage::PrepareRefinementPlanContext | PmoStage::PreparePlanContext,
-                PmoOutcome::ContextPrepared(path),
-            ) => {
-                self.context_path = path;
-                self.stage = PmoStage::InvokePlan;
-            }
-            (PmoStage::AcquireCandidate, PmoOutcome::Claim(PmoClaimOutcome::Won)) => {
-                self.held_issue_iid = Some(self.issue().iid);
-                self.stage = PmoStage::ShutdownAfterClaim;
-            }
-            (PmoStage::AcquireCandidate, PmoOutcome::Claim(PmoClaimOutcome::Lost)) => {
-                self.stage = PmoStage::NextCandidate
-            }
-            (PmoStage::AcquireCandidate, PmoOutcome::Claim(PmoClaimOutcome::Interrupted)) => {
-                self.stage = PmoStage::Finish
-            }
-            (PmoStage::ReleaseInterruptedClaim, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::Finish
-            }
-            (PmoStage::SaveClaim, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.plan_origin = PlanOrigin::Fresh;
-                self.stage = PmoStage::PreparePlanContext;
-            }
-            (PmoStage::InvokePlan, PmoOutcome::Planned(decision)) => {
-                self.install_decision(decision)?;
-            }
-            (PmoStage::InvokePlan, PmoOutcome::Failed(_))
-            | (PmoStage::PreparePlanContext, PmoOutcome::Failed(_))
-            | (PmoStage::PrepareRefinementPlanContext, PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::ShutdownAfterProcessingFailure
-            }
-            (PmoStage::DecisionAction, PmoOutcome::Done) => {
-                self.decision_actions.pop_front();
-            }
-            (PmoStage::DecisionAction, PmoOutcome::Failed(error)) => {
-                self.decision_actions.pop_front();
-                if self.current_action_required {
-                    warn!(
-                        "{}: required PMO decision action failed: {error}",
-                        self.agent_id
-                    );
-                    self.stage = PmoStage::ShutdownAfterProcessingFailure;
-                }
-            }
-            (PmoStage::BeginSplit, PmoOutcome::Done) => self.stage = PmoStage::NextChild,
-            (PmoStage::CreateChild, PmoOutcome::IssueCreated(iid)) => {
-                self.child_iid = Some(iid);
-                self.stage = PmoStage::LabelChildPriority;
-            }
-            (PmoStage::LabelChildPriority, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::LabelChildScope
-            }
-            (PmoStage::LabelChildScope, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::HoldChild
-            }
-            (PmoStage::HoldChild, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::CheckpointChild
-            }
-            (PmoStage::CheckpointChild, PmoOutcome::Done) => {
-                let child_iid = self.child_iid();
-                self.pending
-                    .as_mut()
-                    .expect("checkpoint stage has pending split")
-                    .created_issue_ids
-                    .push(child_iid);
-                self.stage = PmoStage::NextChild;
-            }
-            (PmoStage::UnholdDependent, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::LabelDependency
-            }
-            (PmoStage::LabelDependency, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::CommentDependency
-            }
-            (PmoStage::CommentDependency, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.dependency_index += 1;
-                self.stage = PmoStage::NextDependency;
-            }
-            (PmoStage::CommentParentLinks, PmoOutcome::Done) => {
-                self.stage = PmoStage::RemoveParentActionRequired
-            }
-            (PmoStage::RemoveParentActionRequired, PmoOutcome::Done) => {
-                self.stage = PmoStage::AddParentProcessed
-            }
-            (PmoStage::AddParentProcessed, PmoOutcome::Done) => {
-                self.stage = PmoStage::DeleteCheckpoint
-            }
-            (PmoStage::DeleteCheckpoint, PmoOutcome::Done) => {
-                self.stage = PmoStage::CloseSplitParent
-            }
-            (PmoStage::CloseSplitParent, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::ReleaseCompletedClaim
-            }
-            (PmoStage::ReleaseCompletedClaim, PmoOutcome::Done)
-            | (PmoStage::ReleaseCompletedClaim, PmoOutcome::Failed(_))
-                if self.resumed_split =>
-            {
-                self.held_issue_iid = None;
-                self.stage = PmoStage::ClearCompletedState;
-            }
-            (PmoStage::ReleaseCompletedClaim, PmoOutcome::Done) => {
-                self.held_issue_iid = None;
-                self.stage = PmoStage::ClearCompletedState;
-            }
-            (PmoStage::ClearCompletedState, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = if self.resumed_split || self.plan_origin == PlanOrigin::Refinement {
-                    PmoStage::Finish
-                } else {
-                    self.maintenance_queue = self.issues.iter().cloned().collect();
-                    PmoStage::ShutdownBeforePriorities
-                };
-            }
-            (PmoStage::ReleaseFailedClaim, PmoOutcome::Done) => {
-                self.held_issue_iid = None;
-                self.stage = PmoStage::ClearFailedState;
-            }
-            (PmoStage::ClearFailedState, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::ShutdownBeforePriorities
-            }
-            (PmoStage::AddDefaultPriority, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::NextDefaultPriority
-            }
-            (PmoStage::CommentStaleIssue, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::CloseStaleIssue
-            }
-            (PmoStage::CloseStaleIssue, PmoOutcome::Done | PmoOutcome::Failed(_)) => {
-                self.stage = PmoStage::NextStaleIssue
-            }
-            (_, PmoOutcome::Failed(error)) => return Err(error),
-            (stage, _) => anyhow::bail!("PMO port reported unexpected outcome for {stage:?}"),
+        if child.depends_on != 0 {
+            let _ = port.add_issue_label(child_iid, labels::DO_NOT_IMPLEMENT);
         }
-        Ok(())
+        let mut checkpoint = pending.clone();
+        checkpoint.created_issue_ids.push(child_iid);
+        port.save_split_checkpoint(&checkpoint)?;
+        pending.created_issue_ids.push(child_iid);
     }
 
-    fn install_decision(&mut self, decision: PmoOutput) -> Result<()> {
-        let iid = self.issue().iid;
-        self.decision_actions.clear();
-        self.keep_claim_after_decision = false;
-        match decision {
-            PmoOutput::NeedsClarification {
-                question,
-                plan_text,
-            } => {
-                if let Some(plan) = plan_text.filter(|text| !text.trim().is_empty()) {
-                    let body = strip_internal_markers(plan.trim());
-                    if !body.is_empty() {
-                        self.decision_actions.push_back((
-                            PmoAction::UpdateIssueDescription {
-                                issue_iid: iid,
-                                body,
-                            },
-                            false,
-                        ));
-                    }
-                }
-                let question =
-                    strip_internal_markers(&clarification_question_or_default(&question));
-                self.decision_actions.push_back((
-                    PmoAction::AddIssueComment {
-                        issue_iid: iid,
-                        body: format!(
-                            "**PMO needs clarification before proceeding:**\n\n{question}\n\nPlease reply to this comment with the requested information. The PMO will refine the plan based on your feedback. Remove the `pmo-pending` label when you are satisfied with the plan to let the PMO proceed."
-                        ),
-                    },
-                    true,
-                ));
-                self.decision_actions.push_back((
-                    PmoAction::AddIssueLabel {
-                        issue_iid: iid,
-                        label: labels::PMO_PENDING.to_string(),
-                    },
-                    true,
-                ));
-                // Needs-clarification intentionally keeps its claim.
-                self.decision_actions
-                    .push_back((PmoAction::SaveClaimState { issue_iid: iid }, false));
-                self.keep_claim_after_decision = true;
-                self.stage = PmoStage::DecisionAction;
-            }
-            PmoOutput::AlreadyDone { reason } => {
-                let reason = strip_internal_markers(&already_done_reason_or_default(&reason));
-                self.queue_decision(
-                    PmoAction::AddIssueComment {
-                        issue_iid: iid,
-                        body: format!(
-                            "**PMO: Closing — this work is already implemented.**\n\n{reason}"
-                        ),
-                    },
-                    true,
-                );
-                self.queue_remove(iid, ACTION_REQUIRED_LABEL, false);
-                self.queue_remove(iid, PMO_PROCESSED_LABEL, false);
-                self.queue_decision(PmoAction::CloseIssue { issue_iid: iid }, true);
-                self.stage = PmoStage::DecisionAction;
-            }
-            PmoOutput::WaitForDependency {
-                dependency_issue_iid,
-            } => {
-                self.queue_decision(
-                    PmoAction::AddIssueLabel {
-                        issue_iid: iid,
-                        label: format!("waiting-on-issue:#{dependency_issue_iid}"),
-                    },
-                    false,
-                );
-                self.queue_remove(iid, ACTION_REQUIRED_LABEL, false);
-                self.queue_remove(iid, PMO_PROCESSED_LABEL, false);
-                self.queue_decision(
-                    PmoAction::AddIssueComment {
-                        issue_iid: iid,
-                        body: format!(
-                            "**PMO: Parking — this issue depends on issue #{dependency_issue_iid} which is still open.**\n\nThe worker will skip this issue until #{dependency_issue_iid} is closed, then resume automatically."
-                        ),
-                    },
-                    true,
-                );
-                self.stage = PmoStage::DecisionAction;
-            }
-            PmoOutput::GuideWorker { instructions } => {
-                let guidance = strip_internal_markers(&guidance_or_empty(&instructions));
-                if guidance.trim().is_empty() {
-                    anyhow::bail!(
-                        "PMO GUIDE_WORKER output for issue #{iid} had no usable guidance; retrying later"
-                    );
-                }
-                self.queue_decision(
-                    PmoAction::AddIssueComment {
-                        issue_iid: iid,
-                        body: format_pmo_guidance_comment(&guidance),
-                    },
-                    true,
-                );
-                self.queue_remove(iid, ACTION_REQUIRED_LABEL, true);
-                self.queue_remove(iid, PMO_PROCESSED_LABEL, false);
-                self.stage = PmoStage::DecisionAction;
-            }
-            PmoOutput::Split { sub_issues } => {
-                let sub_issues = normalize_sub_issues(sub_issues);
-                if sub_issues.is_empty() {
-                    anyhow::bail!(
-                        "PMO split output for issue #{iid} was not machine-readable; retrying later"
-                    );
-                }
-                self.pending = Some(PendingSplit {
-                    parent_issue_iid: iid,
-                    parent_issue_title: self.issue().title.clone(),
-                    parent_priority: self.issue().priority(),
-                    sub_issues,
-                    created_issue_ids: Vec::new(),
-                });
-                self.resumed_split = false;
-                self.stage = PmoStage::BeginSplit;
-            }
+    for (index, child) in pending.sub_issues.iter().enumerate() {
+        if child.depends_on == 0 || child.depends_on > pending.created_issue_ids.len() {
+            continue;
         }
-        Ok(())
-    }
-
-    fn queue_decision(&mut self, action: PmoAction, required: bool) {
-        self.decision_actions.push_back((action, required));
-    }
-
-    fn queue_remove(&mut self, issue_iid: u64, label: &str, required: bool) {
-        self.queue_decision(
-            PmoAction::RemoveIssueLabel {
-                issue_iid,
-                label: label.to_string(),
-            },
-            required,
+        let child_iid = pending.created_issue_ids[index];
+        let dependency_iid = pending.created_issue_ids[child.depends_on - 1];
+        let _ = port.remove_issue_label(child_iid, labels::DO_NOT_IMPLEMENT);
+        let _ = port.add_issue_label(child_iid, &format!("waiting-on-issue:#{dependency_iid}"));
+        let _ = port.add_issue_comment(
+            child_iid,
+            &format!(
+                "This sub-issue depends on #{dependency_iid} and will become actionable after that issue is closed."
+            ),
         );
     }
+
+    let links = pending
+        .created_issue_ids
+        .iter()
+        .map(|iid| format!("- #{iid}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    port.add_issue_comment(
+        pending.parent_issue_iid,
+        &format!(
+            "This issue has been split into {} smaller sub-issues by the PMO Agent:\n\n{}\n\nEach sub-issue is designed to stay around ~500 lines of non-test code (~1500 total including tests). Auto-generated code is excluded from these limits.",
+            pending.created_issue_ids.len(),
+            links
+        ),
+    )?;
+    port.remove_issue_label(pending.parent_issue_iid, ACTION_REQUIRED_LABEL)?;
+    port.add_issue_label(pending.parent_issue_iid, PMO_PROCESSED_LABEL)?;
+    port.delete_split_checkpoint()?;
+    let _ = port.close_issue(pending.parent_issue_iid);
+    Ok(())
 }
 
-fn observe_pmo(port: &dyn PmoPort, query: &PmoQuery) -> Result<PmoFact> {
-    Ok(match query {
-        PmoQuery::DefaultBranch => PmoFact::DefaultBranch(port.default_branch()?),
-        PmoQuery::ShutdownRequested => PmoFact::ShutdownRequested(port.shutdown_requested()),
-        PmoQuery::PendingSplit => PmoFact::PendingSplit(port.pending_split()?),
-        PmoQuery::Issue { issue_iid } => PmoFact::Issue(port.issue(*issue_iid)),
-        PmoQuery::Issues => PmoFact::Issues(port.issues()?),
-        PmoQuery::NewHumanComments { issue_iid } => {
-            PmoFact::NewHumanComments(port.new_human_comments(*issue_iid))
-        }
-        PmoQuery::CurrentEpoch => PmoFact::CurrentEpoch(port.current_epoch()),
-    })
-}
-
-fn run_pmo_cycle(machine: &mut PmoMachine, port: &mut dyn PmoPort) -> Result<()> {
-    loop {
-        match machine.next_step() {
-            Step::Observe(query) => machine.apply_fact(observe_pmo(port, &query))?,
-            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
-            Step::Finish => return Ok(()),
+fn run_pmo_maintenance(
+    issues: &[PmoIssueObservation],
+    scope_label: Option<&str>,
+    port: &mut dyn PmoPort,
+) {
+    if port.shutdown_requested() {
+        return;
+    }
+    for issue in issues {
+        if issue.state == "opened"
+            && issue_in_pmo_scope(issue, scope_label)
+            && !issue
+                .labels
+                .iter()
+                .any(|label| label.starts_with(gitlab::PRIORITY_LABEL_PREFIX))
+        {
+            let _ =
+                port.add_issue_label(issue.iid, &gitlab::priority_label(gitlab::DEFAULT_PRIORITY));
         }
     }
+    if port.shutdown_requested() {
+        return;
+    }
+    let now = port.current_epoch();
+    for issue in issues {
+        if issue.state == "opened"
+            && issue_in_pmo_scope(issue, scope_label)
+            && issue
+                .labels
+                .iter()
+                .any(|label| label == PMO_PROCESSED_LABEL)
+            && issue
+                .updated_at
+                .as_deref()
+                .and_then(parse_iso8601_to_epoch)
+                .is_some_and(|updated| now.saturating_sub(updated) >= STALE_THRESHOLD_SECS)
+        {
+            let _ = port.add_issue_comment(
+                issue.iid,
+                "Closing this issue — it has been marked as `pmo-processed` for over 1 hour with no further activity.",
+            );
+            let _ = port.close_issue(issue.iid);
+        }
+    }
+}
+
+fn handle_processing_failure(
+    port: &mut dyn PmoPort,
+    issues: &[PmoIssueObservation],
+    scope_label: Option<&str>,
+) -> Result<()> {
+    if port.shutdown_requested() {
+        return Ok(());
+    }
+    port.release_claim()?;
+    port.clear_claim_state();
+    run_pmo_maintenance(issues, scope_label, port);
+    Ok(())
+}
+
+fn run_pmo_cycle(
+    agent_id: &str,
+    scope_label: Option<&str>,
+    held_issue_iid: Option<u64>,
+    port: &mut dyn PmoPort,
+) -> Result<()> {
+    let default_branch = port.default_branch()?;
+    port.fetch_repository()?;
+    if port.checkout_default_branch(&default_branch).is_err() {
+        port.reset_worktree()?;
+        port.checkout_default_branch(&default_branch)
+            .context("failed to checkout default branch after resetting worktree")?;
+    }
+
+    if let Some(mut pending) = port.pending_split()? {
+        if let Some(parent) = port.issue(pending.parent_issue_iid) {
+            let issues = port.issues()?;
+            let _ = port.prepare_issue_context(&parent, &issues);
+        }
+        resume_split(&mut pending, scope_label, port)?;
+        // Recovery can legitimately have a checkpoint but no live lease.
+        let _ = port.release_claim();
+        port.clear_claim_state();
+        return Ok(());
+    }
+
+    if let Some(iid) = held_issue_iid {
+        match port.issue(iid) {
+            Some(issue)
+                if issue_in_pmo_scope(&issue, scope_label)
+                    && issue
+                        .labels
+                        .iter()
+                        .any(|label| label == labels::PMO_PENDING) =>
+            {
+                let issues = port.issues()?;
+                let _ = port.prepare_issue_context(&issue, &issues);
+                if !port.new_human_comments(iid) {
+                    return Ok(());
+                }
+                match process_pmo_issue(&issue, &issues, scope_label, port) {
+                    Ok(DecisionDisposition::KeepClaim) => return Ok(()),
+                    Ok(DecisionDisposition::ReleaseClaim) => {
+                        port.release_claim()?;
+                        port.clear_claim_state();
+                        return Ok(());
+                    }
+                    Err(PmoDecisionError::Recoverable(error)) => {
+                        warn!("{agent_id}: PMO refinement failed for issue #{iid}: {error}");
+                        return handle_processing_failure(port, &issues, scope_label);
+                    }
+                    Err(PmoDecisionError::Immediate(error)) => return Err(error),
+                }
+            }
+            _ => {
+                let _ = port.release_claim();
+                port.clear_claim_state();
+            }
+        }
+    }
+
+    let issues = port.issues()?;
+    if port.shutdown_requested() {
+        return Ok(());
+    }
+
+    for issue in &issues {
+        if !should_process_issue(&issue.as_issue(), scope_label)
+            || issue
+                .labels
+                .iter()
+                .any(|label| label.starts_with("claimed:"))
+        {
+            continue;
+        }
+        if port.shutdown_requested() {
+            return Ok(());
+        }
+        match port.acquire_claim(issue.iid)? {
+            PmoClaimOutcome::Lost => continue,
+            PmoClaimOutcome::Interrupted => return Ok(()),
+            PmoClaimOutcome::Won => {}
+        }
+        if port.shutdown_requested() {
+            let _ = port.release_claim();
+            return Ok(());
+        }
+
+        port.save_claim_state(issue.iid);
+        match process_pmo_issue(issue, &issues, scope_label, port) {
+            Ok(DecisionDisposition::KeepClaim) => return Ok(()),
+            Ok(DecisionDisposition::ReleaseClaim) => {
+                port.release_claim()?;
+                port.clear_claim_state();
+                run_pmo_maintenance(&issues, scope_label, port);
+                return Ok(());
+            }
+            Err(PmoDecisionError::Recoverable(error)) => {
+                warn!(
+                    "{agent_id}: required PMO processing failed for issue #{}: {error}",
+                    issue.iid
+                );
+                return handle_processing_failure(port, &issues, scope_label);
+            }
+            Err(PmoDecisionError::Immediate(error)) => return Err(error),
+        }
+    }
+
+    run_pmo_maintenance(&issues, scope_label, port);
+    Ok(())
 }
 
 struct LivePmoPort<'a> {
@@ -1553,13 +960,6 @@ struct LivePmoPort<'a> {
     config: &'a PmoConfig,
 }
 
-fn pmo_done(result: Result<()>) -> PmoOutcome {
-    match result {
-        Ok(()) => PmoOutcome::Done,
-        Err(error) => PmoOutcome::Failed(error),
-    }
-}
-
 impl PmoPort for LivePmoPort<'_> {
     fn default_branch(&self) -> Result<String> {
         self.git_repo.get_default_branch()
@@ -1567,6 +967,18 @@ impl PmoPort for LivePmoPort<'_> {
 
     fn shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    fn fetch_repository(&mut self) -> Result<()> {
+        self.git_repo.fetch()
+    }
+
+    fn checkout_default_branch(&mut self, branch: &str) -> Result<()> {
+        self.git_repo.checkout_remote_branch(branch)
+    }
+
+    fn reset_worktree(&mut self) -> Result<()> {
+        self.git_repo.reset_hard()
     }
 
     fn pending_split(&self) -> Result<Option<PendingSplit>> {
@@ -1603,126 +1015,118 @@ impl PmoPort for LivePmoPort<'_> {
             .as_secs()
     }
 
-    fn execute(&mut self, action: &PmoAction) -> PmoOutcome {
-        match action {
-            PmoAction::FetchRepository => pmo_done(self.git_repo.fetch()),
-            PmoAction::CheckoutDefaultBranch { branch } => {
-                match self.git_repo.checkout_remote_branch(branch) {
-                    Ok(()) => PmoOutcome::Done,
-                    Err(_) => PmoOutcome::CheckoutFailed,
-                }
+    fn acquire_claim(&mut self, issue_iid: u64) -> Result<PmoClaimOutcome> {
+        match claim::acquire(
+            self.gitlab,
+            ClaimResource::Issue(issue_iid),
+            self.state.agent_id,
+            self.shutdown.as_ref(),
+        )? {
+            ClaimAcquireOutcome::Won(lease) => {
+                *self.claimed_issue = Some(lease);
+                Ok(PmoClaimOutcome::Won)
             }
-            PmoAction::ResetWorktree => pmo_done(self.git_repo.reset_hard()),
-            PmoAction::AcquireClaim { issue_iid } => match claim::acquire(
-                self.gitlab,
-                ClaimResource::Issue(*issue_iid),
-                self.state.agent_id,
-                self.shutdown.as_ref(),
-            ) {
-                Ok(ClaimAcquireOutcome::Won(lease)) => {
-                    *self.claimed_issue = Some(lease);
-                    PmoOutcome::Claim(PmoClaimOutcome::Won)
-                }
-                Ok(ClaimAcquireOutcome::Lost) => PmoOutcome::Claim(PmoClaimOutcome::Lost),
-                Ok(ClaimAcquireOutcome::Interrupted) => {
-                    PmoOutcome::Claim(PmoClaimOutcome::Interrupted)
-                }
-                Err(error) => PmoOutcome::Failed(error),
-            },
-            PmoAction::ReleaseClaim => {
-                let Some(lease) = self.claimed_issue.take() else {
-                    return PmoOutcome::Done;
-                };
-                pmo_done(lease.release(self.gitlab))
-            }
-            PmoAction::SaveClaimState { issue_iid } => {
-                self.state.save_state(*issue_iid);
-                PmoOutcome::Done
-            }
-            PmoAction::ClearClaimState => {
-                self.state.clear_state();
-                PmoOutcome::Done
-            }
-            PmoAction::PrepareIssueContext { issue, all_issues } => {
-                let issue = issue.as_issue();
-                let all_issues: Vec<Issue> = all_issues
-                    .iter()
-                    .map(PmoIssueObservation::as_issue)
-                    .collect();
-                match refresh_pmo_issue_context_file(self.state, self.gitlab, &issue, &all_issues) {
-                    Ok(path) => PmoOutcome::ContextPrepared(path),
-                    Err(error) => PmoOutcome::Failed(error),
-                }
-            }
-            PmoAction::InvokePlan {
-                issue,
-                context_path,
-            } => {
-                let issue_value = issue.as_issue();
-                let prompt = match build_split_prompt(
-                    self.state,
-                    &issue_value,
-                    context_path,
-                    issue.priority(),
-                ) {
-                    Ok(prompt) => prompt,
-                    Err(error) => return PmoOutcome::Failed(error),
-                };
-                let provider: Option<Arc<dyn CapabilityProvider>> = if self.config.ask_via_gitlab {
-                    let timeout = (self.config.ask_gitlab_timeout_secs > 0)
-                        .then(|| Duration::from_secs(self.config.ask_gitlab_timeout_secs));
-                    Some(Arc::new(GitLabIssueAskHandler::new(
-                        issue.iid,
-                        self.gitlab.clone(),
-                        Arc::clone(&self.shutdown),
-                        timeout,
-                    )))
-                } else {
-                    None
-                };
-                self.model.set_capability_provider(provider);
-                let result = self.model.complete_typed::<PmoOutput>(
-                    &prompt,
-                    &InvokeOptions {
-                        activity_label: Some(format!(
-                            "{} triaging issue #{}",
-                            self.state.agent_id, issue.iid
-                        )),
-                        ..InvokeOptions::default()
-                    },
-                );
-                self.model.set_capability_provider(None);
-                match result {
-                    Ok(completion) => PmoOutcome::Planned(completion.output),
-                    Err(error) => PmoOutcome::Failed(error),
-                }
-            }
-            PmoAction::UpdateIssueDescription { issue_iid, body } => {
-                pmo_done(self.gitlab.update_issue_description(*issue_iid, body))
-            }
-            PmoAction::AddIssueComment { issue_iid, body } => {
-                pmo_done(self.gitlab.add_issue_comment(*issue_iid, body))
-            }
-            PmoAction::AddIssueLabel { issue_iid, label } => {
-                pmo_done(self.gitlab.add_issue_label(*issue_iid, label))
-            }
-            PmoAction::RemoveIssueLabel { issue_iid, label } => {
-                pmo_done(self.gitlab.remove_issue_label(*issue_iid, label))
-            }
-            PmoAction::CloseIssue { issue_iid } => pmo_done(self.gitlab.close_issue(*issue_iid)),
-            PmoAction::SaveSplitCheckpoint(pending) => {
-                pmo_done(save_pending_split(&self.state.task_path(), pending))
-            }
-            PmoAction::DeleteSplitCheckpoint => {
-                pmo_done(delete_pending_split(&self.state.task_path()))
-            }
-            PmoAction::CreateChild { title, description } => {
-                match self.gitlab.create_issue(title, description) {
-                    Ok(iid) => PmoOutcome::IssueCreated(iid),
-                    Err(error) => PmoOutcome::Failed(error),
-                }
-            }
+            ClaimAcquireOutcome::Lost => Ok(PmoClaimOutcome::Lost),
+            ClaimAcquireOutcome::Interrupted => Ok(PmoClaimOutcome::Interrupted),
         }
+    }
+
+    fn release_claim(&mut self) -> Result<()> {
+        let Some(lease) = self.claimed_issue.take() else {
+            return Ok(());
+        };
+        lease.release(self.gitlab)
+    }
+
+    fn save_claim_state(&mut self, issue_iid: u64) {
+        self.state.save_state(issue_iid);
+    }
+
+    fn clear_claim_state(&mut self) {
+        self.state.clear_state();
+    }
+
+    fn prepare_issue_context(
+        &mut self,
+        issue: &PmoIssueObservation,
+        all_issues: &[PmoIssueObservation],
+    ) -> Result<String> {
+        let issue = issue.as_issue();
+        let all_issues: Vec<Issue> = all_issues
+            .iter()
+            .map(PmoIssueObservation::as_issue)
+            .collect();
+        refresh_pmo_issue_context_file(self.state, self.gitlab, &issue, &all_issues)
+    }
+
+    fn invoke_plan(
+        &mut self,
+        issue: &PmoIssueObservation,
+        context_path: &str,
+    ) -> Result<PmoOutput> {
+        let prompt = build_split_prompt(
+            self.state,
+            &issue.as_issue(),
+            context_path,
+            issue.priority(),
+        )?;
+        let provider: Option<Arc<dyn CapabilityProvider>> = if self.config.ask_via_gitlab {
+            let timeout = (self.config.ask_gitlab_timeout_secs > 0)
+                .then(|| Duration::from_secs(self.config.ask_gitlab_timeout_secs));
+            Some(Arc::new(GitLabIssueAskHandler::new(
+                issue.iid,
+                self.gitlab.clone(),
+                Arc::clone(&self.shutdown),
+                timeout,
+            )))
+        } else {
+            None
+        };
+        self.model.set_capability_provider(provider);
+        let result = self.model.complete_typed::<PmoOutput>(
+            &prompt,
+            &InvokeOptions {
+                activity_label: Some(format!(
+                    "{} triaging issue #{}",
+                    self.state.agent_id, issue.iid
+                )),
+                ..InvokeOptions::default()
+            },
+        );
+        self.model.set_capability_provider(None);
+        Ok(result?.output)
+    }
+
+    fn update_issue_description(&mut self, issue_iid: u64, body: &str) -> Result<()> {
+        self.gitlab.update_issue_description(issue_iid, body)
+    }
+
+    fn add_issue_comment(&mut self, issue_iid: u64, body: &str) -> Result<()> {
+        self.gitlab.add_issue_comment(issue_iid, body)
+    }
+
+    fn add_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()> {
+        self.gitlab.add_issue_label(issue_iid, label)
+    }
+
+    fn remove_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()> {
+        self.gitlab.remove_issue_label(issue_iid, label)
+    }
+
+    fn close_issue(&mut self, issue_iid: u64) -> Result<()> {
+        self.gitlab.close_issue(issue_iid)
+    }
+
+    fn save_split_checkpoint(&mut self, pending: &PendingSplit) -> Result<()> {
+        save_pending_split(&self.state.task_path(), pending)
+    }
+
+    fn delete_split_checkpoint(&mut self) -> Result<()> {
+        delete_pending_split(&self.state.task_path())
+    }
+
+    fn create_child(&mut self, title: &str, description: &str) -> Result<u64> {
+        self.gitlab.create_issue(title, description)
     }
 }
 
@@ -1738,7 +1142,6 @@ fn pmo_cycle(
     pmo_config: &PmoConfig,
 ) -> Result<()> {
     let held_issue_iid = claimed_issue.as_ref().map(|lease| lease.resource().iid());
-    let mut machine = PmoMachine::new(state.agent_id, scope_label, held_issue_iid);
     let mut port = LivePmoPort {
         state,
         git_repo,
@@ -1748,7 +1151,7 @@ fn pmo_cycle(
         shutdown: Arc::clone(&shutdown),
         config: pmo_config,
     };
-    run_pmo_cycle(&mut machine, &mut port)
+    run_pmo_cycle(state.agent_id, scope_label, held_issue_iid, &mut port)
 }
 
 const STALE_THRESHOLD_SECS: u64 = 3600; // 1 hour
@@ -2659,8 +2062,12 @@ mod tests {
         issues: Vec<PmoIssueObservation>,
         plan: PmoOutput,
         next_iid: Cell<u64>,
-        fail_required: Option<&'static str>,
-        fail_best_effort: Vec<&'static str>,
+        failures: Vec<&'static str>,
+        claim_outcomes: RefCell<VecDeque<PmoClaimOutcome>>,
+        checkout_failures: Cell<usize>,
+        new_comments: bool,
+        descriptions: Vec<(u64, String)>,
+        comments: Vec<(u64, String)>,
     }
 
     impl FakePmoPort {
@@ -2707,8 +2114,12 @@ mod tests {
                 issues: vec![Self::issue(10)],
                 plan: Self::split_plan(),
                 next_iid: Cell::new(101),
-                fail_required: None,
-                fail_best_effort: Vec::new(),
+                failures: Vec::new(),
+                claim_outcomes: RefCell::new(VecDeque::new()),
+                checkout_failures: Cell::new(0),
+                new_comments: true,
+                descriptions: Vec::new(),
+                comments: Vec::new(),
             }
         }
 
@@ -2716,70 +2127,15 @@ mod tests {
             self.trace.borrow_mut().push(event.into());
         }
 
-        fn action_name(action: &PmoAction) -> &'static str {
-            match action {
-                PmoAction::FetchRepository => "fetch",
-                PmoAction::CheckoutDefaultBranch { .. } => "checkout",
-                PmoAction::ResetWorktree => "reset",
-                PmoAction::AcquireClaim { .. } => "claim",
-                PmoAction::ReleaseClaim => "release",
-                PmoAction::SaveClaimState { .. } => "save_claim",
-                PmoAction::ClearClaimState => "clear_claim",
-                PmoAction::PrepareIssueContext { .. } => "context",
-                PmoAction::InvokePlan { .. } => "model",
-                PmoAction::UpdateIssueDescription { .. } => "description",
-                PmoAction::AddIssueComment { .. } => "comment",
-                PmoAction::AddIssueLabel { .. } => "add_label",
-                PmoAction::RemoveIssueLabel { .. } => "remove_label",
-                PmoAction::CloseIssue { .. } => "close",
-                PmoAction::SaveSplitCheckpoint(_) => "checkpoint",
-                PmoAction::DeleteSplitCheckpoint => "delete_checkpoint",
-                PmoAction::CreateChild { .. } => "create",
+        fn fail(&self, name: &'static str) -> Result<()> {
+            if self.failures.contains(&name) {
+                anyhow::bail!("injected {name} failure");
             }
+            Ok(())
         }
 
-        fn event(action: &PmoAction) -> String {
-            match action {
-                PmoAction::FetchRepository => "act:fetch".into(),
-                PmoAction::CheckoutDefaultBranch { branch } => {
-                    format!("act:checkout:{branch}")
-                }
-                PmoAction::ResetWorktree => "act:reset".into(),
-                PmoAction::AcquireClaim { issue_iid } => format!("act:claim:{issue_iid}"),
-                PmoAction::ReleaseClaim => "act:release".into(),
-                PmoAction::SaveClaimState { issue_iid } => {
-                    format!("act:save_claim:{issue_iid}")
-                }
-                PmoAction::ClearClaimState => "act:clear_claim".into(),
-                PmoAction::PrepareIssueContext { issue, .. } => {
-                    format!("act:context:{}", issue.iid)
-                }
-                PmoAction::InvokePlan { issue, .. } => format!("act:model:{}", issue.iid),
-                PmoAction::UpdateIssueDescription { issue_iid, .. } => {
-                    format!("act:description:{issue_iid}")
-                }
-                PmoAction::AddIssueComment { issue_iid, body } => {
-                    if body.starts_with("This issue has been split") {
-                        format!("act:parent_comment:{issue_iid}")
-                    } else if body.starts_with("This sub-issue depends") {
-                        format!("act:dependency_comment:{issue_iid}")
-                    } else {
-                        format!("act:comment:{issue_iid}")
-                    }
-                }
-                PmoAction::AddIssueLabel { issue_iid, label } => {
-                    format!("act:add:{issue_iid}:{label}")
-                }
-                PmoAction::RemoveIssueLabel { issue_iid, label } => {
-                    format!("act:remove:{issue_iid}:{label}")
-                }
-                PmoAction::CloseIssue { issue_iid } => format!("act:close:{issue_iid}"),
-                PmoAction::SaveSplitCheckpoint(checkpoint) => {
-                    format!("act:checkpoint:{:?}", checkpoint.created_issue_ids)
-                }
-                PmoAction::DeleteSplitCheckpoint => "act:delete_checkpoint".into(),
-                PmoAction::CreateChild { title, .. } => format!("act:create:{title}"),
-            }
+        fn child_label_failure(&self, issue_iid: u64) -> bool {
+            issue_iid != 10 && self.failures.contains(&"child_label")
         }
     }
 
@@ -2792,6 +2148,26 @@ mod tests {
         fn shutdown_requested(&self) -> bool {
             self.record("observe:shutdown");
             self.shutdown.borrow_mut().pop_front().unwrap_or(false)
+        }
+
+        fn fetch_repository(&mut self) -> Result<()> {
+            self.record("act:fetch");
+            self.fail("fetch")
+        }
+
+        fn checkout_default_branch(&mut self, branch: &str) -> Result<()> {
+            self.record(format!("act:checkout:{branch}"));
+            let remaining = self.checkout_failures.get();
+            if remaining > 0 {
+                self.checkout_failures.set(remaining - 1);
+                anyhow::bail!("injected checkout failure");
+            }
+            self.fail("checkout")
+        }
+
+        fn reset_worktree(&mut self) -> Result<()> {
+            self.record("act:reset");
+            self.fail("reset")
         }
 
         fn pending_split(&self) -> Result<Option<PendingSplit>> {
@@ -2814,7 +2190,7 @@ mod tests {
 
         fn new_human_comments(&self, issue_iid: u64) -> bool {
             self.record(format!("observe:comments:{issue_iid}"));
-            true
+            self.new_comments
         }
 
         fn current_epoch(&self) -> u64 {
@@ -2822,45 +2198,114 @@ mod tests {
             1_800_000_000
         }
 
-        fn execute(&mut self, action: &PmoAction) -> PmoOutcome {
-            self.record(Self::event(action));
-            let name = Self::action_name(action);
-            let child_label_failure = self.fail_best_effort.contains(&"child_label")
-                && matches!(
-                    action,
-                    PmoAction::AddIssueLabel { issue_iid, .. }
-                        | PmoAction::RemoveIssueLabel { issue_iid, .. }
-                        if *issue_iid != 10
-                );
-            if self.fail_required == Some(name)
-                || self.fail_best_effort.contains(&name)
-                || child_label_failure
-            {
-                return PmoOutcome::Failed(anyhow::anyhow!("injected {name} failure"));
+        fn acquire_claim(&mut self, issue_iid: u64) -> Result<PmoClaimOutcome> {
+            self.record(format!("act:claim:{issue_iid}"));
+            self.fail("claim")?;
+            Ok(self
+                .claim_outcomes
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(PmoClaimOutcome::Won))
+        }
+
+        fn release_claim(&mut self) -> Result<()> {
+            self.record("act:release");
+            self.fail("release")
+        }
+
+        fn save_claim_state(&mut self, issue_iid: u64) {
+            self.record(format!("act:save_claim:{issue_iid}"));
+        }
+
+        fn clear_claim_state(&mut self) {
+            self.record("act:clear_claim");
+        }
+
+        fn prepare_issue_context(
+            &mut self,
+            issue: &PmoIssueObservation,
+            _all_issues: &[PmoIssueObservation],
+        ) -> Result<String> {
+            self.record(format!("act:context:{}", issue.iid));
+            self.fail("context")?;
+            Ok("/sessions/pmo-issue.md".into())
+        }
+
+        fn invoke_plan(
+            &mut self,
+            issue: &PmoIssueObservation,
+            _context_path: &str,
+        ) -> Result<PmoOutput> {
+            self.record(format!("act:model:{}", issue.iid));
+            self.fail("model")?;
+            Ok(self.plan.clone())
+        }
+
+        fn update_issue_description(&mut self, issue_iid: u64, body: &str) -> Result<()> {
+            self.record(format!("act:description:{issue_iid}"));
+            self.descriptions.push((issue_iid, body.to_string()));
+            self.fail("description")
+        }
+
+        fn add_issue_comment(&mut self, issue_iid: u64, body: &str) -> Result<()> {
+            let kind = if body.starts_with("This issue has been split") {
+                "parent_comment"
+            } else if body.starts_with("This sub-issue depends") {
+                "dependency_comment"
+            } else {
+                "comment"
+            };
+            self.record(format!("act:{kind}:{issue_iid}"));
+            self.comments.push((issue_iid, body.to_string()));
+            self.fail(kind)
+        }
+
+        fn add_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()> {
+            self.record(format!("act:add:{issue_iid}:{label}"));
+            if self.child_label_failure(issue_iid) {
+                anyhow::bail!("injected child label failure");
             }
-            match action {
-                PmoAction::AcquireClaim { .. } => PmoOutcome::Claim(PmoClaimOutcome::Won),
-                PmoAction::PrepareIssueContext { .. } => {
-                    PmoOutcome::ContextPrepared("/sessions/pmo-issue.md".into())
-                }
-                PmoAction::InvokePlan { .. } => PmoOutcome::Planned(self.plan.clone()),
-                PmoAction::CreateChild { .. } => {
-                    let iid = self.next_iid.get();
-                    self.next_iid.set(iid + 1);
-                    PmoOutcome::IssueCreated(iid)
-                }
-                _ => PmoOutcome::Done,
+            self.fail("add_label")
+        }
+
+        fn remove_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()> {
+            self.record(format!("act:remove:{issue_iid}:{label}"));
+            if self.child_label_failure(issue_iid) {
+                anyhow::bail!("injected child label failure");
             }
+            self.fail("remove_label")
+        }
+
+        fn close_issue(&mut self, issue_iid: u64) -> Result<()> {
+            self.record(format!("act:close:{issue_iid}"));
+            self.fail("close")
+        }
+
+        fn save_split_checkpoint(&mut self, pending: &PendingSplit) -> Result<()> {
+            self.record(format!("act:checkpoint:{:?}", pending.created_issue_ids));
+            self.fail("checkpoint")
+        }
+
+        fn delete_split_checkpoint(&mut self) -> Result<()> {
+            self.record("act:delete_checkpoint");
+            self.fail("delete_checkpoint")
+        }
+
+        fn create_child(&mut self, title: &str, _description: &str) -> Result<u64> {
+            self.record(format!("act:create:{title}"));
+            self.fail("create")?;
+            let iid = self.next_iid.get();
+            self.next_iid.set(iid + 1);
+            Ok(iid)
         }
     }
 
     fn run_fake(port: &mut FakePmoPort, held_issue_iid: Option<u64>) -> Result<()> {
-        let mut machine = PmoMachine::new("pmo-0", Some("scope::test"), held_issue_iid);
-        run_pmo_cycle(&mut machine, port)
+        run_pmo_cycle("pmo-0", Some("scope::test"), held_issue_iid, port)
     }
 
     #[test]
-    fn pmo_machine_records_full_split_order_and_generated_iids() {
+    fn pmo_cycle_records_full_split_order_and_generated_iids() {
         let mut port = FakePmoPort::successful();
         run_fake(&mut port, None).unwrap();
         assert_eq!(
@@ -2906,7 +2351,7 @@ mod tests {
     }
 
     #[test]
-    fn pmo_machine_resumes_from_generated_iid_checkpoint_without_recreating_prefix() {
+    fn pmo_cycle_resumes_from_generated_iid_checkpoint_without_recreating_prefix() {
         let mut port = FakePmoPort::successful();
         let mut pending = match FakePmoPort::split_plan() {
             PmoOutput::Split { sub_issues } => PendingSplit {
@@ -2935,13 +2380,13 @@ mod tests {
     }
 
     #[test]
-    fn pmo_machine_aborts_required_split_failures_but_continues_best_effort_labels() {
+    fn pmo_cycle_aborts_required_split_failures_but_continues_best_effort_labels() {
         let mut required = FakePmoPort::successful();
-        required.fail_required = Some("checkpoint");
+        required.failures = vec!["checkpoint"];
         assert!(run_fake(&mut required, None).is_err());
 
         let mut best_effort = FakePmoPort::successful();
-        best_effort.fail_best_effort = vec!["child_label"];
+        best_effort.failures = vec!["child_label"];
         run_fake(&mut best_effort, None).unwrap();
         assert!(
             best_effort
@@ -2952,7 +2397,7 @@ mod tests {
     }
 
     #[test]
-    fn pmo_machine_honors_shutdown_before_claim_and_after_claim() {
+    fn pmo_cycle_honors_shutdown_before_claim_and_after_claim() {
         let mut before = FakePmoPort::successful();
         before.shutdown.borrow_mut().push_back(true);
         run_fake(&mut before, None).unwrap();
@@ -2969,6 +2414,225 @@ mod tests {
         run_fake(&mut after, None).unwrap();
         assert!(after.trace.borrow().contains(&"act:release".to_string()));
         assert!(!after.trace.borrow().contains(&"act:model:10".to_string()));
+    }
+
+    #[test]
+    fn pmo_decision_branches_preserve_order_policy_and_payloads() {
+        let issue = FakePmoPort::issue(10);
+
+        let mut clarification = FakePmoPort::successful();
+        let disposition = apply_pmo_decision(
+            &issue,
+            PmoOutput::NeedsClarification {
+                question: "Which API?".into(),
+                plan_text: Some("Proposed plan".into()),
+            },
+            Some("scope::test"),
+            &mut clarification,
+        )
+        .unwrap();
+        assert_eq!(disposition, DecisionDisposition::KeepClaim);
+        assert_eq!(
+            *clarification.trace.borrow(),
+            vec![
+                "act:description:10",
+                "act:comment:10",
+                "act:add:10:pmo-pending",
+                "act:save_claim:10",
+            ]
+        );
+        assert_eq!(
+            clarification.descriptions,
+            vec![(10, "Proposed plan".into())]
+        );
+        assert!(clarification.comments[0].1.contains("Which API?"));
+
+        let mut done = FakePmoPort::successful();
+        apply_pmo_decision(
+            &issue,
+            PmoOutput::AlreadyDone {
+                reason: "Already shipped".into(),
+            },
+            Some("scope::test"),
+            &mut done,
+        )
+        .unwrap();
+        assert_eq!(
+            *done.trace.borrow(),
+            vec![
+                "act:comment:10",
+                "act:remove:10:action-required",
+                "act:remove:10:pmo-processed",
+                "act:close:10",
+            ]
+        );
+        assert!(done.comments[0].1.contains("Already shipped"));
+
+        let mut waiting = FakePmoPort::successful();
+        apply_pmo_decision(
+            &issue,
+            PmoOutput::WaitForDependency {
+                dependency_issue_iid: 77,
+            },
+            Some("scope::test"),
+            &mut waiting,
+        )
+        .unwrap();
+        assert_eq!(
+            *waiting.trace.borrow(),
+            vec![
+                "act:add:10:waiting-on-issue:#77",
+                "act:remove:10:action-required",
+                "act:remove:10:pmo-processed",
+                "act:comment:10",
+            ]
+        );
+        assert!(waiting.comments[0].1.contains("#77"));
+
+        let mut guidance = FakePmoPort::successful();
+        apply_pmo_decision(
+            &issue,
+            PmoOutput::GuideWorker {
+                instructions: "Implement the parser first.".into(),
+            },
+            Some("scope::test"),
+            &mut guidance,
+        )
+        .unwrap();
+        assert_eq!(
+            *guidance.trace.borrow(),
+            vec![
+                "act:comment:10",
+                "act:remove:10:action-required",
+                "act:remove:10:pmo-processed",
+            ]
+        );
+        assert!(
+            guidance.comments[0]
+                .1
+                .contains("Implement the parser first.")
+        );
+    }
+
+    #[test]
+    fn pmo_cycle_retries_checkout_and_stops_after_first_won_claim() {
+        let mut port = FakePmoPort::successful();
+        port.checkout_failures.set(1);
+        port.issues.push(FakePmoPort::issue(11));
+        port.claim_outcomes
+            .borrow_mut()
+            .extend([PmoClaimOutcome::Lost, PmoClaimOutcome::Won]);
+        port.plan = PmoOutput::GuideWorker {
+            instructions: "Proceed carefully.".into(),
+        };
+
+        run_fake(&mut port, None).unwrap();
+        let trace = port.trace.borrow();
+        assert_eq!(
+            &trace[..5],
+            [
+                "observe:default_branch",
+                "act:fetch",
+                "act:checkout:main",
+                "act:reset",
+                "act:checkout:main",
+            ]
+        );
+        assert!(
+            trace
+                .windows(2)
+                .any(|events| events == ["act:claim:10", "observe:shutdown"])
+        );
+        assert!(trace.contains(&"act:claim:11".to_string()));
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| event.as_str() == "act:model:11")
+                .count(),
+            1
+        );
+        assert!(!trace.iter().any(|event| event == "act:model:10"));
+    }
+
+    #[test]
+    fn pmo_cycle_preserves_claim_on_shutdown_failure_and_tolerates_recovery_release_failure() {
+        let mut shutdown_failure = FakePmoPort::successful();
+        shutdown_failure.failures = vec!["model"];
+        shutdown_failure
+            .shutdown
+            .borrow_mut()
+            .extend([false, false, false, true]);
+        run_fake(&mut shutdown_failure, None).unwrap();
+        assert!(
+            !shutdown_failure
+                .trace
+                .borrow()
+                .contains(&"act:release".to_string())
+        );
+        assert!(
+            !shutdown_failure
+                .trace
+                .borrow()
+                .contains(&"act:clear_claim".to_string())
+        );
+
+        let mut recovered = FakePmoPort::successful();
+        recovered.pending = Some(match FakePmoPort::split_plan() {
+            PmoOutput::Split { sub_issues } => PendingSplit {
+                parent_issue_iid: 10,
+                parent_issue_title: "Broad parent".into(),
+                parent_priority: 2,
+                sub_issues: normalize_sub_issues(sub_issues),
+                created_issue_ids: vec![101, 102],
+            },
+            _ => unreachable!(),
+        });
+        recovered.failures = vec!["release"];
+        run_fake(&mut recovered, None).unwrap();
+        assert_eq!(
+            recovered.trace.borrow().last().map(String::as_str),
+            Some("act:clear_claim")
+        );
+    }
+
+    #[test]
+    fn pmo_cycle_preserves_irregular_release_failure_policies_and_interruption() {
+        let mut interrupted = FakePmoPort::successful();
+        interrupted
+            .claim_outcomes
+            .borrow_mut()
+            .push_back(PmoClaimOutcome::Interrupted);
+        run_fake(&mut interrupted, None).unwrap();
+        let trace = interrupted.trace.borrow();
+        assert!(trace.contains(&"act:claim:10".to_string()));
+        assert!(!trace.contains(&"act:model:10".to_string()));
+        assert!(!trace.contains(&"act:release".to_string()));
+        drop(trace);
+
+        let mut invalid_held = FakePmoPort::successful();
+        invalid_held.failures = vec!["release"];
+        invalid_held.shutdown.borrow_mut().push_back(true);
+        run_fake(&mut invalid_held, Some(10)).unwrap();
+        assert!(
+            invalid_held
+                .trace
+                .borrow()
+                .windows(2)
+                .any(|events| events == ["act:release", "act:clear_claim"])
+        );
+
+        let mut fresh_completion = FakePmoPort::successful();
+        fresh_completion.plan = PmoOutput::GuideWorker {
+            instructions: "Continue with the focused implementation.".into(),
+        };
+        fresh_completion.failures = vec!["release"];
+        assert!(run_fake(&mut fresh_completion, None).is_err());
+        assert!(
+            !fresh_completion
+                .trace
+                .borrow()
+                .contains(&"act:clear_claim".to_string())
+        );
     }
 
     // -----------------------------------------------------------------
