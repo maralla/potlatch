@@ -100,28 +100,24 @@ fn normalize_sub_issues(raw: Vec<RawSubIssue>) -> Vec<PmoSubIssue> {
 /// [`AgentModel::complete_typed`]).
 #[derive(Debug, Clone, PartialEq)]
 enum PmoOutput {
-    GuideWorker {
-        instructions: String,
-    },
-    Split {
-        sub_issues: Vec<RawSubIssue>,
-    },
-    AlreadyDone {
-        reason: String,
-    },
-    NeedsClarification {
-        question: String,
-        plan_text: Option<String>,
-    },
-    WaitForDependency {
-        dependency_issue_iid: u64,
-    },
+    GuideWorker { instructions: String },
+    ProposePlan { plan_text: String },
+    Split { sub_issues: Vec<RawSubIssue> },
+    AlreadyDone { reason: String },
+    NeedsClarification { question: String },
+    WaitForDependency { dependency_issue_iid: u64 },
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GuideWorkerWire {
     instructions: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposePlanWire {
+    plan_text: String,
 }
 
 #[derive(Deserialize)]
@@ -140,8 +136,6 @@ struct AlreadyDoneWire {
 #[serde(deny_unknown_fields)]
 struct NeedsClarificationWire {
     question: String,
-    #[serde(default)]
-    plan_text: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +154,7 @@ const DEPENDENCY_IID_ALIASES: &[&str] = &[
 
 const PMO_DECISIONS: &[&str] = &[
     "guide_worker",
+    "propose_plan",
     "split",
     "already_done",
     "needs_clarification",
@@ -178,6 +173,11 @@ impl<'de> Deserialize<'de> for PmoOutput {
                     instructions: wire.instructions,
                 })
             }
+            "propose_plan" => {
+                tagged::branch(fields).map(|wire: ProposePlanWire| Self::ProposePlan {
+                    plan_text: wire.plan_text,
+                })
+            }
             "split" => tagged::branch(fields).map(|wire: SplitWire| Self::Split {
                 sub_issues: wire.sub_issues,
             }),
@@ -189,7 +189,6 @@ impl<'de> Deserialize<'de> for PmoOutput {
             "needs_clarification" => tagged::branch(fields).map(|wire: NeedsClarificationWire| {
                 Self::NeedsClarification {
                     question: wire.question,
-                    plan_text: wire.plan_text,
                 }
             }),
             "wait_for_dependency" => {
@@ -215,6 +214,14 @@ structured_output! {
                     object({
                         required instructions: string(
                             "3-5 sentences, one clear action for the worker. Posted to GitLab as a plain issue comment that the worker reads from the comment stream. Keep it worker-facing and actionable."
+                        ),
+                    })
+                ),
+                "propose_plan" => (
+                    "The issue needs a detailed implementation plan in its description before work proceeds or while an existing PMO plan is being refined.",
+                    object({
+                        required plan_text: string(
+                            "A repository-informed implementation plan. For an issue without a bound merge request, provide the complete rewritten issue description. For an issue already bound to an MR, provide only the proposed changes and refinements relative to the existing issue description and prior comments; the system posts them as a new comment without replacing the description."
                         ),
                     })
                 ),
@@ -252,9 +259,6 @@ structured_output! {
                     object({
                         required question: string(
                             "Specific questions for a human. Posted as a GitLab comment."
-                        ),
-                        optional plan_text: string(
-                            "Your current best plan for this issue. The system will update the issue description with this text so humans can see and refine your proposed approach. Write a structured plan including scope, proposed approach, and any open questions. Each refinement cycle overwrites the description with an improved version."
                         ),
                     })
                 ),
@@ -572,8 +576,13 @@ trait PmoPort {
         issue: &PmoIssueObservation,
         all_issues: &[PmoIssueObservation],
     ) -> Result<String>;
-    fn invoke_plan(&mut self, issue: &PmoIssueObservation, context_path: &str)
-    -> Result<PmoOutput>;
+    fn bound_merge_request(&self, issue_iid: u64) -> Result<Option<u64>>;
+    fn invoke_plan(
+        &mut self,
+        issue: &PmoIssueObservation,
+        context_path: &str,
+        bound_mr_iid: Option<u64>,
+    ) -> Result<PmoOutput>;
     fn update_issue_description(&mut self, issue_iid: u64, body: &str) -> Result<()>;
     fn add_issue_comment(&mut self, issue_iid: u64, body: &str) -> Result<()>;
     fn add_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()>;
@@ -593,6 +602,7 @@ enum DecisionDisposition {
 #[derive(Debug)]
 enum PmoDecisionError {
     Recoverable(anyhow::Error),
+    KeepPending(anyhow::Error),
     Immediate(anyhow::Error),
 }
 
@@ -603,21 +613,13 @@ fn issue_in_pmo_scope(issue: &PmoIssueObservation, scope_label: Option<&str>) ->
 fn apply_pmo_decision(
     issue: &PmoIssueObservation,
     decision: PmoOutput,
+    bound_mr_iid: Option<u64>,
     scope_label: Option<&str>,
     port: &mut dyn PmoPort,
 ) -> std::result::Result<DecisionDisposition, PmoDecisionError> {
     let iid = issue.iid;
     match decision {
-        PmoOutput::NeedsClarification {
-            question,
-            plan_text,
-        } => {
-            if let Some(plan) = plan_text.filter(|text| !text.trim().is_empty()) {
-                let body = strip_internal_markers(plan.trim());
-                if !body.is_empty() {
-                    let _ = port.update_issue_description(iid, &body);
-                }
-            }
+        PmoOutput::NeedsClarification { question } => {
             let question = strip_internal_markers(&clarification_question_or_default(&question));
             port.add_issue_comment(
                 iid,
@@ -629,6 +631,30 @@ fn apply_pmo_decision(
             port.add_issue_label(iid, labels::PMO_PENDING)
                 .map_err(PmoDecisionError::Recoverable)?;
             port.save_claim_state(iid);
+            Ok(DecisionDisposition::KeepClaim)
+        }
+        PmoOutput::ProposePlan { plan_text } => {
+            let plan = strip_internal_markers(plan_text.trim());
+            if plan.trim().is_empty() {
+                return Err(PmoDecisionError::Recoverable(anyhow::anyhow!(
+                    "PMO PROPOSE_PLAN output for issue #{iid} had no usable implementation plan; retrying later"
+                )));
+            }
+            port.add_issue_label(iid, labels::PMO_PENDING)
+                .map_err(PmoDecisionError::Recoverable)?;
+            port.save_claim_state(iid);
+            if let Some(mr_iid) = bound_mr_iid {
+                port.add_issue_comment(
+                    iid,
+                    &format!(
+                        "**PMO plan refinement for merge request !{mr_iid}:**\n\n{plan}\n\n_The existing issue description was preserved because this issue is already associated with an MR._"
+                    ),
+                )
+                .map_err(PmoDecisionError::KeepPending)?;
+            } else {
+                port.update_issue_description(iid, &plan)
+                    .map_err(PmoDecisionError::KeepPending)?;
+            }
             Ok(DecisionDisposition::KeepClaim)
         }
         PmoOutput::AlreadyDone { reason } => {
@@ -704,10 +730,21 @@ fn process_pmo_issue(
     let path = port
         .prepare_issue_context(issue, issues)
         .map_err(PmoDecisionError::Recoverable)?;
+    let bound_mr_iid = port.bound_merge_request(issue.iid).map_err(|error| {
+        if issue
+            .labels
+            .iter()
+            .any(|label| label == labels::PMO_PENDING)
+        {
+            PmoDecisionError::KeepPending(error)
+        } else {
+            PmoDecisionError::Recoverable(error)
+        }
+    })?;
     let decision = port
-        .invoke_plan(issue, &path)
+        .invoke_plan(issue, &path, bound_mr_iid)
         .map_err(PmoDecisionError::Recoverable)?;
-    apply_pmo_decision(issue, decision, scope_label, port)
+    apply_pmo_decision(issue, decision, bound_mr_iid, scope_label, port)
 }
 
 fn resume_split(
@@ -889,6 +926,12 @@ fn run_pmo_cycle(
                         warn!("{agent_id}: PMO refinement failed for issue #{iid}: {error}");
                         return handle_processing_failure(port, &issues, scope_label);
                     }
+                    Err(PmoDecisionError::KeepPending(error)) => {
+                        warn!(
+                            "{agent_id}: PMO could not rewrite the plan for issue #{iid}; keeping it pmo-pending: {error}"
+                        );
+                        return Ok(());
+                    }
                     Err(PmoDecisionError::Immediate(error)) => return Err(error),
                 }
             }
@@ -941,6 +984,13 @@ fn run_pmo_cycle(
                     issue.iid
                 );
                 return handle_processing_failure(port, &issues, scope_label);
+            }
+            Err(PmoDecisionError::KeepPending(error)) => {
+                warn!(
+                    "{agent_id}: PMO could not rewrite the plan for issue #{}; keeping it pmo-pending: {error}",
+                    issue.iid
+                );
+                return Ok(());
             }
             Err(PmoDecisionError::Immediate(error)) => return Err(error),
         }
@@ -1059,16 +1109,27 @@ impl PmoPort for LivePmoPort<'_> {
         refresh_pmo_issue_context_file(self.state, self.gitlab, &issue, &all_issues)
     }
 
+    fn bound_merge_request(&self, issue_iid: u64) -> Result<Option<u64>> {
+        let branch_name = format!("issue-{issue_iid}");
+        Ok(self
+            .gitlab
+            .find_mrs_by_source_branch(&branch_name)?
+            .into_iter()
+            .next())
+    }
+
     fn invoke_plan(
         &mut self,
         issue: &PmoIssueObservation,
         context_path: &str,
+        bound_mr_iid: Option<u64>,
     ) -> Result<PmoOutput> {
         let prompt = build_split_prompt(
             self.state,
             &issue.as_issue(),
             context_path,
             issue.priority(),
+            bound_mr_iid,
         )?;
         let provider: Option<Arc<dyn CapabilityProvider>> = if self.config.ask_via_gitlab {
             let timeout = (self.config.ask_gitlab_timeout_secs > 0)
@@ -1470,13 +1531,33 @@ fn build_split_prompt(
     issue: &Issue,
     context_path: &str,
     parent_priority: u8,
+    bound_mr_iid: Option<u64>,
 ) -> Result<String> {
+    let planning_state = if issue
+        .labels
+        .iter()
+        .any(|label| label == labels::PMO_PENDING)
+    {
+        "This issue is already pmo-pending. Human comments are refinement feedback: produce the requested plan update rather than only worker guidance or an unrelated clarification question."
+    } else {
+        "This issue is not currently in PMO plan refinement."
+    };
+    let plan_destination = match bound_mr_iid {
+        Some(mr_iid) => format!(
+            "This issue is already bound to merge request !{mr_iid}. Do not rewrite or restate the full issue description. Provide only the plan changes and refinements relative to the existing description and previous comments; they will be posted as a new issue comment."
+        ),
+        None => "This issue is not bound to a merge request. A proposed plan must be the complete rewritten issue description.".to_string(),
+    };
     let prompt = format!(
         r#"You are a Project Management Office (PMO) agent responsible for triaging issues that an automated worker agent could not implement.
 
 PROJECT: {project}
 
 ISSUE #{iid}: {title}  _(summary only — not sufficient by itself)_
+
+PMO PLANNING STATE:
+{planning_state}
+{plan_destination}
 
 TASK CONTEXT FILE (you MUST open and read this path on disk — it has the full picture):
 {context_path}
@@ -1504,6 +1585,13 @@ TRIAGE POLICY:
 - Park work behind an existing open issue only when that issue is a real build-order prerequisite. Merely related or parallel work is not a dependency.
 - Produce one triage result; do not combine alternatives.
 
+PLAN PROPOSAL POLICY:
+- Propose a plan when the issue is a coherent task and the repository provides enough information to write an implementation-ready plan, but the current issue description lacks the concrete scope and steps needed for reliable execution.
+- When no MR is bound, a proposed plan is the complete rewritten issue description. Preserve the original requirements and add repository-informed code areas, ordered implementation steps, acceptance criteria, tests, assumptions, and open questions.
+- When an MR is already bound, preserve the issue description and propose only changes relative to the existing description and previous comments. The changes are posted in a new comment; do not produce a full rewritten description.
+- Proposing or refining a plan keeps the issue pmo-pending so human comments can trigger another refinement cycle.
+- Do not use worker guidance as a substitute for a missing plan. Use clarification only when missing human information prevents you from writing a useful plan.
+
 DECOMPOSITION POLICY:
 - The parent is a task container and will be closed after its sub-issues are created.
 - Keep each sub-issue focused around the same approximate size limits as above.
@@ -1528,6 +1616,8 @@ Proceed with analyzing the issue autonomously.
         project = &state.project_name,
         iid = issue.iid,
         title = issue.title,
+        planning_state = planning_state,
+        plan_destination = plan_destination,
         context_path = context_path,
         parent_priority = parent_priority,
     );
@@ -2066,6 +2156,7 @@ mod tests {
         claim_outcomes: RefCell<VecDeque<PmoClaimOutcome>>,
         checkout_failures: Cell<usize>,
         new_comments: bool,
+        bound_mr_iid: Option<u64>,
         descriptions: Vec<(u64, String)>,
         comments: Vec<(u64, String)>,
     }
@@ -2118,6 +2209,7 @@ mod tests {
                 claim_outcomes: RefCell::new(VecDeque::new()),
                 checkout_failures: Cell::new(0),
                 new_comments: true,
+                bound_mr_iid: None,
                 descriptions: Vec::new(),
                 comments: Vec::new(),
             }
@@ -2231,10 +2323,17 @@ mod tests {
             Ok("/sessions/pmo-issue.md".into())
         }
 
+        fn bound_merge_request(&self, issue_iid: u64) -> Result<Option<u64>> {
+            self.record(format!("observe:bound_mr:{issue_iid}"));
+            self.fail("bound_mr")?;
+            Ok(self.bound_mr_iid)
+        }
+
         fn invoke_plan(
             &mut self,
             issue: &PmoIssueObservation,
             _context_path: &str,
+            _bound_mr_iid: Option<u64>,
         ) -> Result<PmoOutput> {
             self.record(format!("act:model:{}", issue.iid));
             self.fail("model")?;
@@ -2322,6 +2421,7 @@ mod tests {
                 "observe:shutdown",
                 "act:save_claim:10",
                 "act:context:10",
+                "observe:bound_mr:10",
                 "act:model:10",
                 "act:checkpoint:[]",
                 "act:create:Foundation",
@@ -2425,8 +2525,8 @@ mod tests {
             &issue,
             PmoOutput::NeedsClarification {
                 question: "Which API?".into(),
-                plan_text: Some("Proposed plan".into()),
             },
+            None,
             Some("scope::test"),
             &mut clarification,
         )
@@ -2435,17 +2535,42 @@ mod tests {
         assert_eq!(
             *clarification.trace.borrow(),
             vec![
-                "act:description:10",
                 "act:comment:10",
                 "act:add:10:pmo-pending",
                 "act:save_claim:10",
             ]
         );
-        assert_eq!(
-            clarification.descriptions,
-            vec![(10, "Proposed plan".into())]
-        );
+        assert!(clarification.descriptions.is_empty());
         assert!(clarification.comments[0].1.contains("Which API?"));
+
+        let mut planning = FakePmoPort::successful();
+        let disposition = apply_pmo_decision(
+            &issue,
+            PmoOutput::ProposePlan {
+                plan_text: "## Implementation plan\n\nUpdate the parser and its tests.".into(),
+            },
+            None,
+            Some("scope::test"),
+            &mut planning,
+        )
+        .unwrap();
+        assert_eq!(disposition, DecisionDisposition::KeepClaim);
+        assert_eq!(
+            *planning.trace.borrow(),
+            vec![
+                "act:add:10:pmo-pending",
+                "act:save_claim:10",
+                "act:description:10",
+            ]
+        );
+        assert_eq!(
+            planning.descriptions,
+            vec![(
+                10,
+                "## Implementation plan\n\nUpdate the parser and its tests.".into()
+            )]
+        );
+        assert!(planning.comments.is_empty());
 
         let mut done = FakePmoPort::successful();
         apply_pmo_decision(
@@ -2453,6 +2578,7 @@ mod tests {
             PmoOutput::AlreadyDone {
                 reason: "Already shipped".into(),
             },
+            None,
             Some("scope::test"),
             &mut done,
         )
@@ -2474,6 +2600,7 @@ mod tests {
             PmoOutput::WaitForDependency {
                 dependency_issue_iid: 77,
             },
+            None,
             Some("scope::test"),
             &mut waiting,
         )
@@ -2495,6 +2622,7 @@ mod tests {
             PmoOutput::GuideWorker {
                 instructions: "Implement the parser first.".into(),
             },
+            None,
             Some("scope::test"),
             &mut guidance,
         )
@@ -2512,6 +2640,97 @@ mod tests {
                 .1
                 .contains("Implement the parser first.")
         );
+    }
+
+    #[test]
+    fn propose_plan_rejects_empty_content_before_mutating_the_issue() {
+        let issue = FakePmoPort::issue(10);
+        let mut port = FakePmoPort::successful();
+
+        let result = apply_pmo_decision(
+            &issue,
+            PmoOutput::ProposePlan {
+                plan_text: " \n\t ".into(),
+            },
+            None,
+            Some("scope::test"),
+            &mut port,
+        );
+
+        assert!(matches!(result, Err(PmoDecisionError::Recoverable(_))));
+        assert!(port.trace.borrow().is_empty());
+        assert!(port.descriptions.is_empty());
+    }
+
+    #[test]
+    fn propose_plan_keeps_fresh_and_refined_issues_claimed_and_pending() {
+        let plan = "## Plan\n\n1. Update `src/parser.rs`.\n2. Add parser tests.";
+
+        let mut fresh = FakePmoPort::successful();
+        fresh.plan = PmoOutput::ProposePlan {
+            plan_text: plan.into(),
+        };
+        run_fake(&mut fresh, None).unwrap();
+        let trace = fresh.trace.borrow();
+        assert!(trace.contains(&"act:add:10:pmo-pending".to_string()));
+        assert!(trace.contains(&"act:description:10".to_string()));
+        assert!(!trace.contains(&"act:release".to_string()));
+        assert!(!trace.contains(&"act:clear_claim".to_string()));
+        drop(trace);
+        assert_eq!(fresh.descriptions, vec![(10, plan.into())]);
+        assert!(fresh.comments.is_empty());
+
+        let mut refinement = FakePmoPort::successful();
+        refinement.issues[0].labels.push(labels::PMO_PENDING.into());
+        refinement.bound_mr_iid = Some(88);
+        refinement.plan = PmoOutput::ProposePlan {
+            plan_text: "Change the parser validation step to cover empty arrays.".into(),
+        };
+        run_fake(&mut refinement, Some(10)).unwrap();
+        let trace = refinement.trace.borrow();
+        assert!(trace.contains(&"observe:comments:10".to_string()));
+        assert!(trace.contains(&"observe:bound_mr:10".to_string()));
+        assert!(trace.contains(&"act:add:10:pmo-pending".to_string()));
+        assert!(trace.contains(&"act:comment:10".to_string()));
+        assert!(!trace.contains(&"act:description:10".to_string()));
+        assert!(!trace.contains(&"act:release".to_string()));
+        assert!(!trace.contains(&"act:clear_claim".to_string()));
+        drop(trace);
+        assert!(refinement.descriptions.is_empty());
+        assert!(refinement.comments[0].1.contains("merge request !88"));
+        assert!(
+            refinement.comments[0]
+                .1
+                .contains("Change the parser validation step")
+        );
+    }
+
+    #[test]
+    fn propose_plan_description_failure_preserves_pending_claim_state() {
+        let mut port = FakePmoPort::successful();
+        port.plan = PmoOutput::ProposePlan {
+            plan_text: "## Plan\n\nImplement and test the change.".into(),
+        };
+        port.failures = vec!["description"];
+
+        run_fake(&mut port, None).unwrap();
+
+        let trace = port.trace.borrow();
+        let pending = trace
+            .iter()
+            .position(|event| event == "act:add:10:pmo-pending")
+            .unwrap();
+        let save = trace
+            .iter()
+            .rposition(|event| event == "act:save_claim:10")
+            .unwrap();
+        let description = trace
+            .iter()
+            .position(|event| event == "act:description:10")
+            .unwrap();
+        assert!(pending < save && save < description);
+        assert!(!trace.contains(&"act:release".to_string()));
+        assert!(!trace.contains(&"act:clear_claim".to_string()));
     }
 
     #[test]
@@ -3026,7 +3245,7 @@ mod tests {
             created_at: None,
             updated_at: None,
         };
-        let prompt = build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2).unwrap();
+        let prompt = build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2, None).unwrap();
         // Structured-output presentation belongs to the backend vendor, not
         // the role prompt.
         assert!(!prompt.contains("`plan` tool"));
@@ -3035,6 +3254,7 @@ mod tests {
         assert!(!prompt.contains("JSON shape above"));
         for marker in [
             "guide_worker",
+            "propose_plan",
             "already_done",
             "needs_clarification",
             "wait_for_dependency",
@@ -3057,6 +3277,35 @@ mod tests {
         assert!(prompt.contains("broad task containers"));
         assert!(prompt.contains("Never duplicate or substantially overlap existing work"));
         assert!(prompt.contains("repository already fully implements"));
+        assert!(prompt.contains("complete rewritten issue description"));
+        assert!(prompt.contains("keeps the issue pmo-pending"));
+    }
+
+    #[test]
+    fn build_split_prompt_treats_human_comments_as_plan_refinement_while_pending() {
+        let state = AgentState {
+            sessions_dir: "/tmp",
+            agent_id: "pmo-test",
+            project_name: "test-proj",
+        };
+        let issue = Issue {
+            iid: 42,
+            title: "Refine parser design".into(),
+            description: "## Existing plan".into(),
+            labels: vec![labels::PMO_PENDING.into()],
+            state: "opened".into(),
+            created_at: None,
+            updated_at: None,
+        };
+
+        let prompt =
+            build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2, Some(77)).unwrap();
+
+        assert!(prompt.contains("Human comments are refinement feedback"));
+        assert!(prompt.contains("already bound to merge request !77"));
+        assert!(prompt.contains("only the plan changes and refinements"));
+        assert!(prompt.contains("posted as a new issue comment"));
+        assert!(prompt.contains("do not produce a full rewritten description"));
     }
 
     #[test]
@@ -3154,8 +3403,7 @@ mod tests {
                 "question": "Which modules should be covered?"
             })),
             PmoOutput::NeedsClarification {
-                question: "Which modules should be covered?".into(),
-                plan_text: None
+                question: "Which modules should be covered?".into()
             }
         );
     }
@@ -3432,34 +3680,30 @@ mod tests {
     }
 
     #[test]
-    fn pmo_output_deserializes_needs_clarification_plan_text() {
+    fn pmo_output_deserializes_propose_plan() {
         let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
-            "decision": "needs_clarification",
-            "question": "Which config?",
+            "decision": "propose_plan",
             "plan_text": "## Plan Draft\n\n1. Implement X\n2. Test X\n\nOpen question: which config?"
         }));
         match output {
-            PmoOutput::NeedsClarification { plan_text, .. } => {
-                let plan = plan_text.unwrap();
-                assert!(plan.contains("## Plan Draft"));
-                assert!(plan.contains("Implement X"));
+            PmoOutput::ProposePlan { plan_text } => {
+                assert!(plan_text.contains("## Plan Draft"));
+                assert!(plan_text.contains("Implement X"));
             }
-            other => panic!("expected NeedsClarification, got {other:?}"),
+            other => panic!("expected ProposePlan, got {other:?}"),
         }
     }
 
     #[test]
-    fn pmo_output_needs_clarification_plan_text_absent_when_not_provided() {
-        let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
-            "decision": "needs_clarification",
-            "question": "Which config?"
+    fn pmo_output_requires_plan_text_for_propose_plan() {
+        conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+            "decision": "propose_plan"
         }));
-        match output {
-            PmoOutput::NeedsClarification { plan_text, .. } => {
-                assert!(plan_text.is_none());
-            }
-            other => panic!("expected NeedsClarification, got {other:?}"),
-        }
+        conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+            "decision": "needs_clarification",
+            "question": "Which config?",
+            "plan_text": "This belongs only to propose_plan."
+        }));
     }
 
     #[test]
