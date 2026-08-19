@@ -863,6 +863,7 @@ enum IssueHold {
 enum ClearReason {
     OutOfScope,
     Pending,
+    DoNotImplement,
 }
 
 fn decide_issue_hold(issue: &IssueObservation, scope_label: Option<&str>) -> IssueHold {
@@ -871,6 +872,9 @@ fn decide_issue_hold(issue: &IssueObservation, scope_label: Option<&str>) -> Iss
     }
     if !issue.in_scope(scope_label) {
         return IssueHold::ClearState(ClearReason::OutOfScope);
+    }
+    if issue_has_do_not_implement_label(&issue.labels) {
+        return IssueHold::ClearState(ClearReason::DoNotImplement);
     }
     if issue_has_worker_pending_label(&issue.labels) {
         return IssueHold::ClearState(ClearReason::Pending);
@@ -903,6 +907,10 @@ fn screen_issue_candidate(
         return CandidateScreening::AlreadyClaimed;
     }
     CandidateScreening::Claimable
+}
+
+fn claimed_issue_is_still_eligible(issue: &IssueObservation, scope_label: Option<&str>) -> bool {
+    issue.state == "opened" && issue.in_scope(scope_label) && !should_skip_issue(issue)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,6 +986,12 @@ fn apply_active_issue_hold(
                 ClearReason::Pending => info!(
                     "{}: Active issue #{} has `{}` — yielding (issue stays open)",
                     agent_id, tracked.issue_iid, WORKER_PENDING_LABEL
+                ),
+                ClearReason::DoNotImplement => info!(
+                    "{}: Active issue #{} has `{}` — releasing without implementation",
+                    agent_id,
+                    tracked.issue_iid,
+                    super::labels::DO_NOT_IMPLEMENT
                 ),
             }
             if port.clear_issue_state(tracked.issue_iid) {
@@ -1294,13 +1308,34 @@ fn poll_for_work(
             port.release_acquired_claim(issue.iid);
             return Ok(());
         }
+        let claimed_issue = match port.issue(issue.iid) {
+            Ok(claimed_issue) if claimed_issue_is_still_eligible(&claimed_issue, scope_label) => {
+                claimed_issue
+            }
+            Ok(_) => {
+                info!(
+                    "{}: Issue #{} became ineligible while being claimed, releasing it",
+                    agent_id, issue.iid
+                );
+                port.release_acquired_claim(issue.iid);
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    "{}: Failed to revalidate issue #{} after claiming: {}, releasing it",
+                    agent_id, issue.iid, error
+                );
+                port.release_acquired_claim(issue.iid);
+                continue;
+            }
+        };
         port.preserve_issue_claim(issue.iid);
         port.save_session(issue.iid, 0);
         info!(
             "{}: Implementing issue #{}: {}",
-            agent_id, issue.iid, issue.title
+            agent_id, claimed_issue.iid, claimed_issue.title
         );
-        finish_implementation(port, agent_id, active, &issue, false);
+        finish_implementation(port, agent_id, active, &claimed_issue, false);
         return Ok(());
     }
     Ok(())
@@ -1615,10 +1650,7 @@ fn should_skip_issue(issue: &IssueObservation) -> bool {
         return true;
     }
 
-    if issue
-        .labels
-        .contains(&super::labels::DO_NOT_IMPLEMENT.to_string())
-    {
+    if issue_has_do_not_implement_label(&issue.labels) {
         return true;
     }
 
@@ -1637,6 +1669,12 @@ fn should_skip_issue(issue: &IssueObservation) -> bool {
     false
 }
 
+fn issue_has_do_not_implement_label(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|label| label == super::labels::DO_NOT_IMPLEMENT)
+}
+
 fn issue_has_worker_pending_label(labels: &[String]) -> bool {
     labels.contains(&WORKER_PENDING_LABEL.to_string())
 }
@@ -1647,6 +1685,7 @@ fn issue_has_worker_review_only_label(labels: &[String]) -> bool {
 
 fn worker_should_cancel_issue_processing(issue: &IssueObservation) -> bool {
     issue.state != "opened"
+        || issue_has_do_not_implement_label(&issue.labels)
         || issue_has_worker_review_only_label(&issue.labels)
         || issue_has_worker_pending_label(&issue.labels)
 }
@@ -5259,7 +5298,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_should_cancel_issue_processing_for_review_only_closed_or_pending() {
+    fn worker_should_cancel_issue_processing_for_blocking_changes() {
         let mut issue = IssueObservation {
             iid: 9,
             title: "Test".into(),
@@ -5276,6 +5315,9 @@ mod tests {
         // `pending` label set by a human mid-run must cancel in-flight work.
         issue.state = "opened".into();
         issue.labels = vec![WORKER_PENDING_LABEL.to_string()];
+        assert!(worker_should_cancel_issue_processing(&issue));
+
+        issue.labels = vec![super::super::labels::DO_NOT_IMPLEMENT.to_string()];
         assert!(worker_should_cancel_issue_processing(&issue));
 
         // Opened with no blocking labels → keep working.
@@ -6171,6 +6213,7 @@ mod tests {
                 "shutdown",
                 "acquire_claim:7",
                 "shutdown",
+                "issue:7",
                 "preserve_claim:7",
                 "save_session:7:0",
                 "run_implementation:7",
@@ -6185,6 +6228,32 @@ mod tests {
         assert_eq!(
             port.implementation_payloads.borrow().as_slice(),
             &[candidate]
+        );
+    }
+
+    #[test]
+    fn worker_releases_a_claim_when_do_not_implement_appears_after_screening() {
+        let candidate = issue_observation(7, &[]);
+        let blocked = issue_observation(7, &[super::super::labels::DO_NOT_IMPLEMENT]);
+        let mut port = FakeWorkerPort::new()
+            .knowing(&[blocked])
+            .listing(&[candidate]);
+
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        assert!(run.active.is_none());
+        assert!(run.trace.ends_with(&strings(&[
+            "shutdown",
+            "acquire_claim:7",
+            "shutdown",
+            "issue:7",
+            "release_acquired:7",
+        ])));
+        assert!(
+            !run.trace
+                .iter()
+                .any(|event| event.starts_with("run_implementation:"))
         );
     }
 
@@ -6489,6 +6558,7 @@ mod tests {
 
         for (label, action) in [
             (WORKER_PENDING_LABEL, "clear_state:7"),
+            (super::super::labels::DO_NOT_IMPLEMENT, "clear_state:7"),
             (WORKER_REVIEW_ONLY_LABEL, "release_review_only:7"),
         ] {
             let mut port = FakeWorkerPort::new()
