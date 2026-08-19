@@ -1905,8 +1905,9 @@ fn find_claimed_pmo_issue(
             recovered.push(lease);
         }
     }
-    let primary = recovered.first().map(|lease| lease.resource().iid());
-    for mut extra in recovered.drain(1..) {
+    let (lease, recovered) = split_recovered_claims(recovered)?;
+    let issue_iid = lease.resource().iid();
+    for mut extra in recovered {
         let iid = extra.resource().iid();
         if let Err(error) = extra.try_release(gitlab) {
             warn!(
@@ -1916,14 +1917,20 @@ fn find_claimed_pmo_issue(
             extra.preserve();
         }
     }
-    let lease = recovered.pop()?;
-    let issue_iid = primary.expect("recovered contains its primary lease");
     info!(
         "{}: Recovered orphaned claim on issue #{} from GitLab",
         state.agent_id, issue_iid
     );
     state.save_state(issue_iid);
     Some(lease)
+}
+
+fn split_recovered_claims(mut claims: Vec<ClaimLease>) -> Option<(ClaimLease, Vec<ClaimLease>)> {
+    if claims.is_empty() {
+        return None;
+    }
+    let primary = claims.remove(0);
+    Some((primary, claims))
 }
 
 /// Checkpoint resume decision: index `index` of `pending.sub_issues` was
@@ -3355,6 +3362,11 @@ mod tests {
         let gitlab = GitLabClient::for_test("/tmp/unused-repo");
 
         assert!(try_resume_pmo_state(&state, &gitlab, None).is_none());
+    }
+
+    #[test]
+    fn empty_orphan_claim_scan_has_no_primary_claim() {
+        assert!(split_recovered_claims(Vec::new()).is_none());
     }
 
     #[test]
