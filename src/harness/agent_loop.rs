@@ -875,6 +875,7 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut crate::harness::tools::SessionStates::new(),
+            "test-session",
             "",
             "",
             None,
@@ -923,6 +924,7 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut crate::harness::tools::SessionStates::new(),
+            "test-session",
             "",
             "",
             None,
@@ -971,6 +973,7 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut crate::harness::tools::SessionStates::new(),
+            "test-session",
             "",
             "",
             None,
@@ -1031,6 +1034,7 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut crate::harness::tools::SessionStates::new(),
+            "test-session",
             "",
             "",
             None,
@@ -1207,6 +1211,7 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut crate::harness::tools::SessionStates::new(),
+            "test-session",
             "",
             "",
             None,
@@ -1332,6 +1337,7 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut crate::harness::tools::SessionStates::new(),
+            "test-session",
             "",
             "",
             None,
@@ -1449,6 +1455,7 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut crate::harness::tools::SessionStates::new(),
+            "test-session",
             "",
             "",
             None,

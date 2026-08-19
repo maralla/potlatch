@@ -232,6 +232,7 @@ impl AcpServer {
         // lifetime.
         let mut tools = ToolRegistry::with_builtin_tools(
             &mut session.states,
+            &session.id,
             &cwd,
             &session.model,
             session.allowed_tools.as_deref(),
