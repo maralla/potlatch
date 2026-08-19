@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
-use super::{claim, issue_in_scope, labels, strip_internal_markers};
+use super::{claim, issue_in_scope, labels, strip_internal_markers, with_split_parent};
 use crate::agents::git::GitRepo;
 use crate::agents::gitlab::{self, GitLabClient, Issue, IssueThreadNote};
 use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
@@ -763,7 +763,8 @@ fn resume_split(
         } else {
             &child.title
         };
-        let child_iid = port.create_child(title, &child.description)?;
+        let description = with_split_parent(&child.description, pending.parent_issue_iid);
+        let child_iid = port.create_child(title, &description)?;
         let priority = child.priority.unwrap_or(pending.parent_priority);
         let _ = port.add_issue_label(child_iid, &gitlab::priority_label(priority));
         if let Some(label) = scope_label {
@@ -2159,6 +2160,7 @@ mod tests {
         bound_mr_iid: Option<u64>,
         descriptions: Vec<(u64, String)>,
         comments: Vec<(u64, String)>,
+        children: Vec<(String, String)>,
     }
 
     impl FakePmoPort {
@@ -2212,6 +2214,7 @@ mod tests {
                 bound_mr_iid: None,
                 descriptions: Vec::new(),
                 comments: Vec::new(),
+                children: Vec::new(),
             }
         }
 
@@ -2390,9 +2393,11 @@ mod tests {
             self.fail("delete_checkpoint")
         }
 
-        fn create_child(&mut self, title: &str, _description: &str) -> Result<u64> {
+        fn create_child(&mut self, title: &str, description: &str) -> Result<u64> {
             self.record(format!("act:create:{title}"));
             self.fail("create")?;
+            self.children
+                .push((title.to_string(), description.to_string()));
             let iid = self.next_iid.get();
             self.next_iid.set(iid + 1);
             Ok(iid)
@@ -2448,6 +2453,10 @@ mod tests {
                 "observe:epoch",
             ]
         );
+        assert_eq!(port.children.len(), 2);
+        assert!(port.children.iter().all(|(_, description)| {
+            description.contains("This issue was split from parent issue #10.")
+        }));
     }
 
     #[test]

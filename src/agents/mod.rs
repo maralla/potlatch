@@ -25,6 +25,27 @@ pub fn scope_label_filter(scope_label: &str) -> Option<&str> {
     if t.is_empty() { None } else { Some(t) }
 }
 
+const PMO_SPLIT_PARENT_PREFIX: &str = "This issue was split from parent issue #";
+
+/// Append stable, human-readable split provenance to a PMO-created child issue.
+pub(crate) fn with_split_parent(description: &str, parent_iid: u64) -> String {
+    format!(
+        "{}\n\n---\n\n{PMO_SPLIT_PARENT_PREFIX}{parent_iid}.",
+        description.trim_end()
+    )
+}
+
+/// Read the parent issue IID from PMO split provenance, when present.
+pub(crate) fn split_parent_iid(description: &str) -> Option<u64> {
+    description.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(PMO_SPLIT_PARENT_PREFIX)?
+            .strip_suffix('.')?
+            .parse()
+            .ok()
+    })
+}
+
 pub(crate) fn strip_public_comment_blocks(text: &str) -> String {
     strip_marker_blocks(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END")
 }
@@ -121,7 +142,8 @@ pub fn register(workflow: &mut Workflow) {
 #[cfg(test)]
 mod scope_tests {
     use super::{
-        issue_in_scope, mr_in_scope, register, strip_internal_markers, strip_public_comment_blocks,
+        issue_in_scope, mr_in_scope, register, split_parent_iid, strip_internal_markers,
+        strip_public_comment_blocks, with_split_parent,
     };
     use crate::agents::gitlab::{Issue, MergeRequest};
     use crate::core::config::Config;
@@ -183,6 +205,15 @@ mod scope_tests {
 
         let ai_worker = sample_mr(Some(vec![super::labels::NEED_AI_WORKER]));
         assert!(mr_in_scope(&ai_worker, Some("other-scope")));
+    }
+
+    #[test]
+    fn split_parent_provenance_round_trips_without_changing_the_child_scope() {
+        let description = with_split_parent("Implement the parser.\n", 42);
+
+        assert!(description.starts_with("Implement the parser.\n\n---"));
+        assert_eq!(split_parent_iid(&description), Some(42));
+        assert_eq!(split_parent_iid("Implement an unrelated issue."), None);
     }
 
     #[test]
