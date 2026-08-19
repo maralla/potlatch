@@ -25,7 +25,6 @@ use crate::core::agent::{
 };
 use crate::core::banner::Banner;
 use crate::core::config::Config;
-use crate::core::cycle::Step;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 
@@ -773,114 +772,6 @@ impl MrStatusObservation {
     }
 }
 
-/// One question the routing machine asks before it decides anything.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerQuery {
-    ShutdownRequested,
-    Issue {
-        issue_iid: u64,
-    },
-    MergeRequestStatus {
-        mr_iid: u64,
-    },
-    Issues,
-    /// The default branch, falling back to `main` — a read the worker never
-    /// fails a cycle over.
-    DefaultBranchOrMain,
-}
-
-/// The answer to one [`WorkerQuery`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerFact {
-    ShutdownRequested(bool),
-    Issue(IssueObservation),
-    MergeRequestStatus(MrStatusObservation),
-    Issues(Vec<IssueObservation>),
-    DefaultBranchOrMain(String),
-}
-
-/// A single side effect the routing machine asks the port to perform.
-///
-/// Composite variants (`ClearIssueState`, `AbandonClosedIssue`,
-/// `ReleaseReviewOnlyHold`, `RunImplementation`, `RunFeedback`,
-/// `AdoptOrphanedSession`, `HandleNeedAiWorkerMr`, `ResolveCancelledIssue`)
-/// stand for one existing deep helper each: the helper stays the executor
-/// and keeps its own internal mutation order, while the decision to run it
-/// at this point in the cycle is the machine's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerAction {
-    ResetWorktree,
-    CheckoutBranch {
-        branch: String,
-    },
-    DeleteLocalBranch {
-        branch: String,
-    },
-    DeleteRemoteBranch {
-        branch: String,
-    },
-    ReleaseIssueClaim {
-        issue_iid: u64,
-    },
-    RemoveWorkingOnLabel {
-        issue_iid: u64,
-    },
-    RemoveIssueLabel {
-        issue_iid: u64,
-        label: String,
-    },
-    CleanupSession {
-        issue_iid: u64,
-    },
-    SaveSession {
-        issue_iid: u64,
-        mr_iid: u64,
-    },
-    CloseIssue {
-        issue_iid: u64,
-    },
-    AcquireIssueClaim {
-        issue_iid: u64,
-    },
-    /// Hand the just-won claim over to `active`/the session file: GitLab's
-    /// label stays in place across cycles and restarts.
-    PreserveIssueClaim {
-        issue_iid: u64,
-    },
-    /// Give the just-won claim straight back (shutdown landed).
-    ReleaseAcquiredClaim {
-        issue_iid: u64,
-    },
-    ClearIssueState {
-        issue_iid: u64,
-    },
-    ReleaseReviewOnlyHold {
-        issue_iid: u64,
-    },
-    AbandonClosedIssue {
-        issue_iid: u64,
-        mr_iid: Option<u64>,
-    },
-    AdoptOrphanedSession,
-    HandleNeedAiWorkerMr,
-    RunImplementation {
-        issue: Box<IssueObservation>,
-    },
-    RunFeedback {
-        mr_iid: u64,
-        linked_issue_iid: Option<u64>,
-        comments_only: bool,
-    },
-    ResolveCancelledIssue {
-        issue_iid: u64,
-    },
-    /// Re-read the issue to see whether the worker may keep tracking it,
-    /// releasing a `review-only` hold when it may not.
-    CheckIssueTrackable {
-        issue_iid: u64,
-    },
-}
-
 /// Result of a claim attempt, mirroring [`ClaimAcquireOutcome`] without the
 /// lease: the lease itself lives in the port, which owns claim effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -890,54 +781,51 @@ enum IssueClaimAttempt {
     Interrupted,
 }
 
-/// What the port reports after executing one [`WorkerAction`].
-enum WorkerOutcome {
-    Done,
-    Failed(anyhow::Error),
-    Claim(IssueClaimAttempt),
-    Adopted(Option<ActiveIssue>),
-    /// `true` when a labeled MR was handled this cycle.
-    HandledNeedAiWorkerMr(bool),
-    /// An implementation run: the in-flight issue as the run left it, plus
-    /// the error when the run failed. Both are needed, because the cleanup
-    /// the cycle performs after a failure depends on how far the run got.
-    Implementation {
-        current: ActiveIssue,
-        error: Option<anyhow::Error>,
-    },
-    /// A feedback run; `abandoned` is the old `Ok(true)`: the MR was closed
-    /// and the issue handed back.
-    Feedback {
-        abandoned: bool,
-    },
-    /// Whether an external cancel signal was handled as an intentional stop.
-    CancelHandled(bool),
-    Trackable(bool),
-}
-
-/// The narrow surface the worker's routing cycle needs. Object-safe and
-/// role-local: the worker's own observe/execute vocabulary rather than a
-/// general GitLab, git, session-store, or model interface.
+/// The narrow, typed surface used by the worker routing workflows.
 trait WorkerRoutingPort {
     fn shutdown_requested(&self) -> bool;
     fn issue(&self, issue_iid: u64) -> Result<IssueObservation>;
     fn merge_request_status(&self, mr_iid: u64) -> Result<MrStatusObservation>;
     fn issues(&self) -> Result<Vec<IssueObservation>>;
     fn default_branch_or_main(&self) -> String;
-    fn execute(&mut self, action: &WorkerAction) -> WorkerOutcome;
+    fn reset_worktree(&mut self);
+    fn checkout_branch(&mut self, branch: &str);
+    fn delete_local_branch(&mut self, branch: &str);
+    fn delete_remote_branch(&mut self, branch: &str);
+    fn release_issue_claim(&mut self, issue_iid: u64);
+    fn remove_working_on_label(&mut self, issue_iid: u64);
+    fn remove_issue_label(&mut self, issue_iid: u64, label: &str);
+    fn cleanup_session(&mut self, issue_iid: u64);
+    fn save_session(&mut self, issue_iid: u64, mr_iid: u64);
+    fn close_issue(&mut self, issue_iid: u64);
+    fn acquire_issue_claim(&mut self, issue_iid: u64) -> Result<IssueClaimAttempt>;
+    fn preserve_issue_claim(&mut self, issue_iid: u64);
+    fn release_acquired_claim(&mut self, issue_iid: u64);
+    fn clear_issue_state(&mut self, issue_iid: u64);
+    fn release_review_only_hold(&mut self, issue_iid: u64);
+    fn abandon_closed_issue(&mut self, issue_iid: u64, mr_iid: Option<u64>);
+    fn adopt_orphaned_session(&mut self) -> Option<ActiveIssue>;
+    fn handle_need_ai_worker_mr(&mut self) -> Result<bool>;
+    fn run_implementation(
+        &mut self,
+        issue: &IssueObservation,
+    ) -> (ActiveIssue, Option<anyhow::Error>);
+    fn run_feedback(
+        &mut self,
+        mr_iid: u64,
+        linked_issue_iid: Option<u64>,
+        comments_only: bool,
+    ) -> Result<bool>;
+    fn resolve_cancelled_issue(&mut self, issue_iid: u64) -> bool;
+    fn issue_trackable(&mut self, issue_iid: u64) -> bool;
 }
-
-type WorkerStep = Step<WorkerQuery, WorkerAction>;
 
 // ---------------------------------------------------------------------------
 // Pure routing decisions
 // ---------------------------------------------------------------------------
 
 /// Whether the worker still owns the issue it is pinned to, and how it lets
-/// go when it does not. Pure — no GitLab call — so the release rules and
-/// their precedence can be characterized without a live client. Shared by
-/// the MR-watch path and the no-MR re-attempt path, which release on
-/// exactly the same conditions.
+/// go when it does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IssueHold {
     Keep,
@@ -946,8 +834,6 @@ enum IssueHold {
     ReleaseReviewOnly,
 }
 
-/// Why the worker dropped its local state for an issue. Only the log
-/// differs between these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClearReason {
     OutOfScope,
@@ -970,9 +856,6 @@ fn decide_issue_hold(issue: &IssueObservation, scope_label: Option<&str>) -> Iss
     IssueHold::Keep
 }
 
-/// What the poll does with one candidate issue. Pure: mirrors the filter
-/// chain in the polling loop, including that the dependency check runs
-/// before the claim check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateScreening {
     Skip,
@@ -997,9 +880,6 @@ fn screen_issue_candidate(
     CandidateScreening::Claimable
 }
 
-/// Whether a dependency issue still parks the candidate. A dependency that
-/// GitLab no longer has (404) is treated as resolved: the label is dropped
-/// and the candidate proceeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DependencyDecision {
     Resolved,
@@ -1016,1057 +896,407 @@ fn decide_dependency(dependency: Result<&IssueObservation, &anyhow::Error>) -> D
     }
 }
 
-/// The ordered worktree and GitLab writes that release an issue whose merge
-/// request finished. The order never changes; a merge additionally deletes
-/// the remote branch and closes the issue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinishedMrStep {
-    ObserveDefaultBranch,
-    ResetWorktree,
-    CheckoutDefaultBranch,
-    DeleteLocalBranch,
-    DeleteRemoteBranch,
-    ReleaseClaim,
-    RemoveWorkingOnLabel,
-    CleanupSession,
-    CloseIssue,
-}
+fn apply_active_issue_hold(
+    port: &mut dyn WorkerRoutingPort,
+    agent_id: &str,
+    scope_label: Option<&str>,
+    active: &mut Option<ActiveIssue>,
+    watching_mr: bool,
+) -> bool {
+    let tracked = active
+        .as_ref()
+        .expect("active issue validation requires an active issue")
+        .clone();
+    let issue = match port.issue(tracked.issue_iid) {
+        Ok(issue) => issue,
+        Err(e) => {
+            if watching_mr {
+                warn!(
+                    "{}: Failed to verify active issue #{}: {}, releasing worker state",
+                    agent_id, tracked.issue_iid, e
+                );
+            } else {
+                warn!(
+                    "{}: Failed to verify active issue #{}: {}, releasing",
+                    agent_id, tracked.issue_iid, e
+                );
+            }
+            *active = None;
+            port.clear_issue_state(tracked.issue_iid);
+            return false;
+        }
+    };
 
-impl FinishedMrStep {
-    fn next(self, merged: bool) -> Option<Self> {
-        let next = match self {
-            Self::ObserveDefaultBranch => Self::ResetWorktree,
-            Self::ResetWorktree => Self::CheckoutDefaultBranch,
-            Self::CheckoutDefaultBranch => Self::DeleteLocalBranch,
-            Self::DeleteLocalBranch if merged => Self::DeleteRemoteBranch,
-            Self::DeleteLocalBranch | Self::DeleteRemoteBranch => Self::ReleaseClaim,
-            Self::ReleaseClaim => Self::RemoveWorkingOnLabel,
-            Self::RemoveWorkingOnLabel => Self::CleanupSession,
-            Self::CleanupSession if merged => Self::CloseIssue,
-            Self::CleanupSession | Self::CloseIssue => return None,
-        };
-        Some(next)
+    match decide_issue_hold(&issue, scope_label) {
+        IssueHold::Keep => true,
+        IssueHold::AbandonClosed => {
+            *active = None;
+            port.abandon_closed_issue(
+                tracked.issue_iid,
+                watching_mr.then_some(tracked.mr_iid).flatten(),
+            );
+            false
+        }
+        IssueHold::ClearState(reason) => {
+            match reason {
+                ClearReason::OutOfScope if watching_mr => info!(
+                    "{}: Issue #{} left scope label {:?}, releasing worker state",
+                    agent_id, tracked.issue_iid, scope_label
+                ),
+                ClearReason::OutOfScope => info!(
+                    "{}: Active issue #{} left scope label {:?}, releasing",
+                    agent_id, tracked.issue_iid, scope_label
+                ),
+                ClearReason::Pending if watching_mr => info!(
+                    "{}: Issue #{} has `{}` — stopping MR watch (issue stays open)",
+                    agent_id, tracked.issue_iid, WORKER_PENDING_LABEL
+                ),
+                ClearReason::Pending => info!(
+                    "{}: Active issue #{} has `{}` — yielding (issue stays open)",
+                    agent_id, tracked.issue_iid, WORKER_PENDING_LABEL
+                ),
+            }
+            *active = None;
+            port.clear_issue_state(tracked.issue_iid);
+            false
+        }
+        IssueHold::ReleaseReviewOnly => {
+            *active = None;
+            port.release_review_only_hold(tracked.issue_iid);
+            false
+        }
     }
 }
 
-/// Which releases follow an implementation run that produced no merge
-/// request, or failed. The order of the steps never changes; the plan only
-/// says which of them apply.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CleanupPlan {
+fn cleanup_finished_mr(port: &mut dyn WorkerRoutingPort, issue_iid: u64, merged: bool) {
+    let branch = format!("issue-{issue_iid}");
+    let default_branch = port.default_branch_or_main();
+    port.reset_worktree();
+    port.checkout_branch(&default_branch);
+    port.delete_local_branch(&branch);
+    if merged {
+        port.delete_remote_branch(&branch);
+    }
+    port.release_issue_claim(issue_iid);
+    port.remove_working_on_label(issue_iid);
+    port.cleanup_session(issue_iid);
+    if merged {
+        port.close_issue(issue_iid);
+    }
+}
+
+fn cleanup_implementation(
+    port: &mut dyn WorkerRoutingPort,
     issue_iid: u64,
     remove_working_label: bool,
     cleanup_session: bool,
-    branch: Option<String>,
+    branch: Option<&str>,
+) {
+    port.release_issue_claim(issue_iid);
+    if remove_working_label {
+        port.remove_working_on_label(issue_iid);
+    }
+    if cleanup_session {
+        port.cleanup_session(issue_iid);
+    }
+    if let Some(branch) = branch {
+        let default_branch = port.default_branch_or_main();
+        port.reset_worktree();
+        port.checkout_branch(&default_branch);
+        port.delete_local_branch(branch);
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CleanupStep {
-    ReleaseClaim,
-    RemoveWorkingOnLabel,
-    CleanupSession,
-    ObserveDefaultBranch,
-    ResetWorktree,
-    CheckoutDefaultBranch,
-    DeleteLocalBranch,
-}
-
-impl CleanupPlan {
-    fn first(&self) -> CleanupStep {
-        CleanupStep::ReleaseClaim
+/// Returns whether routing should continue by looking for new work.
+fn handle_active_mr(
+    port: &mut dyn WorkerRoutingPort,
+    agent_id: &str,
+    scope_label: Option<&str>,
+    active: &mut Option<ActiveIssue>,
+) -> Result<bool> {
+    if !apply_active_issue_hold(port, agent_id, scope_label, active, true) {
+        return Ok(true);
+    }
+    let tracked = active.as_ref().unwrap().clone();
+    let mr_iid = tracked.mr_iid.expect("active MR workflow requires an MR");
+    let mr = match port.merge_request_status(mr_iid) {
+        Ok(mr) => mr,
+        Err(e) => {
+            warn!("{}: Failed to check MR !{}: {}", agent_id, mr_iid, e);
+            return Ok(false);
+        }
+    };
+    if mr.is_finished() {
+        info!(
+            "{}: MR !{} is {}, releasing issue #{}",
+            agent_id, mr.iid, mr.state, tracked.issue_iid
+        );
+        cleanup_finished_mr(port, tracked.issue_iid, mr.is_merged());
+        *active = None;
+        return Ok(true);
     }
 
-    fn next(&self, after: CleanupStep) -> Option<CleanupStep> {
-        let mut step = after;
-        loop {
-            step = match step {
-                CleanupStep::ReleaseClaim => CleanupStep::RemoveWorkingOnLabel,
-                CleanupStep::RemoveWorkingOnLabel => CleanupStep::CleanupSession,
-                CleanupStep::CleanupSession => CleanupStep::ObserveDefaultBranch,
-                CleanupStep::ObserveDefaultBranch => CleanupStep::ResetWorktree,
-                CleanupStep::ResetWorktree => CleanupStep::CheckoutDefaultBranch,
-                CleanupStep::CheckoutDefaultBranch => CleanupStep::DeleteLocalBranch,
-                CleanupStep::DeleteLocalBranch => return None,
-            };
-            let applies = match step {
-                CleanupStep::RemoveWorkingOnLabel => self.remove_working_label,
-                CleanupStep::CleanupSession => self.cleanup_session,
-                CleanupStep::ObserveDefaultBranch
-                | CleanupStep::ResetWorktree
-                | CleanupStep::CheckoutDefaultBranch
-                | CleanupStep::DeleteLocalBranch => self.branch.is_some(),
-                CleanupStep::ReleaseClaim => true,
-            };
-            if applies {
-                return Some(step);
+    match port.run_feedback(mr_iid, Some(tracked.issue_iid), false) {
+        Ok(false) => Ok(false),
+        Ok(true) => {
+            info!(
+                "{}: Issue #{} abandoned, MR !{} closed",
+                agent_id, tracked.issue_iid, mr_iid
+            );
+            port.release_issue_claim(tracked.issue_iid);
+            port.cleanup_session(tracked.issue_iid);
+            *active = None;
+            Ok(true)
+        }
+        Err(e) => {
+            let message = format!("{e:#}");
+            if port.shutdown_requested() {
+                return Ok(false);
             }
+            if message.contains(WORKER_AGENT_CANCELLED_MSG)
+                && port.resolve_cancelled_issue(tracked.issue_iid)
+            {
+                *active = None;
+                return Ok(false);
+            }
+            error!(
+                "{}: Failed to handle comments for MR !{}: {}",
+                agent_id, mr_iid, message
+            );
+            Ok(false)
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Worker routing state machine
-// ---------------------------------------------------------------------------
+fn finish_implementation(
+    port: &mut dyn WorkerRoutingPort,
+    agent_id: &str,
+    active: &mut Option<ActiveIssue>,
+    issue: &IssueObservation,
+    reattempt: bool,
+) {
+    let (current, run_error) = port.run_implementation(issue);
+    if let Some(e) = run_error {
+        let message = format!("{e:#}");
+        if port.shutdown_requested() {
+            *active = Some(current);
+            return;
+        }
+        if message.contains(WORKER_AGENT_CANCELLED_MSG)
+            && port.resolve_cancelled_issue(current.issue_iid)
+        {
+            *active = None;
+            return;
+        }
+        if reattempt {
+            error!(
+                "{}: Failed to re-process issue #{}: {}",
+                agent_id, current.issue_iid, message
+            );
+        } else {
+            error!(
+                "{}: Failed to process issue #{}: {}",
+                agent_id, current.issue_iid, message
+            );
+        }
+        *active = None;
+        cleanup_implementation(
+            port,
+            current.issue_iid,
+            true,
+            reattempt,
+            current.branch_name.as_deref(),
+        );
+        return;
+    }
 
-/// Where the routing cycle is. Each variant names the single next
-/// observation, action, or pure transition, so
-/// [`WorkerRoutingMachine::next_step`] is a function of this plus what the
-/// machine already learned — never of the world.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerStage {
-    // The active issue's merge request.
-    ObserveActiveIssue,
-    ObserveActiveMr,
-    ClearIssueStateThen(u64),
-    AbandonClosedIssueThen(u64, Option<u64>),
-    ReleaseReviewOnlyHoldThen(u64),
-    ReleaseFinishedMr(FinishedMrStep),
-    RunActiveFeedback,
-    ReleaseClaimAfterAbandon,
-    CleanupSessionAfterAbandon,
-    ShutdownAfterFeedbackError(String),
-    ResolveCancelledActiveIssue(String),
-    // The active issue that never reached a merge request.
-    ObserveIssueBeforeReattempt,
-    ObserveIssueForReattempt,
-    RunReattemptImplementation,
-    CheckTrackableAfterReattempt,
-    ShutdownAfterImplementationError(String),
-    ResolveCancelledImplementation(String),
-    Cleanup(CleanupStep),
-    // Looking for new work.
-    ShutdownBeforePolling,
-    AdoptOrphanedSession,
-    HandleNeedAiWorkerMr,
-    ObserveIssues,
-    ShutdownAfterIssues,
-    NextCandidate,
-    ShutdownBeforeCandidate,
-    ScreenCandidate,
-    ObserveDependencyIssue(u64),
-    RemoveDependencyLabel(u64),
-    AcquireCandidateClaim,
-    ShutdownAfterCandidateClaim,
-    ReleaseCandidateClaimAtShutdown,
-    PreserveCandidateClaim,
-    SaveCandidatePreSession,
-    RunCandidateImplementation,
-    CheckTrackableAfterCandidate,
-    Finish,
+    if current.mr_created {
+        *active = port.issue_trackable(current.issue_iid).then_some(current);
+    } else {
+        *active = None;
+        cleanup_implementation(port, issue.iid, false, reattempt, None);
+    }
 }
 
-/// What the machine does once the cleanup sequence it is running finishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AfterCleanup {
-    LookForNewWork,
-    Finish,
+/// Returns whether routing should continue by looking for new work.
+fn handle_active_reattempt(
+    port: &mut dyn WorkerRoutingPort,
+    agent_id: &str,
+    scope_label: Option<&str>,
+    active: &mut Option<ActiveIssue>,
+) -> bool {
+    if !apply_active_issue_hold(port, agent_id, scope_label, active, false) {
+        return true;
+    }
+    let issue_iid = active.as_ref().unwrap().issue_iid;
+    info!(
+        "{}: Active issue #{} has no MR, re-attempting implementation",
+        agent_id, issue_iid
+    );
+    let issue = match port.issue(issue_iid) {
+        Ok(issue) => issue,
+        Err(e) => {
+            warn!(
+                "{}: Failed to fetch issue #{} for re-attempt: {}, releasing",
+                agent_id, issue_iid, e
+            );
+            *active = None;
+            cleanup_implementation(port, issue_iid, true, true, None);
+            return true;
+        }
+    };
+    finish_implementation(port, agent_id, active, &issue, true);
+    false
 }
 
-/// Which of the two implementation paths is in flight. They release
-/// differently after a failed or fruitless run, and log differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImplementationPhase {
-    /// The active issue never reached a merge request, so the worker is
-    /// implementing it again.
-    Reattempt,
-    /// A freshly claimed issue from the poll.
-    Candidate,
-}
-
-/// The worker's routing state. Plain data only — no GitLab client, no git
-/// repo, no lease — so every decision is a pure function of what the
-/// machine has observed.
-struct WorkerRoutingMachine<'a> {
-    agent_id: &'a str,
-    scope_label: Option<&'a str>,
-    stage: WorkerStage,
-    active: Option<ActiveIssue>,
-    /// The issue an implementation run is being performed for, as the run
-    /// left it.
-    current: Option<ActiveIssue>,
-    default_branch: String,
-    candidates: std::collections::VecDeque<IssueObservation>,
-    candidate: Option<IssueObservation>,
-    cleanup: Option<(CleanupPlan, AfterCleanup)>,
-    finished_mr_merged: bool,
-    implementation_phase: ImplementationPhase,
-}
-
-impl<'a> WorkerRoutingMachine<'a> {
-    fn new(agent_id: &'a str, scope_label: Option<&'a str>, active: Option<ActiveIssue>) -> Self {
-        let stage = Self::entry_stage(active.as_ref());
-        Self {
+fn poll_for_work(
+    port: &mut dyn WorkerRoutingPort,
+    agent_id: &str,
+    scope_label: Option<&str>,
+    active: &mut Option<ActiveIssue>,
+) -> Result<()> {
+    if port.shutdown_requested() {
+        return Ok(());
+    }
+    if active.is_none()
+        && let Some(adopted) = port.adopt_orphaned_session()
+    {
+        info!(
+            "{}: Adopted orphaned issue #{} with MR !{}",
             agent_id,
-            scope_label,
-            stage,
-            active,
-            current: None,
-            default_branch: String::new(),
-            candidates: std::collections::VecDeque::new(),
-            candidate: None,
-            cleanup: None,
-            finished_mr_merged: false,
-            implementation_phase: ImplementationPhase::Candidate,
+            adopted.issue_iid,
+            adopted.mr_iid.unwrap_or(0)
+        );
+        *active = Some(adopted);
+        return Ok(());
+    }
+    if port.handle_need_ai_worker_mr()? {
+        return Ok(());
+    }
+    let issues = port.issues()?;
+    if port.shutdown_requested() {
+        return Ok(());
+    }
+
+    for issue in issues {
+        if port.shutdown_requested() {
+            return Ok(());
         }
-    }
-
-    /// Where a cycle starts: watching the active MR, re-attempting an
-    /// implementation that never produced one, or looking for new work.
-    fn entry_stage(active: Option<&ActiveIssue>) -> WorkerStage {
-        match active {
-            Some(a) if a.mr_iid.is_some() => WorkerStage::ObserveActiveIssue,
-            Some(a) if !a.mr_created => WorkerStage::ObserveIssueBeforeReattempt,
-            _ => WorkerStage::ShutdownBeforePolling,
-        }
-    }
-
-    fn active_issue(&self) -> &ActiveIssue {
-        self.active
-            .as_ref()
-            .expect("active stages run only while an issue is active")
-    }
-
-    fn active_iid(&self) -> u64 {
-        self.active_issue().issue_iid
-    }
-
-    fn candidate(&self) -> &IssueObservation {
-        self.candidate
-            .as_ref()
-            .expect("candidate stages run only after a candidate is picked")
-    }
-
-    /// Drop the active issue and continue to the new-work search, which is
-    /// what every release path in the active phases does.
-    fn release_active(&mut self) -> WorkerStage {
-        self.active = None;
-        WorkerStage::ShutdownBeforePolling
-    }
-
-    fn start_cleanup(&mut self, plan: CleanupPlan, after: AfterCleanup) -> WorkerStage {
-        let first = plan.first();
-        self.cleanup = Some((plan, after));
-        WorkerStage::Cleanup(first)
-    }
-
-    fn advance_cleanup(&mut self, after_step: CleanupStep) -> WorkerStage {
-        let (plan, after) = self
-            .cleanup
-            .as_ref()
-            .expect("cleanup stages run only while a plan is set");
-        match plan.next(after_step) {
-            Some(step) => WorkerStage::Cleanup(step),
-            None => {
-                let after = *after;
-                self.cleanup = None;
-                match after {
-                    AfterCleanup::LookForNewWork => WorkerStage::ShutdownBeforePolling,
-                    AfterCleanup::Finish => WorkerStage::Finish,
-                }
+        match screen_issue_candidate(&issue, scope_label) {
+            CandidateScreening::Skip => continue,
+            CandidateScreening::AlreadyClaimed => {
+                debug!(
+                    "{}: Issue #{} already claimed, skipping",
+                    agent_id, issue.iid
+                );
+                continue;
             }
-        }
-    }
-
-    fn cleanup_plan(&self) -> &CleanupPlan {
-        &self
-            .cleanup
-            .as_ref()
-            .expect("cleanup stages run only while a plan is set")
-            .0
-    }
-
-    /// The single next thing to do. Pure: resolves the stages that need no
-    /// port interaction before handing back an observation or an action.
-    fn next_step(&mut self) -> WorkerStep {
-        loop {
-            match self.stage.clone() {
-                WorkerStage::ObserveActiveIssue | WorkerStage::ObserveIssueBeforeReattempt => {
-                    return WorkerStep::Observe(WorkerQuery::Issue {
-                        issue_iid: self.active_iid(),
-                    });
-                }
-                WorkerStage::ObserveIssueForReattempt => {
-                    return WorkerStep::Observe(WorkerQuery::Issue {
-                        issue_iid: self.active_iid(),
-                    });
-                }
-                WorkerStage::ObserveActiveMr => {
-                    let mr_iid = self
-                        .active_issue()
-                        .mr_iid
-                        .expect("the MR watch runs only for an active issue with an MR");
-                    return WorkerStep::Observe(WorkerQuery::MergeRequestStatus { mr_iid });
-                }
-                WorkerStage::ClearIssueStateThen(issue_iid) => {
-                    return WorkerStep::Act(WorkerAction::ClearIssueState { issue_iid });
-                }
-                WorkerStage::AbandonClosedIssueThen(issue_iid, mr_iid) => {
-                    return WorkerStep::Act(WorkerAction::AbandonClosedIssue { issue_iid, mr_iid });
-                }
-                WorkerStage::ReleaseReviewOnlyHoldThen(issue_iid) => {
-                    return WorkerStep::Act(WorkerAction::ReleaseReviewOnlyHold { issue_iid });
-                }
-                WorkerStage::ReleaseFinishedMr(step) => {
-                    return self.finished_mr_step(step);
-                }
-                WorkerStage::RunActiveFeedback => {
-                    let active = self.active_issue();
-                    return WorkerStep::Act(WorkerAction::RunFeedback {
-                        mr_iid: active
-                            .mr_iid
-                            .expect("the feedback run needs the active issue's MR"),
-                        linked_issue_iid: Some(active.issue_iid),
-                        comments_only: false,
-                    });
-                }
-                WorkerStage::ReleaseClaimAfterAbandon => {
-                    return WorkerStep::Act(WorkerAction::ReleaseIssueClaim {
-                        issue_iid: self.active_iid(),
-                    });
-                }
-                WorkerStage::CleanupSessionAfterAbandon => {
-                    return WorkerStep::Act(WorkerAction::CleanupSession {
-                        issue_iid: self.active_iid(),
-                    });
-                }
-                WorkerStage::ShutdownAfterFeedbackError(_)
-                | WorkerStage::ShutdownAfterImplementationError(_)
-                | WorkerStage::ShutdownBeforePolling
-                | WorkerStage::ShutdownAfterIssues
-                | WorkerStage::ShutdownBeforeCandidate
-                | WorkerStage::ShutdownAfterCandidateClaim => {
-                    return WorkerStep::Observe(WorkerQuery::ShutdownRequested);
-                }
-                WorkerStage::ResolveCancelledActiveIssue(_) => {
-                    return WorkerStep::Act(WorkerAction::ResolveCancelledIssue {
-                        issue_iid: self.active_iid(),
-                    });
-                }
-                WorkerStage::ResolveCancelledImplementation(_) => {
-                    return WorkerStep::Act(WorkerAction::ResolveCancelledIssue {
-                        issue_iid: self.implementation_iid(),
-                    });
-                }
-                WorkerStage::RunReattemptImplementation => {
-                    let issue = self
-                        .candidate
-                        .clone()
-                        .expect("the re-attempt runs against a freshly observed issue");
-                    self.implementation_phase = ImplementationPhase::Reattempt;
-                    return WorkerStep::Act(WorkerAction::RunImplementation {
-                        issue: Box::new(issue),
-                    });
-                }
-                WorkerStage::CheckTrackableAfterReattempt
-                | WorkerStage::CheckTrackableAfterCandidate => {
-                    return WorkerStep::Act(WorkerAction::CheckIssueTrackable {
-                        issue_iid: self.implementation_iid(),
-                    });
-                }
-                WorkerStage::Cleanup(step) => return self.cleanup_step(step),
-                WorkerStage::AdoptOrphanedSession => {
-                    return WorkerStep::Act(WorkerAction::AdoptOrphanedSession);
-                }
-                WorkerStage::HandleNeedAiWorkerMr => {
-                    return WorkerStep::Act(WorkerAction::HandleNeedAiWorkerMr);
-                }
-                WorkerStage::ObserveIssues => return WorkerStep::Observe(WorkerQuery::Issues),
-                WorkerStage::NextCandidate => match self.candidates.pop_front() {
-                    Some(issue) => {
-                        self.candidate = Some(issue);
-                        self.stage = WorkerStage::ShutdownBeforeCandidate;
-                    }
-                    None => self.stage = WorkerStage::Finish,
-                },
-                WorkerStage::ScreenCandidate => {
-                    let issue = self.candidate().clone();
-                    self.stage = match screen_issue_candidate(&issue, self.scope_label) {
-                        CandidateScreening::Skip => WorkerStage::NextCandidate,
-                        CandidateScreening::AlreadyClaimed => {
+            CandidateScreening::WaitingOnIssue(dep_issue_iid) => {
+                let dependency = port.issue(dep_issue_iid);
+                match decide_dependency(dependency.as_ref()) {
+                    DependencyDecision::Resolved => {
+                        if dependency.is_ok() {
+                            info!(
+                                "{}: Issue #{} dependency issue #{} closed, resuming",
+                                agent_id, issue.iid, dep_issue_iid
+                            );
+                        } else {
+                            info!(
+                                "{}: Issue #{} dependency issue #{} not found (deleted or never existed), dropping dependency label and resuming",
+                                agent_id, issue.iid, dep_issue_iid
+                            );
+                        }
+                        port.remove_issue_label(
+                            issue.iid,
+                            &format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{dep_issue_iid}"),
+                        );
+                        if claim::is_claimed(&issue.labels) {
                             debug!(
                                 "{}: Issue #{} already claimed, skipping",
-                                self.agent_id, issue.iid
+                                agent_id, issue.iid
                             );
-                            WorkerStage::NextCandidate
+                            continue;
                         }
-                        CandidateScreening::WaitingOnIssue(dep) => {
-                            WorkerStage::ObserveDependencyIssue(dep)
-                        }
-                        CandidateScreening::Claimable => WorkerStage::AcquireCandidateClaim,
-                    };
-                }
-                WorkerStage::ObserveDependencyIssue(dep_issue_iid) => {
-                    return WorkerStep::Observe(WorkerQuery::Issue {
-                        issue_iid: dep_issue_iid,
-                    });
-                }
-                WorkerStage::RemoveDependencyLabel(dep_issue_iid) => {
-                    return WorkerStep::Act(WorkerAction::RemoveIssueLabel {
-                        issue_iid: self.candidate().iid,
-                        label: format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{dep_issue_iid}"),
-                    });
-                }
-                WorkerStage::AcquireCandidateClaim => {
-                    return WorkerStep::Act(WorkerAction::AcquireIssueClaim {
-                        issue_iid: self.candidate().iid,
-                    });
-                }
-                WorkerStage::ReleaseCandidateClaimAtShutdown => {
-                    return WorkerStep::Act(WorkerAction::ReleaseAcquiredClaim {
-                        issue_iid: self.candidate().iid,
-                    });
-                }
-                WorkerStage::PreserveCandidateClaim => {
-                    return WorkerStep::Act(WorkerAction::PreserveIssueClaim {
-                        issue_iid: self.candidate().iid,
-                    });
-                }
-                WorkerStage::SaveCandidatePreSession => {
-                    return WorkerStep::Act(WorkerAction::SaveSession {
-                        issue_iid: self.candidate().iid,
-                        mr_iid: 0,
-                    });
-                }
-                WorkerStage::RunCandidateImplementation => {
-                    let issue = self.candidate().clone();
-                    info!(
-                        "{}: Implementing issue #{}: {}",
-                        self.agent_id, issue.iid, issue.title
-                    );
-                    self.implementation_phase = ImplementationPhase::Candidate;
-                    return WorkerStep::Act(WorkerAction::RunImplementation {
-                        issue: Box::new(issue),
-                    });
-                }
-                WorkerStage::Finish => return WorkerStep::Finish,
-            }
-        }
-    }
-
-    /// The issue an implementation run is in flight for — the in-flight
-    /// `current` while it exists, otherwise the candidate it started from.
-    fn implementation_iid(&self) -> u64 {
-        self.current
-            .as_ref()
-            .map(|current| current.issue_iid)
-            .unwrap_or_else(|| self.candidate().iid)
-    }
-
-    fn finished_mr_step(&self, step: FinishedMrStep) -> WorkerStep {
-        let active = self.active_issue();
-        let issue_iid = active.issue_iid;
-        let branch = format!("issue-{issue_iid}");
-        match step {
-            FinishedMrStep::ObserveDefaultBranch => {
-                WorkerStep::Observe(WorkerQuery::DefaultBranchOrMain)
-            }
-            FinishedMrStep::ResetWorktree => WorkerStep::Act(WorkerAction::ResetWorktree),
-            FinishedMrStep::CheckoutDefaultBranch => {
-                WorkerStep::Act(WorkerAction::CheckoutBranch {
-                    branch: self.default_branch.clone(),
-                })
-            }
-            FinishedMrStep::DeleteLocalBranch => {
-                WorkerStep::Act(WorkerAction::DeleteLocalBranch { branch })
-            }
-            FinishedMrStep::DeleteRemoteBranch => {
-                WorkerStep::Act(WorkerAction::DeleteRemoteBranch { branch })
-            }
-            FinishedMrStep::ReleaseClaim => {
-                WorkerStep::Act(WorkerAction::ReleaseIssueClaim { issue_iid })
-            }
-            FinishedMrStep::RemoveWorkingOnLabel => {
-                WorkerStep::Act(WorkerAction::RemoveWorkingOnLabel { issue_iid })
-            }
-            FinishedMrStep::CleanupSession => {
-                WorkerStep::Act(WorkerAction::CleanupSession { issue_iid })
-            }
-            FinishedMrStep::CloseIssue => WorkerStep::Act(WorkerAction::CloseIssue { issue_iid }),
-        }
-    }
-
-    fn cleanup_step(&self, step: CleanupStep) -> WorkerStep {
-        let plan = self.cleanup_plan();
-        let issue_iid = plan.issue_iid;
-        match step {
-            CleanupStep::ReleaseClaim => {
-                WorkerStep::Act(WorkerAction::ReleaseIssueClaim { issue_iid })
-            }
-            CleanupStep::RemoveWorkingOnLabel => {
-                WorkerStep::Act(WorkerAction::RemoveWorkingOnLabel { issue_iid })
-            }
-            CleanupStep::CleanupSession => {
-                WorkerStep::Act(WorkerAction::CleanupSession { issue_iid })
-            }
-            CleanupStep::ObserveDefaultBranch => {
-                WorkerStep::Observe(WorkerQuery::DefaultBranchOrMain)
-            }
-            CleanupStep::ResetWorktree => WorkerStep::Act(WorkerAction::ResetWorktree),
-            CleanupStep::CheckoutDefaultBranch => WorkerStep::Act(WorkerAction::CheckoutBranch {
-                branch: self.default_branch.clone(),
-            }),
-            CleanupStep::DeleteLocalBranch => WorkerStep::Act(WorkerAction::DeleteLocalBranch {
-                branch: plan
-                    .branch
-                    .clone()
-                    .expect("branch cleanup steps run only when the plan has a branch"),
-            }),
-        }
-    }
-
-    /// Feed back the answer to the observation the machine just asked for.
-    /// `Err` here fails the cycle, exactly where the original code used `?`.
-    fn apply_fact(&mut self, fact: Result<WorkerFact>) -> Result<()> {
-        match (self.stage.clone(), fact) {
-            (WorkerStage::ObserveActiveIssue, observed) => {
-                self.stage = self.apply_active_issue_hold(observed, true)?;
-            }
-            (WorkerStage::ObserveIssueBeforeReattempt, observed) => {
-                let next = self.apply_active_issue_hold(observed, false)?;
-                self.stage = if matches!(next, WorkerStage::Finish) {
-                    // `Keep` for the no-MR path means: re-read the issue and
-                    // implement it again from scratch.
-                    let issue_iid = self.active_iid();
-                    info!(
-                        "{}: Active issue #{} has no MR, re-attempting implementation",
-                        self.agent_id, issue_iid
-                    );
-                    WorkerStage::ObserveIssueForReattempt
-                } else {
-                    next
-                };
-            }
-            (WorkerStage::ObserveIssueForReattempt, Ok(WorkerFact::Issue(issue))) => {
-                self.candidate = Some(issue);
-                self.current = None;
-                self.stage = WorkerStage::RunReattemptImplementation;
-            }
-            (WorkerStage::ObserveIssueForReattempt, Err(e)) => {
-                let issue_iid = self.active_iid();
-                warn!(
-                    "{}: Failed to fetch issue #{} for re-attempt: {}, releasing",
-                    self.agent_id, issue_iid, e
-                );
-                self.active = None;
-                self.stage = self.start_cleanup(
-                    CleanupPlan {
-                        issue_iid,
-                        remove_working_label: true,
-                        cleanup_session: true,
-                        branch: None,
-                    },
-                    AfterCleanup::LookForNewWork,
-                );
-            }
-            (WorkerStage::ObserveActiveMr, Ok(WorkerFact::MergeRequestStatus(mr))) => {
-                if mr.is_finished() {
-                    info!(
-                        "{}: MR !{} is {}, releasing issue #{}",
-                        self.agent_id,
-                        mr.iid,
-                        mr.state,
-                        self.active_iid()
-                    );
-                    self.finished_mr_merged = mr.is_merged();
-                    self.stage =
-                        WorkerStage::ReleaseFinishedMr(FinishedMrStep::ObserveDefaultBranch);
-                } else {
-                    self.stage = WorkerStage::RunActiveFeedback;
-                }
-            }
-            (WorkerStage::ObserveActiveMr, Err(e)) => {
-                let mr_iid = self.active_issue().mr_iid.unwrap_or(0);
-                warn!("{}: Failed to check MR !{}: {}", self.agent_id, mr_iid, e);
-                // The issue stays active, so the cycle ends here.
-                self.stage = WorkerStage::Finish;
-            }
-            (
-                WorkerStage::ReleaseFinishedMr(FinishedMrStep::ObserveDefaultBranch),
-                Ok(WorkerFact::DefaultBranchOrMain(branch)),
-            ) => {
-                self.default_branch = branch;
-                self.stage = self.advance_finished_mr(FinishedMrStep::ObserveDefaultBranch);
-            }
-            (
-                WorkerStage::Cleanup(CleanupStep::ObserveDefaultBranch),
-                Ok(WorkerFact::DefaultBranchOrMain(branch)),
-            ) => {
-                self.default_branch = branch;
-                self.stage = self.advance_cleanup(CleanupStep::ObserveDefaultBranch);
-            }
-            (
-                WorkerStage::ShutdownAfterFeedbackError(message),
-                Ok(WorkerFact::ShutdownRequested(stop)),
-            ) => {
-                if stop {
-                    self.stage = WorkerStage::Finish;
-                } else if message.contains(WORKER_AGENT_CANCELLED_MSG) {
-                    self.stage = WorkerStage::ResolveCancelledActiveIssue(message);
-                } else {
-                    error!(
-                        "{}: Failed to handle comments for MR !{}: {}",
-                        self.agent_id,
-                        self.active_issue().mr_iid.unwrap_or(0),
-                        message
-                    );
-                    // The issue is still active, so the cycle ends here.
-                    self.stage = WorkerStage::Finish;
-                }
-            }
-            (
-                WorkerStage::ShutdownAfterImplementationError(message),
-                Ok(WorkerFact::ShutdownRequested(stop)),
-            ) => {
-                self.stage = self.apply_implementation_error(&message, stop);
-            }
-            (WorkerStage::ShutdownBeforePolling, Ok(WorkerFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    WorkerStage::Finish
-                } else if self.active.is_none() {
-                    WorkerStage::AdoptOrphanedSession
-                } else {
-                    WorkerStage::HandleNeedAiWorkerMr
-                };
-            }
-            (WorkerStage::ObserveIssues, Ok(WorkerFact::Issues(issues))) => {
-                self.candidates = issues.into();
-                self.stage = WorkerStage::ShutdownAfterIssues;
-            }
-            (WorkerStage::ShutdownAfterIssues, Ok(WorkerFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    WorkerStage::Finish
-                } else {
-                    WorkerStage::NextCandidate
-                };
-            }
-            (WorkerStage::ShutdownBeforeCandidate, Ok(WorkerFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    WorkerStage::Finish
-                } else {
-                    WorkerStage::ScreenCandidate
-                };
-            }
-            (WorkerStage::ObserveDependencyIssue(dep_issue_iid), observed) => {
-                let candidate_iid = self.candidate().iid;
-                let as_ref = match &observed {
-                    Ok(WorkerFact::Issue(issue)) => Ok(issue),
-                    Ok(fact) => {
-                        anyhow::bail!("worker port answered a dependency observation with {fact:?}")
-                    }
-                    Err(e) => Err(e),
-                };
-                self.stage = match decide_dependency(as_ref) {
-                    DependencyDecision::Resolved => {
-                        match &observed {
-                            Ok(_) => info!(
-                                "{}: Issue #{} dependency issue #{} closed, resuming",
-                                self.agent_id, candidate_iid, dep_issue_iid
-                            ),
-                            Err(_) => info!(
-                                "{}: Issue #{} dependency issue #{} not found (deleted or never existed), dropping dependency label and resuming",
-                                self.agent_id, candidate_iid, dep_issue_iid
-                            ),
-                        }
-                        WorkerStage::RemoveDependencyLabel(dep_issue_iid)
                     }
                     DependencyDecision::StillWaiting => {
                         debug!(
                             "{}: Issue #{} waiting on issue #{} (not yet closed), skipping",
-                            self.agent_id, candidate_iid, dep_issue_iid
+                            agent_id, issue.iid, dep_issue_iid
                         );
-                        WorkerStage::NextCandidate
+                        continue;
                     }
                     DependencyDecision::Unknown => {
                         warn!(
                             "{}: Issue #{} waiting on issue #{} — failed to check dependency state: {}, skipping this cycle",
-                            self.agent_id,
-                            candidate_iid,
+                            agent_id,
+                            issue.iid,
                             dep_issue_iid,
-                            observed.err().map(|e| e.to_string()).unwrap_or_default()
+                            dependency.err().map(|e| e.to_string()).unwrap_or_default()
                         );
-                        WorkerStage::NextCandidate
+                        continue;
                     }
-                };
-            }
-            (WorkerStage::ShutdownAfterCandidateClaim, Ok(WorkerFact::ShutdownRequested(stop))) => {
-                self.stage = if stop {
-                    WorkerStage::ReleaseCandidateClaimAtShutdown
-                } else {
-                    WorkerStage::PreserveCandidateClaim
-                };
-            }
-            (stage, Ok(fact)) => {
-                anyhow::bail!("worker port answered {stage:?} with {fact:?}");
-            }
-            (_, Err(e)) => return Err(e),
-        }
-        Ok(())
-    }
-
-    /// Apply the shared release rules for the issue the worker is pinned
-    /// to. `Keep` maps to [`WorkerStage::Finish`] for the caller to
-    /// reinterpret, since the two active phases continue differently.
-    fn apply_active_issue_hold(
-        &mut self,
-        observed: Result<WorkerFact>,
-        watching_mr: bool,
-    ) -> Result<WorkerStage> {
-        let issue_iid = self.active_iid();
-        let mr_iid = self.active_issue().mr_iid;
-        let issue = match observed {
-            Ok(WorkerFact::Issue(issue)) => issue,
-            Ok(fact) => anyhow::bail!("worker port answered an issue observation with {fact:?}"),
-            Err(e) => {
-                if watching_mr {
-                    warn!(
-                        "{}: Failed to verify active issue #{}: {}, releasing worker state",
-                        self.agent_id, issue_iid, e
-                    );
-                } else {
-                    warn!(
-                        "{}: Failed to verify active issue #{}: {}, releasing",
-                        self.agent_id, issue_iid, e
-                    );
-                }
-                self.active = None;
-                return Ok(WorkerStage::ClearIssueStateThen(issue_iid));
-            }
-        };
-
-        Ok(match decide_issue_hold(&issue, self.scope_label) {
-            IssueHold::Keep => {
-                if watching_mr {
-                    WorkerStage::ObserveActiveMr
-                } else {
-                    WorkerStage::Finish
                 }
             }
-            IssueHold::AbandonClosed => {
-                self.active = None;
-                WorkerStage::AbandonClosedIssueThen(
-                    issue_iid,
-                    if watching_mr { mr_iid } else { None },
-                )
-            }
-            IssueHold::ClearState(reason) => {
-                match reason {
-                    ClearReason::OutOfScope if watching_mr => info!(
-                        "{}: Issue #{} left scope label {:?}, releasing worker state",
-                        self.agent_id, issue_iid, self.scope_label
-                    ),
-                    ClearReason::OutOfScope => info!(
-                        "{}: Active issue #{} left scope label {:?}, releasing",
-                        self.agent_id, issue_iid, self.scope_label
-                    ),
-                    ClearReason::Pending if watching_mr => info!(
-                        "{}: Issue #{} has `{}` — stopping MR watch (issue stays open)",
-                        self.agent_id, issue_iid, WORKER_PENDING_LABEL
-                    ),
-                    ClearReason::Pending => info!(
-                        "{}: Active issue #{} has `{}` — yielding (issue stays open)",
-                        self.agent_id, issue_iid, WORKER_PENDING_LABEL
-                    ),
-                }
-                self.active = None;
-                WorkerStage::ClearIssueStateThen(issue_iid)
-            }
-            IssueHold::ReleaseReviewOnly => {
-                self.active = None;
-                WorkerStage::ReleaseReviewOnlyHoldThen(issue_iid)
-            }
-        })
-    }
-
-    fn advance_finished_mr(&mut self, after_step: FinishedMrStep) -> WorkerStage {
-        match after_step.next(self.finished_mr_merged) {
-            Some(step) => WorkerStage::ReleaseFinishedMr(step),
-            None => self.release_active(),
+            CandidateScreening::Claimable => {}
         }
-    }
 
-    /// How a failed implementation run ends. Shutdown keeps the issue
-    /// active so the shutdown hook can persist it; an external cancel is
-    /// resolved by the cancel helper; anything else is logged and released.
-    fn apply_implementation_error(&mut self, message: &str, shutting_down: bool) -> WorkerStage {
-        if shutting_down {
-            // Keep the in-flight issue active so the shutdown hook can
-            // persist the claim and session for the next start.
-            self.active = self.current.clone();
-            return WorkerStage::Finish;
-        }
-        if message.contains(WORKER_AGENT_CANCELLED_MSG) {
-            return WorkerStage::ResolveCancelledImplementation(message.to_string());
-        }
-        self.release_after_failed_implementation(message)
-    }
-
-    fn release_after_failed_implementation(&mut self, message: &str) -> WorkerStage {
-        let current = self
-            .current
-            .clone()
-            .expect("an implementation run records its in-flight issue");
-        match self.implementation_phase {
-            ImplementationPhase::Reattempt => {
-                error!(
-                    "{}: Failed to re-process issue #{}: {}",
-                    self.agent_id, current.issue_iid, message
+        match port.acquire_issue_claim(issue.iid)? {
+            IssueClaimAttempt::Lost => {
+                info!(
+                    "{}: Failed to claim issue #{}, skipping",
+                    agent_id, issue.iid
                 );
-                self.active = None;
-                self.start_cleanup(
-                    CleanupPlan {
-                        issue_iid: current.issue_iid,
-                        remove_working_label: true,
-                        cleanup_session: true,
-                        branch: current.branch_name.clone(),
-                    },
-                    AfterCleanup::Finish,
-                )
+                continue;
             }
-            ImplementationPhase::Candidate => {
-                error!(
-                    "{}: Failed to process issue #{}: {}",
-                    self.agent_id, current.issue_iid, message
-                );
-                self.start_cleanup(
-                    CleanupPlan {
-                        issue_iid: current.issue_iid,
-                        remove_working_label: true,
-                        cleanup_session: false,
-                        branch: current.branch_name.clone(),
-                    },
-                    AfterCleanup::Finish,
-                )
-            }
+            IssueClaimAttempt::Interrupted => return Ok(()),
+            IssueClaimAttempt::Won => {}
         }
+        if port.shutdown_requested() {
+            port.release_acquired_claim(issue.iid);
+            return Ok(());
+        }
+        port.preserve_issue_claim(issue.iid);
+        port.save_session(issue.iid, 0);
+        info!(
+            "{}: Implementing issue #{}: {}",
+            agent_id, issue.iid, issue.title
+        );
+        finish_implementation(port, agent_id, active, &issue, false);
+        return Ok(());
     }
-
-    /// Feed back the outcome of the action the machine just asked for.
-    fn apply_outcome(&mut self, outcome: WorkerOutcome) -> Result<()> {
-        match (self.stage.clone(), outcome) {
-            (
-                WorkerStage::ClearIssueStateThen(_)
-                | WorkerStage::AbandonClosedIssueThen(_, _)
-                | WorkerStage::ReleaseReviewOnlyHoldThen(_),
-                WorkerOutcome::Done,
-            ) => {
-                self.stage = WorkerStage::ShutdownBeforePolling;
-            }
-            (WorkerStage::ReleaseFinishedMr(step), WorkerOutcome::Done) => {
-                self.stage = self.advance_finished_mr(step);
-            }
-            (WorkerStage::RunActiveFeedback, WorkerOutcome::Feedback { abandoned }) => {
-                if abandoned {
-                    let active = self.active_issue();
-                    info!(
-                        "{}: Issue #{} abandoned, MR !{} closed",
-                        self.agent_id,
-                        active.issue_iid,
-                        active.mr_iid.unwrap_or(0)
-                    );
-                    self.stage = WorkerStage::ReleaseClaimAfterAbandon;
-                } else {
-                    // The issue stays active, so the cycle ends here.
-                    self.stage = WorkerStage::Finish;
-                }
-            }
-            (WorkerStage::RunActiveFeedback, WorkerOutcome::Failed(e)) => {
-                self.stage = WorkerStage::ShutdownAfterFeedbackError(format!("{e:#}"));
-            }
-            (WorkerStage::ReleaseClaimAfterAbandon, WorkerOutcome::Done) => {
-                self.stage = WorkerStage::CleanupSessionAfterAbandon;
-            }
-            (WorkerStage::CleanupSessionAfterAbandon, WorkerOutcome::Done) => {
-                self.stage = self.release_active();
-            }
-            (
-                WorkerStage::ResolveCancelledActiveIssue(message),
-                WorkerOutcome::CancelHandled(handled),
-            ) => {
-                if handled {
-                    self.stage = self.release_active_and_finish();
-                } else {
-                    error!(
-                        "{}: Failed to handle comments for MR !{}: {}",
-                        self.agent_id,
-                        self.active_issue().mr_iid.unwrap_or(0),
-                        message
-                    );
-                    self.stage = WorkerStage::Finish;
-                }
-            }
-            (
-                WorkerStage::ResolveCancelledImplementation(message),
-                WorkerOutcome::CancelHandled(handled),
-            ) => {
-                self.stage = if handled {
-                    self.active = None;
-                    WorkerStage::Finish
-                } else {
-                    self.release_after_failed_implementation(&message)
-                };
-            }
-            (
-                WorkerStage::RunReattemptImplementation | WorkerStage::RunCandidateImplementation,
-                WorkerOutcome::Implementation { current, error },
-            ) => {
-                let mr_created = current.mr_created;
-                self.current = Some(current);
-                self.stage = match error {
-                    Some(e) => WorkerStage::ShutdownAfterImplementationError(format!("{e:#}")),
-                    None if mr_created => match self.implementation_phase {
-                        ImplementationPhase::Reattempt => WorkerStage::CheckTrackableAfterReattempt,
-                        ImplementationPhase::Candidate => WorkerStage::CheckTrackableAfterCandidate,
-                    },
-                    None => {
-                        let issue_iid = self.implementation_iid();
-                        let cleanup_session =
-                            matches!(self.implementation_phase, ImplementationPhase::Reattempt);
-                        self.active = None;
-                        self.start_cleanup(
-                            CleanupPlan {
-                                issue_iid,
-                                remove_working_label: false,
-                                cleanup_session,
-                                branch: None,
-                            },
-                            AfterCleanup::Finish,
-                        )
-                    }
-                };
-            }
-            (
-                WorkerStage::CheckTrackableAfterReattempt
-                | WorkerStage::CheckTrackableAfterCandidate,
-                WorkerOutcome::Trackable(trackable),
-            ) => {
-                self.active = trackable.then(|| {
-                    self.current
-                        .clone()
-                        .expect("an implementation run records its in-flight issue")
-                });
-                self.stage = WorkerStage::Finish;
-            }
-            (WorkerStage::Cleanup(step), WorkerOutcome::Done) => {
-                self.stage = self.advance_cleanup(step);
-            }
-            (WorkerStage::AdoptOrphanedSession, WorkerOutcome::Adopted(adopted)) => {
-                self.stage = match adopted {
-                    Some(active) => {
-                        info!(
-                            "{}: Adopted orphaned issue #{} with MR !{}",
-                            self.agent_id,
-                            active.issue_iid,
-                            active.mr_iid.unwrap_or(0)
-                        );
-                        self.active = Some(active);
-                        WorkerStage::Finish
-                    }
-                    None => WorkerStage::HandleNeedAiWorkerMr,
-                };
-            }
-            (WorkerStage::HandleNeedAiWorkerMr, WorkerOutcome::HandledNeedAiWorkerMr(handled)) => {
-                self.stage = if handled {
-                    WorkerStage::Finish
-                } else {
-                    WorkerStage::ObserveIssues
-                };
-            }
-            (WorkerStage::RemoveDependencyLabel(_), WorkerOutcome::Done) => {
-                let candidate = self.candidate();
-                self.stage = if claim::is_claimed(&candidate.labels) {
-                    debug!(
-                        "{}: Issue #{} already claimed, skipping",
-                        self.agent_id, candidate.iid
-                    );
-                    WorkerStage::NextCandidate
-                } else {
-                    WorkerStage::AcquireCandidateClaim
-                };
-            }
-            (WorkerStage::AcquireCandidateClaim, WorkerOutcome::Claim(attempt)) => {
-                self.stage = match attempt {
-                    IssueClaimAttempt::Won => WorkerStage::ShutdownAfterCandidateClaim,
-                    IssueClaimAttempt::Lost => {
-                        info!(
-                            "{}: Failed to claim issue #{}, skipping",
-                            self.agent_id,
-                            self.candidate().iid
-                        );
-                        WorkerStage::NextCandidate
-                    }
-                    IssueClaimAttempt::Interrupted => WorkerStage::Finish,
-                };
-            }
-            (WorkerStage::ReleaseCandidateClaimAtShutdown, WorkerOutcome::Done) => {
-                self.stage = WorkerStage::Finish;
-            }
-            (WorkerStage::PreserveCandidateClaim, WorkerOutcome::Done) => {
-                self.stage = WorkerStage::SaveCandidatePreSession;
-            }
-            (WorkerStage::SaveCandidatePreSession, WorkerOutcome::Done) => {
-                self.stage = WorkerStage::RunCandidateImplementation;
-            }
-            // The reads and writes the cycle performed with `?` abort it.
-            (
-                WorkerStage::HandleNeedAiWorkerMr | WorkerStage::AcquireCandidateClaim,
-                WorkerOutcome::Failed(e),
-            ) => return Err(e),
-            (stage, _) => {
-                anyhow::bail!("worker port reported an unexpected outcome for {stage:?}");
-            }
-        }
-        Ok(())
-    }
-
-    /// Drop the active issue and end the cycle.
-    fn release_active_and_finish(&mut self) -> WorkerStage {
-        self.active = None;
-        WorkerStage::Finish
-    }
-}
-
-/// Ask the routing port one question.
-fn observe_worker(port: &dyn WorkerRoutingPort, query: &WorkerQuery) -> Result<WorkerFact> {
-    Ok(match query {
-        WorkerQuery::ShutdownRequested => WorkerFact::ShutdownRequested(port.shutdown_requested()),
-        WorkerQuery::Issue { issue_iid } => WorkerFact::Issue(port.issue(*issue_iid)?),
-        WorkerQuery::MergeRequestStatus { mr_iid } => {
-            WorkerFact::MergeRequestStatus(port.merge_request_status(*mr_iid)?)
-        }
-        WorkerQuery::Issues => WorkerFact::Issues(port.issues()?),
-        WorkerQuery::DefaultBranchOrMain => {
-            WorkerFact::DefaultBranchOrMain(port.default_branch_or_main())
-        }
-    })
+    Ok(())
 }
 
 fn run_worker_routing_cycle(
-    machine: &mut WorkerRoutingMachine,
     port: &mut dyn WorkerRoutingPort,
+    agent_id: &str,
+    scope_label: Option<&str>,
+    active: &mut Option<ActiveIssue>,
 ) -> Result<()> {
-    loop {
-        match machine.next_step() {
-            Step::Observe(query) => machine.apply_fact(observe_worker(port, &query))?,
-            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
-            Step::Finish => return Ok(()),
+    let continue_polling = match active.as_ref() {
+        Some(active_issue) if active_issue.mr_iid.is_some() => {
+            handle_active_mr(port, agent_id, scope_label, active)?
         }
+        Some(active_issue) if !active_issue.mr_created => {
+            handle_active_reattempt(port, agent_id, scope_label, active)
+        }
+        _ => true,
+    };
+    if continue_polling {
+        poll_for_work(port, agent_id, scope_label, active)?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Live worker routing port
 // ---------------------------------------------------------------------------
 
-/// The routing port backed by the real runtime: the worker's only place
-/// where a routing decision meets git, GitLab, the session store, or the
-/// model.
 struct LiveWorkerRoutingPort<'a> {
     state: &'a AgentState<'a>,
     model: &'a AgentModel,
     shutdown: &'a AtomicBool,
     scope_label: Option<&'a str>,
-    /// The claim won for the candidate currently being screened, until the
-    /// machine preserves or releases it.
     candidate_lease: Option<ClaimLease>,
 }
 
@@ -2106,148 +1336,135 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
             .unwrap_or("main".to_string())
     }
 
-    fn execute(&mut self, action: &WorkerAction) -> WorkerOutcome {
-        let state = self.state;
-        match action {
-            WorkerAction::ResetWorktree => {
-                let _ = state.git_repo.reset_hard();
-                WorkerOutcome::Done
-            }
-            WorkerAction::CheckoutBranch { branch } => {
-                let _ = state.git_repo.checkout_remote_branch(branch);
-                WorkerOutcome::Done
-            }
-            WorkerAction::DeleteLocalBranch { branch } => {
-                let _ = state.git_repo.delete_local_branch(branch);
-                WorkerOutcome::Done
-            }
-            WorkerAction::DeleteRemoteBranch { branch } => {
-                state.git_repo.delete_remote_branch_best_effort(branch);
-                WorkerOutcome::Done
-            }
-            WorkerAction::ReleaseIssueClaim { issue_iid } => {
-                let _ =
-                    claim::release(state.glab, ClaimResource::Issue(*issue_iid), state.agent_id);
-                WorkerOutcome::Done
-            }
-            WorkerAction::RemoveWorkingOnLabel { issue_iid } => {
-                let _ = state.glab.remove_issue_label(*issue_iid, WORKING_ON_LABEL);
-                WorkerOutcome::Done
-            }
-            WorkerAction::RemoveIssueLabel { issue_iid, label } => {
-                let _ = state.glab.remove_issue_label(*issue_iid, label);
-                WorkerOutcome::Done
-            }
-            WorkerAction::CleanupSession { issue_iid } => {
-                state.cleanup_session(*issue_iid);
-                WorkerOutcome::Done
-            }
-            WorkerAction::SaveSession { issue_iid, mr_iid } => {
-                let _ = state.save_session(*issue_iid, *mr_iid);
-                WorkerOutcome::Done
-            }
-            WorkerAction::CloseIssue { issue_iid } => {
-                close_issue_best_effort(state.glab, *issue_iid);
-                WorkerOutcome::Done
-            }
-            WorkerAction::AcquireIssueClaim { issue_iid } => match claim::acquire(
-                state.glab,
-                ClaimResource::Issue(*issue_iid),
-                state.agent_id,
+    fn reset_worktree(&mut self) {
+        let _ = self.state.git_repo.reset_hard();
+    }
+    fn checkout_branch(&mut self, branch: &str) {
+        let _ = self.state.git_repo.checkout_remote_branch(branch);
+    }
+    fn delete_local_branch(&mut self, branch: &str) {
+        let _ = self.state.git_repo.delete_local_branch(branch);
+    }
+    fn delete_remote_branch(&mut self, branch: &str) {
+        self.state.git_repo.delete_remote_branch_best_effort(branch);
+    }
+    fn release_issue_claim(&mut self, issue_iid: u64) {
+        let _ = claim::release(
+            self.state.glab,
+            ClaimResource::Issue(issue_iid),
+            self.state.agent_id,
+        );
+    }
+    fn remove_working_on_label(&mut self, issue_iid: u64) {
+        let _ = self
+            .state
+            .glab
+            .remove_issue_label(issue_iid, WORKING_ON_LABEL);
+    }
+    fn remove_issue_label(&mut self, issue_iid: u64, label: &str) {
+        let _ = self.state.glab.remove_issue_label(issue_iid, label);
+    }
+    fn cleanup_session(&mut self, issue_iid: u64) {
+        self.state.cleanup_session(issue_iid);
+    }
+    fn save_session(&mut self, issue_iid: u64, mr_iid: u64) {
+        let _ = self.state.save_session(issue_iid, mr_iid);
+    }
+    fn close_issue(&mut self, issue_iid: u64) {
+        close_issue_best_effort(self.state.glab, issue_iid);
+    }
+
+    fn acquire_issue_claim(&mut self, issue_iid: u64) -> Result<IssueClaimAttempt> {
+        Ok(
+            match claim::acquire(
+                self.state.glab,
+                ClaimResource::Issue(issue_iid),
+                self.state.agent_id,
                 self.shutdown,
-            ) {
-                Ok(ClaimAcquireOutcome::Won(lease)) => {
+            )? {
+                ClaimAcquireOutcome::Won(lease) => {
                     self.candidate_lease = Some(lease);
-                    WorkerOutcome::Claim(IssueClaimAttempt::Won)
+                    IssueClaimAttempt::Won
                 }
-                Ok(ClaimAcquireOutcome::Lost) => WorkerOutcome::Claim(IssueClaimAttempt::Lost),
-                Ok(ClaimAcquireOutcome::Interrupted) => {
-                    WorkerOutcome::Claim(IssueClaimAttempt::Interrupted)
-                }
-                Err(e) => WorkerOutcome::Failed(e),
+                ClaimAcquireOutcome::Lost => IssueClaimAttempt::Lost,
+                ClaimAcquireOutcome::Interrupted => IssueClaimAttempt::Interrupted,
             },
-            WorkerAction::PreserveIssueClaim { .. } => {
-                // Ownership is tracked by issue IID from here on (in
-                // `active` and the session file): GitLab's claim label is
-                // the source of truth across cycles and restarts.
-                if let Some(lease) = self.candidate_lease.take() {
-                    lease.preserve();
-                }
-                WorkerOutcome::Done
-            }
-            WorkerAction::ReleaseAcquiredClaim { .. } => {
-                if let Some(lease) = self.candidate_lease.take() {
-                    let _ = lease.release(state.glab);
-                }
-                WorkerOutcome::Done
-            }
-            WorkerAction::ClearIssueState { issue_iid } => {
-                state.clear_resumed_issue_state(*issue_iid);
-                WorkerOutcome::Done
-            }
-            WorkerAction::ReleaseReviewOnlyHold { issue_iid } => {
-                state.release_worker_hold_review_only(*issue_iid);
-                WorkerOutcome::Done
-            }
-            WorkerAction::AbandonClosedIssue { issue_iid, mr_iid } => {
-                state.abandon_closed_issue(*issue_iid, *mr_iid);
-                WorkerOutcome::Done
-            }
-            WorkerAction::AdoptOrphanedSession => WorkerOutcome::Adopted(
-                try_adopt_orphaned_session(state, self.shutdown, self.scope_label),
-            ),
-            WorkerAction::HandleNeedAiWorkerMr => {
-                match try_handle_need_ai_worker_mr(
-                    state,
-                    self.model,
-                    self.shutdown,
-                    self.scope_label,
-                ) {
-                    Ok(handled) => WorkerOutcome::HandledNeedAiWorkerMr(handled),
-                    Err(e) => WorkerOutcome::Failed(e),
-                }
-            }
-            WorkerAction::RunImplementation { issue } => {
-                let mut current = ActiveIssue {
-                    issue_iid: issue.iid,
-                    mr_iid: None,
-                    branch_name: None,
-                    mr_created: false,
-                };
-                let error =
-                    process_issue(state, self.model, issue, &mut current, self.scope_label).err();
-                WorkerOutcome::Implementation { current, error }
-            }
-            WorkerAction::RunFeedback {
-                mr_iid,
-                linked_issue_iid,
-                comments_only,
-            } => match handle_mr_comments(
-                state,
-                self.model,
-                *mr_iid,
-                *linked_issue_iid,
-                *comments_only,
-            ) {
-                Ok(abandoned) => WorkerOutcome::Feedback { abandoned },
-                Err(e) => WorkerOutcome::Failed(e),
-            },
-            WorkerAction::ResolveCancelledIssue { issue_iid } => {
-                let error = anyhow::anyhow!("{}", WORKER_AGENT_CANCELLED_MSG);
-                WorkerOutcome::CancelHandled(handle_worker_issue_processing_cancelled(
-                    state, *issue_iid, &error,
-                ))
-            }
-            WorkerAction::CheckIssueTrackable { issue_iid } => {
-                WorkerOutcome::Trackable(should_track_worker_issue(state, *issue_iid))
-            }
+        )
+    }
+
+    fn preserve_issue_claim(&mut self, _issue_iid: u64) {
+        if let Some(lease) = self.candidate_lease.take() {
+            lease.preserve();
         }
+    }
+    fn release_acquired_claim(&mut self, _issue_iid: u64) {
+        if let Some(lease) = self.candidate_lease.take() {
+            let _ = lease.release(self.state.glab);
+        }
+    }
+    fn clear_issue_state(&mut self, issue_iid: u64) {
+        self.state.clear_resumed_issue_state(issue_iid);
+    }
+    fn release_review_only_hold(&mut self, issue_iid: u64) {
+        self.state.release_worker_hold_review_only(issue_iid);
+    }
+    fn abandon_closed_issue(&mut self, issue_iid: u64, mr_iid: Option<u64>) {
+        self.state.abandon_closed_issue(issue_iid, mr_iid);
+    }
+    fn adopt_orphaned_session(&mut self) -> Option<ActiveIssue> {
+        try_adopt_orphaned_session(self.state, self.shutdown, self.scope_label)
+    }
+    fn handle_need_ai_worker_mr(&mut self) -> Result<bool> {
+        try_handle_need_ai_worker_mr(self.state, self.model, self.shutdown, self.scope_label)
+    }
+    fn run_implementation(
+        &mut self,
+        issue: &IssueObservation,
+    ) -> (ActiveIssue, Option<anyhow::Error>) {
+        let mut current = ActiveIssue {
+            issue_iid: issue.iid,
+            mr_iid: None,
+            branch_name: None,
+            mr_created: false,
+        };
+        let error = process_issue(
+            self.state,
+            self.model,
+            issue,
+            &mut current,
+            self.scope_label,
+        )
+        .err();
+        (current, error)
+    }
+    fn run_feedback(
+        &mut self,
+        mr_iid: u64,
+        linked_issue_iid: Option<u64>,
+        comments_only: bool,
+    ) -> Result<bool> {
+        handle_mr_comments(
+            self.state,
+            self.model,
+            mr_iid,
+            linked_issue_iid,
+            comments_only,
+        )
+    }
+    fn resolve_cancelled_issue(&mut self, issue_iid: u64) -> bool {
+        handle_worker_issue_processing_cancelled(
+            self.state,
+            issue_iid,
+            &anyhow::anyhow!("{}", WORKER_AGENT_CANCELLED_MSG),
+        )
+    }
+    fn issue_trackable(&mut self, issue_iid: u64) -> bool {
+        should_track_worker_issue(self.state, issue_iid)
     }
 }
 
-/// The worker's routing cycle: pick up where the last cycle left off, or
-/// find new work. Observes, decides one step, executes it, feeds the result
-/// back — see [`WorkerRoutingMachine`].
+/// The worker's routing cycle: resume active work or imperatively look for one
+/// new candidate.
 fn worker_cycle(
     state: &AgentState,
     model: &AgentModel,
@@ -2255,7 +1472,6 @@ fn worker_cycle(
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Result<()> {
-    let mut machine = WorkerRoutingMachine::new(state.agent_id, scope_label, active.take());
     let mut port = LiveWorkerRoutingPort {
         state,
         model,
@@ -2263,9 +1479,7 @@ fn worker_cycle(
         scope_label,
         candidate_lease: None,
     };
-    let result = run_worker_routing_cycle(&mut machine, &mut port);
-    *active = machine.active.take();
-    result
+    run_worker_routing_cycle(&mut port, state.agent_id, scope_label, active)
 }
 
 fn mr_has_label(mr: &crate::agents::gitlab::MergeRequest, label: &str) -> bool {
@@ -2552,134 +1766,6 @@ fn has_worker_skip_label(labels: &[String]) -> bool {
 // Implementation progression port
 // ---------------------------------------------------------------------------
 
-/// One question the implementation progression asks before it decides
-/// anything. Reads only — every write is an [`ImplAction`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ImplQuery {
-    /// The merge request linked to the issue by a `Closes #` keyword.
-    ClosesLinkedMr,
-    /// An open merge request on the issue's own branch.
-    OpenMrForIssue,
-    /// The default branch; a read the run cannot proceed without.
-    DefaultBranch,
-    /// The default branch, falling back to `main` — used by the release
-    /// paths, which never fail the run over it.
-    DefaultBranchOrMain,
-    RemoteBranchExists,
-    DiffAgainstDefault,
-    StagedChanges,
-    /// The state of a merge request the model claims already implements the
-    /// issue; `None` when it could not be fetched at all.
-    MergeRequestState {
-        mr_iid: u64,
-    },
-    DependencyClosed {
-        issue_iid: u64,
-    },
-    IssueComments,
-}
-
-/// The answer to one [`ImplQuery`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ImplFact {
-    ClosesLinkedMr(Option<ClosesLinkedMr>),
-    OpenMrForIssue(Option<u64>),
-    DefaultBranch(String),
-    DefaultBranchOrMain(String),
-    RemoteBranchExists(bool),
-    DiffAgainstDefault(bool),
-    StagedChanges(bool),
-    MergeRequestState(Option<String>),
-    DependencyClosed(bool),
-    IssueComments(String),
-}
-
-/// One side effect in the implementation progression: the workspace
-/// preparation, the model invocation, and every GitLab write are all
-/// actions the machine asks for one at a time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ImplAction {
-    /// Release the issue if a human asked for review-only in the meantime.
-    StopIfReviewOnly,
-    AddWorkingOnLabel,
-    /// The same label write, where the original code failed the run on it.
-    RequireWorkingOnLabel,
-    RemoveWorkingOnLabel,
-    AddIssueLabel {
-        label: String,
-    },
-    AddIssueComment {
-        body: String,
-    },
-    ReleaseIssueClaim,
-    CleanupSession,
-    CloseIssue,
-    SaveSession {
-        mr_iid: u64,
-    },
-    RequireSaveSession {
-        mr_iid: u64,
-    },
-    RequireSaveSessionWithSummary {
-        mr_iid: u64,
-        summary: String,
-    },
-    FetchRemote,
-    ResetWorktree,
-    CheckoutBranch {
-        branch: String,
-    },
-    /// The same checkout on a release path, where a failure is tolerated.
-    CheckoutBranchBestEffort {
-        branch: String,
-    },
-    DeleteLocalBranch {
-        branch: String,
-    },
-    DeleteRemoteBranch {
-        branch: String,
-    },
-    CreateBranchFrom {
-        branch: String,
-        base: String,
-    },
-    MergeBaseIntoBranch {
-        base: String,
-    },
-    /// Workspace preparation for the model: render the prompt and write the
-    /// task context file next to the session.
-    BuildPrompt {
-        continuation: bool,
-        comments: String,
-    },
-    InvokeImplementationModel {
-        prompt: String,
-    },
-    /// Continue the same model session after a nominally successful handoff
-    /// produced no repository changes.
-    NudgeImplementationModel,
-    StageAll,
-    Commit {
-        message: String,
-    },
-    PushBranch {
-        branch: String,
-    },
-    CreateMergeRequest {
-        branch: String,
-        base: String,
-        title: String,
-        description: String,
-    },
-    AddMrScopeLabel {
-        mr_iid: u64,
-    },
-    HandIssueBackToHumans {
-        branch: String,
-        reason: String,
-    },
-}
-
 /// How one model invocation ended.
 enum ImplModelResult {
     Output(Box<WorkerImplementationOutput>),
@@ -2688,702 +1774,281 @@ enum ImplModelResult {
     Cancelled,
 }
 
-/// What the port reports after executing one [`ImplAction`].
-enum ImplOutcome {
-    Done,
-    Failed(anyhow::Error),
-    /// [`ImplAction::StopIfReviewOnly`]: whether the run must stop.
-    Stopped(bool),
-    /// [`ImplAction::MergeBaseIntoBranch`]: whether the merge was clean.
-    Merged(bool),
-    Prompt(String),
-    Model(ImplModelResult),
-    MergeRequestCreated(u64),
-}
-
 /// The narrow surface one implementation run needs: the worktree, the
 /// issue's merge requests, the session store, and the model. Object-safe
 /// and role-local.
 trait ImplementationPort {
     fn closes_linked_mr(&self) -> Option<ClosesLinkedMr>;
     fn open_mr_for_issue(&self) -> Option<u64>;
+    fn stop_if_review_only(&mut self) -> bool;
+    fn add_working_on_label(&mut self);
+    fn require_working_on_label(&mut self) -> Result<()>;
+    fn remove_working_on_label(&mut self);
+    fn add_issue_label(&mut self, label: &str);
+    fn add_issue_comment(&mut self, body: &str);
+    fn release_issue_claim(&mut self);
+    fn cleanup_session(&mut self);
+    fn close_issue(&mut self);
+    fn save_session(&mut self, mr_iid: u64);
+    fn require_save_session(&mut self, mr_iid: u64) -> Result<()>;
+    fn require_save_session_with_summary(&mut self, mr_iid: u64, summary: &str) -> Result<()>;
     fn default_branch(&self) -> Result<String>;
     fn default_branch_or_main(&self) -> String;
+    fn fetch_remote(&mut self) -> Result<()>;
+    fn reset_worktree(&mut self);
     fn remote_branch_exists(&self, branch: &str) -> Result<bool>;
+    fn checkout_branch(&mut self, branch: &str) -> Result<()>;
+    fn checkout_branch_best_effort(&mut self, branch: &str);
+    fn delete_local_branch(&mut self, branch: &str);
+    fn delete_remote_branch(&mut self, branch: &str);
+    fn create_branch_from(&mut self, branch: &str, base: &str) -> Result<()>;
+    fn merge_base_into_branch(&mut self, base: &str) -> Result<bool>;
     fn has_diff_against(&self, base: &str) -> Result<bool>;
     fn has_staged_changes(&self) -> Result<bool>;
     fn merge_request_state(&self, mr_iid: u64) -> Option<String>;
     fn dependency_closed(&self, issue_iid: u64) -> bool;
     fn issue_comments(&self) -> String;
-    fn execute(&mut self, action: &ImplAction) -> ImplOutcome;
+    fn build_prompt(&mut self, continuation: bool, comments: &str) -> Result<String>;
+    fn invoke_implementation_model(&mut self, prompt: &str) -> Result<ImplModelResult>;
+    fn nudge_implementation_model(&mut self) -> Result<ImplModelResult>;
+    fn stage_all(&mut self) -> Result<()>;
+    fn commit(&mut self, message: &str) -> Result<()>;
+    fn push_branch(&mut self, branch: &str) -> Result<()>;
+    fn create_merge_request(
+        &mut self,
+        branch: &str,
+        base: &str,
+        title: &str,
+        description: &str,
+    ) -> Result<u64>;
+    fn add_mr_scope_label(&mut self, mr_iid: u64);
+    fn hand_issue_back_to_humans(&mut self, branch: &str, reason: &str) -> Result<()>;
 }
 
-type ImplStep = Step<ImplQuery, ImplAction>;
-
-/// Where an implementation run is. The variants spell out the fixed order:
-/// adopt an existing merge request if there is one, then prepare the
-/// worktree, then invoke the model, then commit, push, and open the MR.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ImplStage {
-    StopBeforeDiscovery,
-    ObserveClosesLinkedMr,
-    LabelClosesMr(u64),
-    SaveClosesMrSession(u64),
-    CloseIssueForMergedMr,
-    CleanupSessionForMergedMr,
-    ObserveOpenMrForIssue,
-    LabelOpenMr(u64),
-    SaveOpenMrSession(u64),
-    ObserveDefaultBranch,
-    FetchRemote,
-    ResetBeforePreparation,
-    ObserveRemoteBranch,
-    CheckoutExistingBranch,
-    ObserveBranchDiff,
-    ResetStaleBranch,
-    CheckoutDefaultAfterStale,
-    DeleteLocalStaleBranch,
-    DeleteRemoteStaleBranch,
-    CreateBranchAfterStale,
-    MergeDefaultIntoBranch,
-    ResetConflictedBranch,
-    CheckoutDefaultAfterConflict,
-    DeleteLocalConflictedBranch,
-    CreateBranchAfterConflict,
-    CreateBranch,
-    StopAfterPreparation,
-    RequireWorkingOnLabel,
-    ObserveIssueComments,
-    BuildPrompt,
-    InvokeModel,
-    NudgeModelAfterNoChanges,
-    ObserveExistingMrState(u64),
-    ResetForExistingMr(u64),
-    ObserveDefaultForExistingMr(u64),
-    CheckoutDefaultForExistingMr(u64),
-    DeleteLocalBranchForExistingMr(u64),
-    SaveExistingMrSession(u64),
-    LabelExistingMr(u64),
-    HandBackToHumans(String),
-    ObserveDependencyState(u64),
-    ParkLabelDependency(u64),
-    ParkRemoveWorkingOnLabel(u64),
-    ParkComment(u64),
-    ParkReleaseClaim(u64),
-    ParkCleanupSession(u64),
-    ParkObserveDefaultBranch(u64),
-    ParkResetWorktree(u64),
-    ParkCheckoutDefault(u64),
-    ParkDeleteLocalBranch(u64),
-    StageAll,
-    ObserveStagedChanges,
-    CommitChanges,
-    ObserveDiffBeforePush,
-    PushBranch,
-    CreateMergeRequest,
-    AddScopeLabel(u64),
-    SaveSessionWithSummary(u64),
-    Finish,
-}
-
-/// The state of one implementation run. Plain data: no git repo, no GitLab
-/// client, no model, so every transition is a pure function of what the
-/// machine already observed.
-struct ImplementationMachine<'a> {
-    agent_id: &'a str,
-    scope_label: Option<&'a str>,
-    issue: IssueObservation,
-    stage: ImplStage,
-    branch_name: String,
-    default_branch: String,
-    branch_existed: bool,
-    metadata: ImplementedMetadata,
-    /// The rendered issue comments, held only between the observation that
-    /// read them and the prompt build that consumes them.
-    comments: String,
-    prompt: String,
-    /// The merge request this run ends up tracking, if any — the old
-    /// `Ok(Some(mr_iid))`.
+#[derive(Default)]
+struct ImplementationCycleResult {
     tracked_mr: Option<u64>,
-    /// Mirrors the `current` the cycle cleans up from: the branch the run
-    /// left behind and whether it produced a merge request.
-    left_branch: Option<String>,
     mr_created: bool,
-}
-
-impl<'a> ImplementationMachine<'a> {
-    fn new(agent_id: &'a str, scope_label: Option<&'a str>, issue: IssueObservation) -> Self {
-        let branch_name = format!("issue-{}", issue.iid);
-        Self {
-            agent_id,
-            scope_label,
-            issue,
-            stage: ImplStage::StopBeforeDiscovery,
-            branch_name,
-            default_branch: String::new(),
-            branch_existed: false,
-            metadata: ImplementedMetadata::default(),
-            comments: String::new(),
-            prompt: String::new(),
-            tracked_mr: None,
-            left_branch: None,
-            mr_created: false,
-        }
-    }
-
-    fn mr_title(&self) -> String {
-        extract_mr_title(self.metadata.mr_title.as_deref(), &self.issue.title)
-    }
-
-    /// The single next thing to do; resolves the stages that need no port
-    /// interaction on the way.
-    fn next_step(&mut self) -> ImplStep {
-        match self.stage.clone() {
-            ImplStage::StopBeforeDiscovery | ImplStage::StopAfterPreparation => {
-                ImplStep::Act(ImplAction::StopIfReviewOnly)
-            }
-            ImplStage::ObserveClosesLinkedMr => ImplStep::Observe(ImplQuery::ClosesLinkedMr),
-            ImplStage::LabelClosesMr(_) | ImplStage::LabelOpenMr(_) => {
-                ImplStep::Act(ImplAction::AddWorkingOnLabel)
-            }
-            ImplStage::SaveClosesMrSession(mr_iid) => {
-                ImplStep::Act(ImplAction::SaveSession { mr_iid })
-            }
-            ImplStage::CloseIssueForMergedMr => ImplStep::Act(ImplAction::CloseIssue),
-            ImplStage::CleanupSessionForMergedMr | ImplStage::ParkCleanupSession(_) => {
-                ImplStep::Act(ImplAction::CleanupSession)
-            }
-            ImplStage::ObserveOpenMrForIssue => ImplStep::Observe(ImplQuery::OpenMrForIssue),
-            ImplStage::SaveOpenMrSession(mr_iid) | ImplStage::SaveExistingMrSession(mr_iid) => {
-                ImplStep::Act(ImplAction::RequireSaveSession { mr_iid })
-            }
-            ImplStage::ObserveDefaultBranch => ImplStep::Observe(ImplQuery::DefaultBranch),
-            ImplStage::FetchRemote => ImplStep::Act(ImplAction::FetchRemote),
-            ImplStage::ResetBeforePreparation
-            | ImplStage::ResetStaleBranch
-            | ImplStage::ResetConflictedBranch
-            | ImplStage::ResetForExistingMr(_)
-            | ImplStage::ParkResetWorktree(_) => ImplStep::Act(ImplAction::ResetWorktree),
-            ImplStage::ObserveRemoteBranch => ImplStep::Observe(ImplQuery::RemoteBranchExists),
-            ImplStage::CheckoutExistingBranch => ImplStep::Act(ImplAction::CheckoutBranch {
-                branch: self.branch_name.clone(),
-            }),
-            ImplStage::ObserveBranchDiff | ImplStage::ObserveDiffBeforePush => {
-                ImplStep::Observe(ImplQuery::DiffAgainstDefault)
-            }
-            ImplStage::CheckoutDefaultAfterStale | ImplStage::CheckoutDefaultAfterConflict => {
-                ImplStep::Act(ImplAction::CheckoutBranch {
-                    branch: self.default_branch.clone(),
-                })
-            }
-            ImplStage::CheckoutDefaultForExistingMr(_) | ImplStage::ParkCheckoutDefault(_) => {
-                ImplStep::Act(ImplAction::CheckoutBranchBestEffort {
-                    branch: self.default_branch.clone(),
-                })
-            }
-            ImplStage::DeleteLocalStaleBranch
-            | ImplStage::DeleteLocalConflictedBranch
-            | ImplStage::DeleteLocalBranchForExistingMr(_)
-            | ImplStage::ParkDeleteLocalBranch(_) => ImplStep::Act(ImplAction::DeleteLocalBranch {
-                branch: self.branch_name.clone(),
-            }),
-            ImplStage::DeleteRemoteStaleBranch => ImplStep::Act(ImplAction::DeleteRemoteBranch {
-                branch: self.branch_name.clone(),
-            }),
-            ImplStage::CreateBranchAfterStale
-            | ImplStage::CreateBranchAfterConflict
-            | ImplStage::CreateBranch => ImplStep::Act(ImplAction::CreateBranchFrom {
-                branch: self.branch_name.clone(),
-                base: self.default_branch.clone(),
-            }),
-            ImplStage::MergeDefaultIntoBranch => ImplStep::Act(ImplAction::MergeBaseIntoBranch {
-                base: self.default_branch.clone(),
-            }),
-            ImplStage::RequireWorkingOnLabel => ImplStep::Act(ImplAction::RequireWorkingOnLabel),
-            ImplStage::ObserveIssueComments => ImplStep::Observe(ImplQuery::IssueComments),
-            ImplStage::BuildPrompt => ImplStep::Act(ImplAction::BuildPrompt {
-                continuation: self.branch_existed,
-                comments: self.comments.clone(),
-            }),
-            ImplStage::InvokeModel => ImplStep::Act(ImplAction::InvokeImplementationModel {
-                prompt: self.prompt.clone(),
-            }),
-            ImplStage::NudgeModelAfterNoChanges => {
-                ImplStep::Act(ImplAction::NudgeImplementationModel)
-            }
-            ImplStage::ObserveExistingMrState(mr_iid) => {
-                ImplStep::Observe(ImplQuery::MergeRequestState { mr_iid })
-            }
-            ImplStage::ObserveDefaultForExistingMr(_) | ImplStage::ParkObserveDefaultBranch(_) => {
-                ImplStep::Observe(ImplQuery::DefaultBranchOrMain)
-            }
-            ImplStage::LabelExistingMr(_) => ImplStep::Act(ImplAction::AddWorkingOnLabel),
-            ImplStage::HandBackToHumans(reason) => {
-                ImplStep::Act(ImplAction::HandIssueBackToHumans {
-                    branch: self.branch_name.clone(),
-                    reason,
-                })
-            }
-            ImplStage::ObserveDependencyState(issue_iid) => {
-                ImplStep::Observe(ImplQuery::DependencyClosed { issue_iid })
-            }
-            ImplStage::ParkLabelDependency(dep_issue_iid) => {
-                ImplStep::Act(ImplAction::AddIssueLabel {
-                    label: waiting_on_issue_label(dep_issue_iid),
-                })
-            }
-            ImplStage::ParkRemoveWorkingOnLabel(_) => {
-                ImplStep::Act(ImplAction::RemoveWorkingOnLabel)
-            }
-            ImplStage::ParkComment(dep_issue_iid) => ImplStep::Act(ImplAction::AddIssueComment {
-                body: format!(
-                    "Implementation cannot proceed until issue #{} is closed. \
-                     Parking this issue until the dependency resolves.",
-                    dep_issue_iid
-                ),
-            }),
-            ImplStage::ParkReleaseClaim(_) => ImplStep::Act(ImplAction::ReleaseIssueClaim),
-            ImplStage::StageAll => ImplStep::Act(ImplAction::StageAll),
-            ImplStage::ObserveStagedChanges => ImplStep::Observe(ImplQuery::StagedChanges),
-            ImplStage::CommitChanges => ImplStep::Act(ImplAction::Commit {
-                message: build_commit_message(&self.mr_title(), self.issue.iid),
-            }),
-            ImplStage::PushBranch => ImplStep::Act(ImplAction::PushBranch {
-                branch: self.branch_name.clone(),
-            }),
-            ImplStage::CreateMergeRequest => ImplStep::Act(ImplAction::CreateMergeRequest {
-                branch: self.branch_name.clone(),
-                base: self.default_branch.clone(),
-                title: self.mr_title(),
-                description: format!(
-                    "Closes #{}\n\n{}",
-                    self.issue.iid,
-                    extract_mr_description(self.metadata.mr_description.as_deref())
-                ),
-            }),
-            ImplStage::AddScopeLabel(mr_iid) => {
-                ImplStep::Act(ImplAction::AddMrScopeLabel { mr_iid })
-            }
-            ImplStage::SaveSessionWithSummary(mr_iid) => {
-                ImplStep::Act(ImplAction::RequireSaveSessionWithSummary {
-                    mr_iid,
-                    summary: extract_mr_description(self.metadata.mr_description.as_deref()),
-                })
-            }
-            ImplStage::Finish => ImplStep::Finish,
-        }
-    }
-
-    fn apply_fact(&mut self, fact: Result<ImplFact>) -> Result<()> {
-        match (self.stage.clone(), fact?) {
-            (ImplStage::ObserveClosesLinkedMr, ImplFact::ClosesLinkedMr(linked)) => {
-                self.stage = match linked {
-                    Some(ClosesLinkedMr::Open(mr_iid)) => {
-                        info!(
-                            "Issue #{} has open MR !{} (linked via Closes #{}), tracking it",
-                            self.issue.iid, mr_iid, self.issue.iid
-                        );
-                        self.tracked_mr = Some(mr_iid);
-                        self.mr_created = true;
-                        ImplStage::LabelClosesMr(mr_iid)
-                    }
-                    Some(ClosesLinkedMr::Merged) => {
-                        info!(
-                            "Issue #{}: merged MR already references it via Closes #; closing issue",
-                            self.issue.iid
-                        );
-                        ImplStage::CloseIssueForMergedMr
-                    }
-                    None => ImplStage::ObserveOpenMrForIssue,
-                };
-            }
-            (ImplStage::ObserveOpenMrForIssue, ImplFact::OpenMrForIssue(found)) => {
-                self.stage = match found {
-                    Some(mr_iid) => {
-                        info!(
-                            "Issue #{} already has open MR !{}, tracking it",
-                            self.issue.iid, mr_iid
-                        );
-                        self.tracked_mr = Some(mr_iid);
-                        self.mr_created = true;
-                        ImplStage::LabelOpenMr(mr_iid)
-                    }
-                    None => ImplStage::ObserveDefaultBranch,
-                };
-            }
-            (ImplStage::ObserveDefaultBranch, ImplFact::DefaultBranch(branch)) => {
-                self.default_branch = branch;
-                self.stage = ImplStage::FetchRemote;
-            }
-            (ImplStage::ObserveRemoteBranch, ImplFact::RemoteBranchExists(exists)) => {
-                self.stage = if exists {
-                    info!(
-                        "Branch {} already exists on remote, checking if it's stale",
-                        self.branch_name
-                    );
-                    ImplStage::CheckoutExistingBranch
-                } else {
-                    ImplStage::CreateBranch
-                };
-            }
-            (ImplStage::ObserveBranchDiff, ImplFact::DiffAgainstDefault(has_diff)) => {
-                self.stage = if has_diff {
-                    ImplStage::MergeDefaultIntoBranch
-                } else {
-                    warn!(
-                        "Branch {} has no diff against {}, discarding stale branch",
-                        self.branch_name, self.default_branch
-                    );
-                    ImplStage::ResetStaleBranch
-                };
-            }
-            (ImplStage::ObserveIssueComments, ImplFact::IssueComments(comments)) => {
-                self.comments = comments;
-                self.stage = ImplStage::BuildPrompt;
-            }
-            (ImplStage::ObserveExistingMrState(mr_iid), ImplFact::MergeRequestState(state)) => {
-                self.stage = match state.as_deref() {
-                    Some("opened") => {
-                        info!(
-                            "Issue #{}: model identified existing MR !{} as the implementation; tracking it",
-                            self.issue.iid, mr_iid
-                        );
-                        ImplStage::ResetForExistingMr(mr_iid)
-                    }
-                    Some(other) => {
-                        warn!(
-                            "Issue #{}: model identified MR !{} but it is not open (state={}); proceeding with new MR",
-                            self.issue.iid, mr_iid, other
-                        );
-                        ImplStage::StageAll
-                    }
-                    None => {
-                        warn!(
-                            "Issue #{}: model identified MR !{} but it could not be fetched; proceeding with new MR",
-                            self.issue.iid, mr_iid
-                        );
-                        ImplStage::StageAll
-                    }
-                };
-            }
-            (
-                ImplStage::ObserveDefaultForExistingMr(mr_iid),
-                ImplFact::DefaultBranchOrMain(branch),
-            ) => {
-                self.default_branch = branch;
-                self.stage = ImplStage::CheckoutDefaultForExistingMr(mr_iid);
-            }
-            (ImplStage::ParkObserveDefaultBranch(dep), ImplFact::DefaultBranchOrMain(branch)) => {
-                self.default_branch = branch;
-                self.stage = ImplStage::ParkResetWorktree(dep);
-            }
-            (ImplStage::ObserveDependencyState(dep), ImplFact::DependencyClosed(closed)) => {
-                self.stage = if closed {
-                    ImplStage::StageAll
-                } else {
-                    ImplStage::ParkLabelDependency(dep)
-                };
-            }
-            (ImplStage::ObserveStagedChanges, ImplFact::StagedChanges(staged)) => {
-                self.stage = if staged {
-                    ImplStage::CommitChanges
-                } else {
-                    ImplStage::ObserveDiffBeforePush
-                };
-            }
-            (ImplStage::ObserveDiffBeforePush, ImplFact::DiffAgainstDefault(has_diff)) => {
-                if !has_diff {
-                    warn!(
-                        "Issue #{}: agent produced no code changes, nudging the current session",
-                        self.issue.iid
-                    );
-                    self.stage = ImplStage::NudgeModelAfterNoChanges;
-                    return Ok(());
-                }
-                self.stage = ImplStage::PushBranch;
-            }
-            (stage, fact) => {
-                anyhow::bail!("implementation port answered {stage:?} with {fact:?}");
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_outcome(&mut self, outcome: ImplOutcome) -> Result<()> {
-        match (self.stage.clone(), outcome) {
-            (ImplStage::StopBeforeDiscovery, ImplOutcome::Stopped(stop)) => {
-                self.stage = if stop {
-                    ImplStage::Finish
-                } else {
-                    ImplStage::ObserveClosesLinkedMr
-                };
-            }
-            (ImplStage::StopAfterPreparation, ImplOutcome::Stopped(stop)) => {
-                self.stage = if stop {
-                    ImplStage::Finish
-                } else {
-                    ImplStage::RequireWorkingOnLabel
-                };
-            }
-            (ImplStage::LabelClosesMr(mr_iid), ImplOutcome::Done) => {
-                self.stage = ImplStage::SaveClosesMrSession(mr_iid);
-            }
-            (ImplStage::SaveClosesMrSession(_), ImplOutcome::Done) => {
-                self.stage = ImplStage::Finish;
-            }
-            (ImplStage::CloseIssueForMergedMr, ImplOutcome::Done) => {
-                self.stage = ImplStage::CleanupSessionForMergedMr;
-            }
-            (ImplStage::CleanupSessionForMergedMr, ImplOutcome::Done) => {
-                self.stage = ImplStage::Finish;
-            }
-            (ImplStage::LabelOpenMr(mr_iid), ImplOutcome::Done) => {
-                self.stage = ImplStage::SaveOpenMrSession(mr_iid);
-            }
-            (ImplStage::SaveOpenMrSession(_), ImplOutcome::Done) => {
-                self.stage = ImplStage::Finish;
-            }
-            (ImplStage::FetchRemote, ImplOutcome::Done) => {
-                self.stage = ImplStage::ResetBeforePreparation;
-            }
-            (ImplStage::ResetBeforePreparation, ImplOutcome::Done) => {
-                self.stage = ImplStage::ObserveRemoteBranch;
-            }
-            (ImplStage::CheckoutExistingBranch, ImplOutcome::Done) => {
-                self.stage = ImplStage::ObserveBranchDiff;
-            }
-            (ImplStage::ResetStaleBranch, ImplOutcome::Done) => {
-                self.stage = ImplStage::CheckoutDefaultAfterStale;
-            }
-            (ImplStage::CheckoutDefaultAfterStale, ImplOutcome::Done) => {
-                self.stage = ImplStage::DeleteLocalStaleBranch;
-            }
-            (ImplStage::DeleteLocalStaleBranch, ImplOutcome::Done) => {
-                self.stage = ImplStage::DeleteRemoteStaleBranch;
-            }
-            (ImplStage::DeleteRemoteStaleBranch, ImplOutcome::Done) => {
-                self.stage = ImplStage::CreateBranchAfterStale;
-            }
-            (ImplStage::MergeDefaultIntoBranch, ImplOutcome::Merged(clean)) => {
-                self.stage = if clean {
-                    self.branch_existed = true;
-                    self.enter_preparation_done()
-                } else {
-                    warn!(
-                        "Branch {} has conflicts with {}, creating fresh branch instead",
-                        self.branch_name, self.default_branch
-                    );
-                    ImplStage::ResetConflictedBranch
-                };
-            }
-            (ImplStage::ResetConflictedBranch, ImplOutcome::Done) => {
-                self.stage = ImplStage::CheckoutDefaultAfterConflict;
-            }
-            (ImplStage::CheckoutDefaultAfterConflict, ImplOutcome::Done) => {
-                self.stage = ImplStage::DeleteLocalConflictedBranch;
-            }
-            (ImplStage::DeleteLocalConflictedBranch, ImplOutcome::Done) => {
-                self.stage = ImplStage::CreateBranchAfterConflict;
-            }
-            (
-                ImplStage::CreateBranchAfterStale
-                | ImplStage::CreateBranchAfterConflict
-                | ImplStage::CreateBranch,
-                ImplOutcome::Done,
-            ) => {
-                self.branch_existed = false;
-                self.stage = self.enter_preparation_done();
-            }
-            (ImplStage::RequireWorkingOnLabel, ImplOutcome::Done) => {
-                self.stage = ImplStage::ObserveIssueComments;
-            }
-            (ImplStage::BuildPrompt, ImplOutcome::Prompt(prompt)) => {
-                self.prompt = prompt;
-                self.stage = ImplStage::InvokeModel;
-            }
-            (
-                ImplStage::InvokeModel | ImplStage::NudgeModelAfterNoChanges,
-                ImplOutcome::Model(result),
-            ) => {
-                self.stage = match result {
-                    ImplModelResult::Cancelled => ImplStage::Finish,
-                    ImplModelResult::Output(output) => {
-                        info!(
-                            "{}: Worker agent finished issue #{}",
-                            self.agent_id, self.issue.iid
-                        );
-                        self.classify_model_output(&output)
-                    }
-                };
-            }
-            (ImplStage::ResetForExistingMr(mr_iid), ImplOutcome::Done) => {
-                self.stage = ImplStage::ObserveDefaultForExistingMr(mr_iid);
-            }
-            (ImplStage::CheckoutDefaultForExistingMr(mr_iid), ImplOutcome::Done) => {
-                self.stage = ImplStage::DeleteLocalBranchForExistingMr(mr_iid);
-            }
-            (ImplStage::DeleteLocalBranchForExistingMr(mr_iid), ImplOutcome::Done) => {
-                self.tracked_mr = Some(mr_iid);
-                self.mr_created = true;
-                self.stage = ImplStage::SaveExistingMrSession(mr_iid);
-            }
-            (ImplStage::SaveExistingMrSession(mr_iid), ImplOutcome::Done) => {
-                self.stage = ImplStage::LabelExistingMr(mr_iid);
-            }
-            (ImplStage::LabelExistingMr(_), ImplOutcome::Done) => {
-                self.stage = ImplStage::Finish;
-            }
-            (ImplStage::HandBackToHumans(_), ImplOutcome::Done) => {
-                self.left_branch = None;
-                self.stage = ImplStage::Finish;
-            }
-            (ImplStage::ParkLabelDependency(dep), ImplOutcome::Done) => {
-                self.stage = ImplStage::ParkRemoveWorkingOnLabel(dep);
-            }
-            (ImplStage::ParkRemoveWorkingOnLabel(dep), ImplOutcome::Done) => {
-                self.stage = ImplStage::ParkComment(dep);
-            }
-            (ImplStage::ParkComment(dep), ImplOutcome::Done) => {
-                self.stage = ImplStage::ParkReleaseClaim(dep);
-            }
-            (ImplStage::ParkReleaseClaim(dep), ImplOutcome::Done) => {
-                self.stage = ImplStage::ParkCleanupSession(dep);
-            }
-            (ImplStage::ParkCleanupSession(dep), ImplOutcome::Done) => {
-                self.stage = ImplStage::ParkObserveDefaultBranch(dep);
-            }
-            (ImplStage::ParkResetWorktree(dep), ImplOutcome::Done) => {
-                self.stage = ImplStage::ParkCheckoutDefault(dep);
-            }
-            (ImplStage::ParkCheckoutDefault(dep), ImplOutcome::Done) => {
-                self.stage = ImplStage::ParkDeleteLocalBranch(dep);
-            }
-            (ImplStage::ParkDeleteLocalBranch(dep), ImplOutcome::Done) => {
-                info!(
-                    "{}: Issue #{} parked waiting on issue #{} (dependency open), released claim",
-                    self.agent_id, self.issue.iid, dep
-                );
-                self.mr_created = false;
-                self.left_branch = None;
-                self.stage = ImplStage::Finish;
-            }
-            (ImplStage::StageAll, ImplOutcome::Done) => {
-                self.stage = ImplStage::ObserveStagedChanges;
-            }
-            (ImplStage::CommitChanges, ImplOutcome::Done) => {
-                self.stage = ImplStage::ObserveDiffBeforePush;
-            }
-            (ImplStage::PushBranch, ImplOutcome::Done) => {
-                self.stage = ImplStage::CreateMergeRequest;
-            }
-            (ImplStage::CreateMergeRequest, ImplOutcome::MergeRequestCreated(mr_iid)) => {
-                self.tracked_mr = Some(mr_iid);
-                self.mr_created = true;
-                info!("Created MR !{} for issue #{}", mr_iid, self.issue.iid);
-                self.stage = if self.scope_label.is_some() {
-                    ImplStage::AddScopeLabel(mr_iid)
-                } else {
-                    ImplStage::SaveSessionWithSummary(mr_iid)
-                };
-            }
-            (ImplStage::AddScopeLabel(mr_iid), ImplOutcome::Done) => {
-                self.stage = ImplStage::SaveSessionWithSummary(mr_iid);
-            }
-            (ImplStage::SaveSessionWithSummary(_), ImplOutcome::Done) => {
-                self.stage = ImplStage::Finish;
-            }
-            (_, ImplOutcome::Failed(e)) => return Err(e),
-            (stage, _) => {
-                anyhow::bail!("implementation port reported an unexpected outcome for {stage:?}");
-            }
-        }
-        Ok(())
-    }
-
-    /// The branch is ready: record it as the branch this run may have to
-    /// clean up, then re-check the review-only hold.
-    fn enter_preparation_done(&mut self) -> ImplStage {
-        self.left_branch = Some(self.branch_name.clone());
-        ImplStage::StopAfterPreparation
-    }
-
-    /// Which of the handoff branches the run took. The branches that
-    /// resolve the issue on their own end the run; the rest fall through to
-    /// the ordinary commit/push/open-MR path.
-    fn classify_model_output(&mut self, output: &WorkerImplementationOutput) -> ImplStage {
-        match output {
-            WorkerImplementationOutput::Implemented(metadata) => {
-                self.metadata = metadata.clone();
-                ImplStage::StageAll
-            }
-            WorkerImplementationOutput::ExistingMr { existing_mr_iid } => {
-                ImplStage::ObserveExistingMrState(*existing_mr_iid)
-            }
-            WorkerImplementationOutput::NeedsSplit(blocked) => {
-                warn!("Issue #{} is too broad, needs splitting", self.issue.iid);
-                ImplStage::HandBackToHumans(format!(
-                    "This issue needs to be split into smaller, focused issues:\n\n{}",
-                    extract_split_reason(blocked)
-                ))
-            }
-            WorkerImplementationOutput::NeedsClarification(blocked) => {
-                warn!("Issue #{} needs clarification", self.issue.iid);
-                ImplStage::HandBackToHumans(extract_clarification(blocked))
-            }
-            WorkerImplementationOutput::CannotImplement(blocked) => {
-                warn!("Issue #{} cannot be implemented", self.issue.iid);
-                ImplStage::HandBackToHumans(extract_cannot_implement_reason(blocked))
-            }
-            WorkerImplementationOutput::WaitDependency { depends_on_issue } => {
-                ImplStage::ObserveDependencyState(*depends_on_issue)
-            }
-        }
-    }
-}
-
-/// Ask the implementation port one question.
-fn observe_implementation(
-    port: &dyn ImplementationPort,
-    query: &ImplQuery,
-    machine: &ImplementationMachine,
-) -> Result<ImplFact> {
-    Ok(match query {
-        ImplQuery::ClosesLinkedMr => ImplFact::ClosesLinkedMr(port.closes_linked_mr()),
-        ImplQuery::OpenMrForIssue => ImplFact::OpenMrForIssue(port.open_mr_for_issue()),
-        ImplQuery::DefaultBranch => ImplFact::DefaultBranch(port.default_branch()?),
-        ImplQuery::DefaultBranchOrMain => {
-            ImplFact::DefaultBranchOrMain(port.default_branch_or_main())
-        }
-        ImplQuery::RemoteBranchExists => {
-            ImplFact::RemoteBranchExists(port.remote_branch_exists(&machine.branch_name)?)
-        }
-        ImplQuery::DiffAgainstDefault => {
-            ImplFact::DiffAgainstDefault(port.has_diff_against(&machine.default_branch)?)
-        }
-        ImplQuery::StagedChanges => ImplFact::StagedChanges(port.has_staged_changes()?),
-        ImplQuery::MergeRequestState { mr_iid } => {
-            ImplFact::MergeRequestState(port.merge_request_state(*mr_iid))
-        }
-        ImplQuery::DependencyClosed { issue_iid } => {
-            ImplFact::DependencyClosed(port.dependency_closed(*issue_iid))
-        }
-        ImplQuery::IssueComments => ImplFact::IssueComments(port.issue_comments()),
-    })
+    left_branch: Option<String>,
 }
 
 fn run_implementation_cycle(
-    machine: &mut ImplementationMachine,
     port: &mut dyn ImplementationPort,
+    agent_id: &str,
+    scope_label: Option<&str>,
+    issue: &IssueObservation,
+    result: &mut ImplementationCycleResult,
 ) -> Result<()> {
-    loop {
-        match machine.next_step() {
-            Step::Observe(query) => {
-                let fact = observe_implementation(port, &query, machine);
-                machine.apply_fact(fact)?;
-            }
-            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
-            Step::Finish => return Ok(()),
+    if port.stop_if_review_only() {
+        return Ok(());
+    }
+
+    match port.closes_linked_mr() {
+        Some(ClosesLinkedMr::Open(mr_iid)) => {
+            info!(
+                "Issue #{} has open MR !{} (linked via Closes #{}), tracking it",
+                issue.iid, mr_iid, issue.iid
+            );
+            result.tracked_mr = Some(mr_iid);
+            result.mr_created = true;
+            port.add_working_on_label();
+            port.save_session(mr_iid);
+            return Ok(());
         }
+        Some(ClosesLinkedMr::Merged) => {
+            info!(
+                "Issue #{}: merged MR already references it via Closes #; closing issue",
+                issue.iid
+            );
+            port.close_issue();
+            port.cleanup_session();
+            return Ok(());
+        }
+        None => {}
+    }
+
+    if let Some(mr_iid) = port.open_mr_for_issue() {
+        info!(
+            "Issue #{} already has open MR !{}, tracking it",
+            issue.iid, mr_iid
+        );
+        result.tracked_mr = Some(mr_iid);
+        result.mr_created = true;
+        port.add_working_on_label();
+        port.require_save_session(mr_iid)?;
+        return Ok(());
+    }
+
+    let branch_name = format!("issue-{}", issue.iid);
+    let default_branch = port.default_branch()?;
+    port.fetch_remote()?;
+    port.reset_worktree();
+    let mut branch_existed = false;
+    if port.remote_branch_exists(&branch_name)? {
+        info!(
+            "Branch {} already exists on remote, checking if it's stale",
+            branch_name
+        );
+        port.checkout_branch(&branch_name)?;
+        if port.has_diff_against(&default_branch)? {
+            if port.merge_base_into_branch(&default_branch)? {
+                branch_existed = true;
+            } else {
+                warn!(
+                    "Branch {} has conflicts with {}, creating fresh branch instead",
+                    branch_name, default_branch
+                );
+                port.reset_worktree();
+                port.checkout_branch(&default_branch)?;
+                port.delete_local_branch(&branch_name);
+                port.create_branch_from(&branch_name, &default_branch)?;
+            }
+        } else {
+            warn!(
+                "Branch {} has no diff against {}, discarding stale branch",
+                branch_name, default_branch
+            );
+            port.reset_worktree();
+            port.checkout_branch(&default_branch)?;
+            port.delete_local_branch(&branch_name);
+            port.delete_remote_branch(&branch_name);
+            port.create_branch_from(&branch_name, &default_branch)?;
+        }
+    } else {
+        port.create_branch_from(&branch_name, &default_branch)?;
+    }
+    result.left_branch = Some(branch_name.clone());
+
+    if port.stop_if_review_only() {
+        return Ok(());
+    }
+    port.require_working_on_label()?;
+    let comments = port.issue_comments();
+    let prompt = port.build_prompt(branch_existed, &comments)?;
+    let mut model_result = port.invoke_implementation_model(&prompt)?;
+    let mut metadata = ImplementedMetadata::default();
+
+    loop {
+        let output = match model_result {
+            ImplModelResult::Cancelled => return Ok(()),
+            ImplModelResult::Output(output) => {
+                info!("{}: Worker agent finished issue #{}", agent_id, issue.iid);
+                output
+            }
+        };
+
+        match *output {
+            WorkerImplementationOutput::Implemented(output_metadata) => {
+                metadata = output_metadata;
+            }
+            WorkerImplementationOutput::ExistingMr { existing_mr_iid } => {
+                match port.merge_request_state(existing_mr_iid).as_deref() {
+                    Some("opened") => {
+                        info!(
+                            "Issue #{}: model identified existing MR !{} as the implementation; tracking it",
+                            issue.iid, existing_mr_iid
+                        );
+                        port.reset_worktree();
+                        let release_branch = port.default_branch_or_main();
+                        port.checkout_branch_best_effort(&release_branch);
+                        port.delete_local_branch(&branch_name);
+                        result.tracked_mr = Some(existing_mr_iid);
+                        result.mr_created = true;
+                        port.require_save_session(existing_mr_iid)?;
+                        port.add_working_on_label();
+                        return Ok(());
+                    }
+                    Some(state) => warn!(
+                        "Issue #{}: model identified MR !{} but it is not open (state={}); proceeding with new MR",
+                        issue.iid, existing_mr_iid, state
+                    ),
+                    None => warn!(
+                        "Issue #{}: model identified MR !{} but it could not be fetched; proceeding with new MR",
+                        issue.iid, existing_mr_iid
+                    ),
+                }
+            }
+            WorkerImplementationOutput::NeedsSplit(blocked) => {
+                warn!("Issue #{} is too broad, needs splitting", issue.iid);
+                let reason = format!(
+                    "This issue needs to be split into smaller, focused issues:\n\n{}",
+                    extract_split_reason(&blocked)
+                );
+                port.hand_issue_back_to_humans(&branch_name, &reason)?;
+                result.left_branch = None;
+                return Ok(());
+            }
+            WorkerImplementationOutput::NeedsClarification(blocked) => {
+                warn!("Issue #{} needs clarification", issue.iid);
+                let reason = extract_clarification(&blocked);
+                port.hand_issue_back_to_humans(&branch_name, &reason)?;
+                result.left_branch = None;
+                return Ok(());
+            }
+            WorkerImplementationOutput::CannotImplement(blocked) => {
+                warn!("Issue #{} cannot be implemented", issue.iid);
+                let reason = extract_cannot_implement_reason(&blocked);
+                port.hand_issue_back_to_humans(&branch_name, &reason)?;
+                result.left_branch = None;
+                return Ok(());
+            }
+            WorkerImplementationOutput::WaitDependency { depends_on_issue } => {
+                if !port.dependency_closed(depends_on_issue) {
+                    port.add_issue_label(&waiting_on_issue_label(depends_on_issue));
+                    port.remove_working_on_label();
+                    port.add_issue_comment(&format!(
+                        "Implementation cannot proceed until issue #{} is closed. \
+                         Parking this issue until the dependency resolves.",
+                        depends_on_issue
+                    ));
+                    port.release_issue_claim();
+                    port.cleanup_session();
+                    let release_branch = port.default_branch_or_main();
+                    port.reset_worktree();
+                    port.checkout_branch_best_effort(&release_branch);
+                    port.delete_local_branch(&branch_name);
+                    info!(
+                        "{}: Issue #{} parked waiting on issue #{} (dependency open), released claim",
+                        agent_id, issue.iid, depends_on_issue
+                    );
+                    result.mr_created = false;
+                    result.left_branch = None;
+                    return Ok(());
+                }
+            }
+        }
+
+        port.stage_all()?;
+        if port.has_staged_changes()? {
+            let title = extract_mr_title(metadata.mr_title.as_deref(), &issue.title);
+            port.commit(&build_commit_message(&title, issue.iid))?;
+        }
+        if !port.has_diff_against(&default_branch)? {
+            warn!(
+                "Issue #{}: agent produced no code changes, nudging the current session",
+                issue.iid
+            );
+            model_result = port.nudge_implementation_model()?;
+            continue;
+        }
+
+        let title = extract_mr_title(metadata.mr_title.as_deref(), &issue.title);
+        let summary = extract_mr_description(metadata.mr_description.as_deref());
+        port.push_branch(&branch_name)?;
+        let mr_iid = port.create_merge_request(
+            &branch_name,
+            &default_branch,
+            &title,
+            &format!("Closes #{}\n\n{}", issue.iid, summary),
+        )?;
+        result.tracked_mr = Some(mr_iid);
+        result.mr_created = true;
+        info!("Created MR !{} for issue #{}", mr_iid, issue.iid);
+        if scope_label.is_some() {
+            port.add_mr_scope_label(mr_iid);
+        }
+        port.require_save_session_with_summary(mr_iid, &summary)?;
+        return Ok(());
     }
 }
 
@@ -3496,172 +2161,158 @@ impl ImplementationPort for LiveImplementationPort<'_> {
         format_issue_comments_for_worker_context(self.state.glab, self.issue.iid)
     }
 
-    fn execute(&mut self, action: &ImplAction) -> ImplOutcome {
-        let state = self.state;
-        let issue_iid = self.issue.iid;
-        match action {
-            ImplAction::StopIfReviewOnly => {
-                ImplOutcome::Stopped(stop_worker_issue_if_review_only(state, issue_iid))
-            }
-            ImplAction::AddWorkingOnLabel => {
-                let _ = state.glab.add_issue_label(issue_iid, WORKING_ON_LABEL);
-                ImplOutcome::Done
-            }
-            ImplAction::RequireWorkingOnLabel => {
-                match state.glab.add_issue_label(issue_iid, WORKING_ON_LABEL) {
-                    Ok(()) => ImplOutcome::Done,
-                    Err(e) => ImplOutcome::Failed(e),
-                }
-            }
-            ImplAction::RemoveWorkingOnLabel => {
-                let _ = state.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
-                ImplOutcome::Done
-            }
-            ImplAction::AddIssueLabel { label } => {
-                let _ = state.glab.add_issue_label(issue_iid, label);
-                ImplOutcome::Done
-            }
-            ImplAction::AddIssueComment { body } => {
-                let _ = state.glab.add_issue_comment(issue_iid, body);
-                ImplOutcome::Done
-            }
-            ImplAction::ReleaseIssueClaim => {
-                let _ = claim::release(state.glab, ClaimResource::Issue(issue_iid), state.agent_id);
-                ImplOutcome::Done
-            }
-            ImplAction::CleanupSession => {
-                state.cleanup_session(issue_iid);
-                ImplOutcome::Done
-            }
-            ImplAction::CloseIssue => {
-                close_issue_best_effort(state.glab, issue_iid);
-                ImplOutcome::Done
-            }
-            ImplAction::SaveSession { mr_iid } => {
-                let _ = state.save_session(issue_iid, *mr_iid);
-                ImplOutcome::Done
-            }
-            ImplAction::RequireSaveSession { mr_iid } => {
-                match state.save_session(issue_iid, *mr_iid) {
-                    Ok(()) => ImplOutcome::Done,
-                    Err(e) => ImplOutcome::Failed(e),
-                }
-            }
-            ImplAction::RequireSaveSessionWithSummary { mr_iid, summary } => {
-                match state.save_session_with_summary(issue_iid, *mr_iid, summary) {
-                    Ok(()) => ImplOutcome::Done,
-                    Err(e) => ImplOutcome::Failed(e),
-                }
-            }
-            ImplAction::FetchRemote => match state.git_repo.fetch() {
-                Ok(()) => ImplOutcome::Done,
-                Err(e) => ImplOutcome::Failed(e),
-            },
-            ImplAction::ResetWorktree => {
-                let _ = state.git_repo.reset_hard();
-                ImplOutcome::Done
-            }
-            ImplAction::CheckoutBranch { branch } => {
-                match state.git_repo.checkout_remote_branch(branch) {
-                    Ok(()) => ImplOutcome::Done,
-                    Err(e) => ImplOutcome::Failed(e),
-                }
-            }
-            ImplAction::CheckoutBranchBestEffort { branch } => {
-                let _ = state.git_repo.checkout_remote_branch(branch);
-                ImplOutcome::Done
-            }
-            ImplAction::DeleteLocalBranch { branch } => {
-                let _ = state.git_repo.delete_local_branch(branch);
-                ImplOutcome::Done
-            }
-            ImplAction::DeleteRemoteBranch { branch } => {
-                let _ = state.git_repo.delete_remote_branch(branch);
-                ImplOutcome::Done
-            }
-            ImplAction::CreateBranchFrom { branch, base } => {
-                match state.git_repo.create_branch_from(branch, base) {
-                    Ok(()) => ImplOutcome::Done,
-                    Err(e) => ImplOutcome::Failed(e),
-                }
-            }
-            ImplAction::MergeBaseIntoBranch { base } => match state.git_repo.try_merge(base) {
-                Ok(clean) => ImplOutcome::Merged(clean),
-                Err(e) => ImplOutcome::Failed(e),
-            },
-            ImplAction::BuildPrompt {
-                continuation,
-                comments,
-            } => {
-                let built = if *continuation {
-                    build_continuation_prompt(state, self.issue, comments)
-                } else {
-                    build_implementation_prompt(state, self.issue, comments)
-                };
-                match built {
-                    Ok(prompt) => ImplOutcome::Prompt(prompt),
-                    Err(e) => ImplOutcome::Failed(e),
-                }
-            }
-            ImplAction::InvokeImplementationModel { prompt } => {
-                match self.invoke_implementation_model(Some(prompt)) {
-                    Ok(result) => ImplOutcome::Model(result),
-                    Err(error) => ImplOutcome::Failed(error),
-                }
-            }
-            ImplAction::NudgeImplementationModel => match self.invoke_implementation_model(None) {
-                Ok(result) => ImplOutcome::Model(result),
-                Err(error) => ImplOutcome::Failed(error),
-            },
-            ImplAction::StageAll => match state.git_repo.add_all() {
-                Ok(()) => ImplOutcome::Done,
-                Err(e) => ImplOutcome::Failed(e),
-            },
-            ImplAction::Commit { message } => match state.git_repo.commit(message) {
-                Ok(()) => ImplOutcome::Done,
-                Err(e) => ImplOutcome::Failed(e),
-            },
-            ImplAction::PushBranch { branch } => match state.git_repo.push(branch) {
-                Ok(()) => ImplOutcome::Done,
-                Err(e) => ImplOutcome::Failed(e),
-            },
-            ImplAction::CreateMergeRequest {
-                branch,
-                base,
-                title,
-                description,
-            } => match state
-                .glab
-                .create_merge_request(branch, base, title, description)
-            {
-                Ok(mr_iid) => ImplOutcome::MergeRequestCreated(mr_iid),
-                Err(e) => ImplOutcome::Failed(e),
-            },
-            ImplAction::AddMrScopeLabel { mr_iid } => {
-                if let Some(label) = self.scope_label
-                    && let Err(e) = state.glab.add_mr_label_with_retries(*mr_iid, label)
-                {
-                    warn!(
-                        "{}: Failed to add scope label {:?} to MR !{} (permanent error): {}",
-                        state.agent_id, label, mr_iid, e
-                    );
-                }
-                ImplOutcome::Done
-            }
-            ImplAction::HandIssueBackToHumans { branch, reason } => {
-                match hand_issue_back_to_humans(state, issue_iid, branch, reason) {
-                    Ok(()) => ImplOutcome::Done,
-                    Err(e) => ImplOutcome::Failed(e),
-                }
-            }
+    fn stop_if_review_only(&mut self) -> bool {
+        stop_worker_issue_if_review_only(self.state, self.issue.iid)
+    }
+
+    fn add_working_on_label(&mut self) {
+        let _ = self
+            .state
+            .glab
+            .add_issue_label(self.issue.iid, WORKING_ON_LABEL);
+    }
+
+    fn require_working_on_label(&mut self) -> Result<()> {
+        self.state
+            .glab
+            .add_issue_label(self.issue.iid, WORKING_ON_LABEL)
+    }
+
+    fn remove_working_on_label(&mut self) {
+        let _ = self
+            .state
+            .glab
+            .remove_issue_label(self.issue.iid, WORKING_ON_LABEL);
+    }
+
+    fn add_issue_label(&mut self, label: &str) {
+        let _ = self.state.glab.add_issue_label(self.issue.iid, label);
+    }
+
+    fn add_issue_comment(&mut self, body: &str) {
+        let _ = self.state.glab.add_issue_comment(self.issue.iid, body);
+    }
+
+    fn release_issue_claim(&mut self) {
+        let _ = claim::release(
+            self.state.glab,
+            ClaimResource::Issue(self.issue.iid),
+            self.state.agent_id,
+        );
+    }
+
+    fn cleanup_session(&mut self) {
+        self.state.cleanup_session(self.issue.iid);
+    }
+
+    fn close_issue(&mut self) {
+        close_issue_best_effort(self.state.glab, self.issue.iid);
+    }
+
+    fn save_session(&mut self, mr_iid: u64) {
+        let _ = self.state.save_session(self.issue.iid, mr_iid);
+    }
+
+    fn require_save_session(&mut self, mr_iid: u64) -> Result<()> {
+        self.state.save_session(self.issue.iid, mr_iid)
+    }
+
+    fn require_save_session_with_summary(&mut self, mr_iid: u64, summary: &str) -> Result<()> {
+        self.state
+            .save_session_with_summary(self.issue.iid, mr_iid, summary)
+    }
+
+    fn fetch_remote(&mut self) -> Result<()> {
+        self.state.git_repo.fetch()
+    }
+
+    fn reset_worktree(&mut self) {
+        let _ = self.state.git_repo.reset_hard();
+    }
+
+    fn checkout_branch(&mut self, branch: &str) -> Result<()> {
+        self.state.git_repo.checkout_remote_branch(branch)
+    }
+
+    fn checkout_branch_best_effort(&mut self, branch: &str) {
+        let _ = self.state.git_repo.checkout_remote_branch(branch);
+    }
+
+    fn delete_local_branch(&mut self, branch: &str) {
+        let _ = self.state.git_repo.delete_local_branch(branch);
+    }
+
+    fn delete_remote_branch(&mut self, branch: &str) {
+        let _ = self.state.git_repo.delete_remote_branch(branch);
+    }
+
+    fn create_branch_from(&mut self, branch: &str, base: &str) -> Result<()> {
+        self.state.git_repo.create_branch_from(branch, base)
+    }
+
+    fn merge_base_into_branch(&mut self, base: &str) -> Result<bool> {
+        self.state.git_repo.try_merge(base)
+    }
+
+    fn build_prompt(&mut self, continuation: bool, comments: &str) -> Result<String> {
+        if continuation {
+            build_continuation_prompt(self.state, self.issue, comments)
+        } else {
+            build_implementation_prompt(self.state, self.issue, comments)
         }
+    }
+
+    fn invoke_implementation_model(&mut self, prompt: &str) -> Result<ImplModelResult> {
+        LiveImplementationPort::invoke_implementation_model(self, Some(prompt))
+    }
+
+    fn nudge_implementation_model(&mut self) -> Result<ImplModelResult> {
+        LiveImplementationPort::invoke_implementation_model(self, None)
+    }
+
+    fn stage_all(&mut self) -> Result<()> {
+        self.state.git_repo.add_all()
+    }
+
+    fn commit(&mut self, message: &str) -> Result<()> {
+        self.state.git_repo.commit(message)
+    }
+
+    fn push_branch(&mut self, branch: &str) -> Result<()> {
+        self.state.git_repo.push(branch)
+    }
+
+    fn create_merge_request(
+        &mut self,
+        branch: &str,
+        base: &str,
+        title: &str,
+        description: &str,
+    ) -> Result<u64> {
+        self.state
+            .glab
+            .create_merge_request(branch, base, title, description)
+    }
+
+    fn add_mr_scope_label(&mut self, mr_iid: u64) {
+        if let Some(label) = self.scope_label
+            && let Err(e) = self.state.glab.add_mr_label_with_retries(mr_iid, label)
+        {
+            warn!(
+                "{}: Failed to add scope label {:?} to MR !{} (permanent error): {}",
+                self.state.agent_id, label, mr_iid, e
+            );
+        }
+    }
+
+    fn hand_issue_back_to_humans(&mut self, branch: &str, reason: &str) -> Result<()> {
+        hand_issue_back_to_humans(self.state, self.issue.iid, branch, reason)
     }
 }
 
 /// Implement one issue: adopt an existing merge request if the issue
 /// already has one, otherwise prepare the branch, invoke the model, and
-/// turn what it produced into a merge request. Observes, decides one step,
-/// executes it, feeds the result back — see [`ImplementationMachine`].
+/// turn what it produced into a merge request.
 ///
 /// `current` is updated as the run progresses, because the cycle's cleanup
 /// after a failure depends on how far the run got.
@@ -3672,18 +2323,19 @@ fn process_issue(
     current: &mut ActiveIssue,
     scope_label: Option<&str>,
 ) -> Result<Option<u64>> {
-    let mut machine = ImplementationMachine::new(state.agent_id, scope_label, issue.clone());
     let mut port = LiveImplementationPort {
         state,
         model,
         issue,
         scope_label,
     };
-    let result = run_implementation_cycle(&mut machine, &mut port);
-    current.mr_iid = machine.tracked_mr;
-    current.mr_created = machine.mr_created;
-    current.branch_name = machine.left_branch.clone();
-    result.map(|()| machine.tracked_mr)
+    let mut cycle = ImplementationCycleResult::default();
+    let result =
+        run_implementation_cycle(&mut port, state.agent_id, scope_label, issue, &mut cycle);
+    current.mr_iid = cycle.tracked_mr;
+    current.mr_created = cycle.mr_created;
+    current.branch_name = cycle.left_branch;
+    result.map(|()| cycle.tracked_mr)
 }
 
 /// Post `reason` on the issue, close any MR the branch already had, reset the
@@ -4081,10 +2733,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         }
     };
 
-    // From here the run is a driven progression: metadata, then
-    // commit/push, then the conflict recheck, then the GitLab replies. The
-    // decisions live in `FeedbackMachine`; the writes live in the port.
-    let mut machine = FeedbackMachine::new(FeedbackTailInput {
+    let input = FeedbackTailInput {
         mr_iid: latest_mr.iid,
         source_branch: latest_mr.source_branch.clone(),
         target_branch: latest_mr.target_branch.clone(),
@@ -4095,7 +2744,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         issue_iid: issue_number,
         surface_before: MrSurfaceObservation::from_mr(&latest_mr),
         resolution,
-    });
+    };
     let mut port = LiveFeedbackTailPort {
         git_repo: state.git_repo,
         glab: state.glab,
@@ -4103,63 +2752,13 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
         source_branch: latest_mr.source_branch.clone(),
         target_branch: latest_mr.target_branch.clone(),
     };
-    run_feedback_cycle(&mut machine, &mut port)?;
+    run_feedback_tail(&mut port, &input)?;
 
     Ok(false)
 }
 
-/// One GitLab write in the feedback-reply tail of [`handle_mr_comments`],
-/// in the exact order [`plan_feedback_reply_steps`] emits them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FeedbackReplyStep {
-    Reply { discussion_id: String },
-    Resolve { discussion_id: String },
-    PostPlainComment,
-}
-
-/// Decide the ordered sequence of discussion replies, discussion resolves,
-/// and the plain-comment reply that [`handle_mr_comments`] performs after
-/// pushing feedback changes. Pure — takes only the already-computed gating
-/// booleans — so the reply-before-resolve ordering and the plain-comment
-/// gating can be locked down without a live GitLab client.
-///
-/// Mirrors current behavior exactly: each unresolved discussion gets a
-/// reply immediately followed by a resolve (only when `resolve_discussions`
-/// is true), in `ids_to_resolve` order; the plain-comment reply, if any, is
-/// always emitted last. Nothing is emitted when there is no reply body.
-fn plan_feedback_reply_steps(
-    ids_to_resolve: &[String],
-    reply_body_present: bool,
-    resolve_discussions: bool,
-    plain_comments_present: bool,
-    should_post_plain_comment: bool,
-) -> Vec<FeedbackReplyStep> {
-    let mut steps = Vec::new();
-    if reply_body_present {
-        for discussion_id in ids_to_resolve {
-            steps.push(FeedbackReplyStep::Reply {
-                discussion_id: discussion_id.clone(),
-            });
-            if resolve_discussions {
-                steps.push(FeedbackReplyStep::Resolve {
-                    discussion_id: discussion_id.clone(),
-                });
-            }
-        }
-        if plain_comments_present && should_post_plain_comment {
-            steps.push(FeedbackReplyStep::PostPlainComment);
-        }
-    }
-    steps
-}
-
-// ---------------------------------------------------------------------------
-// Feedback progression port
-// ---------------------------------------------------------------------------
-
-/// The MR fields the feedback progression compares before and after the
-/// model run: a metadata-only edit must not imply that feedback was
-/// addressed.
+/// The MR fields the feedback tail compares before and after the model run:
+/// a metadata-only edit must not imply that feedback was addressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MrSurfaceObservation {
     title: String,
@@ -4178,8 +2777,6 @@ impl MrSurfaceObservation {
         }
     }
 
-    /// True when title, description, or labels differ (e.g. metadata edit,
-    /// label added or removed).
     fn differs_from(&self, other: &Self) -> bool {
         self.title.trim() != other.title.trim()
             || self.description.trim() != other.description.trim()
@@ -4187,8 +2784,7 @@ impl MrSurfaceObservation {
     }
 }
 
-/// Everything the pre-model half of a feedback run already learned, as one
-/// immutable snapshot the progression decides from.
+/// Everything the pre-model half of a feedback run already learned.
 #[derive(Debug, Clone)]
 struct FeedbackTailInput {
     mr_iid: u64,
@@ -4196,8 +2792,6 @@ struct FeedbackTailInput {
     target_branch: String,
     pre_agent_sha: String,
     requires_conflict_resolution: bool,
-    /// The discussions that were unresolved before the model ran; empty
-    /// when the run was triggered by conflicts alone.
     unresolved_ids: Vec<String>,
     plain_comments_present: bool,
     issue_iid: Option<u64>,
@@ -4224,607 +2818,204 @@ impl FeedbackTailInput {
     }
 }
 
-/// One question the feedback progression asks about the worktree, the
-/// branch, or the merge request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FeedbackQuery {
-    ChangesSinceModelRun,
-    MergeInProgress,
-    MergeConflictsPresent,
-    StagedChanges,
-    UpToDateWithTarget,
-    DiffHighlights,
-    MergeRequestSurface,
-    OriginHead,
-    UnresolvedDiscussionIds,
-}
-
-/// The answer to one [`FeedbackQuery`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FeedbackFact {
-    ChangesSinceModelRun(bool),
-    MergeInProgress(bool),
-    MergeConflictsPresent(bool),
-    StagedChanges(bool),
-    UpToDateWithTarget(bool),
-    DiffHighlights(Option<String>),
-    MergeRequestSurface(MrSurfaceObservation),
-    OriginHead(String),
-    UnresolvedDiscussionIds(Vec<String>),
-}
-
-/// One side effect in the feedback progression. Everything from the
-/// metadata write to the last GitLab reply.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FeedbackAction {
-    UpdateMrMetadata { title: String, description: String },
-    FetchBranches,
-    StageResolvedConflicts,
-    StageAll,
-    Commit { message: String },
-    CompleteMergeIfReady { message: String },
-    PushSourceBranch,
-    ReplyToDiscussion { discussion_id: String, body: String },
-    ResolveDiscussion { discussion_id: String },
-    PostPlainComment { body: String },
-}
-
-/// What the port reports after executing one [`FeedbackAction`].
-enum FeedbackOutcome {
-    Done,
-    Failed(anyhow::Error),
-    /// [`FeedbackAction::StageResolvedConflicts`]: whether anything was
-    /// staged.
-    Staged(bool),
-    /// [`FeedbackAction::CompleteMergeIfReady`]: whether the in-progress
-    /// merge was concluded.
-    MergeCompleted(bool),
-}
-
-/// The narrow surface the feedback progression needs: the worktree, the
-/// branch tips, and the MR's discussions. Object-safe and role-local.
+/// Direct operations needed by the imperative feedback tail. Git operations
+/// return errors; metadata and GitLab discussion writes are best effort.
 trait FeedbackTailPort {
+    fn update_mr_metadata(&mut self, title: &str, description: &str);
+    fn fetch_branches(&mut self) -> Result<()>;
     fn has_changes_since(&self, base_ref: &str) -> Result<bool>;
     fn merge_in_progress(&self) -> Result<bool>;
-    fn merge_conflicts_present(&self) -> Result<bool>;
+    fn stage_resolved_conflicts(&mut self) -> Result<bool>;
+    fn stage_all(&mut self) -> Result<()>;
     fn has_staged_changes(&self) -> Result<bool>;
+    fn commit(&mut self, message: &str) -> Result<()>;
+    fn complete_merge_if_ready(&mut self, message: &str) -> Result<bool>;
+    fn merge_conflicts_present(&self) -> Result<bool>;
     fn up_to_date_with_target(&self, target_branch: &str) -> Result<bool>;
-    /// Best effort: no highlights is a valid answer, never a failed run.
     fn diff_highlights(&self, base_ref: &str) -> Option<String>;
+    fn push_source_branch(&mut self) -> Result<()>;
     fn merge_request_surface(&self, mr_iid: u64) -> Result<MrSurfaceObservation>;
-    /// Best effort: falls back to the pre-run SHA when the tip cannot be
-    /// read.
     fn origin_head(&self, source_branch: &str) -> Option<String>;
-    /// Best effort: an unreadable list is treated as empty.
     fn unresolved_discussion_ids(&self, mr_iid: u64) -> Vec<String>;
-    fn execute(&mut self, action: &FeedbackAction) -> FeedbackOutcome;
+    fn reply_to_discussion(&mut self, discussion_id: &str, body: &str);
+    fn resolve_discussion(&mut self, discussion_id: &str);
+    fn post_plain_comment(&mut self, body: &str);
 }
 
-type FeedbackStep = Step<FeedbackQuery, FeedbackAction>;
-
-/// Where the feedback progression is. The stage names spell out the
-/// required order: metadata, then commit/push, then the conflict recheck,
-/// then the GitLab replies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FeedbackStage {
-    UpdateMetadata,
-    FetchAfterModelRun,
-    ObserveChangesAfterModelRun,
-    ObserveMergeInProgress,
-    StageResolvedConflicts,
-    StageAllForMerge,
-    ObserveChangesAfterStaging,
-    StageAllForCommit,
-    ObserveStagedForCommit,
-    CommitChanges,
-    CompleteMerge,
-    ObserveConflictsAfterMerge,
-    FetchForConflictRecheck,
-    ObserveUpToDateWithTarget,
-    ObserveChangesAfterRecheck,
-    StageAllForMergeCommit,
-    ObserveStagedForMergeCommit,
-    CommitMergeResolution,
-    ObserveConflictsBeforeReplies,
-    ObserveDiffHighlights,
-    PushChanges,
-    ObserveMergeRequestSurface,
-    ObserveOriginHead,
-    ObserveUnresolvedIds,
-    Reply(usize),
-    Finish,
-}
-
-/// The state of one feedback progression. Plain data: no git repo, no
-/// GitLab client, no model.
-struct FeedbackMachine {
-    input: FeedbackTailInput,
-    stage: FeedbackStage,
-    has_new_changes: bool,
-    conflicts_unresolved: bool,
-    diff_highlights: Option<String>,
-    branch_tip_changed: bool,
-    surface_changed: bool,
-    ids_to_resolve: Vec<String>,
-    reply_body: Option<String>,
-    reply_steps: Vec<FeedbackReplyStep>,
-}
-
-impl FeedbackMachine {
-    fn new(input: FeedbackTailInput) -> Self {
-        Self {
-            input,
-            stage: FeedbackStage::UpdateMetadata,
-            has_new_changes: false,
-            conflicts_unresolved: false,
-            diff_highlights: None,
-            branch_tip_changed: false,
-            surface_changed: false,
-            ids_to_resolve: Vec::new(),
-            reply_body: None,
-            reply_steps: Vec::new(),
-        }
+/// Finish a feedback run directly: metadata first, required git operations,
+/// conflict gates, then best-effort GitLab replies.
+fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput) -> Result<()> {
+    if let Some(update) = plan_mr_metadata_update(
+        &input.surface_before.title,
+        &input.surface_before.description,
+        &input.resolution,
+    ) {
+        port.update_mr_metadata(&update.title, &update.description);
     }
 
-    /// The single next thing to do; resolves the stages that need no port
-    /// interaction on the way.
-    fn next_step(&mut self) -> FeedbackStep {
-        loop {
-            match self.stage.clone() {
-                FeedbackStage::UpdateMetadata => {
-                    match plan_mr_metadata_update(
-                        &self.input.surface_before.title,
-                        &self.input.surface_before.description,
-                        &self.input.resolution,
-                    ) {
-                        Some(update) => {
-                            return FeedbackStep::Act(FeedbackAction::UpdateMrMetadata {
-                                title: update.title,
-                                description: update.description,
-                            });
-                        }
-                        None => self.stage = FeedbackStage::FetchAfterModelRun,
-                    }
-                }
-                FeedbackStage::FetchAfterModelRun | FeedbackStage::FetchForConflictRecheck => {
-                    return FeedbackStep::Act(FeedbackAction::FetchBranches);
-                }
-                FeedbackStage::ObserveChangesAfterModelRun
-                | FeedbackStage::ObserveChangesAfterStaging
-                | FeedbackStage::ObserveChangesAfterRecheck => {
-                    return FeedbackStep::Observe(FeedbackQuery::ChangesSinceModelRun);
-                }
-                FeedbackStage::ObserveMergeInProgress => {
-                    return FeedbackStep::Observe(FeedbackQuery::MergeInProgress);
-                }
-                FeedbackStage::StageResolvedConflicts => {
-                    return FeedbackStep::Act(FeedbackAction::StageResolvedConflicts);
-                }
-                FeedbackStage::StageAllForMerge
-                | FeedbackStage::StageAllForCommit
-                | FeedbackStage::StageAllForMergeCommit => {
-                    return FeedbackStep::Act(FeedbackAction::StageAll);
-                }
-                FeedbackStage::ObserveStagedForCommit
-                | FeedbackStage::ObserveStagedForMergeCommit => {
-                    return FeedbackStep::Observe(FeedbackQuery::StagedChanges);
-                }
-                FeedbackStage::CommitChanges => {
-                    return FeedbackStep::Act(FeedbackAction::Commit {
-                        message: self.input.commit_message(),
-                    });
-                }
-                FeedbackStage::CommitMergeResolution => {
-                    return FeedbackStep::Act(FeedbackAction::Commit {
-                        message: self.input.merge_commit_message(),
-                    });
-                }
-                FeedbackStage::CompleteMerge => {
-                    return FeedbackStep::Act(FeedbackAction::CompleteMergeIfReady {
-                        message: self.input.merge_commit_message(),
-                    });
-                }
-                FeedbackStage::ObserveConflictsAfterMerge
-                | FeedbackStage::ObserveConflictsBeforeReplies => {
-                    return FeedbackStep::Observe(FeedbackQuery::MergeConflictsPresent);
-                }
-                FeedbackStage::ObserveUpToDateWithTarget => {
-                    return FeedbackStep::Observe(FeedbackQuery::UpToDateWithTarget);
-                }
-                FeedbackStage::ObserveDiffHighlights => {
-                    return FeedbackStep::Observe(FeedbackQuery::DiffHighlights);
-                }
-                FeedbackStage::PushChanges => {
-                    return FeedbackStep::Act(FeedbackAction::PushSourceBranch);
-                }
-                FeedbackStage::ObserveMergeRequestSurface => {
-                    return FeedbackStep::Observe(FeedbackQuery::MergeRequestSurface);
-                }
-                FeedbackStage::ObserveOriginHead => {
-                    return FeedbackStep::Observe(FeedbackQuery::OriginHead);
-                }
-                FeedbackStage::ObserveUnresolvedIds => {
-                    return FeedbackStep::Observe(FeedbackQuery::UnresolvedDiscussionIds);
-                }
-                FeedbackStage::Reply(index) => match self.reply_steps.get(index).cloned() {
-                    None => self.stage = FeedbackStage::Finish,
-                    Some(step) => {
-                        self.stage = FeedbackStage::Reply(index + 1);
-                        let body = self
-                            .reply_body
-                            .clone()
-                            .expect("reply steps are only planned with a reply body");
-                        return FeedbackStep::Act(match step {
-                            FeedbackReplyStep::Reply { discussion_id } => {
-                                FeedbackAction::ReplyToDiscussion {
-                                    discussion_id,
-                                    body,
-                                }
-                            }
-                            FeedbackReplyStep::Resolve { discussion_id } => {
-                                FeedbackAction::ResolveDiscussion { discussion_id }
-                            }
-                            FeedbackReplyStep::PostPlainComment => {
-                                FeedbackAction::PostPlainComment { body }
-                            }
-                        });
-                    }
-                },
-                FeedbackStage::Finish => return FeedbackStep::Finish,
-            }
-        }
-    }
+    port.fetch_branches()?;
+    let mut has_new_changes = port.has_changes_since(&input.pre_agent_sha)?;
 
-    fn apply_fact(&mut self, fact: Result<FeedbackFact>) -> Result<()> {
-        match (self.stage.clone(), fact?) {
-            (
-                FeedbackStage::ObserveChangesAfterModelRun,
-                FeedbackFact::ChangesSinceModelRun(changed),
-            ) => {
-                self.has_new_changes = changed;
-                self.stage = FeedbackStage::ObserveMergeInProgress;
-            }
-            (FeedbackStage::ObserveMergeInProgress, FeedbackFact::MergeInProgress(in_progress)) => {
-                self.stage = if in_progress {
-                    FeedbackStage::StageResolvedConflicts
-                } else if self.has_new_changes {
-                    FeedbackStage::StageAllForCommit
-                } else {
-                    FeedbackStage::CompleteMerge
-                };
-            }
-            (
-                FeedbackStage::ObserveChangesAfterStaging,
-                FeedbackFact::ChangesSinceModelRun(changed),
-            ) => {
-                self.has_new_changes = changed;
-                self.stage = FeedbackStage::CompleteMerge;
-            }
-            (FeedbackStage::ObserveStagedForCommit, FeedbackFact::StagedChanges(staged)) => {
-                self.stage = if staged {
-                    FeedbackStage::CommitChanges
-                } else {
-                    FeedbackStage::CompleteMerge
-                };
-            }
-            (
-                FeedbackStage::ObserveConflictsAfterMerge,
-                FeedbackFact::MergeConflictsPresent(present),
-            ) => {
-                self.conflicts_unresolved = present;
-                self.stage = if self.input.requires_conflict_resolution {
-                    FeedbackStage::FetchForConflictRecheck
-                } else {
-                    self.after_conflict_recheck()
-                };
-            }
-            (FeedbackStage::ObserveUpToDateWithTarget, FeedbackFact::UpToDateWithTarget(ok)) => {
-                self.stage = if ok {
-                    FeedbackStage::ObserveChangesAfterRecheck
-                } else {
-                    self.conflicts_unresolved = true;
-                    warn!(
-                        "MR !{}: branch still does not merge cleanly with origin/{} (fetched latest target and source)",
-                        self.input.mr_iid, self.input.target_branch
-                    );
-                    self.after_conflict_recheck()
-                };
-            }
-            (
-                FeedbackStage::ObserveChangesAfterRecheck,
-                FeedbackFact::ChangesSinceModelRun(changed),
-            ) => {
-                self.stage = if changed {
-                    self.has_new_changes = true;
-                    FeedbackStage::StageAllForMergeCommit
-                } else {
-                    self.after_conflict_recheck()
-                };
-            }
-            (FeedbackStage::ObserveStagedForMergeCommit, FeedbackFact::StagedChanges(staged)) => {
-                self.stage = if staged {
-                    FeedbackStage::CommitMergeResolution
-                } else {
-                    self.after_conflict_recheck()
-                };
-            }
-            (
-                FeedbackStage::ObserveConflictsBeforeReplies,
-                FeedbackFact::MergeConflictsPresent(present),
-            ) => {
-                self.conflicts_unresolved = present;
-                self.stage = self.after_conflicts_known();
-            }
-            (FeedbackStage::ObserveDiffHighlights, FeedbackFact::DiffHighlights(highlights)) => {
-                self.diff_highlights = highlights;
-                self.stage = self.after_diff_highlights();
-            }
-            (
-                FeedbackStage::ObserveMergeRequestSurface,
-                FeedbackFact::MergeRequestSurface(surface),
-            ) => {
-                if surface.has_conflicts {
-                    self.conflicts_unresolved = true;
-                    warn!(
-                        "MR !{}: GitLab still reports merge conflicts after worker run",
-                        self.input.mr_iid
-                    );
-                }
-                self.surface_changed = self.input.surface_before.differs_from(&surface);
-                self.stage = FeedbackStage::ObserveOriginHead;
-            }
-            (FeedbackStage::ObserveOriginHead, FeedbackFact::OriginHead(head)) => {
-                self.branch_tip_changed = head.trim() != self.input.pre_agent_sha.trim();
-                if self.surface_changed && !self.implicit_resolve_discussions() {
-                    info!(
-                        "MR !{} metadata changed without branch updates; discussions will remain open unless explicitly requested",
-                        self.input.mr_iid
-                    );
-                }
-                self.stage = if self.input.unresolved_ids.is_empty() {
-                    FeedbackStage::ObserveUnresolvedIds
-                } else {
-                    self.ids_to_resolve = self.input.unresolved_ids.clone();
-                    self.plan_replies()?
-                };
-            }
-            (FeedbackStage::ObserveUnresolvedIds, FeedbackFact::UnresolvedDiscussionIds(ids)) => {
-                self.ids_to_resolve = ids;
-                self.stage = self.plan_replies()?;
-            }
-            (stage, fact) => {
-                anyhow::bail!("feedback port answered {stage:?} with {fact:?}");
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_outcome(&mut self, outcome: FeedbackOutcome) -> Result<()> {
-        match (self.stage.clone(), outcome) {
-            // The metadata write is best effort; the port logs its failure.
-            (FeedbackStage::UpdateMetadata, FeedbackOutcome::Done) => {
-                self.stage = FeedbackStage::FetchAfterModelRun;
-            }
-            (FeedbackStage::FetchAfterModelRun, FeedbackOutcome::Done) => {
-                self.stage = FeedbackStage::ObserveChangesAfterModelRun;
-            }
-            (FeedbackStage::StageResolvedConflicts, FeedbackOutcome::Staged(staged)) => {
-                if staged {
-                    info!(
-                        "MR !{}: staged merge-conflict files with no remaining conflict markers",
-                        self.input.mr_iid
-                    );
-                }
-                self.stage = FeedbackStage::StageAllForMerge;
-            }
-            (FeedbackStage::StageAllForMerge, FeedbackOutcome::Done) => {
-                self.stage = FeedbackStage::ObserveChangesAfterStaging;
-            }
-            (FeedbackStage::StageAllForCommit, FeedbackOutcome::Done) => {
-                self.stage = FeedbackStage::ObserveStagedForCommit;
-            }
-            (FeedbackStage::CommitChanges, FeedbackOutcome::Done) => {
-                self.stage = FeedbackStage::CompleteMerge;
-            }
-            (FeedbackStage::CompleteMerge, FeedbackOutcome::MergeCompleted(completed)) => {
-                if completed {
-                    self.has_new_changes = true;
-                    info!(
-                        "MR !{}: concluded in-progress merge with origin/{}",
-                        self.input.mr_iid, self.input.target_branch
-                    );
-                }
-                self.stage = FeedbackStage::ObserveConflictsAfterMerge;
-            }
-            (FeedbackStage::FetchForConflictRecheck, FeedbackOutcome::Done) => {
-                self.stage = FeedbackStage::ObserveUpToDateWithTarget;
-            }
-            (FeedbackStage::StageAllForMergeCommit, FeedbackOutcome::Done) => {
-                self.stage = FeedbackStage::ObserveStagedForMergeCommit;
-            }
-            (FeedbackStage::CommitMergeResolution, FeedbackOutcome::Done) => {
-                self.stage = self.after_conflict_recheck();
-            }
-            (FeedbackStage::PushChanges, FeedbackOutcome::Done) => {
-                info!(
-                    "Pushed changes addressing feedback for MR !{}",
-                    self.input.mr_iid
-                );
-                self.stage = FeedbackStage::ObserveMergeRequestSurface;
-            }
-            // Every GitLab reply, resolve, and plain comment is best
-            // effort; the port logs what it could not post.
-            (FeedbackStage::Reply(_), FeedbackOutcome::Done) => {}
-            (_, FeedbackOutcome::Failed(e)) => return Err(e),
-            (stage, _) => {
-                anyhow::bail!("feedback port reported an unexpected outcome for {stage:?}");
-            }
-        }
-        Ok(())
-    }
-
-    /// Where the progression goes once the conflict recheck is done: one
-    /// more conflict probe unless conflicts are already known to remain.
-    fn after_conflict_recheck(&self) -> FeedbackStage {
-        if self.conflicts_unresolved {
-            self.after_conflicts_known()
-        } else {
-            FeedbackStage::ObserveConflictsBeforeReplies
-        }
-    }
-
-    fn after_conflicts_known(&self) -> FeedbackStage {
-        if self.has_new_changes {
-            FeedbackStage::ObserveDiffHighlights
-        } else {
-            self.after_diff_highlights()
-        }
-    }
-
-    /// The push decision: conflicts hold the branch back, no changes means
-    /// nothing to push.
-    fn after_diff_highlights(&self) -> FeedbackStage {
-        if self.has_new_changes && self.conflicts_unresolved {
-            warn!(
-                "MR !{}: not pushing — merge conflicts with origin/{} are still unresolved",
-                self.input.mr_iid, self.input.target_branch
-            );
-            FeedbackStage::ObserveMergeRequestSurface
-        } else if self.has_new_changes {
-            FeedbackStage::PushChanges
-        } else {
+    if port.merge_in_progress()? {
+        if port.stage_resolved_conflicts()? {
             info!(
-                "Agent processed comments for MR !{} but made no code changes",
-                self.input.mr_iid
+                "MR !{}: staged merge-conflict files with no remaining conflict markers",
+                input.mr_iid
             );
-            FeedbackStage::ObserveMergeRequestSurface
+        }
+        port.stage_all()?;
+        has_new_changes = port.has_changes_since(&input.pre_agent_sha)?;
+    } else if has_new_changes {
+        port.stage_all()?;
+        if port.has_staged_changes()? {
+            port.commit(&input.commit_message())?;
         }
     }
 
-    fn implicit_resolve_discussions(&self) -> bool {
-        self.has_new_changes || self.branch_tip_changed
-    }
-
-    /// Decide the reply body and the ordered GitLab writes. Fails the run
-    /// when the worker produced neither changes nor an explanation, which
-    /// is what the pre-machine code did.
-    fn plan_replies(&mut self) -> Result<FeedbackStage> {
-        let should_post_plain_comment = self.input.resolution.post_plain_comment;
-        let needs_reply_body = !self.ids_to_resolve.is_empty()
-            || (self.input.plain_comments_present && should_post_plain_comment);
-
-        if self.input.requires_conflict_resolution && self.conflicts_unresolved {
-            info!(
-                "MR !{}: merge conflicts with origin/{} remain; skipping GitLab replies until the branch merges cleanly",
-                self.input.mr_iid, self.input.target_branch
-            );
-            return Ok(FeedbackStage::Finish);
-        }
-
-        self.reply_body = if needs_reply_body {
-            let reply_raw = if let Some(block) =
-                extract_worker_public_comment(self.input.resolution.public_comment.as_deref())
-            {
-                block
-            } else if let Some(reply) = build_feedback_resolution_reply(
-                &self.input.resolution,
-                self.has_new_changes,
-                self.diff_highlights.as_deref(),
-            ) {
-                reply
-            } else {
-                return Err(anyhow::anyhow!(
-                    "worker produced no source changes and no feedback reply for MR !{}",
-                    self.input.mr_iid
-                ));
-            };
-            Some(strip_worker_reply_boilerplate(&reply_raw))
-        } else {
-            None
-        };
-
-        let resolve_discussions = feedback_discussions_may_be_resolved(
-            &self.input.resolution,
-            self.implicit_resolve_discussions(),
-            self.conflicts_unresolved,
+    if port.complete_merge_if_ready(&input.merge_commit_message())? {
+        has_new_changes = true;
+        info!(
+            "MR !{}: concluded in-progress merge with origin/{}",
+            input.mr_iid, input.target_branch
         );
-        if self.conflicts_unresolved
-            && self.input.resolution.mark_discussions_resolved == Some(true)
+    }
+
+    let mut conflicts_unresolved = port.merge_conflicts_present()?;
+    if input.requires_conflict_resolution {
+        port.fetch_branches()?;
+        if port.up_to_date_with_target(&input.target_branch)? {
+            if port.has_changes_since(&input.pre_agent_sha)? {
+                has_new_changes = true;
+                port.stage_all()?;
+                if port.has_staged_changes()? {
+                    port.commit(&input.merge_commit_message())?;
+                }
+            }
+        } else {
+            conflicts_unresolved = true;
+            warn!(
+                "MR !{}: branch still does not merge cleanly with origin/{} (fetched latest target and source)",
+                input.mr_iid, input.target_branch
+            );
+        }
+    }
+    if !conflicts_unresolved {
+        conflicts_unresolved = port.merge_conflicts_present()?;
+    }
+
+    let diff_highlights = has_new_changes
+        .then(|| port.diff_highlights(&input.pre_agent_sha))
+        .flatten();
+    if has_new_changes && conflicts_unresolved {
+        warn!(
+            "MR !{}: not pushing — merge conflicts with origin/{} are still unresolved",
+            input.mr_iid, input.target_branch
+        );
+    } else if has_new_changes {
+        port.push_source_branch()?;
+        info!(
+            "Pushed changes addressing feedback for MR !{}",
+            input.mr_iid
+        );
+    } else {
+        info!(
+            "Agent processed comments for MR !{} but made no code changes",
+            input.mr_iid
+        );
+    }
+
+    let surface_after = port.merge_request_surface(input.mr_iid)?;
+    if surface_after.has_conflicts {
+        conflicts_unresolved = true;
+        warn!(
+            "MR !{}: GitLab still reports merge conflicts after worker run",
+            input.mr_iid
+        );
+    }
+    let surface_changed = input.surface_before.differs_from(&surface_after);
+    let origin_head = port
+        .origin_head(&input.source_branch)
+        .unwrap_or_else(|| input.pre_agent_sha.clone());
+    let branch_tip_changed = origin_head.trim() != input.pre_agent_sha.trim();
+    let implicit_resolve_discussions = has_new_changes || branch_tip_changed;
+    if surface_changed && !implicit_resolve_discussions {
+        info!(
+            "MR !{} metadata changed without branch updates; discussions will remain open unless explicitly requested",
+            input.mr_iid
+        );
+    }
+
+    let ids_to_resolve = if input.unresolved_ids.is_empty() {
+        port.unresolved_discussion_ids(input.mr_iid)
+    } else {
+        input.unresolved_ids.clone()
+    };
+    let should_post_plain_comment = input.resolution.post_plain_comment;
+    let needs_reply_body =
+        !ids_to_resolve.is_empty() || (input.plain_comments_present && should_post_plain_comment);
+
+    if input.requires_conflict_resolution && conflicts_unresolved {
+        info!(
+            "MR !{}: merge conflicts with origin/{} remain; skipping GitLab replies until the branch merges cleanly",
+            input.mr_iid, input.target_branch
+        );
+        return Ok(());
+    }
+
+    let reply_body = if needs_reply_body {
+        let reply_raw = if let Some(block) =
+            extract_worker_public_comment(input.resolution.public_comment.as_deref())
         {
-            warn!(
-                "MR !{}: ignoring agent request to mark discussions resolved while merge conflicts remain",
-                self.input.mr_iid
-            );
-        }
-        if !resolve_discussions && !self.ids_to_resolve.is_empty() {
-            info!(
-                "MR !{}: posting feedback replies without resolving discussions (no mark_discussions_resolved signal and no implicit resolving actions)",
-                self.input.mr_iid
-            );
-        }
+            block
+        } else if let Some(reply) = build_feedback_resolution_reply(
+            &input.resolution,
+            has_new_changes,
+            diff_highlights.as_deref(),
+        ) {
+            reply
+        } else {
+            return Err(anyhow::anyhow!(
+                "worker produced no source changes and no feedback reply for MR !{}",
+                input.mr_iid
+            ));
+        };
+        Some(strip_worker_reply_boilerplate(&reply_raw))
+    } else {
+        None
+    };
 
-        self.reply_steps = plan_feedback_reply_steps(
-            &self.ids_to_resolve,
-            self.reply_body.is_some(),
-            resolve_discussions,
-            self.input.plain_comments_present,
-            should_post_plain_comment,
+    let resolve_discussions = feedback_discussions_may_be_resolved(
+        &input.resolution,
+        implicit_resolve_discussions,
+        conflicts_unresolved,
+    );
+    if conflicts_unresolved && input.resolution.mark_discussions_resolved == Some(true) {
+        warn!(
+            "MR !{}: ignoring agent request to mark discussions resolved while merge conflicts remain",
+            input.mr_iid
         );
-        Ok(FeedbackStage::Reply(0))
     }
-}
+    if !resolve_discussions && !ids_to_resolve.is_empty() {
+        info!(
+            "MR !{}: posting feedback replies without resolving discussions (no mark_discussions_resolved signal and no implicit resolving actions)",
+            input.mr_iid
+        );
+    }
 
-/// Ask the feedback port one question.
-fn observe_feedback(
-    port: &dyn FeedbackTailPort,
-    query: &FeedbackQuery,
-    input: &FeedbackTailInput,
-) -> Result<FeedbackFact> {
-    Ok(match query {
-        FeedbackQuery::ChangesSinceModelRun => {
-            FeedbackFact::ChangesSinceModelRun(port.has_changes_since(&input.pre_agent_sha)?)
-        }
-        FeedbackQuery::MergeInProgress => FeedbackFact::MergeInProgress(port.merge_in_progress()?),
-        FeedbackQuery::MergeConflictsPresent => {
-            FeedbackFact::MergeConflictsPresent(port.merge_conflicts_present()?)
-        }
-        FeedbackQuery::StagedChanges => FeedbackFact::StagedChanges(port.has_staged_changes()?),
-        FeedbackQuery::UpToDateWithTarget => {
-            FeedbackFact::UpToDateWithTarget(port.up_to_date_with_target(&input.target_branch)?)
-        }
-        FeedbackQuery::DiffHighlights => {
-            FeedbackFact::DiffHighlights(port.diff_highlights(&input.pre_agent_sha))
-        }
-        FeedbackQuery::MergeRequestSurface => {
-            FeedbackFact::MergeRequestSurface(port.merge_request_surface(input.mr_iid)?)
-        }
-        FeedbackQuery::OriginHead => FeedbackFact::OriginHead(
-            port.origin_head(&input.source_branch)
-                .unwrap_or_else(|| input.pre_agent_sha.clone()),
-        ),
-        FeedbackQuery::UnresolvedDiscussionIds => {
-            FeedbackFact::UnresolvedDiscussionIds(port.unresolved_discussion_ids(input.mr_iid))
-        }
-    })
-}
-
-fn run_feedback_cycle(
-    machine: &mut FeedbackMachine,
-    port: &mut dyn FeedbackTailPort,
-) -> Result<()> {
-    loop {
-        match machine.next_step() {
-            Step::Observe(query) => {
-                let fact = observe_feedback(port, &query, &machine.input);
-                machine.apply_fact(fact)?;
+    if let Some(body) = reply_body.as_deref() {
+        for discussion_id in &ids_to_resolve {
+            port.reply_to_discussion(discussion_id, body);
+            if resolve_discussions {
+                port.resolve_discussion(discussion_id);
             }
-            Step::Act(action) => machine.apply_outcome(port.execute(&action))?,
-            Step::Finish => return Ok(()),
+        }
+        if input.plain_comments_present && should_post_plain_comment {
+            port.post_plain_comment(body);
         }
     }
+    Ok(())
 }
 
-/// The feedback progression backed by the real worktree and GitLab client.
 struct LiveFeedbackTailPort<'a> {
     git_repo: &'a GitRepo,
     glab: &'a GitLabClient,
@@ -4834,6 +3025,25 @@ struct LiveFeedbackTailPort<'a> {
 }
 
 impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
+    fn update_mr_metadata(&mut self, title: &str, description: &str) {
+        if let Err(e) = self
+            .glab
+            .update_mr_title_description(self.mr_iid, title, description)
+        {
+            warn!("Failed to update MR !{} metadata: {}", self.mr_iid, e);
+        } else {
+            info!(
+                "Updated MR !{} title/description from agent feedback",
+                self.mr_iid
+            );
+        }
+    }
+
+    fn fetch_branches(&mut self) -> Result<()> {
+        self.git_repo
+            .fetch_branches(&[self.target_branch.as_str(), self.source_branch.as_str()])
+    }
+
     fn has_changes_since(&self, base_ref: &str) -> Result<bool> {
         self.git_repo.has_changes_since(base_ref)
     }
@@ -4842,12 +3052,28 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
         self.git_repo.is_merge_in_progress()
     }
 
-    fn merge_conflicts_present(&self) -> Result<bool> {
-        self.git_repo.merge_conflicts_present()
+    fn stage_resolved_conflicts(&mut self) -> Result<bool> {
+        self.git_repo.stage_resolved_unmerged_paths()
+    }
+
+    fn stage_all(&mut self) -> Result<()> {
+        self.git_repo.add_all()
     }
 
     fn has_staged_changes(&self) -> Result<bool> {
         self.git_repo.has_staged_changes()
+    }
+
+    fn commit(&mut self, message: &str) -> Result<()> {
+        self.git_repo.commit(message)
+    }
+
+    fn complete_merge_if_ready(&mut self, message: &str) -> Result<bool> {
+        self.git_repo.complete_merge_if_ready(message)
+    }
+
+    fn merge_conflicts_present(&self) -> Result<bool> {
+        self.git_repo.merge_conflicts_present()
     }
 
     fn up_to_date_with_target(&self, target_branch: &str) -> Result<bool> {
@@ -4856,6 +3082,10 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
 
     fn diff_highlights(&self, base_ref: &str) -> Option<String> {
         build_diff_highlights_since(self.git_repo, base_ref)
+    }
+
+    fn push_source_branch(&mut self) -> Result<()> {
+        self.git_repo.push(&self.source_branch)
     }
 
     fn merge_request_surface(&self, mr_iid: u64) -> Result<MrSurfaceObservation> {
@@ -4876,80 +3106,27 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
             .unwrap_or_default()
     }
 
-    fn execute(&mut self, action: &FeedbackAction) -> FeedbackOutcome {
-        match action {
-            FeedbackAction::UpdateMrMetadata { title, description } => {
-                if let Err(e) =
-                    self.glab
-                        .update_mr_title_description(self.mr_iid, title, description)
-                {
-                    warn!("Failed to update MR !{} metadata: {}", self.mr_iid, e);
-                } else {
-                    info!(
-                        "Updated MR !{} title/description from agent feedback",
-                        self.mr_iid
-                    );
-                }
-                FeedbackOutcome::Done
-            }
-            FeedbackAction::FetchBranches => match self
-                .git_repo
-                .fetch_branches(&[self.target_branch.as_str(), self.source_branch.as_str()])
-            {
-                Ok(()) => FeedbackOutcome::Done,
-                Err(e) => FeedbackOutcome::Failed(e),
-            },
-            FeedbackAction::StageResolvedConflicts => {
-                match self.git_repo.stage_resolved_unmerged_paths() {
-                    Ok(staged) => FeedbackOutcome::Staged(staged),
-                    Err(e) => FeedbackOutcome::Failed(e),
-                }
-            }
-            FeedbackAction::StageAll => match self.git_repo.add_all() {
-                Ok(()) => FeedbackOutcome::Done,
-                Err(e) => FeedbackOutcome::Failed(e),
-            },
-            FeedbackAction::Commit { message } => match self.git_repo.commit(message) {
-                Ok(()) => FeedbackOutcome::Done,
-                Err(e) => FeedbackOutcome::Failed(e),
-            },
-            FeedbackAction::CompleteMergeIfReady { message } => {
-                match self.git_repo.complete_merge_if_ready(message) {
-                    Ok(completed) => FeedbackOutcome::MergeCompleted(completed),
-                    Err(e) => FeedbackOutcome::Failed(e),
-                }
-            }
-            FeedbackAction::PushSourceBranch => match self.git_repo.push(&self.source_branch) {
-                Ok(()) => FeedbackOutcome::Done,
-                Err(e) => FeedbackOutcome::Failed(e),
-            },
-            FeedbackAction::ReplyToDiscussion {
-                discussion_id,
-                body,
-            } => {
-                if let Err(e) = self
-                    .glab
-                    .reply_to_discussion(self.mr_iid, discussion_id, body)
-                {
-                    warn!("Failed to reply to discussion {}: {}", discussion_id, e);
-                }
-                FeedbackOutcome::Done
-            }
-            FeedbackAction::ResolveDiscussion { discussion_id } => {
-                if let Err(e) = self.glab.resolve_discussion(self.mr_iid, discussion_id) {
-                    warn!("Failed to resolve discussion {}: {}", discussion_id, e);
-                }
-                FeedbackOutcome::Done
-            }
-            FeedbackAction::PostPlainComment { body } => {
-                if let Err(e) = self.glab.add_mr_comment(self.mr_iid, body) {
-                    warn!(
-                        "Failed to post MR !{} reply for plain comments: {}",
-                        self.mr_iid, e
-                    );
-                }
-                FeedbackOutcome::Done
-            }
+    fn reply_to_discussion(&mut self, discussion_id: &str, body: &str) {
+        if let Err(e) = self
+            .glab
+            .reply_to_discussion(self.mr_iid, discussion_id, body)
+        {
+            warn!("Failed to reply to discussion {}: {}", discussion_id, e);
+        }
+    }
+
+    fn resolve_discussion(&mut self, discussion_id: &str) {
+        if let Err(e) = self.glab.resolve_discussion(self.mr_iid, discussion_id) {
+            warn!("Failed to resolve discussion {}: {}", discussion_id, e);
+        }
+    }
+
+    fn post_plain_comment(&mut self, body: &str) {
+        if let Err(e) = self.glab.add_mr_comment(self.mr_iid, body) {
+            warn!(
+                "Failed to post MR !{} reply for plain comments: {}",
+                self.mr_iid, e
+            );
         }
     }
 }
@@ -6510,94 +4687,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `handle_mr_comments` characterization: reply/resolve/plain-comment
-    // ordering tail.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn plan_feedback_reply_steps_is_empty_without_a_reply_body() {
-        let steps = plan_feedback_reply_steps(
-            &["d1".to_string()],
-            false, // no reply body
-            true,
-            true,
-            true,
-        );
-        assert!(steps.is_empty());
-    }
-
-    #[test]
-    fn plan_feedback_reply_steps_replies_before_resolving_each_discussion() {
-        let ids = vec!["d1".to_string(), "d2".to_string()];
-        let steps = plan_feedback_reply_steps(&ids, true, true, false, false);
-        assert_eq!(
-            steps,
-            vec![
-                FeedbackReplyStep::Reply {
-                    discussion_id: "d1".to_string()
-                },
-                FeedbackReplyStep::Resolve {
-                    discussion_id: "d1".to_string()
-                },
-                FeedbackReplyStep::Reply {
-                    discussion_id: "d2".to_string()
-                },
-                FeedbackReplyStep::Resolve {
-                    discussion_id: "d2".to_string()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_feedback_reply_steps_replies_without_resolving_when_not_permitted() {
-        let ids = vec!["d1".to_string()];
-        let steps = plan_feedback_reply_steps(&ids, true, false, false, false);
-        assert_eq!(
-            steps,
-            vec![FeedbackReplyStep::Reply {
-                discussion_id: "d1".to_string()
-            }]
-        );
-    }
-
-    #[test]
-    fn plan_feedback_reply_steps_appends_plain_comment_last() {
-        let ids = vec!["d1".to_string()];
-        let steps = plan_feedback_reply_steps(&ids, true, true, true, true);
-        assert_eq!(
-            steps,
-            vec![
-                FeedbackReplyStep::Reply {
-                    discussion_id: "d1".to_string()
-                },
-                FeedbackReplyStep::Resolve {
-                    discussion_id: "d1".to_string()
-                },
-                FeedbackReplyStep::PostPlainComment,
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_feedback_reply_steps_plain_comment_only_when_no_discussions() {
-        let steps = plan_feedback_reply_steps(&[], true, true, true, true);
-        assert_eq!(steps, vec![FeedbackReplyStep::PostPlainComment]);
-    }
-
-    #[test]
-    fn plan_feedback_reply_steps_omits_plain_comment_when_not_requested() {
-        let steps = plan_feedback_reply_steps(&[], true, true, true, false);
-        assert!(steps.is_empty());
-    }
-
-    #[test]
-    fn plan_feedback_reply_steps_omits_plain_comment_when_none_present() {
-        let steps = plan_feedback_reply_steps(&[], true, true, false, true);
-        assert!(steps.is_empty());
-    }
-
-    // -----------------------------------------------------------------
     // Git-mutation ordering used by `handle_mr_comments`: commit only when
     // something is staged, push only once committed, and a real `rev_parse`
     // comparison detects whether the remote branch tip moved. Exercised
@@ -7579,10 +5668,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Routing driver traces against a recording fake port. The machine is
-    // plain data, so a whole cycle can be characterized as an ordered
-    // list of observations and actions — including the failure paths,
-    // which are the ones that are hardest to reach against live GitLab.
+    // Direct routing workflow traces.
     // -----------------------------------------------------------------
 
     const ROUTING_AGENT: &str = "worker-1";
@@ -7597,8 +5683,6 @@ mod tests {
         }
     }
 
-    /// What one scripted implementation run does: whether it produced an
-    /// MR, which branch it left behind, and how it ended.
     #[derive(Clone)]
     struct ImplementationScript {
         mr_created: bool,
@@ -7636,12 +5720,10 @@ mod tests {
         }
     }
 
-    /// A recording routing port. The world is scripted per observation
-    /// kind; failures are injected by naming the exact query or action
-    /// that should fail, so each test reads as "this world, then this
-    /// trace".
     struct FakeWorkerPort {
-        trace: std::cell::RefCell<Vec<WorkerStep>>,
+        trace: std::cell::RefCell<Vec<String>>,
+        implementation_payloads: std::cell::RefCell<Vec<IssueObservation>>,
+        feedback_payloads: std::cell::RefCell<Vec<(u64, Option<u64>, bool)>>,
         shutdown_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
         issues: Vec<IssueObservation>,
         known_issues: Vec<IssueObservation>,
@@ -7655,114 +5737,104 @@ mod tests {
         feedback_error: Option<String>,
         cancel_handled: bool,
         trackable: bool,
-        failing_queries: Vec<WorkerQuery>,
-        failing_actions: Vec<WorkerAction>,
+        failures: Vec<String>,
+        issue_reads: std::cell::RefCell<std::collections::HashMap<u64, usize>>,
+        fail_issue_read: Option<(u64, usize)>,
     }
 
     impl FakeWorkerPort {
         fn new() -> Self {
             Self {
-                trace: std::cell::RefCell::new(Vec::new()),
-                shutdown_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
-                issues: Vec::new(),
-                known_issues: Vec::new(),
-                mr_states: Vec::new(),
+                trace: Default::default(),
+                implementation_payloads: Default::default(),
+                feedback_payloads: Default::default(),
+                shutdown_answers: Default::default(),
+                issues: vec![],
+                known_issues: vec![],
+                mr_states: vec![],
                 default_branch: "main".to_string(),
-                claim_attempts: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                claim_attempts: Default::default(),
                 adopted: None,
                 handled_labeled_mr: false,
-                implementation: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                implementation: Default::default(),
                 feedback_abandoned: false,
                 feedback_error: None,
                 cancel_handled: false,
                 trackable: true,
-                failing_queries: Vec::new(),
-                failing_actions: Vec::new(),
+                failures: vec![],
+                issue_reads: Default::default(),
+                fail_issue_read: None,
             }
         }
 
-        /// The issues the poll lists; they are answerable by IID too.
         fn listing(mut self, issues: &[IssueObservation]) -> Self {
             self.issues = issues.to_vec();
             self.known_issues.extend(issues.iter().cloned());
             self
         }
-
         fn knowing(mut self, issues: &[IssueObservation]) -> Self {
             self.known_issues.extend(issues.iter().cloned());
             self
         }
-
-        fn with_mr_state(mut self, mr_iid: u64, state: &str) -> Self {
-            self.mr_states.push((mr_iid, state.to_string()));
+        fn with_mr_state(mut self, iid: u64, state: &str) -> Self {
+            self.mr_states.push((iid, state.to_string()));
             self
         }
-
         fn with_shutdown_answers(self, answers: &[bool]) -> Self {
             self.shutdown_answers.borrow_mut().extend(answers);
             self
         }
-
         fn with_claim_attempts(self, attempts: &[IssueClaimAttempt]) -> Self {
             self.claim_attempts.borrow_mut().extend(attempts);
             self
         }
-
         fn implementing(self, scripts: &[ImplementationScript]) -> Self {
             self.implementation
                 .borrow_mut()
                 .extend(scripts.iter().cloned());
             self
         }
-
         fn adopting(mut self, active: ActiveIssue) -> Self {
             self.adopted = Some(active);
             self
         }
-
         fn handling_labeled_mr(mut self) -> Self {
             self.handled_labeled_mr = true;
             self
         }
-
         fn abandoning_feedback(mut self) -> Self {
             self.feedback_abandoned = true;
             self
         }
-
         fn failing_feedback(mut self, message: &str) -> Self {
             self.feedback_error = Some(message.to_string());
             self
         }
-
         fn handling_cancel(mut self) -> Self {
             self.cancel_handled = true;
             self
         }
-
         fn untrackable(mut self) -> Self {
             self.trackable = false;
             self
         }
-
-        fn failing_query(mut self, query: WorkerQuery) -> Self {
-            self.failing_queries.push(query);
+        fn failing(mut self, operation: &str) -> Self {
+            self.failures.push(operation.to_string());
+            self
+        }
+        fn failing_issue_read(mut self, iid: u64, read: usize) -> Self {
+            self.fail_issue_read = Some((iid, read));
             self
         }
 
-        fn failing_action(mut self, action: WorkerAction) -> Self {
-            self.failing_actions.push(action);
-            self
+        fn record(&self, operation: impl Into<String>) {
+            self.trace.borrow_mut().push(operation.into());
         }
-
-        fn record(&self, step: WorkerStep) {
-            self.trace.borrow_mut().push(step);
-        }
-
-        fn observe(&self, query: WorkerQuery) -> Result<()> {
-            self.record(WorkerStep::Observe(query.clone()));
-            if self.failing_queries.contains(&query) {
-                anyhow::bail!("injected failure observing {query:?}");
+        fn required(&self, operation: impl Into<String>) -> Result<()> {
+            let operation = operation.into();
+            self.record(operation.clone());
+            if self.failures.contains(&operation) {
+                anyhow::bail!("injected failure: {operation}");
             }
             Ok(())
         }
@@ -7770,24 +5842,30 @@ mod tests {
 
     impl WorkerRoutingPort for FakeWorkerPort {
         fn shutdown_requested(&self) -> bool {
-            self.record(WorkerStep::Observe(WorkerQuery::ShutdownRequested));
+            self.record("shutdown");
             self.shutdown_answers
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(false)
         }
-
         fn issue(&self, issue_iid: u64) -> Result<IssueObservation> {
-            self.observe(WorkerQuery::Issue { issue_iid })?;
+            let operation = format!("issue:{issue_iid}");
+            self.required(operation)?;
+            let mut reads = self.issue_reads.borrow_mut();
+            let read = reads.entry(issue_iid).or_default();
+            let current = *read;
+            *read += 1;
+            if self.fail_issue_read == Some((issue_iid, current)) {
+                anyhow::bail!("injected failure on issue read {current}");
+            }
             self.known_issues
                 .iter()
-                .find(|issue| issue.iid == issue_iid)
+                .find(|i| i.iid == issue_iid)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("404 Issue Not Found: #{issue_iid}"))
         }
-
         fn merge_request_status(&self, mr_iid: u64) -> Result<MrStatusObservation> {
-            self.observe(WorkerQuery::MergeRequestStatus { mr_iid })?;
+            self.required(format!("mr_status:{mr_iid}"))?;
             let state = self
                 .mr_states
                 .iter()
@@ -7796,94 +5874,139 @@ mod tests {
                 .unwrap_or_else(|| "opened".to_string());
             Ok(MrStatusObservation { iid: mr_iid, state })
         }
-
         fn issues(&self) -> Result<Vec<IssueObservation>> {
-            self.observe(WorkerQuery::Issues)?;
+            self.required("issues")?;
             Ok(self.issues.clone())
         }
-
         fn default_branch_or_main(&self) -> String {
-            self.record(WorkerStep::Observe(WorkerQuery::DefaultBranchOrMain));
+            self.record("default_branch");
             self.default_branch.clone()
         }
-
-        fn execute(&mut self, action: &WorkerAction) -> WorkerOutcome {
-            self.record(WorkerStep::Act(action.clone()));
-            if self.failing_actions.contains(action) {
-                return WorkerOutcome::Failed(anyhow::anyhow!(
-                    "injected failure executing {action:?}"
-                ));
-            }
-            match action {
-                WorkerAction::AcquireIssueClaim { .. } => WorkerOutcome::Claim(
-                    self.claim_attempts
-                        .borrow_mut()
-                        .pop_front()
-                        .unwrap_or(IssueClaimAttempt::Won),
-                ),
-                WorkerAction::AdoptOrphanedSession => WorkerOutcome::Adopted(self.adopted.clone()),
-                WorkerAction::HandleNeedAiWorkerMr => {
-                    WorkerOutcome::HandledNeedAiWorkerMr(self.handled_labeled_mr)
-                }
-                WorkerAction::RunImplementation { issue } => {
-                    let script = self
-                        .implementation
-                        .borrow_mut()
-                        .pop_front()
-                        .unwrap_or_else(ImplementationScript::no_mr);
-                    WorkerOutcome::Implementation {
-                        current: ActiveIssue {
-                            issue_iid: issue.iid,
-                            mr_iid: script.mr_iid,
-                            branch_name: script.branch_name.clone(),
-                            mr_created: script.mr_created,
-                        },
-                        error: script.error.as_ref().map(|e| anyhow::anyhow!("{e}")),
-                    }
-                }
-                WorkerAction::RunFeedback { .. } => match &self.feedback_error {
-                    Some(message) => WorkerOutcome::Failed(anyhow::anyhow!("{message}")),
-                    None => WorkerOutcome::Feedback {
-                        abandoned: self.feedback_abandoned,
-                    },
+        fn reset_worktree(&mut self) {
+            self.record("reset_worktree");
+        }
+        fn checkout_branch(&mut self, branch: &str) {
+            self.record(format!("checkout:{branch}"));
+        }
+        fn delete_local_branch(&mut self, branch: &str) {
+            self.record(format!("delete_local:{branch}"));
+        }
+        fn delete_remote_branch(&mut self, branch: &str) {
+            self.record(format!("delete_remote:{branch}"));
+        }
+        fn release_issue_claim(&mut self, iid: u64) {
+            self.record(format!("release_claim:{iid}"));
+        }
+        fn remove_working_on_label(&mut self, iid: u64) {
+            self.record(format!("remove_working:{iid}"));
+        }
+        fn remove_issue_label(&mut self, iid: u64, label: &str) {
+            self.record(format!("remove_label:{iid}:{label}"));
+        }
+        fn cleanup_session(&mut self, iid: u64) {
+            self.record(format!("cleanup_session:{iid}"));
+        }
+        fn save_session(&mut self, iid: u64, mr: u64) {
+            self.record(format!("save_session:{iid}:{mr}"));
+        }
+        fn close_issue(&mut self, iid: u64) {
+            self.record(format!("close_issue:{iid}"));
+        }
+        fn acquire_issue_claim(&mut self, iid: u64) -> Result<IssueClaimAttempt> {
+            self.required(format!("acquire_claim:{iid}"))?;
+            Ok(self
+                .claim_attempts
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(IssueClaimAttempt::Won))
+        }
+        fn preserve_issue_claim(&mut self, iid: u64) {
+            self.record(format!("preserve_claim:{iid}"));
+        }
+        fn release_acquired_claim(&mut self, iid: u64) {
+            self.record(format!("release_acquired:{iid}"));
+        }
+        fn clear_issue_state(&mut self, iid: u64) {
+            self.record(format!("clear_state:{iid}"));
+        }
+        fn release_review_only_hold(&mut self, iid: u64) {
+            self.record(format!("release_review_only:{iid}"));
+        }
+        fn abandon_closed_issue(&mut self, iid: u64, mr: Option<u64>) {
+            self.record(format!("abandon_closed:{iid}:{mr:?}"));
+        }
+        fn adopt_orphaned_session(&mut self) -> Option<ActiveIssue> {
+            self.record("adopt_orphan");
+            self.adopted.clone()
+        }
+        fn handle_need_ai_worker_mr(&mut self) -> Result<bool> {
+            self.required("handle_labeled_mr")?;
+            Ok(self.handled_labeled_mr)
+        }
+        fn run_implementation(
+            &mut self,
+            issue: &IssueObservation,
+        ) -> (ActiveIssue, Option<anyhow::Error>) {
+            self.record(format!("run_implementation:{}", issue.iid));
+            self.implementation_payloads
+                .borrow_mut()
+                .push(issue.clone());
+            let script = self
+                .implementation
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(ImplementationScript::no_mr);
+            (
+                ActiveIssue {
+                    issue_iid: issue.iid,
+                    mr_iid: script.mr_iid,
+                    branch_name: script.branch_name,
+                    mr_created: script.mr_created,
                 },
-                WorkerAction::ResolveCancelledIssue { .. } => {
-                    WorkerOutcome::CancelHandled(self.cancel_handled)
-                }
-                WorkerAction::CheckIssueTrackable { .. } => {
-                    WorkerOutcome::Trackable(self.trackable)
-                }
-                _ => WorkerOutcome::Done,
+                script.error.map(|e| anyhow::anyhow!(e)),
+            )
+        }
+        fn run_feedback(
+            &mut self,
+            mr: u64,
+            issue: Option<u64>,
+            comments_only: bool,
+        ) -> Result<bool> {
+            self.record(format!("run_feedback:{mr}:{issue:?}:{comments_only}"));
+            self.feedback_payloads
+                .borrow_mut()
+                .push((mr, issue, comments_only));
+            match &self.feedback_error {
+                Some(e) => Err(anyhow::anyhow!(e.clone())),
+                None => Ok(self.feedback_abandoned),
             }
+        }
+        fn resolve_cancelled_issue(&mut self, iid: u64) -> bool {
+            self.record(format!("resolve_cancel:{iid}"));
+            self.cancel_handled
+        }
+        fn issue_trackable(&mut self, iid: u64) -> bool {
+            self.record(format!("trackable:{iid}"));
+            self.trackable
         }
     }
 
     struct FakeWorkerRun {
         result: Result<()>,
-        trace: Vec<WorkerStep>,
+        trace: Vec<String>,
         active: Option<ActiveIssue>,
     }
 
-    fn run_worker_routing(port: &mut FakeWorkerPort, active: Option<ActiveIssue>) -> FakeWorkerRun {
-        let mut machine = WorkerRoutingMachine::new(ROUTING_AGENT, None, active);
-        let result = run_worker_routing_cycle(&mut machine, port);
+    fn run_worker_routing(
+        port: &mut FakeWorkerPort,
+        mut active: Option<ActiveIssue>,
+    ) -> FakeWorkerRun {
+        let result = run_worker_routing_cycle(port, ROUTING_AGENT, None, &mut active);
         FakeWorkerRun {
             result,
             trace: port.trace.borrow().clone(),
-            active: machine.active.take(),
+            active,
         }
-    }
-
-    fn w_observe(query: WorkerQuery) -> WorkerStep {
-        WorkerStep::Observe(query)
-    }
-
-    fn w_act(action: WorkerAction) -> WorkerStep {
-        WorkerStep::Act(action)
-    }
-
-    fn w_shutdown() -> WorkerStep {
-        w_observe(WorkerQuery::ShutdownRequested)
     }
 
     fn active_with_mr(issue_iid: u64, mr_iid: u64) -> ActiveIssue {
@@ -7894,7 +6017,6 @@ mod tests {
             mr_created: true,
         }
     }
-
     fn active_without_mr(issue_iid: u64) -> ActiveIssue {
         ActiveIssue {
             issue_iid,
@@ -7903,17 +6025,17 @@ mod tests {
             mr_created: false,
         }
     }
-
-    /// The steps a cycle with no active issue performs before it looks at
-    /// any candidate.
-    fn polling_steps() -> Vec<WorkerStep> {
-        vec![
-            w_shutdown(),
-            w_act(WorkerAction::AdoptOrphanedSession),
-            w_act(WorkerAction::HandleNeedAiWorkerMr),
-            w_observe(WorkerQuery::Issues),
-            w_shutdown(),
+    fn polling_steps() -> Vec<String> {
+        [
+            "shutdown",
+            "adopt_orphan",
+            "handle_labeled_mr",
+            "issues",
+            "shutdown",
         ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     }
 
     #[test]
@@ -7923,678 +6045,401 @@ mod tests {
             .listing(std::slice::from_ref(&candidate))
             .implementing(&[ImplementationScript::succeeded(7)]);
         let run = run_worker_routing(&mut port, None);
-
-        assert!(run.result.is_ok());
         let mut expected = polling_steps();
-        expected.extend([
-            w_shutdown(),
-            w_act(WorkerAction::AcquireIssueClaim { issue_iid: 7 }),
-            w_shutdown(),
-            w_act(WorkerAction::PreserveIssueClaim { issue_iid: 7 }),
-            w_act(WorkerAction::SaveSession {
-                issue_iid: 7,
-                mr_iid: 0,
-            }),
-            w_act(WorkerAction::RunImplementation {
-                issue: Box::new(candidate),
-            }),
-            w_act(WorkerAction::CheckIssueTrackable { issue_iid: 7 }),
-        ]);
+        expected.extend(
+            [
+                "shutdown",
+                "acquire_claim:7",
+                "shutdown",
+                "preserve_claim:7",
+                "save_session:7:0",
+                "run_implementation:7",
+                "trackable:7",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        assert!(run.result.is_ok());
         assert_eq!(run.trace, expected);
         assert_eq!(run.active, Some(active_with_mr(7, 7)));
+        assert_eq!(
+            port.implementation_payloads.borrow().as_slice(),
+            &[candidate]
+        );
     }
 
     #[test]
-    fn worker_cycle_releases_only_the_claim_when_the_run_produced_no_merge_request() {
+    fn worker_cycle_preserves_candidate_cleanup_and_shutdown_policies() {
         let candidate = issue_observation(7, &[]);
-        let mut port = FakeWorkerPort::new()
-            .listing(&[candidate])
+        let mut no_mr = FakeWorkerPort::new()
+            .listing(std::slice::from_ref(&candidate))
             .implementing(&[ImplementationScript::no_mr()]);
-        let run = run_worker_routing(&mut port, None);
-
-        assert!(run.result.is_ok());
+        let run = run_worker_routing(&mut no_mr, None);
         assert_eq!(
-            run.trace.last(),
-            Some(&w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }))
+            run.trace.last().map(String::as_str),
+            Some("release_claim:7")
         );
         assert!(run.active.is_none());
-    }
 
-    #[test]
-    fn worker_cycle_cleans_the_branch_up_after_a_failed_candidate_run() {
-        let candidate = issue_observation(7, &[]);
-        let mut port = FakeWorkerPort::new()
-            .listing(&[candidate])
+        let mut failed = FakeWorkerPort::new()
+            .listing(std::slice::from_ref(&candidate))
             .implementing(&[ImplementationScript::failed(Some("issue-7"), "boom")]);
-        let run = run_worker_routing(&mut port, None);
-
-        assert!(run.result.is_ok());
-        // A failed candidate run keeps the session file (only the
-        // re-attempt path drops it) and cleans the worktree last.
+        let run = run_worker_routing(&mut failed, None);
         assert_eq!(
             &run.trace[run.trace.len() - 7..],
-            &[
-                w_shutdown(),
-                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
-                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
-                w_observe(WorkerQuery::DefaultBranchOrMain),
-                w_act(WorkerAction::ResetWorktree),
-                w_act(WorkerAction::CheckoutBranch {
-                    branch: "main".to_string(),
-                }),
-                w_act(WorkerAction::DeleteLocalBranch {
-                    branch: "issue-7".to_string(),
-                }),
-            ]
+            &strings(&[
+                "shutdown",
+                "release_claim:7",
+                "remove_working:7",
+                "default_branch",
+                "reset_worktree",
+                "checkout:main",
+                "delete_local:issue-7"
+            ])
         );
-        assert!(run.active.is_none());
-    }
+        assert!(!run.trace.contains(&"cleanup_session:7".to_string()));
 
-    #[test]
-    fn worker_cycle_keeps_the_issue_active_when_shutdown_lands_mid_implementation() {
-        let candidate = issue_observation(7, &[]);
-        let mut port = FakeWorkerPort::new()
+        let mut shutdown = FakeWorkerPort::new()
             .listing(&[candidate])
             .implementing(&[ImplementationScript::failed(Some("issue-7"), "interrupted")])
             .with_shutdown_answers(&[false, false, false, false, true]);
-        let run = run_worker_routing(&mut port, None);
-
-        assert!(run.result.is_ok());
-        assert_eq!(run.trace.last(), Some(&w_shutdown()));
-        // The shutdown hook needs the in-flight issue to persist the claim.
-        assert_eq!(
-            run.active,
-            Some(ActiveIssue {
-                issue_iid: 7,
-                mr_iid: None,
-                branch_name: Some("issue-7".to_string()),
-                mr_created: false,
-            })
-        );
+        let run = run_worker_routing(&mut shutdown, None);
+        assert_eq!(run.trace.last().map(String::as_str), Some("shutdown"));
+        assert_eq!(run.active.unwrap().branch_name.as_deref(), Some("issue-7"));
     }
 
     #[test]
-    fn worker_cycle_resolves_an_externally_cancelled_candidate_run_without_cleanup() {
+    fn worker_cycle_handles_candidate_cancel_and_claim_outcomes() {
         let candidate = issue_observation(7, &[]);
-        let mut port = FakeWorkerPort::new()
-            .listing(&[candidate])
+        let mut cancelled = FakeWorkerPort::new()
+            .listing(std::slice::from_ref(&candidate))
             .implementing(&[ImplementationScript::failed(
                 Some("issue-7"),
                 WORKER_AGENT_CANCELLED_MSG,
             )])
             .handling_cancel();
-        let run = run_worker_routing(&mut port, None);
-
-        assert!(run.result.is_ok());
+        let run = run_worker_routing(&mut cancelled, None);
         assert_eq!(
-            run.trace.last(),
-            Some(&w_act(WorkerAction::ResolveCancelledIssue { issue_iid: 7 }))
+            run.trace.last().map(String::as_str),
+            Some("resolve_cancel:7")
         );
         assert!(run.active.is_none());
-    }
 
-    #[test]
-    fn worker_cycle_falls_back_to_cleanup_when_a_cancel_turns_out_to_be_a_real_failure() {
-        let candidate = issue_observation(7, &[]);
-        let mut port = FakeWorkerPort::new().listing(&[candidate]).implementing(&[
-            ImplementationScript::failed(None, WORKER_AGENT_CANCELLED_MSG),
-        ]);
-        let run = run_worker_routing(&mut port, None);
-
-        assert!(run.result.is_ok());
+        let mut real_failure = FakeWorkerPort::new()
+            .listing(std::slice::from_ref(&candidate))
+            .implementing(&[ImplementationScript::failed(
+                None,
+                WORKER_AGENT_CANCELLED_MSG,
+            )]);
+        let run = run_worker_routing(&mut real_failure, None);
         assert_eq!(
             &run.trace[run.trace.len() - 3..],
-            &[
-                w_act(WorkerAction::ResolveCancelledIssue { issue_iid: 7 }),
-                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
-                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
-            ]
+            &strings(&["resolve_cancel:7", "release_claim:7", "remove_working:7"])
         );
-    }
 
-    #[test]
-    fn worker_cycle_gives_a_won_claim_straight_back_when_shutdown_lands() {
-        let candidate = issue_observation(7, &[]);
-        let mut port = FakeWorkerPort::new()
-            .listing(&[candidate])
+        let mut shutdown = FakeWorkerPort::new()
+            .listing(std::slice::from_ref(&candidate))
             .with_shutdown_answers(&[false, false, false, true]);
-        let run = run_worker_routing(&mut port, None);
-
-        assert!(run.result.is_ok());
+        let run = run_worker_routing(&mut shutdown, None);
         assert_eq!(
             &run.trace[run.trace.len() - 2..],
-            &[
-                w_shutdown(),
-                w_act(WorkerAction::ReleaseAcquiredClaim { issue_iid: 7 }),
-            ]
+            &strings(&["shutdown", "release_acquired:7"])
         );
-        assert!(run.active.is_none());
-    }
 
-    #[test]
-    fn worker_cycle_moves_on_when_a_candidate_claim_is_lost_and_stops_when_interrupted() {
         let mut lost = FakeWorkerPort::new()
-            .listing(&[issue_observation(7, &[]), issue_observation(9, &[])])
+            .listing(&[candidate, issue_observation(9, &[])])
             .with_claim_attempts(&[IssueClaimAttempt::Lost, IssueClaimAttempt::Won])
             .implementing(&[ImplementationScript::succeeded(9)]);
-        let run = run_worker_routing(&mut lost, None);
-        assert!(run.result.is_ok());
-        assert_eq!(run.active, Some(active_with_mr(9, 9)));
+        assert_eq!(
+            run_worker_routing(&mut lost, None).active,
+            Some(active_with_mr(9, 9))
+        );
 
         let mut interrupted = FakeWorkerPort::new()
             .listing(&[issue_observation(7, &[]), issue_observation(9, &[])])
             .with_claim_attempts(&[IssueClaimAttempt::Interrupted]);
         let run = run_worker_routing(&mut interrupted, None);
-        assert!(run.result.is_ok());
         assert_eq!(
-            run.trace.last(),
-            Some(&w_act(WorkerAction::AcquireIssueClaim { issue_iid: 7 }))
+            run.trace.last().map(String::as_str),
+            Some("acquire_claim:7")
         );
-        assert!(run.active.is_none());
     }
 
     #[test]
-    fn worker_cycle_skips_candidates_that_are_out_of_reach_without_touching_gitlab() {
-        let mut port = FakeWorkerPort::new().listing(&[
+    fn worker_cycle_screens_candidates_and_dependencies_in_order() {
+        let mut skipped = FakeWorkerPort::new().listing(&[
             issue_observation(1, &[WORKING_ON_LABEL]),
-            issue_observation(2, &[&format!("claimed:{}", "worker-2")]),
+            issue_observation(2, &["claimed:worker-2"]),
             issue_observation(3, &[ACTION_REQUIRED_LABEL]),
         ]);
-        let run = run_worker_routing(&mut port, None);
-
-        assert!(run.result.is_ok());
-        // Screening is pure, so the whole poll is the listing steps plus
-        // one shutdown check per candidate.
+        let run = run_worker_routing(&mut skipped, None);
         let mut expected = polling_steps();
-        expected.extend([w_shutdown(), w_shutdown(), w_shutdown()]);
+        expected.extend(strings(&["shutdown", "shutdown", "shutdown"]));
         assert_eq!(run.trace, expected);
-    }
 
-    #[test]
-    fn worker_cycle_drops_a_resolved_dependency_label_before_claiming() {
         let candidate = issue_observation(7, &[&waiting_on_issue_label(4)]);
-        let mut closed_dependency = issue_observation(4, &[]);
-        closed_dependency.state = "closed".to_string();
-        let mut port = FakeWorkerPort::new()
-            .listing(&[candidate])
-            .knowing(&[closed_dependency])
+        let mut closed_dep = issue_observation(4, &[]);
+        closed_dep.state = "closed".to_string();
+        let mut resumed = FakeWorkerPort::new()
+            .listing(std::slice::from_ref(&candidate))
+            .knowing(&[closed_dep])
             .implementing(&[ImplementationScript::succeeded(7)]);
-        let run = run_worker_routing(&mut port, None);
+        let run = run_worker_routing(&mut resumed, None);
+        assert!(run.trace.windows(3).any(|w| w
+            == strings(&[
+                "issue:4",
+                "remove_label:7:waiting-on-issue:#4",
+                "acquire_claim:7"
+            ])));
 
-        assert!(run.result.is_ok());
-        let mut expected = polling_steps();
-        expected.extend([
-            w_shutdown(),
-            w_observe(WorkerQuery::Issue { issue_iid: 4 }),
-            w_act(WorkerAction::RemoveIssueLabel {
-                issue_iid: 7,
-                label: waiting_on_issue_label(4),
-            }),
-            w_act(WorkerAction::AcquireIssueClaim { issue_iid: 7 }),
-            w_shutdown(),
-            w_act(WorkerAction::PreserveIssueClaim { issue_iid: 7 }),
-            w_act(WorkerAction::SaveSession {
-                issue_iid: 7,
-                mr_iid: 0,
-            }),
-            w_act(WorkerAction::RunImplementation {
-                issue: Box::new(issue_observation(7, &[&waiting_on_issue_label(4)])),
-            }),
-            w_act(WorkerAction::CheckIssueTrackable { issue_iid: 7 }),
-        ]);
-        assert_eq!(run.trace, expected);
-    }
-
-    #[test]
-    fn worker_cycle_leaves_a_candidate_parked_while_its_dependency_is_open() {
-        let candidate = issue_observation(7, &[&waiting_on_issue_label(4)]);
-        let mut port = FakeWorkerPort::new()
-            .listing(&[candidate])
+        let mut waiting = FakeWorkerPort::new()
+            .listing(std::slice::from_ref(&candidate))
             .knowing(&[issue_observation(4, &[])]);
-        let run = run_worker_routing(&mut port, None);
+        let run = run_worker_routing(&mut waiting, None);
+        assert_eq!(run.trace.last().map(String::as_str), Some("issue:4"));
 
-        assert!(run.result.is_ok());
-        let mut expected = polling_steps();
-        expected.extend([w_shutdown(), w_observe(WorkerQuery::Issue { issue_iid: 4 })]);
-        assert_eq!(run.trace, expected);
-    }
-
-    #[test]
-    fn worker_cycle_treats_a_missing_dependency_as_resolved_but_an_unreadable_one_as_parked() {
-        let candidate = issue_observation(7, &[&waiting_on_issue_label(4)]);
         let mut missing = FakeWorkerPort::new().listing(std::slice::from_ref(&candidate));
         let run = run_worker_routing(&mut missing, None);
-        assert!(run.result.is_ok());
-        assert!(run.trace.contains(&w_act(WorkerAction::RemoveIssueLabel {
-            issue_iid: 7,
-            label: waiting_on_issue_label(4),
-        })));
+        assert!(
+            run.trace
+                .contains(&"remove_label:7:waiting-on-issue:#4".to_string())
+        );
 
         let mut unreadable = FakeWorkerPort::new()
             .listing(&[candidate])
             .knowing(&[issue_observation(4, &[])])
-            .failing_query(WorkerQuery::Issue { issue_iid: 4 });
+            .failing("issue:4");
         let run = run_worker_routing(&mut unreadable, None);
         assert!(run.result.is_ok());
-        assert_eq!(
-            run.trace.last(),
-            Some(&w_observe(WorkerQuery::Issue { issue_iid: 4 }))
-        );
+        assert_eq!(run.trace.last().map(String::as_str), Some("issue:4"));
     }
 
     #[test]
-    fn worker_cycle_stops_at_an_adopted_orphan_and_at_a_handled_labeled_mr() {
+    fn worker_cycle_adopts_or_handles_labeled_mr_before_listing() {
         let mut adopting = FakeWorkerPort::new().adopting(active_with_mr(7, 12));
         let run = run_worker_routing(&mut adopting, None);
-        assert!(run.result.is_ok());
-        assert_eq!(
-            run.trace,
-            vec![w_shutdown(), w_act(WorkerAction::AdoptOrphanedSession)]
-        );
+        assert_eq!(run.trace, strings(&["shutdown", "adopt_orphan"]));
         assert_eq!(run.active, Some(active_with_mr(7, 12)));
 
         let mut labeled = FakeWorkerPort::new().handling_labeled_mr();
         let run = run_worker_routing(&mut labeled, None);
-        assert!(run.result.is_ok());
         assert_eq!(
             run.trace,
-            vec![
-                w_shutdown(),
-                w_act(WorkerAction::AdoptOrphanedSession),
-                w_act(WorkerAction::HandleNeedAiWorkerMr),
-            ]
+            strings(&["shutdown", "adopt_orphan", "handle_labeled_mr"])
         );
-        assert!(run.active.is_none());
     }
 
     #[test]
-    fn worker_cycle_fails_the_cycle_when_a_required_read_or_write_fails() {
-        let mut listing = FakeWorkerPort::new().failing_query(WorkerQuery::Issues);
+    fn worker_cycle_propagates_required_read_and_write_failures() {
+        let mut listing = FakeWorkerPort::new().failing("issues");
         assert!(run_worker_routing(&mut listing, None).result.is_err());
-
-        let mut labeled_mr =
-            FakeWorkerPort::new().failing_action(WorkerAction::HandleNeedAiWorkerMr);
-        assert!(run_worker_routing(&mut labeled_mr, None).result.is_err());
-
-        let mut claiming = FakeWorkerPort::new()
+        let mut labeled = FakeWorkerPort::new().failing("handle_labeled_mr");
+        assert!(run_worker_routing(&mut labeled, None).result.is_err());
+        let mut claim = FakeWorkerPort::new()
             .listing(&[issue_observation(7, &[])])
-            .failing_action(WorkerAction::AcquireIssueClaim { issue_iid: 7 });
-        assert!(run_worker_routing(&mut claiming, None).result.is_err());
+            .failing("acquire_claim:7");
+        assert!(run_worker_routing(&mut claim, None).result.is_err());
     }
 
     #[test]
-    fn worker_cycle_ends_the_release_of_a_merged_mr_by_closing_the_issue() {
-        let mut port = FakeWorkerPort::new()
+    fn worker_cycle_cleans_finished_merge_requests_in_exact_order() {
+        let mut merged = FakeWorkerPort::new()
             .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
             .with_mr_state(12, "merged")
             .with_shutdown_answers(&[true]);
-        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
-
-        assert!(run.result.is_ok());
+        let run = run_worker_routing(&mut merged, Some(active_with_mr(7, 12)));
         assert_eq!(
             run.trace,
-            vec![
-                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
-                w_observe(WorkerQuery::MergeRequestStatus { mr_iid: 12 }),
-                w_observe(WorkerQuery::DefaultBranchOrMain),
-                w_act(WorkerAction::ResetWorktree),
-                w_act(WorkerAction::CheckoutBranch {
-                    branch: "main".to_string(),
-                }),
-                w_act(WorkerAction::DeleteLocalBranch {
-                    branch: "issue-7".to_string(),
-                }),
-                w_act(WorkerAction::DeleteRemoteBranch {
-                    branch: "issue-7".to_string(),
-                }),
-                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
-                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
-                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
-                w_act(WorkerAction::CloseIssue { issue_iid: 7 }),
-                w_shutdown(),
-            ]
+            strings(&[
+                "issue:7",
+                "mr_status:12",
+                "default_branch",
+                "reset_worktree",
+                "checkout:main",
+                "delete_local:issue-7",
+                "delete_remote:issue-7",
+                "release_claim:7",
+                "remove_working:7",
+                "cleanup_session:7",
+                "close_issue:7",
+                "shutdown",
+            ])
         );
         assert!(run.active.is_none());
-    }
 
-    #[test]
-    fn worker_cycle_keeps_the_remote_branch_and_the_issue_when_the_mr_was_closed() {
-        let mut port = FakeWorkerPort::new()
+        let mut closed = FakeWorkerPort::new()
             .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
             .with_mr_state(12, "closed")
             .with_shutdown_answers(&[true]);
-        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
-
-        assert!(run.result.is_ok());
-        assert!(
-            !run.trace.contains(&w_act(WorkerAction::DeleteRemoteBranch {
-                branch: "issue-7".to_string(),
-            }))
-        );
-        assert!(
-            !run.trace
-                .contains(&w_act(WorkerAction::CloseIssue { issue_iid: 7 }))
-        );
+        let run = run_worker_routing(&mut closed, Some(active_with_mr(7, 12)));
+        assert!(!run.trace.contains(&"delete_remote:issue-7".to_string()));
+        assert!(!run.trace.contains(&"close_issue:7".to_string()));
         assert_eq!(
             &run.trace[run.trace.len() - 2..],
-            &[
-                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
-                w_shutdown()
-            ]
+            &strings(&["cleanup_session:7", "shutdown"])
         );
     }
 
     #[test]
-    fn worker_cycle_runs_feedback_for_an_open_mr_and_keeps_the_issue_active() {
-        let mut port = FakeWorkerPort::new().knowing(&[issue_observation(7, &[WORKING_ON_LABEL])]);
-        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
-
-        assert!(run.result.is_ok());
+    fn worker_cycle_runs_feedback_and_preserves_transient_failures() {
+        let issue = issue_observation(7, &[WORKING_ON_LABEL]);
+        let mut open = FakeWorkerPort::new().knowing(std::slice::from_ref(&issue));
+        let run = run_worker_routing(&mut open, Some(active_with_mr(7, 12)));
         assert_eq!(
             run.trace,
-            vec![
-                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
-                w_observe(WorkerQuery::MergeRequestStatus { mr_iid: 12 }),
-                w_act(WorkerAction::RunFeedback {
-                    mr_iid: 12,
-                    linked_issue_iid: Some(7),
-                    comments_only: false,
-                }),
-            ]
+            strings(&["issue:7", "mr_status:12", "run_feedback:12:Some(7):false"])
+        );
+        assert_eq!(
+            open.feedback_payloads.borrow().as_slice(),
+            &[(12, Some(7), false)]
         );
         assert_eq!(run.active, Some(active_with_mr(7, 12)));
-    }
 
-    #[test]
-    fn worker_cycle_releases_the_issue_when_feedback_abandoned_the_merge_request() {
-        let mut port = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+        let mut abandoned = FakeWorkerPort::new()
+            .knowing(std::slice::from_ref(&issue))
             .abandoning_feedback()
             .with_shutdown_answers(&[true]);
-        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
-
-        assert!(run.result.is_ok());
+        let run = run_worker_routing(&mut abandoned, Some(active_with_mr(7, 12)));
         assert_eq!(
             &run.trace[run.trace.len() - 3..],
-            &[
-                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
-                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
-                w_shutdown(),
-            ]
+            &strings(&["release_claim:7", "cleanup_session:7", "shutdown"])
         );
         assert!(run.active.is_none());
-    }
 
-    #[test]
-    fn worker_cycle_handles_a_failed_feedback_run_by_shutdown_cancel_or_logging() {
-        // Shutdown: keep the issue active and stop.
-        let mut shutting_down = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+        let mut shutdown = FakeWorkerPort::new()
+            .knowing(std::slice::from_ref(&issue))
             .failing_feedback("boom")
             .with_shutdown_answers(&[true]);
-        let run = run_worker_routing(&mut shutting_down, Some(active_with_mr(7, 12)));
-        assert!(run.result.is_ok());
-        assert_eq!(run.trace.last(), Some(&w_shutdown()));
+        let run = run_worker_routing(&mut shutdown, Some(active_with_mr(7, 12)));
         assert_eq!(run.active, Some(active_with_mr(7, 12)));
 
-        // An external cancel is resolved and releases the issue.
         let mut cancelled = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .knowing(std::slice::from_ref(&issue))
             .failing_feedback(WORKER_AGENT_CANCELLED_MSG)
             .handling_cancel();
         let run = run_worker_routing(&mut cancelled, Some(active_with_mr(7, 12)));
-        assert!(run.result.is_ok());
         assert_eq!(
-            run.trace.last(),
-            Some(&w_act(WorkerAction::ResolveCancelledIssue { issue_iid: 7 }))
+            run.trace.last().map(String::as_str),
+            Some("resolve_cancel:7")
         );
         assert!(run.active.is_none());
 
-        // Anything else is logged; the issue stays active for the next cycle.
-        let mut failed = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+        let mut transient = FakeWorkerPort::new()
+            .knowing(&[issue])
             .failing_feedback("boom");
-        let run = run_worker_routing(&mut failed, Some(active_with_mr(7, 12)));
-        assert!(run.result.is_ok());
-        assert_eq!(run.trace.last(), Some(&w_shutdown()));
-        assert_eq!(run.active, Some(active_with_mr(7, 12)));
+        assert_eq!(
+            run_worker_routing(&mut transient, Some(active_with_mr(7, 12))).active,
+            Some(active_with_mr(7, 12))
+        );
     }
 
     #[test]
-    fn worker_cycle_ends_the_mr_watch_when_the_mr_cannot_be_read() {
+    fn worker_cycle_retains_active_mr_when_status_read_fails() {
         let mut port = FakeWorkerPort::new()
             .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
-            .failing_query(WorkerQuery::MergeRequestStatus { mr_iid: 12 });
+            .failing("mr_status:12");
         let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
-
         assert!(run.result.is_ok());
-        assert_eq!(
-            run.trace.last(),
-            Some(&w_observe(WorkerQuery::MergeRequestStatus { mr_iid: 12 }))
-        );
+        assert_eq!(run.trace.last().map(String::as_str), Some("mr_status:12"));
         assert_eq!(run.active, Some(active_with_mr(7, 12)));
     }
 
     #[test]
-    fn worker_cycle_releases_a_watched_issue_that_left_the_worker_behind() {
-        // Closed externally.
+    fn worker_cycle_releases_active_issues_that_are_no_longer_eligible() {
         let mut closed_issue = issue_observation(7, &[WORKING_ON_LABEL]);
         closed_issue.state = "closed".to_string();
         let mut closed = FakeWorkerPort::new()
             .knowing(&[closed_issue])
             .with_shutdown_answers(&[true]);
-        let run = run_worker_routing(&mut closed, Some(active_with_mr(7, 12)));
-        assert!(run.result.is_ok());
         assert_eq!(
-            run.trace,
-            vec![
-                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
-                w_act(WorkerAction::AbandonClosedIssue {
-                    issue_iid: 7,
-                    mr_iid: Some(12),
-                }),
-                w_shutdown(),
-            ]
+            run_worker_routing(&mut closed, Some(active_with_mr(7, 12))).trace,
+            strings(&["issue:7", "abandon_closed:7:Some(12)", "shutdown"])
         );
-        assert!(run.active.is_none());
 
-        // A human parked it with the pending label.
-        let mut pending = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKER_PENDING_LABEL])])
-            .with_shutdown_answers(&[true]);
-        let run = run_worker_routing(&mut pending, Some(active_with_mr(7, 12)));
-        assert!(run.result.is_ok());
-        assert_eq!(
-            run.trace[1],
-            w_act(WorkerAction::ClearIssueState { issue_iid: 7 })
-        );
-        assert!(run.active.is_none());
-
-        // A human asked for review-only.
-        let mut review_only = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKER_REVIEW_ONLY_LABEL])])
-            .with_shutdown_answers(&[true]);
-        let run = run_worker_routing(&mut review_only, Some(active_with_mr(7, 12)));
-        assert!(run.result.is_ok());
-        assert_eq!(
-            run.trace[1],
-            w_act(WorkerAction::ReleaseReviewOnlyHold { issue_iid: 7 })
-        );
-        assert!(run.active.is_none());
-
-        // The issue itself could not be read.
+        for (label, action) in [
+            (WORKER_PENDING_LABEL, "clear_state:7"),
+            (WORKER_REVIEW_ONLY_LABEL, "release_review_only:7"),
+        ] {
+            let mut port = FakeWorkerPort::new()
+                .knowing(&[issue_observation(7, &[label])])
+                .with_shutdown_answers(&[true]);
+            let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
+            assert_eq!(run.trace[1], action);
+            assert!(run.active.is_none());
+        }
         let mut unreadable = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
-            .failing_query(WorkerQuery::Issue { issue_iid: 7 })
+            .failing("issue:7")
             .with_shutdown_answers(&[true]);
         let run = run_worker_routing(&mut unreadable, Some(active_with_mr(7, 12)));
-        assert!(run.result.is_ok());
-        assert_eq!(
-            run.trace[1],
-            w_act(WorkerAction::ClearIssueState { issue_iid: 7 })
-        );
-        assert!(run.active.is_none());
+        assert_eq!(run.trace[1], "clear_state:7");
     }
 
     #[test]
-    fn worker_cycle_re_attempts_an_active_issue_that_never_reached_an_mr() {
-        let mut port = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+    fn worker_cycle_retries_active_issue_and_deletes_reattempt_session() {
+        let issue = issue_observation(7, &[WORKING_ON_LABEL]);
+        let mut success = FakeWorkerPort::new()
+            .knowing(std::slice::from_ref(&issue))
             .implementing(&[ImplementationScript::succeeded(7)]);
-        let run = run_worker_routing(&mut port, Some(active_without_mr(7)));
-
-        assert!(run.result.is_ok());
+        let run = run_worker_routing(&mut success, Some(active_without_mr(7)));
         assert_eq!(
             run.trace,
-            vec![
-                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
-                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
-                w_act(WorkerAction::RunImplementation {
-                    issue: Box::new(issue_observation(7, &[WORKING_ON_LABEL])),
-                }),
-                w_act(WorkerAction::CheckIssueTrackable { issue_iid: 7 }),
-            ]
+            strings(&["issue:7", "issue:7", "run_implementation:7", "trackable:7"])
         );
         assert_eq!(run.active, Some(active_with_mr(7, 7)));
-    }
 
-    #[test]
-    fn worker_cycle_drops_the_issue_when_a_re_attempt_is_not_trackable() {
-        let mut port = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+        let mut untrackable = FakeWorkerPort::new()
+            .knowing(std::slice::from_ref(&issue))
             .implementing(&[ImplementationScript::succeeded(7)])
             .untrackable();
-        let run = run_worker_routing(&mut port, Some(active_without_mr(7)));
+        assert!(
+            run_worker_routing(&mut untrackable, Some(active_without_mr(7)))
+                .active
+                .is_none()
+        );
 
-        assert!(run.result.is_ok());
-        assert!(run.active.is_none());
-    }
-
-    #[test]
-    fn worker_cycle_drops_the_session_after_a_failed_re_attempt() {
-        let mut port = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+        let mut failed = FakeWorkerPort::new()
+            .knowing(std::slice::from_ref(&issue))
             .implementing(&[ImplementationScript::failed(Some("issue-7"), "boom")]);
-        let run = run_worker_routing(&mut port, Some(active_without_mr(7)));
-
-        assert!(run.result.is_ok());
+        let run = run_worker_routing(&mut failed, Some(active_without_mr(7)));
         assert_eq!(
             &run.trace[run.trace.len() - 8..],
-            &[
-                w_shutdown(),
-                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
-                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
-                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
-                w_observe(WorkerQuery::DefaultBranchOrMain),
-                w_act(WorkerAction::ResetWorktree),
-                w_act(WorkerAction::CheckoutBranch {
-                    branch: "main".to_string(),
-                }),
-                w_act(WorkerAction::DeleteLocalBranch {
-                    branch: "issue-7".to_string(),
-                }),
-            ]
+            &strings(&[
+                "shutdown",
+                "release_claim:7",
+                "remove_working:7",
+                "cleanup_session:7",
+                "default_branch",
+                "reset_worktree",
+                "checkout:main",
+                "delete_local:issue-7"
+            ])
         );
-        assert!(run.active.is_none());
-    }
 
-    #[test]
-    fn worker_cycle_releases_a_re_attempt_whose_issue_disappeared_then_looks_for_new_work() {
-        let mut port = FakeWorkerPort::new()
-            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
-            .failing_query(WorkerQuery::Issue { issue_iid: 7 })
+        let mut second_read = FakeWorkerPort::new()
+            .knowing(&[issue])
+            .failing_issue_read(7, 1)
             .with_shutdown_answers(&[true]);
-        let run = run_worker_routing(&mut port, Some(active_without_mr(7)));
-
-        assert!(run.result.is_ok());
-        // The first read is the hold check, which releases through
-        // `ClearIssueState` rather than the fetch-failure cleanup.
+        let run = run_worker_routing(&mut second_read, Some(active_without_mr(7)));
         assert_eq!(
             run.trace,
-            vec![
-                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
-                w_act(WorkerAction::ClearIssueState { issue_iid: 7 }),
-                w_shutdown(),
-            ]
+            strings(&[
+                "issue:7",
+                "issue:7",
+                "release_claim:7",
+                "remove_working:7",
+                "cleanup_session:7",
+                "shutdown"
+            ])
         );
         assert!(run.active.is_none());
     }
 
-    #[test]
-    fn worker_cycle_cleans_up_when_the_re_attempt_read_fails_after_the_hold_check() {
-        struct FailSecondIssueRead {
-            inner: FakeWorkerPort,
-            reads: std::cell::Cell<usize>,
-        }
-
-        impl WorkerRoutingPort for FailSecondIssueRead {
-            fn shutdown_requested(&self) -> bool {
-                self.inner.shutdown_requested()
-            }
-
-            fn issue(&self, issue_iid: u64) -> Result<IssueObservation> {
-                let read = self.reads.get();
-                self.reads.set(read + 1);
-                let observed = self.inner.issue(issue_iid)?;
-                if read == 0 {
-                    Ok(observed)
-                } else {
-                    anyhow::bail!("injected failure on the re-attempt read")
-                }
-            }
-
-            fn merge_request_status(&self, mr_iid: u64) -> Result<MrStatusObservation> {
-                self.inner.merge_request_status(mr_iid)
-            }
-
-            fn issues(&self) -> Result<Vec<IssueObservation>> {
-                self.inner.issues()
-            }
-
-            fn default_branch_or_main(&self) -> String {
-                self.inner.default_branch_or_main()
-            }
-
-            fn execute(&mut self, action: &WorkerAction) -> WorkerOutcome {
-                self.inner.execute(action)
-            }
-        }
-
-        let mut port = FailSecondIssueRead {
-            inner: FakeWorkerPort::new()
-                .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
-                .with_shutdown_answers(&[true]),
-            reads: std::cell::Cell::new(0),
-        };
-        let mut machine =
-            WorkerRoutingMachine::new(ROUTING_AGENT, None, Some(active_without_mr(7)));
-        let result = run_worker_routing_cycle(&mut machine, &mut port);
-
-        assert!(result.is_ok());
-        assert_eq!(
-            port.inner.trace.borrow().clone(),
-            vec![
-                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
-                w_observe(WorkerQuery::Issue { issue_iid: 7 }),
-                w_act(WorkerAction::ReleaseIssueClaim { issue_iid: 7 }),
-                w_act(WorkerAction::RemoveWorkingOnLabel { issue_iid: 7 }),
-                w_act(WorkerAction::CleanupSession { issue_iid: 7 }),
-                w_shutdown(),
-            ]
-        );
-        assert!(machine.active.is_none());
-    }
-
     // -----------------------------------------------------------------
-    // Implementation progression traces. Workspace preparation and the
-    // model invocation are actions, so a whole implementation run — down
-    // to which branch of the handoff union it took — is an ordered trace.
+    // Implementation progression traces.
     // -----------------------------------------------------------------
 
-    /// A recording implementation port. Answers are scripted per query;
-    /// failures are injected by naming the query or action that fails.
     struct FakeImplPort {
-        trace: std::cell::RefCell<Vec<ImplStep>>,
+        trace: std::cell::RefCell<Vec<String>>,
         closes_linked: Option<ClosesLinkedMr>,
         open_mr: Option<u64>,
         default_branch: String,
@@ -8608,8 +6453,7 @@ mod tests {
         model_output: WorkerImplementationOutput,
         created_mr_iid: u64,
         stop_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
-        failing_queries: Vec<ImplQuery>,
-        failing_actions: Vec<ImplAction>,
+        failing_operations: Vec<&'static str>,
     }
 
     impl FakeImplPort {
@@ -8633,8 +6477,7 @@ mod tests {
                 }),
                 created_mr_iid: 12,
                 stop_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
-                failing_queries: Vec::new(),
-                failing_actions: Vec::new(),
+                failing_operations: Vec::new(),
             }
         }
 
@@ -8693,24 +6536,19 @@ mod tests {
             self
         }
 
-        fn failing_query(mut self, query: ImplQuery) -> Self {
-            self.failing_queries.push(query);
+        fn failing(mut self, operation: &'static str) -> Self {
+            self.failing_operations.push(operation);
             self
         }
 
-        fn failing_action(mut self, action: ImplAction) -> Self {
-            self.failing_actions.push(action);
-            self
+        fn record(&self, operation: impl Into<String>) {
+            self.trace.borrow_mut().push(operation.into());
         }
 
-        fn record(&self, step: ImplStep) {
-            self.trace.borrow_mut().push(step);
-        }
-
-        fn observe(&self, query: ImplQuery) -> Result<()> {
-            self.record(ImplStep::Observe(query.clone()));
-            if self.failing_queries.contains(&query) {
-                anyhow::bail!("injected failure observing {query:?}");
+        fn required(&self, operation: &'static str, payload: impl std::fmt::Display) -> Result<()> {
+            self.record(format!("{operation}({payload})"));
+            if self.failing_operations.contains(&operation) {
+                anyhow::bail!("injected failure in {operation}");
             }
             Ok(())
         }
@@ -8718,139 +6556,220 @@ mod tests {
 
     impl ImplementationPort for FakeImplPort {
         fn closes_linked_mr(&self) -> Option<ClosesLinkedMr> {
-            self.record(ImplStep::Observe(ImplQuery::ClosesLinkedMr));
+            self.record("closes_linked_mr");
             self.closes_linked
         }
 
         fn open_mr_for_issue(&self) -> Option<u64> {
-            self.record(ImplStep::Observe(ImplQuery::OpenMrForIssue));
+            self.record("open_mr_for_issue");
             self.open_mr
         }
 
+        fn stop_if_review_only(&mut self) -> bool {
+            self.record("stop_if_review_only");
+            self.stop_answers.borrow_mut().pop_front().unwrap_or(false)
+        }
+
+        fn add_working_on_label(&mut self) {
+            self.record("add_working_on_label");
+        }
+
+        fn require_working_on_label(&mut self) -> Result<()> {
+            self.required("require_working_on_label", "")
+        }
+
+        fn remove_working_on_label(&mut self) {
+            self.record("remove_working_on_label");
+        }
+
+        fn add_issue_label(&mut self, label: &str) {
+            self.record(format!("add_issue_label({label})"));
+        }
+
+        fn add_issue_comment(&mut self, body: &str) {
+            self.record(format!("add_issue_comment({body})"));
+        }
+
+        fn release_issue_claim(&mut self) {
+            self.record("release_issue_claim");
+        }
+
+        fn cleanup_session(&mut self) {
+            self.record("cleanup_session");
+        }
+
+        fn close_issue(&mut self) {
+            self.record("close_issue");
+        }
+
+        fn save_session(&mut self, mr_iid: u64) {
+            self.record(format!("save_session({mr_iid})"));
+        }
+
+        fn require_save_session(&mut self, mr_iid: u64) -> Result<()> {
+            self.required("require_save_session", mr_iid)
+        }
+
+        fn require_save_session_with_summary(&mut self, mr_iid: u64, summary: &str) -> Result<()> {
+            self.required(
+                "require_save_session_with_summary",
+                format!("{mr_iid},{summary}"),
+            )
+        }
+
         fn default_branch(&self) -> Result<String> {
-            self.observe(ImplQuery::DefaultBranch)?;
+            self.required("default_branch", "")?;
             Ok(self.default_branch.clone())
         }
 
         fn default_branch_or_main(&self) -> String {
-            self.record(ImplStep::Observe(ImplQuery::DefaultBranchOrMain));
+            self.record("default_branch_or_main");
             self.default_branch.clone()
         }
 
-        fn remote_branch_exists(&self, _branch: &str) -> Result<bool> {
-            self.observe(ImplQuery::RemoteBranchExists)?;
+        fn fetch_remote(&mut self) -> Result<()> {
+            self.required("fetch_remote", "")
+        }
+
+        fn reset_worktree(&mut self) {
+            self.record("reset_worktree");
+        }
+
+        fn remote_branch_exists(&self, branch: &str) -> Result<bool> {
+            self.required("remote_branch_exists", branch)?;
             Ok(self.remote_branch_exists)
         }
 
-        fn has_diff_against(&self, _base: &str) -> Result<bool> {
-            self.observe(ImplQuery::DiffAgainstDefault)?;
+        fn checkout_branch(&mut self, branch: &str) -> Result<()> {
+            self.required("checkout_branch", branch)
+        }
+
+        fn checkout_branch_best_effort(&mut self, branch: &str) {
+            self.record(format!("checkout_branch_best_effort({branch})"));
+        }
+
+        fn delete_local_branch(&mut self, branch: &str) {
+            self.record(format!("delete_local_branch({branch})"));
+        }
+
+        fn delete_remote_branch(&mut self, branch: &str) {
+            self.record(format!("delete_remote_branch({branch})"));
+        }
+
+        fn create_branch_from(&mut self, branch: &str, base: &str) -> Result<()> {
+            self.required("create_branch_from", format!("{branch},{base}"))
+        }
+
+        fn merge_base_into_branch(&mut self, base: &str) -> Result<bool> {
+            self.required("merge_base_into_branch", base)?;
+            Ok(self.merge_clean)
+        }
+
+        fn has_diff_against(&self, base: &str) -> Result<bool> {
+            self.required("has_diff_against", base)?;
             Ok(self.diff_answers.borrow_mut().pop_front().unwrap_or(true))
         }
 
         fn has_staged_changes(&self) -> Result<bool> {
-            self.observe(ImplQuery::StagedChanges)?;
+            self.required("has_staged_changes", "")?;
             Ok(self.staged)
         }
 
         fn merge_request_state(&self, mr_iid: u64) -> Option<String> {
-            self.record(ImplStep::Observe(ImplQuery::MergeRequestState { mr_iid }));
+            self.record(format!("merge_request_state({mr_iid})"));
             self.existing_mr_state.clone()
         }
 
         fn dependency_closed(&self, issue_iid: u64) -> bool {
-            self.record(ImplStep::Observe(ImplQuery::DependencyClosed { issue_iid }));
+            self.record(format!("dependency_closed({issue_iid})"));
             self.dependency_closed
         }
 
         fn issue_comments(&self) -> String {
-            self.record(ImplStep::Observe(ImplQuery::IssueComments));
+            self.record("issue_comments");
             "- alice: please cap it".to_string()
         }
 
-        fn execute(&mut self, action: &ImplAction) -> ImplOutcome {
-            self.record(ImplStep::Act(action.clone()));
-            if self.failing_actions.contains(action) {
-                return ImplOutcome::Failed(anyhow::anyhow!(
-                    "injected failure executing {action:?}"
-                ));
-            }
-            match action {
-                ImplAction::StopIfReviewOnly => ImplOutcome::Stopped(
-                    self.stop_answers.borrow_mut().pop_front().unwrap_or(false),
-                ),
-                ImplAction::MergeBaseIntoBranch { .. } => ImplOutcome::Merged(self.merge_clean),
-                ImplAction::BuildPrompt { continuation, .. } => {
-                    ImplOutcome::Prompt(format!("prompt(continuation={continuation})"))
-                }
-                ImplAction::InvokeImplementationModel { .. }
-                | ImplAction::NudgeImplementationModel => {
-                    ImplOutcome::Model(if self.model_cancelled {
-                        ImplModelResult::Cancelled
-                    } else {
-                        ImplModelResult::Output(Box::new(self.model_output.clone()))
-                    })
-                }
-                ImplAction::CreateMergeRequest { .. } => {
-                    ImplOutcome::MergeRequestCreated(self.created_mr_iid)
-                }
-                _ => ImplOutcome::Done,
-            }
+        fn build_prompt(&mut self, continuation: bool, comments: &str) -> Result<String> {
+            self.required("build_prompt", format!("{continuation},{comments}"))?;
+            Ok(format!("prompt(continuation={continuation})"))
+        }
+
+        fn invoke_implementation_model(&mut self, prompt: &str) -> Result<ImplModelResult> {
+            self.required("invoke_implementation_model", prompt)?;
+            Ok(if self.model_cancelled {
+                ImplModelResult::Cancelled
+            } else {
+                ImplModelResult::Output(Box::new(self.model_output.clone()))
+            })
+        }
+
+        fn nudge_implementation_model(&mut self) -> Result<ImplModelResult> {
+            self.required("nudge_implementation_model", "")?;
+            Ok(ImplModelResult::Output(Box::new(self.model_output.clone())))
+        }
+
+        fn stage_all(&mut self) -> Result<()> {
+            self.required("stage_all", "")
+        }
+
+        fn commit(&mut self, message: &str) -> Result<()> {
+            self.required("commit", message)
+        }
+
+        fn push_branch(&mut self, branch: &str) -> Result<()> {
+            self.required("push_branch", branch)
+        }
+
+        fn create_merge_request(
+            &mut self,
+            branch: &str,
+            base: &str,
+            title: &str,
+            description: &str,
+        ) -> Result<u64> {
+            self.required(
+                "create_merge_request",
+                format!("{branch},{base},{title},{description}"),
+            )?;
+            Ok(self.created_mr_iid)
+        }
+
+        fn add_mr_scope_label(&mut self, mr_iid: u64) {
+            self.record(format!("add_mr_scope_label({mr_iid})"));
+        }
+
+        fn hand_issue_back_to_humans(&mut self, branch: &str, reason: &str) -> Result<()> {
+            self.required("hand_issue_back_to_humans", format!("{branch},{reason}"))
         }
     }
 
     struct FakeImplRun {
         result: Result<Option<u64>>,
-        trace: Vec<ImplStep>,
+        trace: Vec<String>,
         mr_created: bool,
         branch: Option<String>,
     }
 
     fn run_implementation(port: &mut FakeImplPort, scope_label: Option<&str>) -> FakeImplRun {
-        let mut machine =
-            ImplementationMachine::new(ROUTING_AGENT, scope_label, issue_observation(7, &[]));
-        let result = run_implementation_cycle(&mut machine, port);
+        let mut cycle = ImplementationCycleResult::default();
+        let result = run_implementation_cycle(
+            port,
+            ROUTING_AGENT,
+            scope_label,
+            &issue_observation(7, &[]),
+            &mut cycle,
+        );
         FakeImplRun {
-            result: result.map(|()| machine.tracked_mr),
+            result: result.map(|()| cycle.tracked_mr),
             trace: port.trace.borrow().clone(),
-            mr_created: machine.mr_created,
-            branch: machine.left_branch.clone(),
+            mr_created: cycle.mr_created,
+            branch: cycle.left_branch,
         }
     }
 
-    fn i_observe(query: ImplQuery) -> ImplStep {
-        ImplStep::Observe(query)
-    }
-
-    fn i_act(action: ImplAction) -> ImplStep {
-        ImplStep::Act(action)
-    }
-
-    /// The steps that take a fresh issue from discovery to the model's
-    /// answer, for an issue whose branch does not exist yet.
-    fn steps_up_to_model(continuation: bool) -> Vec<ImplStep> {
-        vec![
-            i_act(ImplAction::StopIfReviewOnly),
-            i_observe(ImplQuery::ClosesLinkedMr),
-            i_observe(ImplQuery::OpenMrForIssue),
-            i_observe(ImplQuery::DefaultBranch),
-            i_act(ImplAction::FetchRemote),
-            i_act(ImplAction::ResetWorktree),
-            i_observe(ImplQuery::RemoteBranchExists),
-            i_act(ImplAction::CreateBranchFrom {
-                branch: "issue-7".to_string(),
-                base: "main".to_string(),
-            }),
-            i_act(ImplAction::StopIfReviewOnly),
-            i_act(ImplAction::RequireWorkingOnLabel),
-            i_observe(ImplQuery::IssueComments),
-            i_act(ImplAction::BuildPrompt {
-                continuation,
-                comments: "- alice: please cap it".to_string(),
-            }),
-            i_act(ImplAction::InvokeImplementationModel {
-                prompt: format!("prompt(continuation={continuation})"),
-            }),
-        ]
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
     }
 
     #[test]
@@ -8859,30 +6778,32 @@ mod tests {
         let run = run_implementation(&mut port, Some("team:core"));
 
         assert_eq!(run.result.unwrap(), Some(12));
-        let mut expected = steps_up_to_model(false);
-        expected.extend([
-            i_act(ImplAction::StageAll),
-            i_observe(ImplQuery::StagedChanges),
-            i_act(ImplAction::Commit {
-                message: build_commit_message("Cap the retry backoff", 7),
-            }),
-            i_observe(ImplQuery::DiffAgainstDefault),
-            i_act(ImplAction::PushBranch {
-                branch: "issue-7".to_string(),
-            }),
-            i_act(ImplAction::CreateMergeRequest {
-                branch: "issue-7".to_string(),
-                base: "main".to_string(),
-                title: "Cap the retry backoff".to_string(),
-                description: "Closes #7\n\nCapped the backoff at 30s.".to_string(),
-            }),
-            i_act(ImplAction::AddMrScopeLabel { mr_iid: 12 }),
-            i_act(ImplAction::RequireSaveSessionWithSummary {
-                mr_iid: 12,
-                summary: "Capped the backoff at 30s.".to_string(),
-            }),
-        ]);
-        assert_eq!(run.trace, expected);
+        assert_eq!(
+            run.trace,
+            strings(&[
+                "stop_if_review_only",
+                "closes_linked_mr",
+                "open_mr_for_issue",
+                "default_branch()",
+                "fetch_remote()",
+                "reset_worktree",
+                "remote_branch_exists(issue-7)",
+                "create_branch_from(issue-7,main)",
+                "stop_if_review_only",
+                "require_working_on_label()",
+                "issue_comments",
+                "build_prompt(false,- alice: please cap it)",
+                "invoke_implementation_model(prompt(continuation=false))",
+                "stage_all()",
+                "has_staged_changes()",
+                "commit(Cap the retry backoff\n\nRefs #7)",
+                "has_diff_against(main)",
+                "push_branch(issue-7)",
+                "create_merge_request(issue-7,main,Cap the retry backoff,Closes #7\n\nCapped the backoff at 30s.)",
+                "add_mr_scope_label(12)",
+                "require_save_session_with_summary(12,Capped the backoff at 30s.)",
+            ])
+        );
         assert!(run.mr_created);
         assert_eq!(run.branch, Some("issue-7".to_string()));
     }
@@ -8896,7 +6817,7 @@ mod tests {
         assert!(
             !run.trace
                 .iter()
-                .any(|step| matches!(step, ImplStep::Act(ImplAction::AddMrScopeLabel { .. })))
+                .any(|step| step.starts_with("add_mr_scope_label("))
         );
     }
 
@@ -8908,12 +6829,12 @@ mod tests {
         assert_eq!(run.result.unwrap(), Some(9));
         assert_eq!(
             run.trace,
-            vec![
-                i_act(ImplAction::StopIfReviewOnly),
-                i_observe(ImplQuery::ClosesLinkedMr),
-                i_act(ImplAction::AddWorkingOnLabel),
-                i_act(ImplAction::SaveSession { mr_iid: 9 }),
-            ]
+            strings(&[
+                "stop_if_review_only",
+                "closes_linked_mr",
+                "add_working_on_label",
+                "save_session(9)",
+            ])
         );
         assert!(run.mr_created);
         assert!(run.branch.is_none());
@@ -8927,12 +6848,12 @@ mod tests {
         assert_eq!(run.result.unwrap(), None);
         assert_eq!(
             run.trace,
-            vec![
-                i_act(ImplAction::StopIfReviewOnly),
-                i_observe(ImplQuery::ClosesLinkedMr),
-                i_act(ImplAction::CloseIssue),
-                i_act(ImplAction::CleanupSession),
-            ]
+            strings(&[
+                "stop_if_review_only",
+                "closes_linked_mr",
+                "close_issue",
+                "cleanup_session",
+            ])
         );
         assert!(!run.mr_created);
     }
@@ -8945,13 +6866,13 @@ mod tests {
         assert_eq!(run.result.unwrap(), Some(9));
         assert_eq!(
             run.trace,
-            vec![
-                i_act(ImplAction::StopIfReviewOnly),
-                i_observe(ImplQuery::ClosesLinkedMr),
-                i_observe(ImplQuery::OpenMrForIssue),
-                i_act(ImplAction::AddWorkingOnLabel),
-                i_act(ImplAction::RequireSaveSession { mr_iid: 9 }),
-            ]
+            strings(&[
+                "stop_if_review_only",
+                "closes_linked_mr",
+                "open_mr_for_issue",
+                "add_working_on_label",
+                "require_save_session(9)",
+            ])
         );
     }
 
@@ -8963,22 +6884,17 @@ mod tests {
         assert_eq!(run.result.unwrap(), Some(12));
         assert_eq!(
             &run.trace[6..10],
-            &[
-                i_observe(ImplQuery::RemoteBranchExists),
-                i_act(ImplAction::CheckoutBranch {
-                    branch: "issue-7".to_string(),
-                }),
-                i_observe(ImplQuery::DiffAgainstDefault),
-                i_act(ImplAction::MergeBaseIntoBranch {
-                    base: "main".to_string(),
-                }),
-            ]
+            strings(&[
+                "remote_branch_exists(issue-7)",
+                "checkout_branch(issue-7)",
+                "has_diff_against(main)",
+                "merge_base_into_branch(main)",
+            ])
         );
-        // A branch that already has work gets the continuation prompt.
-        assert!(run.trace.contains(&i_act(ImplAction::BuildPrompt {
-            continuation: true,
-            comments: "- alice: please cap it".to_string(),
-        })));
+        assert!(
+            run.trace
+                .contains(&"build_prompt(true,- alice: please cap it)".to_string())
+        );
     }
 
     #[test]
@@ -8991,28 +6907,19 @@ mod tests {
         assert_eq!(run.result.unwrap(), Some(12));
         assert_eq!(
             &run.trace[8..14],
-            &[
-                i_observe(ImplQuery::DiffAgainstDefault),
-                i_act(ImplAction::ResetWorktree),
-                i_act(ImplAction::CheckoutBranch {
-                    branch: "main".to_string(),
-                }),
-                i_act(ImplAction::DeleteLocalBranch {
-                    branch: "issue-7".to_string(),
-                }),
-                i_act(ImplAction::DeleteRemoteBranch {
-                    branch: "issue-7".to_string(),
-                }),
-                i_act(ImplAction::CreateBranchFrom {
-                    branch: "issue-7".to_string(),
-                    base: "main".to_string(),
-                }),
-            ]
+            strings(&[
+                "has_diff_against(main)",
+                "reset_worktree",
+                "checkout_branch(main)",
+                "delete_local_branch(issue-7)",
+                "delete_remote_branch(issue-7)",
+                "create_branch_from(issue-7,main)",
+            ])
         );
-        assert!(run.trace.contains(&i_act(ImplAction::BuildPrompt {
-            continuation: false,
-            comments: "- alice: please cap it".to_string(),
-        })));
+        assert!(
+            run.trace
+                .contains(&"build_prompt(false,- alice: please cap it)".to_string())
+        );
     }
 
     #[test]
@@ -9023,28 +6930,18 @@ mod tests {
         assert_eq!(run.result.unwrap(), Some(12));
         assert_eq!(
             &run.trace[9..14],
-            &[
-                i_act(ImplAction::MergeBaseIntoBranch {
-                    base: "main".to_string(),
-                }),
-                i_act(ImplAction::ResetWorktree),
-                i_act(ImplAction::CheckoutBranch {
-                    branch: "main".to_string(),
-                }),
-                i_act(ImplAction::DeleteLocalBranch {
-                    branch: "issue-7".to_string(),
-                }),
-                i_act(ImplAction::CreateBranchFrom {
-                    branch: "issue-7".to_string(),
-                    base: "main".to_string(),
-                }),
-            ]
+            strings(&[
+                "merge_base_into_branch(main)",
+                "reset_worktree",
+                "checkout_branch(main)",
+                "delete_local_branch(issue-7)",
+                "create_branch_from(issue-7,main)",
+            ])
         );
-        // The recreated branch is fresh, so no remote branch is deleted.
         assert!(
             !run.trace
                 .iter()
-                .any(|step| matches!(step, ImplStep::Act(ImplAction::DeleteRemoteBranch { .. })))
+                .any(|step| step.starts_with("delete_remote_branch("))
         );
     }
 
@@ -9053,14 +6950,13 @@ mod tests {
         let mut before = FakeImplPort::new().stopping_at(&[true]);
         let run = run_implementation(&mut before, None);
         assert_eq!(run.result.unwrap(), None);
-        assert_eq!(run.trace, vec![i_act(ImplAction::StopIfReviewOnly)]);
+        assert_eq!(run.trace, strings(&["stop_if_review_only"]));
         assert!(run.branch.is_none());
 
         let mut after_prep = FakeImplPort::new().stopping_at(&[false, true]);
         let run = run_implementation(&mut after_prep, None);
         assert_eq!(run.result.unwrap(), None);
-        assert_eq!(run.trace.last(), Some(&i_act(ImplAction::StopIfReviewOnly)));
-        // The branch was already created, so the cycle has to clean it up.
+        assert_eq!(run.trace.last().unwrap(), "stop_if_review_only");
         assert_eq!(run.branch, Some("issue-7".to_string()));
     }
 
@@ -9070,7 +6966,10 @@ mod tests {
         let run = run_implementation(&mut port, None);
 
         assert_eq!(run.result.unwrap(), None);
-        assert_eq!(run.trace, steps_up_to_model(false));
+        assert_eq!(
+            run.trace.last().unwrap(),
+            "invoke_implementation_model(prompt(continuation=false))"
+        );
         assert!(!run.mr_created);
     }
 
@@ -9094,12 +6993,12 @@ mod tests {
             let run = run_implementation(&mut port, None);
 
             assert_eq!(run.result.unwrap(), None);
-            assert!(matches!(
-                run.trace.last(),
-                Some(ImplStep::Act(ImplAction::HandIssueBackToHumans { .. }))
-            ));
-            // The hand-back already reset the worktree, so the cycle must
-            // not delete the branch a second time.
+            assert!(
+                run.trace
+                    .last()
+                    .unwrap()
+                    .starts_with("hand_issue_back_to_humans(")
+            );
             assert!(run.branch.is_none());
             assert!(!run.mr_created);
         }
@@ -9116,28 +7015,18 @@ mod tests {
         let tail = &run.trace[run.trace.len() - 10..];
         assert_eq!(
             tail,
-            &[
-                i_observe(ImplQuery::DependencyClosed { issue_iid: 4 }),
-                i_act(ImplAction::AddIssueLabel {
-                    label: waiting_on_issue_label(4),
-                }),
-                i_act(ImplAction::RemoveWorkingOnLabel),
-                i_act(ImplAction::AddIssueComment {
-                    body: "Implementation cannot proceed until issue #4 is closed. \
-                         Parking this issue until the dependency resolves."
-                        .to_string(),
-                }),
-                i_act(ImplAction::ReleaseIssueClaim),
-                i_act(ImplAction::CleanupSession),
-                i_observe(ImplQuery::DefaultBranchOrMain),
-                i_act(ImplAction::ResetWorktree),
-                i_act(ImplAction::CheckoutBranchBestEffort {
-                    branch: "main".to_string(),
-                }),
-                i_act(ImplAction::DeleteLocalBranch {
-                    branch: "issue-7".to_string(),
-                }),
-            ]
+            strings(&[
+                "dependency_closed(4)",
+                "add_issue_label(waiting-on-issue:#4)",
+                "remove_working_on_label",
+                "add_issue_comment(Implementation cannot proceed until issue #4 is closed. Parking this issue until the dependency resolves.)",
+                "release_issue_claim",
+                "cleanup_session",
+                "default_branch_or_main",
+                "reset_worktree",
+                "checkout_branch_best_effort(main)",
+                "delete_local_branch(issue-7)",
+            ])
         );
         assert!(run.branch.is_none());
         assert!(!run.mr_created);
@@ -9153,14 +7042,10 @@ mod tests {
         let run = run_implementation(&mut port, None);
 
         assert_eq!(run.result.unwrap(), Some(12));
-        // No MR metadata came back with a dependency handoff, so the title
-        // falls back to the issue title.
-        assert!(run.trace.contains(&i_act(ImplAction::CreateMergeRequest {
-            branch: "issue-7".to_string(),
-            base: "main".to_string(),
-            title: "Cap the retry backoff for issue 7".to_string(),
-            description: "Closes #7\n\nImplementation completed.".to_string(),
-        })));
+        assert!(run.trace.contains(
+            &"create_merge_request(issue-7,main,Cap the retry backoff for issue 7,Closes #7\n\nImplementation completed.)"
+                .to_string()
+        ));
     }
 
     #[test]
@@ -9172,19 +7057,15 @@ mod tests {
         assert_eq!(run.result.unwrap(), Some(9));
         assert_eq!(
             &run.trace[run.trace.len() - 7..],
-            &[
-                i_observe(ImplQuery::MergeRequestState { mr_iid: 9 }),
-                i_act(ImplAction::ResetWorktree),
-                i_observe(ImplQuery::DefaultBranchOrMain),
-                i_act(ImplAction::CheckoutBranchBestEffort {
-                    branch: "main".to_string(),
-                }),
-                i_act(ImplAction::DeleteLocalBranch {
-                    branch: "issue-7".to_string(),
-                }),
-                i_act(ImplAction::RequireSaveSession { mr_iid: 9 }),
-                i_act(ImplAction::AddWorkingOnLabel),
-            ]
+            strings(&[
+                "merge_request_state(9)",
+                "reset_worktree",
+                "default_branch_or_main",
+                "checkout_branch_best_effort(main)",
+                "delete_local_branch(issue-7)",
+                "require_save_session(9)",
+                "add_working_on_label",
+            ])
         );
         assert!(run.mr_created);
     }
@@ -9198,9 +7079,7 @@ mod tests {
             let run = run_implementation(&mut port, None);
 
             assert_eq!(run.result.unwrap(), Some(12));
-            assert!(run.trace.contains(&i_act(ImplAction::PushBranch {
-                branch: "issue-7".to_string(),
-            })));
+            assert!(run.trace.contains(&"push_branch(issue-7)".to_string()));
         }
     }
 
@@ -9210,11 +7089,7 @@ mod tests {
         let run = run_implementation(&mut port, None);
 
         assert_eq!(run.result.unwrap(), Some(12));
-        assert!(
-            !run.trace
-                .iter()
-                .any(|step| matches!(step, ImplStep::Act(ImplAction::Commit { .. })))
-        );
+        assert!(!run.trace.iter().any(|step| step.starts_with("commit(")));
     }
 
     #[test]
@@ -9227,12 +7102,12 @@ mod tests {
         assert_eq!(run.result.unwrap(), Some(12));
         assert!(
             run.trace
-                .contains(&i_act(ImplAction::NudgeImplementationModel))
+                .contains(&"nudge_implementation_model()".to_string())
         );
         assert_eq!(
             run.trace
                 .iter()
-                .filter(|step| { matches!(step, ImplStep::Observe(ImplQuery::DiffAgainstDefault)) })
+                .filter(|step| step.starts_with("has_diff_against("))
                 .count(),
             2
         );
@@ -9241,34 +7116,25 @@ mod tests {
 
     #[test]
     fn implementation_fails_the_run_when_a_required_step_fails() {
-        let mut branching = FakeImplPort::new().failing_action(ImplAction::CreateBranchFrom {
-            branch: "issue-7".to_string(),
-            base: "main".to_string(),
-        });
+        let mut branching = FakeImplPort::new().failing("create_branch_from");
         let run = run_implementation(&mut branching, None);
         assert!(run.result.is_err());
-        // The branch was never created, so there is nothing to clean up.
         assert!(run.branch.is_none());
 
-        let mut pushing = FakeImplPort::new().failing_action(ImplAction::PushBranch {
-            branch: "issue-7".to_string(),
-        });
+        let mut pushing = FakeImplPort::new().failing("push_branch");
         let run = run_implementation(&mut pushing, None);
         assert!(run.result.is_err());
-        assert_eq!(run.branch, Some("issue-7".to_string()));
 
-        let mut labeling = FakeImplPort::new().failing_action(ImplAction::RequireWorkingOnLabel);
+        let mut labeling = FakeImplPort::new().failing("require_working_on_label");
         assert!(run_implementation(&mut labeling, None).result.is_err());
 
-        let mut reading = FakeImplPort::new().failing_query(ImplQuery::DefaultBranch);
+        let mut reading = FakeImplPort::new().failing("default_branch");
         assert!(run_implementation(&mut reading, None).result.is_err());
     }
 
     // -----------------------------------------------------------------
-    // Feedback progression traces. The order the worker performs the
-    // post-model writes in is load-bearing (metadata, then commit/push,
-    // then the conflict recheck, then reply before resolve), so it is
-    // characterized end to end against a recording port.
+    // Direct feedback-tail traces. Payloads are captured as strings/tuples;
+    // the fake deliberately has no replacement protocol enums.
     // -----------------------------------------------------------------
 
     fn feedback_surface(title: &str, has_conflicts: bool) -> MrSurfaceObservation {
@@ -9305,10 +7171,12 @@ mod tests {
         }
     }
 
-    /// A recording feedback port. Every answer is scripted; failures are
-    /// injected by naming the query or action that should fail.
     struct FakeFeedbackPort {
-        trace: std::cell::RefCell<Vec<FeedbackStep>>,
+        trace: std::cell::RefCell<Vec<String>>,
+        metadata: Vec<(String, String)>,
+        replies: Vec<(String, String)>,
+        resolutions: Vec<String>,
+        plain_replies: Vec<String>,
         changes_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
         conflict_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
         staged_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
@@ -9320,14 +7188,17 @@ mod tests {
         surface_after: MrSurfaceObservation,
         origin_head: Option<String>,
         refetched_ids: Vec<String>,
-        failing_queries: Vec<FeedbackQuery>,
-        failing_actions: Vec<FeedbackAction>,
+        failing_operations: Vec<String>,
     }
 
     impl FakeFeedbackPort {
         fn new() -> Self {
             Self {
                 trace: std::cell::RefCell::new(Vec::new()),
+                metadata: Vec::new(),
+                replies: Vec::new(),
+                resolutions: Vec::new(),
+                plain_replies: Vec::new(),
                 changes_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
                 conflict_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
                 staged_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
@@ -9339,8 +7210,7 @@ mod tests {
                 surface_after: feedback_surface("Cap the retry backoff", false),
                 origin_head: None,
                 refetched_ids: Vec::new(),
-                failing_queries: Vec::new(),
-                failing_actions: Vec::new(),
+                failing_operations: Vec::new(),
             }
         }
 
@@ -9390,24 +7260,23 @@ mod tests {
             self
         }
 
-        fn failing_query(mut self, query: FeedbackQuery) -> Self {
-            self.failing_queries.push(query);
+        fn failing(mut self, operation: &str) -> Self {
+            self.failing_operations.push(operation.to_string());
             self
         }
 
-        fn failing_action(mut self, action: FeedbackAction) -> Self {
-            self.failing_actions.push(action);
-            self
+        fn record(&self, operation: impl Into<String>) {
+            self.trace.borrow_mut().push(operation.into());
         }
 
-        fn record(&self, step: FeedbackStep) {
-            self.trace.borrow_mut().push(step);
-        }
-
-        fn observe(&self, query: FeedbackQuery) -> Result<()> {
-            self.record(FeedbackStep::Observe(query.clone()));
-            if self.failing_queries.contains(&query) {
-                anyhow::bail!("injected failure observing {query:?}");
+        fn required(&self, operation: &str) -> Result<()> {
+            self.record(operation);
+            if self
+                .failing_operations
+                .iter()
+                .any(|failed| failed == operation)
+            {
+                anyhow::bail!("injected failure in {operation}");
             }
             Ok(())
         }
@@ -9421,91 +7290,111 @@ mod tests {
     }
 
     impl FeedbackTailPort for FakeFeedbackPort {
-        fn has_changes_since(&self, _base_ref: &str) -> Result<bool> {
-            self.observe(FeedbackQuery::ChangesSinceModelRun)?;
+        fn update_mr_metadata(&mut self, title: &str, description: &str) {
+            self.record(format!("update_mr_metadata({title}|{description})"));
+            self.metadata
+                .push((title.to_string(), description.to_string()));
+        }
+
+        fn fetch_branches(&mut self) -> Result<()> {
+            self.required("fetch_branches")
+        }
+
+        fn has_changes_since(&self, base_ref: &str) -> Result<bool> {
+            self.required(&format!("has_changes_since({base_ref})"))?;
             Ok(Self::next(&self.changes_answers, false))
         }
 
         fn merge_in_progress(&self) -> Result<bool> {
-            self.observe(FeedbackQuery::MergeInProgress)?;
+            self.required("merge_in_progress")?;
             Ok(self.merge_in_progress)
         }
 
-        fn merge_conflicts_present(&self) -> Result<bool> {
-            self.observe(FeedbackQuery::MergeConflictsPresent)?;
-            Ok(Self::next(&self.conflict_answers, false))
+        fn stage_resolved_conflicts(&mut self) -> Result<bool> {
+            self.required("stage_resolved_conflicts")?;
+            Ok(self.staged_conflicts)
+        }
+
+        fn stage_all(&mut self) -> Result<()> {
+            self.required("stage_all")
         }
 
         fn has_staged_changes(&self) -> Result<bool> {
-            self.observe(FeedbackQuery::StagedChanges)?;
+            self.required("has_staged_changes")?;
             Ok(Self::next(&self.staged_answers, true))
         }
 
-        fn up_to_date_with_target(&self, _target_branch: &str) -> Result<bool> {
-            self.observe(FeedbackQuery::UpToDateWithTarget)?;
+        fn commit(&mut self, message: &str) -> Result<()> {
+            self.required(&format!("commit({message})"))
+        }
+
+        fn complete_merge_if_ready(&mut self, message: &str) -> Result<bool> {
+            self.required(&format!("complete_merge_if_ready({message})"))?;
+            Ok(self.merge_completed)
+        }
+
+        fn merge_conflicts_present(&self) -> Result<bool> {
+            self.required("merge_conflicts_present")?;
+            Ok(Self::next(&self.conflict_answers, false))
+        }
+
+        fn up_to_date_with_target(&self, target_branch: &str) -> Result<bool> {
+            self.required(&format!("up_to_date_with_target({target_branch})"))?;
             Ok(self.up_to_date)
         }
 
-        fn diff_highlights(&self, _base_ref: &str) -> Option<String> {
-            self.record(FeedbackStep::Observe(FeedbackQuery::DiffHighlights));
+        fn diff_highlights(&self, base_ref: &str) -> Option<String> {
+            self.record(format!("diff_highlights({base_ref})"));
             self.highlights.clone()
         }
 
-        fn merge_request_surface(&self, _mr_iid: u64) -> Result<MrSurfaceObservation> {
-            self.observe(FeedbackQuery::MergeRequestSurface)?;
+        fn push_source_branch(&mut self) -> Result<()> {
+            self.required("push_source_branch")
+        }
+
+        fn merge_request_surface(&self, mr_iid: u64) -> Result<MrSurfaceObservation> {
+            self.required(&format!("merge_request_surface({mr_iid})"))?;
             Ok(self.surface_after.clone())
         }
 
-        fn origin_head(&self, _source_branch: &str) -> Option<String> {
-            self.record(FeedbackStep::Observe(FeedbackQuery::OriginHead));
+        fn origin_head(&self, source_branch: &str) -> Option<String> {
+            self.record(format!("origin_head({source_branch})"));
             self.origin_head.clone()
         }
 
-        fn unresolved_discussion_ids(&self, _mr_iid: u64) -> Vec<String> {
-            self.record(FeedbackStep::Observe(
-                FeedbackQuery::UnresolvedDiscussionIds,
-            ));
+        fn unresolved_discussion_ids(&self, mr_iid: u64) -> Vec<String> {
+            self.record(format!("unresolved_discussion_ids({mr_iid})"));
             self.refetched_ids.clone()
         }
 
-        fn execute(&mut self, action: &FeedbackAction) -> FeedbackOutcome {
-            self.record(FeedbackStep::Act(action.clone()));
-            if self.failing_actions.contains(action) {
-                return FeedbackOutcome::Failed(anyhow::anyhow!(
-                    "injected failure executing {action:?}"
-                ));
-            }
-            match action {
-                FeedbackAction::StageResolvedConflicts => {
-                    FeedbackOutcome::Staged(self.staged_conflicts)
-                }
-                FeedbackAction::CompleteMergeIfReady { .. } => {
-                    FeedbackOutcome::MergeCompleted(self.merge_completed)
-                }
-                _ => FeedbackOutcome::Done,
-            }
+        fn reply_to_discussion(&mut self, discussion_id: &str, body: &str) {
+            self.record(format!("reply({discussion_id}|{body})"));
+            self.replies
+                .push((discussion_id.to_string(), body.to_string()));
+        }
+
+        fn resolve_discussion(&mut self, discussion_id: &str) {
+            self.record(format!("resolve({discussion_id})"));
+            self.resolutions.push(discussion_id.to_string());
+        }
+
+        fn post_plain_comment(&mut self, body: &str) {
+            self.record(format!("plain_comment({body})"));
+            self.plain_replies.push(body.to_string());
         }
     }
 
     fn run_feedback(
         port: &mut FakeFeedbackPort,
         input: FeedbackTailInput,
-    ) -> (Result<()>, Vec<FeedbackStep>) {
-        let mut machine = FeedbackMachine::new(input);
-        let result = run_feedback_cycle(&mut machine, port);
-        (result, port.trace.borrow().clone())
-    }
-
-    fn f_observe(query: FeedbackQuery) -> FeedbackStep {
-        FeedbackStep::Observe(query)
-    }
-
-    fn f_act(action: FeedbackAction) -> FeedbackStep {
-        FeedbackStep::Act(action)
+    ) -> (Result<()>, Vec<String>) {
+        let result = run_feedback_tail(port, &input);
+        let trace = port.trace.borrow().clone();
+        (result, trace)
     }
 
     #[test]
-    fn feedback_commits_pushes_then_replies_and_resolves_each_discussion_in_order() {
+    fn feedback_commits_pushes_then_replies_and_resolves_in_order() {
         let mut port = FakeFeedbackPort::new()
             .with_changes(&[true])
             .with_origin_head("sha-after");
@@ -9515,49 +7404,37 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        // `strip_worker_reply_boilerplate` trims the prefix and the diff
-        // block back off the generated reply before it is posted.
-        let body = "Capped the backoff";
+        let commit = format!("commit({})", build_commit_message("Capped the backoff", 7));
+        let push = trace
+            .iter()
+            .position(|step| step == "push_source_branch")
+            .unwrap();
+        let reply = trace
+            .iter()
+            .position(|step| step == "reply(d1|Capped the backoff)")
+            .unwrap();
+        assert!(trace.iter().position(|step| step == &commit).unwrap() < push);
+        assert!(push < reply);
         assert_eq!(
-            trace,
+            &trace[reply..],
+            &[
+                "reply(d1|Capped the backoff)",
+                "resolve(d1)",
+                "reply(d2|Capped the backoff)",
+                "resolve(d2)",
+            ]
+        );
+        assert_eq!(
+            port.replies,
             vec![
-                f_act(FeedbackAction::FetchBranches),
-                f_observe(FeedbackQuery::ChangesSinceModelRun),
-                f_observe(FeedbackQuery::MergeInProgress),
-                f_act(FeedbackAction::StageAll),
-                f_observe(FeedbackQuery::StagedChanges),
-                f_act(FeedbackAction::Commit {
-                    message: build_commit_message("Capped the backoff", 7),
-                }),
-                f_act(FeedbackAction::CompleteMergeIfReady {
-                    message: build_commit_message("Merge origin/main into issue-7", 7),
-                }),
-                f_observe(FeedbackQuery::MergeConflictsPresent),
-                f_observe(FeedbackQuery::MergeConflictsPresent),
-                f_observe(FeedbackQuery::DiffHighlights),
-                f_act(FeedbackAction::PushSourceBranch),
-                f_observe(FeedbackQuery::MergeRequestSurface),
-                f_observe(FeedbackQuery::OriginHead),
-                f_act(FeedbackAction::ReplyToDiscussion {
-                    discussion_id: "d1".to_string(),
-                    body: body.to_string(),
-                }),
-                f_act(FeedbackAction::ResolveDiscussion {
-                    discussion_id: "d1".to_string(),
-                }),
-                f_act(FeedbackAction::ReplyToDiscussion {
-                    discussion_id: "d2".to_string(),
-                    body: body.to_string(),
-                }),
-                f_act(FeedbackAction::ResolveDiscussion {
-                    discussion_id: "d2".to_string(),
-                }),
+                ("d1".to_string(), "Capped the backoff".to_string()),
+                ("d2".to_string(), "Capped the backoff".to_string()),
             ]
         );
     }
 
     #[test]
-    fn feedback_updates_mr_metadata_before_it_touches_the_branch() {
+    fn feedback_updates_metadata_before_touching_the_branch() {
         let resolution = FeedbackResolution {
             mr_title: Some("Cap the retry backoff at 30s".to_string()),
             changes_summary: Some("Capped the backoff".to_string()),
@@ -9570,17 +7447,21 @@ mod tests {
         assert_eq!(
             &trace[..2],
             &[
-                f_act(FeedbackAction::UpdateMrMetadata {
-                    title: "Cap the retry backoff at 30s".to_string(),
-                    description: "Closes #7".to_string(),
-                }),
-                f_act(FeedbackAction::FetchBranches),
+                "update_mr_metadata(Cap the retry backoff at 30s|Closes #7)",
+                "fetch_branches",
             ]
+        );
+        assert_eq!(
+            port.metadata,
+            vec![(
+                "Cap the retry backoff at 30s".to_string(),
+                "Closes #7".to_string(),
+            )]
         );
     }
 
     #[test]
-    fn feedback_stages_a_conflict_resolution_before_it_looks_for_changes_again() {
+    fn feedback_stages_conflict_resolution_before_rechecking_changes() {
         let mut port = FakeFeedbackPort::new()
             .merging(true)
             .with_changes(&[false, true])
@@ -9593,24 +7474,21 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(
-            &trace[..7],
+            &trace[..6],
             &[
-                f_act(FeedbackAction::FetchBranches),
-                f_observe(FeedbackQuery::ChangesSinceModelRun),
-                f_observe(FeedbackQuery::MergeInProgress),
-                f_act(FeedbackAction::StageResolvedConflicts),
-                f_act(FeedbackAction::StageAll),
-                f_observe(FeedbackQuery::ChangesSinceModelRun),
-                f_act(FeedbackAction::CompleteMergeIfReady {
-                    message: build_commit_message("Merge origin/main into issue-7", 7),
-                }),
+                "fetch_branches",
+                "has_changes_since(sha-before)",
+                "merge_in_progress",
+                "stage_resolved_conflicts",
+                "stage_all",
+                "has_changes_since(sha-before)",
             ]
         );
-        assert!(trace.contains(&f_act(FeedbackAction::PushSourceBranch)));
+        assert!(trace.contains(&"push_source_branch".to_string()));
     }
 
     #[test]
-    fn feedback_pushes_nothing_and_posts_nothing_while_conflicts_remain() {
+    fn feedback_pushes_and_posts_nothing_while_required_conflicts_remain() {
         let mut input = feedback_input(&["d1"], addressed("Tried to resolve conflicts"));
         input.requires_conflict_resolution = true;
         let mut port = FakeFeedbackPort::new()
@@ -9619,32 +7497,14 @@ mod tests {
         let (result, trace) = run_feedback(&mut port, input);
 
         assert!(result.is_ok());
-        assert_eq!(
-            trace,
-            vec![
-                f_act(FeedbackAction::FetchBranches),
-                f_observe(FeedbackQuery::ChangesSinceModelRun),
-                f_observe(FeedbackQuery::MergeInProgress),
-                f_act(FeedbackAction::StageAll),
-                f_observe(FeedbackQuery::StagedChanges),
-                f_act(FeedbackAction::Commit {
-                    message: build_commit_message("Tried to resolve conflicts", 7),
-                }),
-                f_act(FeedbackAction::CompleteMergeIfReady {
-                    message: build_commit_message("Merge origin/main into issue-7", 7),
-                }),
-                f_observe(FeedbackQuery::MergeConflictsPresent),
-                f_act(FeedbackAction::FetchBranches),
-                f_observe(FeedbackQuery::UpToDateWithTarget),
-                f_observe(FeedbackQuery::DiffHighlights),
-                f_observe(FeedbackQuery::MergeRequestSurface),
-                f_observe(FeedbackQuery::OriginHead),
-            ]
-        );
+        assert!(!trace.contains(&"push_source_branch".to_string()));
+        assert!(port.replies.is_empty());
+        assert!(port.resolutions.is_empty());
+        assert!(trace.contains(&"up_to_date_with_target(main)".to_string()));
     }
 
     #[test]
-    fn feedback_treats_gitlab_reported_conflicts_as_unresolved_after_the_run() {
+    fn feedback_treats_gitlab_reported_conflicts_as_unresolved() {
         let mut input = feedback_input(&["d1"], addressed("Capped the backoff"));
         input.requires_conflict_resolution = true;
         let mut port = FakeFeedbackPort::new()
@@ -9653,14 +7513,13 @@ mod tests {
         let (result, trace) = run_feedback(&mut port, input);
 
         assert!(result.is_ok());
-        // GitLab's own conflict flag is read after the push, so the replies
-        // are skipped even though the local worktree looked clean.
-        assert!(trace.contains(&f_act(FeedbackAction::PushSourceBranch)));
-        assert_eq!(trace.last(), Some(&f_observe(FeedbackQuery::OriginHead)));
+        assert!(trace.contains(&"push_source_branch".to_string()));
+        assert!(port.replies.is_empty());
+        assert!(port.resolutions.is_empty());
     }
 
     #[test]
-    fn feedback_refetches_discussions_when_the_run_was_triggered_by_conflicts_alone() {
+    fn feedback_refetches_discussions_when_triggered_by_conflicts_alone() {
         let mut port = FakeFeedbackPort::new()
             .with_changes(&[true])
             .with_origin_head("sha-after")
@@ -9672,14 +7531,9 @@ mod tests {
         assert_eq!(
             &trace[trace.len() - 3..],
             &[
-                f_observe(FeedbackQuery::UnresolvedDiscussionIds),
-                f_act(FeedbackAction::ReplyToDiscussion {
-                    discussion_id: "conflict-thread".to_string(),
-                    body: "Merged main".to_string(),
-                }),
-                f_act(FeedbackAction::ResolveDiscussion {
-                    discussion_id: "conflict-thread".to_string(),
-                }),
+                "unresolved_discussion_ids(12)",
+                "reply(conflict-thread|Merged main)",
+                "resolve(conflict-thread)",
             ]
         );
     }
@@ -9696,28 +7550,14 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(
-            trace,
-            vec![
-                f_act(FeedbackAction::FetchBranches),
-                f_observe(FeedbackQuery::ChangesSinceModelRun),
-                f_observe(FeedbackQuery::MergeInProgress),
-                f_act(FeedbackAction::CompleteMergeIfReady {
-                    message: build_commit_message("Merge origin/main into issue-7", 7),
-                }),
-                f_observe(FeedbackQuery::MergeConflictsPresent),
-                f_observe(FeedbackQuery::MergeConflictsPresent),
-                f_observe(FeedbackQuery::MergeRequestSurface),
-                f_observe(FeedbackQuery::OriginHead),
-                f_act(FeedbackAction::ReplyToDiscussion {
-                    discussion_id: "d1".to_string(),
-                    body: "The branch already handles this case".to_string(),
-                }),
-            ]
+            trace.last().map(String::as_str),
+            Some("reply(d1|The branch already handles this case)")
         );
+        assert!(port.resolutions.is_empty());
     }
 
     #[test]
-    fn feedback_resolves_without_branch_changes_when_the_agent_says_so_explicitly() {
+    fn feedback_resolves_without_branch_changes_when_explicitly_requested() {
         let resolution = FeedbackResolution {
             reason: Some("Already handled".to_string()),
             mark_discussions_resolved: Some(true),
@@ -9727,16 +7567,11 @@ mod tests {
         let (result, trace) = run_feedback(&mut port, feedback_input(&["d1"], resolution));
 
         assert!(result.is_ok());
-        assert_eq!(
-            trace.last(),
-            Some(&f_act(FeedbackAction::ResolveDiscussion {
-                discussion_id: "d1".to_string(),
-            }))
-        );
+        assert_eq!(trace.last().map(String::as_str), Some("resolve(d1)"));
     }
 
     #[test]
-    fn feedback_posts_the_plain_comment_reply_last() {
+    fn feedback_posts_plain_comment_last() {
         let resolution = FeedbackResolution {
             changes_summary: Some("Capped the backoff".to_string()),
             post_plain_comment: true,
@@ -9750,26 +7585,75 @@ mod tests {
         let (result, trace) = run_feedback(&mut port, input);
 
         assert!(result.is_ok());
-        let body = "Capped the backoff";
         assert_eq!(
             &trace[trace.len() - 3..],
             &[
-                f_act(FeedbackAction::ReplyToDiscussion {
-                    discussion_id: "d1".to_string(),
-                    body: body.to_string(),
-                }),
-                f_act(FeedbackAction::ResolveDiscussion {
-                    discussion_id: "d1".to_string(),
-                }),
-                f_act(FeedbackAction::PostPlainComment {
-                    body: body.to_string(),
-                }),
+                "reply(d1|Capped the backoff)",
+                "resolve(d1)",
+                "plain_comment(Capped the backoff)",
             ]
         );
+        assert_eq!(port.plain_replies, vec!["Capped the backoff"]);
     }
 
     #[test]
-    fn feedback_skips_the_commit_when_the_agent_left_nothing_staged() {
+    fn feedback_posts_plain_comment_without_discussions() {
+        let resolution = FeedbackResolution {
+            public_comment: Some("Acknowledged the plain comment.".to_string()),
+            post_plain_comment: true,
+            ..Default::default()
+        };
+        let mut input = feedback_input(&[], resolution);
+        input.plain_comments_present = true;
+        let mut port = FakeFeedbackPort::new();
+
+        let (result, trace) = run_feedback(&mut port, input);
+
+        assert!(result.is_ok());
+        assert_eq!(port.plain_replies, vec!["Acknowledged the plain comment."]);
+        assert_eq!(
+            trace.last().map(String::as_str),
+            Some("plain_comment(Acknowledged the plain comment.)")
+        );
+        assert!(port.replies.is_empty());
+        assert!(port.resolutions.is_empty());
+    }
+
+    #[test]
+    fn feedback_omits_plain_comment_when_not_requested() {
+        let resolution = FeedbackResolution {
+            public_comment: Some("No public reply requested.".to_string()),
+            ..Default::default()
+        };
+        let mut input = feedback_input(&[], resolution);
+        input.plain_comments_present = true;
+        let mut port = FakeFeedbackPort::new();
+
+        let (result, trace) = run_feedback(&mut port, input);
+
+        assert!(result.is_ok());
+        assert!(port.plain_replies.is_empty());
+        assert!(!trace.iter().any(|step| step.starts_with("plain_comment(")));
+    }
+
+    #[test]
+    fn feedback_omits_plain_comment_when_none_are_present() {
+        let resolution = FeedbackResolution {
+            public_comment: Some("Nothing to reply to.".to_string()),
+            post_plain_comment: true,
+            ..Default::default()
+        };
+        let mut port = FakeFeedbackPort::new();
+
+        let (result, trace) = run_feedback(&mut port, feedback_input(&[], resolution));
+
+        assert!(result.is_ok());
+        assert!(port.plain_replies.is_empty());
+        assert!(!trace.iter().any(|step| step.starts_with("plain_comment(")));
+    }
+
+    #[test]
+    fn feedback_skips_commit_when_nothing_is_staged() {
         let mut port = FakeFeedbackPort::new()
             .with_changes(&[true])
             .with_staged(&[false])
@@ -9780,17 +7664,12 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        assert!(
-            !trace
-                .iter()
-                .any(|step| matches!(step, FeedbackStep::Act(FeedbackAction::Commit { .. })))
-        );
-        // The agent's own commit still counts as a change to push.
-        assert!(trace.contains(&f_act(FeedbackAction::PushSourceBranch)));
+        assert!(!trace.iter().any(|step| step.starts_with("commit(")));
+        assert!(trace.contains(&"push_source_branch".to_string()));
     }
 
     #[test]
-    fn feedback_holds_the_push_back_when_the_worktree_still_has_conflict_markers() {
+    fn feedback_holds_push_when_conflict_markers_remain() {
         let mut port = FakeFeedbackPort::new()
             .with_changes(&[true])
             .with_conflicts(&[true]);
@@ -9800,54 +7679,58 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        assert!(!trace.contains(&f_act(FeedbackAction::PushSourceBranch)));
-        // The conflict probe answered "conflicts", so the second probe is
-        // skipped and the replies go out without resolving anything.
+        assert!(!trace.contains(&"push_source_branch".to_string()));
         assert_eq!(
             trace
                 .iter()
-                .filter(|step| **step == f_observe(FeedbackQuery::MergeConflictsPresent))
+                .filter(|step| step.as_str() == "merge_conflicts_present")
                 .count(),
             1
         );
         assert_eq!(
-            trace.last(),
-            Some(&f_act(FeedbackAction::ReplyToDiscussion {
-                discussion_id: "d1".to_string(),
-                body: "Half-resolved".to_string(),
-            }))
+            trace.last().map(String::as_str),
+            Some("reply(d1|Half-resolved)")
         );
     }
 
     #[test]
-    fn feedback_fails_when_the_worker_produced_neither_changes_nor_an_explanation() {
+    fn feedback_fails_on_silent_no_op() {
         let mut port = FakeFeedbackPort::new();
         let (result, _) = run_feedback(
             &mut port,
             feedback_input(&["d1"], FeedbackResolution::default()),
         );
 
-        let error = result.expect_err("a silent no-op run must fail the feedback cycle");
+        let error = result.expect_err("a silent no-op run must fail the feedback tail");
         assert!(error.to_string().contains("no feedback reply"), "{error}");
     }
 
     #[test]
-    fn feedback_fails_the_run_when_a_required_git_step_fails() {
-        let mut fetching = FakeFeedbackPort::new().failing_action(FeedbackAction::FetchBranches);
-        let (result, _) = run_feedback(&mut fetching, feedback_input(&["d1"], addressed("x")));
-        assert!(result.is_err());
+    fn feedback_fails_when_required_git_operations_fail() {
+        let mut fetching = FakeFeedbackPort::new().failing("fetch_branches");
+        assert!(
+            run_feedback(&mut fetching, feedback_input(&["d1"], addressed("x")))
+                .0
+                .is_err()
+        );
 
         let mut pushing = FakeFeedbackPort::new()
             .with_changes(&[true])
-            .failing_action(FeedbackAction::PushSourceBranch);
-        let (result, _) = run_feedback(&mut pushing, feedback_input(&["d1"], addressed("x")));
-        assert!(result.is_err());
+            .failing("push_source_branch");
+        assert!(
+            run_feedback(&mut pushing, feedback_input(&["d1"], addressed("x")))
+                .0
+                .is_err()
+        );
 
         let mut probing = FakeFeedbackPort::new()
             .with_changes(&[true])
-            .failing_query(FeedbackQuery::MergeConflictsPresent);
-        let (result, _) = run_feedback(&mut probing, feedback_input(&["d1"], addressed("x")));
-        assert!(result.is_err());
+            .failing("merge_conflicts_present");
+        assert!(
+            run_feedback(&mut probing, feedback_input(&["d1"], addressed("x")))
+                .0
+                .is_err()
+        );
     }
 
     #[test]
@@ -9858,7 +7741,7 @@ mod tests {
         let run = run_worker_routing(&mut port, None);
 
         assert!(run.result.is_ok());
-        assert_eq!(run.trace, vec![w_shutdown()]);
+        assert_eq!(run.trace, strings(&["shutdown"]));
     }
 
     #[test]
