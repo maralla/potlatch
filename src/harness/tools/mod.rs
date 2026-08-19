@@ -266,11 +266,13 @@ impl ToolRegistry {
     ///
     /// `model` is the session model, forwarded to the subagent tool so spawned
     /// subagents default to the parent's model.
+    /// `session_id` groups subagent transcripts under the parent session.
     ///
     /// `allowed_tools` filters which tools are registered: `None` registers
     /// all; `Some(names)` registers only tools whose name is in the list.
     pub fn with_builtin_tools(
         states: &mut SessionStates,
+        session_id: &str,
         cwd: &str,
         model: &str,
         allowed_tools: Option<&[String]>,
@@ -307,7 +309,9 @@ impl ToolRegistry {
             reg.register(Arc::new(lsp::LspTool::new(states, cwd)));
         }
         if allowed("subagent") {
-            reg.register(Arc::new(subagent::SubagentTool::new(states, cwd, model)));
+            reg.register(Arc::new(subagent::SubagentTool::new(
+                states, session_id, cwd, model,
+            )));
         }
         reg
     }

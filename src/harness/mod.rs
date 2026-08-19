@@ -128,7 +128,7 @@ fn init_logging() -> Arc<SwappableWriter> {
 
 /// Switch the log output to `~/.potlatch/sessions/<session-id>.log`.
 fn set_session_log(writer: &SwappableWriter, session_id: &str) {
-    let sessions_dir = home_dir().join(".potlatch").join("sessions");
+    let sessions_dir = logging_dir();
     let _ = std::fs::create_dir_all(&sessions_dir);
 
     let log_path = sessions_dir.join(format!("{session_id}.log"));
@@ -142,6 +142,10 @@ fn set_session_log(writer: &SwappableWriter, session_id: &str) {
         tracing::info!("switching session log to {}", log_path.display());
     }
     writer.swap(file);
+}
+
+pub(crate) fn logging_dir() -> std::path::PathBuf {
+    home_dir().join(".potlatch").join("sessions")
 }
 
 fn home_dir() -> std::path::PathBuf {

@@ -85,7 +85,27 @@ impl SubagentTable {
         model: &str,
         tools: Option<&[String]>,
         cwd: &str,
+        parent_session_id: &str,
     ) -> Result<String> {
+        // Keep transcripts with Potlatch's session logs, never in the repository.
+        let subagent_num = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = format!("subagent-{subagent_num}");
+        let logging_dir = crate::harness::logging_dir();
+        let transcript_path = subagent_transcript_path(
+            &logging_dir,
+            parent_session_id,
+            std::process::id(),
+            subagent_num,
+        );
+        std::fs::create_dir_all(
+            transcript_path
+                .parent()
+                .context("subagent transcript path has no parent")?,
+        )
+        .context("create Potlatch logging directory for subagent transcript")?;
+        std::fs::write(&transcript_path, "")
+            .context("initialize subagent transcript in Potlatch logging directory")?;
+
         let exe =
             std::env::current_exe().context("locate current potlatch executable for subagent")?;
 
@@ -110,22 +130,6 @@ impl SubagentTable {
 
         // Synchronous ACP handshake.
         driver.send_request("initialize", json!({}))?;
-
-        // Generate a transcript file path for the child harness to write to.
-        // The parent agent can read this file to inspect the subagent's full
-        // conversation (prompt, response, reasoning, tool calls) in real time.
-        let subagent_num = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let id = format!("subagent-{subagent_num}");
-        let transcript_path = std::path::Path::new(cwd)
-            .join(".potlatch-transcripts")
-            .join(format!("{id}.transcript.md"));
-        let _ = std::fs::create_dir_all(
-            transcript_path
-                .parent()
-                .unwrap_or(std::path::Path::new(".")),
-        );
-        // Truncate any previous transcript for this id.
-        let _ = std::fs::write(&transcript_path, "");
 
         let transcript_path_str = transcript_path.to_string_lossy().to_string();
         let mut session_params = json!({ "cwd": cwd, "mcpServers": [] });
@@ -407,6 +411,18 @@ impl SubagentTable {
     }
 }
 
+fn subagent_transcript_path(
+    logging_dir: &std::path::Path,
+    session_id: &str,
+    process_id: u32,
+    subagent_num: u64,
+) -> std::path::PathBuf {
+    logging_dir
+        .join("transcripts")
+        .join(session_id)
+        .join(format!("subagent-{process_id}-{subagent_num}.log"))
+}
+
 impl Default for SubagentTable {
     fn default() -> Self {
         Self::new()
@@ -644,19 +660,26 @@ fn write_transcript_entry(path: &std::path::Path, header: &str, body: &str) {
 pub struct SubagentTool {
     table: Arc<SubagentTable>,
     model: String,
+    session_id: String,
 }
 
 impl SubagentTool {
     /// Construct with session-scoped state. Creates a `SubagentTable` in
     /// `SessionStates` if not already present (first prompt), then retrieves
     /// it so subagents survive across prompts and are killed on session close.
-    pub fn new(states: &mut super::SessionStates, _cwd: &str, model: &str) -> Self {
+    pub fn new(
+        states: &mut super::SessionStates,
+        session_id: &str,
+        _cwd: &str,
+        model: &str,
+    ) -> Self {
         if states.get::<SubagentTable>().is_none() {
             states.insert(Arc::new(SubagentTable::new()));
         }
         Self {
             table: states.get::<SubagentTable>().unwrap(),
             model: model.to_string(),
+            session_id: session_id.to_string(),
         }
     }
 
@@ -666,6 +689,7 @@ impl SubagentTool {
         Self {
             table,
             model: model.to_string(),
+            session_id: "test-session".to_string(),
         }
     }
 }
@@ -751,7 +775,9 @@ impl Tool for SubagentTool {
             })
             .filter(|v: &Vec<String>| !v.is_empty());
 
-        let id = self.table.spawn(prompt, model, tools.as_deref(), cwd)?;
+        let id = self
+            .table
+            .spawn(prompt, model, tools.as_deref(), cwd, &self.session_id)?;
         Ok(format!(
             "Subagent started: {id}\nprompt: {}",
             prompt.chars().take(200).collect::<String>()
@@ -763,6 +789,16 @@ impl Tool for SubagentTool {
 mod tests {
     use super::*;
     use crate::harness::tools::test_util;
+
+    #[test]
+    fn transcript_path_uses_the_potlatch_logging_directory() {
+        let logging_dir = std::path::Path::new("/home/test/.potlatch/sessions");
+
+        assert_eq!(
+            subagent_transcript_path(logging_dir, "session-abc", 42, 7),
+            logging_dir.join("transcripts/session-abc/subagent-42-7.log")
+        );
+    }
 
     #[test]
     fn extract_update_text_parses_agent_message_chunk() {
