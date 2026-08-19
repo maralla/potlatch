@@ -479,7 +479,8 @@ impl CoreAgent for PmoAgent {
         let claimed_issue = {
             let state = AgentState::from_runtime(&runtime);
             state.ensure_sessions_dir()?;
-            let claimed_issue = try_resume_pmo_state(&state, &runtime.gitlab, scope);
+            let claimed_issue = try_resume_pmo_state(&state, &runtime.gitlab, scope)
+                .or_else(|| find_claimed_pmo_issue(&state, &runtime.gitlab, scope));
             if let Some(ref lease) = claimed_issue {
                 let iid = lease.resource().iid();
                 match (runtime.gitlab.get_issue(iid), runtime.gitlab.list_issues()) {
@@ -937,8 +938,9 @@ fn run_pmo_cycle(
         }
         resume_split(&mut pending, scope_label, port)?;
         // Recovery can legitimately have a checkpoint but no live lease.
-        let _ = port.release_claim();
-        port.clear_claim_state();
+        if port.release_claim().is_ok() {
+            port.clear_claim_state();
+        }
         return Ok(());
     }
 
@@ -978,8 +980,9 @@ fn run_pmo_cycle(
                 }
             }
             _ => {
-                let _ = port.release_claim();
-                port.clear_claim_state();
+                if port.release_claim().is_ok() {
+                    port.clear_claim_state();
+                }
             }
         }
     }
@@ -1129,10 +1132,12 @@ impl PmoPort for LivePmoPort<'_> {
     }
 
     fn release_claim(&mut self) -> Result<()> {
-        let Some(lease) = self.claimed_issue.take() else {
+        let Some(lease) = self.claimed_issue.as_mut() else {
             return Ok(());
         };
-        lease.release(self.gitlab)
+        lease.try_release(self.gitlab)?;
+        *self.claimed_issue = None;
+        Ok(())
     }
 
     fn save_claim_state(&mut self, issue_iid: u64) {
@@ -1863,15 +1868,62 @@ fn try_resume_pmo_state(
         }
         Err(e) => {
             warn!(
-                "{}: Failed to verify issue #{}: {}, discarding state",
+                "{}: Failed to verify issue #{}: {}, retaining state and scanning live claims",
                 &state.agent_id, issue_iid, e
             );
-
-            state.clear_state();
-
-            None
+            find_claimed_pmo_issue(state, gitlab, scope_label)
         }
     }
+}
+
+fn find_claimed_pmo_issue(
+    state: &AgentState,
+    gitlab: &GitLabClient,
+    _scope_label: Option<&str>,
+) -> Option<ClaimLease> {
+    let mut issues = match gitlab.list_issues() {
+        Ok(issues) => issues,
+        Err(error) => {
+            warn!(
+                "{}: Failed to scan for an orphaned PMO claim: {}",
+                state.agent_id, error
+            );
+            return None;
+        }
+    };
+    issues.sort_by_key(|issue| issue.iid);
+    let mut recovered = Vec::new();
+    for issue in issues {
+        if issue.state != "opened" {
+            continue;
+        }
+        if let Some(lease) = ClaimLease::recover(
+            ClaimResource::Issue(issue.iid),
+            state.agent_id,
+            &issue.labels,
+        ) {
+            recovered.push(lease);
+        }
+    }
+    let primary = recovered.first().map(|lease| lease.resource().iid());
+    for mut extra in recovered.drain(1..) {
+        let iid = extra.resource().iid();
+        if let Err(error) = extra.try_release(gitlab) {
+            warn!(
+                "{}: Failed to release extra orphaned claim on issue #{}: {}",
+                state.agent_id, iid, error
+            );
+            extra.preserve();
+        }
+    }
+    let lease = recovered.pop()?;
+    let issue_iid = primary.expect("recovered contains its primary lease");
+    info!(
+        "{}: Recovered orphaned claim on issue #{} from GitLab",
+        state.agent_id, issue_iid
+    );
+    state.save_state(issue_iid);
+    Some(lease)
 }
 
 /// Checkpoint resume decision: index `index` of `pending.sub_issues` was
@@ -2942,8 +2994,9 @@ mod tests {
         run_fake(&mut recovered, None).unwrap();
         assert_eq!(
             recovered.trace.borrow().last().map(String::as_str),
-            Some("act:clear_claim")
+            Some("act:release")
         );
+        assert!(!recovered.trace.borrow().contains(&"act:clear_claim".into()));
     }
 
     #[test]
@@ -2964,12 +3017,12 @@ mod tests {
         invalid_held.failures = vec!["release"];
         invalid_held.shutdown.borrow_mut().push_back(true);
         run_fake(&mut invalid_held, Some(10)).unwrap();
+        assert!(invalid_held.trace.borrow().contains(&"act:release".into()));
         assert!(
-            invalid_held
+            !invalid_held
                 .trace
                 .borrow()
-                .windows(2)
-                .any(|events| events == ["act:release", "act:clear_claim"])
+                .contains(&"act:clear_claim".into())
         );
 
         let mut fresh_completion = FakePmoPort::successful();

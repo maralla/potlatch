@@ -3,15 +3,17 @@
 //! object representing held ownership.
 //!
 //! ## Protocol
-//! 1. Add a unique claim label (`claimed:<agent_id>`) to the resource.
-//! 2. Wait for the settle time, to let concurrent claims from other
+//! 1. Refuse resources that already expose a claim label.
+//! 2. Add this agent's claim label (`claimed:<agent_id>`) to the resource.
+//! 3. Wait for the settle time, to let concurrent claims from other
 //!    instances propagate through the GitLab API.
-//! 3. Re-fetch the resource's labels and check for competing claims.
-//! 4. Repeat the wait+re-fetch once more, to guard against propagation
+//! 4. Re-fetch the resource's labels, require our exact label to be visible,
+//!    and check for competing claims.
+//! 5. Repeat the wait+re-fetch once more, to guard against propagation
 //!    delay on the first read.
-//! 5. If only our claim label is present, we won.
-//! 6. If more than one claim label is present, a deterministic tiebreak
-//!    (lexicographically smallest label wins) decides the winner.
+//! 6. If more than one claim label is present, the earliest active GitLab
+//!    label-add event wins; label order is only a backend fallback.
+//! 7. A winner keeps verifying through every settle round before proceeding.
 //!
 //! A shutdown signal observed during either settle wait interrupts the
 //! attempt. Losing, being interrupted, or failing to read the resource back
@@ -20,7 +22,7 @@
 //!
 //! ## Leases
 //! A won (or recovered) claim is returned as a [`ClaimLease`]. The only way
-//! to relinquish one is to call [`ClaimLease::release`] (remove the label
+//! to relinquish one is to call [`ClaimLease::try_release`] (remove the label
 //! now) or [`ClaimLease::preserve`] (leave the label in place; some later
 //! process — this same instance on a future cycle, or a restarted instance
 //! via [`ClaimLease::recover`] — is responsible for eventually releasing
@@ -46,7 +48,7 @@ use std::fmt;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::agents::gitlab::GitLabClient;
@@ -98,6 +100,14 @@ pub(crate) trait ClaimPort {
     fn add_label(&self, resource: ClaimResource, label: &str) -> Result<()>;
     fn remove_label(&self, resource: ClaimResource, label: &str) -> Result<()>;
     fn labels(&self, resource: ClaimResource) -> Result<Vec<String>>;
+
+    fn ordered_claim_labels(
+        &self,
+        _resource: ClaimResource,
+        active_claim_labels: &[String],
+    ) -> Result<Vec<String>> {
+        Ok(fallback_claim_order(active_claim_labels))
+    }
 }
 
 impl ClaimPort for GitLabClient {
@@ -122,6 +132,19 @@ impl ClaimPort for GitLabClient {
                 Ok(self.get_merge_request(iid)?.labels.unwrap_or_default())
             }
         }
+    }
+
+    fn ordered_claim_labels(
+        &self,
+        resource: ClaimResource,
+        active_claim_labels: &[String],
+    ) -> Result<Vec<String>> {
+        let events = match resource {
+            ClaimResource::Issue(iid) => self.get_issue_label_events(iid)?,
+            ClaimResource::MergeRequest(iid) => self.get_mr_label_events(iid)?,
+        };
+        crate::agents::gitlab::order_active_claim_labels(&events, active_claim_labels)
+            .with_context(|| format!("could not order active claims on {resource}"))
     }
 }
 
@@ -157,9 +180,11 @@ impl ClaimLease {
         live_labels: &[String],
     ) -> Option<Self> {
         let label = claim_label(agent_id);
-        live_labels
+        let claim_labels: Vec<_> = live_labels
             .iter()
-            .any(|l| l == &label)
+            .filter(|label| label.starts_with(CLAIM_LABEL_PREFIX))
+            .collect();
+        (claim_labels.len() == 1 && claim_labels[0] == &label)
             .then(|| Self::new(resource, label, agent_id))
     }
 
@@ -167,23 +192,14 @@ impl ClaimLease {
         self.resource
     }
 
-    /// Explicitly relinquish the claim: removes the label from GitLab.
-    /// Consumes the lease either way, so `Drop` never re-reports it.
-    pub(crate) fn release(self, port: &dyn ClaimPort) -> Result<()> {
-        let mut this = self;
-        this.settled = true;
-        debug!("{}: Releasing claim on {}", this.agent_id, this.resource);
-        port.remove_label(this.resource, &this.label)
-    }
-
     /// Attempt to release without consuming the lease, so a failed attempt
     /// (e.g. a transient GitLab API error) can be retried later against the
     /// same lease rather than losing track of held ownership. On success
-    /// the lease is marked settled, exactly as [`ClaimLease::release`]
-    /// would; on failure it is left unsettled, still owned by the caller.
+    /// the lease is marked settled; on failure it is left unsettled, still
+    /// owned by the caller.
     pub(crate) fn try_release(&mut self, port: &dyn ClaimPort) -> Result<()> {
         debug!("{}: Releasing claim on {}", self.agent_id, self.resource);
-        port.remove_label(self.resource, &self.label)?;
+        remove_claim_label(port, self.resource, &self.label)?;
         self.settled = true;
         Ok(())
     }
@@ -245,16 +261,37 @@ fn acquire_with(
     let label = claim_label(agent_id);
     debug!("{agent_id}: Attempting to claim {resource}");
 
-    port.add_label(resource, &label)?;
+    if port
+        .labels(resource)?
+        .iter()
+        .any(|label| label.starts_with(CLAIM_LABEL_PREFIX))
+    {
+        debug!("{agent_id}: {resource} already has a claim, backing off");
+        return Ok(ClaimAcquireOutcome::Lost);
+    }
+
+    if let Err(add_error) = port.add_label(resource, &label) {
+        let labels = port.labels(resource).with_context(|| {
+            format!(
+                "failed to add claim {label:?} to {resource} ({add_error}); verification also failed"
+            )
+        })?;
+        if !labels.iter().any(|candidate| candidate == &label) {
+            return Err(add_error)
+                .with_context(|| format!("claim {label:?} was not added to {resource}"));
+        }
+        info!("Claim {label:?} is present on {resource} after an ambiguous add failure");
+    }
 
     let outcome = settle_and_check(port, resource, agent_id, &label, shutdown, &mut wait_settle);
 
     // Anything other than a win means we must not keep the label we just
-    // added: contention losses clean up in `resolve_contention` too, but a
-    // shutdown interruption or a failed settle-read never reach it, so the
-    // cleanup lives here where every non-`Won` path funnels through.
+    // added. Never hide cleanup failure: the remaining label still protects
+    // the resource, and startup recovery can reclaim it, but callers must
+    // know the acquisition did not finish cleanly.
     if !matches!(outcome, Ok(ClaimAcquireOutcome::Won(_))) {
-        let _ = port.remove_label(resource, &label);
+        remove_claim_label(port, resource, &label)
+            .context("failed to clean up an unsuccessful claim attempt")?;
     }
 
     outcome
@@ -268,6 +305,7 @@ fn settle_and_check(
     shutdown: &AtomicBool,
     wait_settle: &mut impl FnMut(&AtomicBool, Duration) -> bool,
 ) -> Result<ClaimAcquireOutcome> {
+    let mut own_label_visible = false;
     for _ in 0..CLAIM_SETTLE_ROUNDS {
         if wait_settle(shutdown, Duration::from_secs(CLAIM_SETTLE_SECS)) {
             info!("{agent_id}: Shutdown while claiming {resource}, backing off");
@@ -275,14 +313,40 @@ fn settle_and_check(
         }
 
         let live_labels = port.labels(resource)?;
-        let claim_labels: Vec<&String> = live_labels
+        let claim_labels: Vec<String> = live_labels
             .iter()
             .filter(|l| l.starts_with(CLAIM_LABEL_PREFIX))
+            .cloned()
             .collect();
+        own_label_visible = claim_labels.iter().any(|candidate| candidate == label);
 
-        if claim_labels.len() > 1 {
-            return Ok(resolve_contention(resource, agent_id, label, &claim_labels));
+        if own_label_visible && claim_labels.len() > 1 {
+            let ordered = port.ordered_claim_labels(resource, &claim_labels)?;
+            if ordered.first().is_none_or(|winner| winner != label) {
+                warn!(
+                    "{agent_id}: Lost claim for {resource} to {}, backing off",
+                    ordered
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("unknown owner")
+                );
+                return Ok(ClaimAcquireOutcome::Lost);
+            }
+
+            // Keep our winning label visible through every settle round.
+            // Returning here would let a fast operation release the label
+            // before a slower contender performs its own verification,
+            // allowing both contenders to believe they won.
+            info!(
+                "{agent_id}: Won claim tiebreaker for {resource} against {} other(s); continuing verification",
+                claim_labels.len() - 1
+            );
         }
+    }
+
+    if !own_label_visible {
+        warn!("{agent_id}: Claim label never became visible on {resource}, backing off");
+        return Ok(ClaimAcquireOutcome::Lost);
     }
 
     info!("{agent_id}: Successfully claimed {resource}");
@@ -293,38 +357,10 @@ fn settle_and_check(
     )))
 }
 
-/// Deterministic tiebreak: the lexicographically smallest claim label wins.
-/// Pure — used after the double-settle re-check finds more than one claim
-/// label, so the deadlock between two concurrently-claiming instances
-/// always resolves the same way regardless of which instance observes
-/// contention first.
-fn claim_tiebreak_wins(own_label: &str, claim_labels: &[&String]) -> bool {
-    let winner = claim_labels
-        .iter()
-        .min()
-        .expect("claim_labels is non-empty");
-    winner.as_str() == own_label
-}
-
-fn resolve_contention(
-    resource: ClaimResource,
-    agent_id: &str,
-    label: &str,
-    claim_labels: &[&String],
-) -> ClaimAcquireOutcome {
-    if claim_tiebreak_wins(label, claim_labels) {
-        info!(
-            "{agent_id}: Won claim tiebreaker for {resource} against {} other(s)",
-            claim_labels.len() - 1
-        );
-        return ClaimAcquireOutcome::Won(ClaimLease::new(resource, label.to_string(), agent_id));
-    }
-
-    warn!(
-        "{agent_id}: Lost claim for {resource} to {}, backing off",
-        claim_labels.iter().min().unwrap()
-    );
-    ClaimAcquireOutcome::Lost
+fn fallback_claim_order(active_claim_labels: &[String]) -> Vec<String> {
+    let mut labels = active_claim_labels.to_vec();
+    labels.sort();
+    labels
 }
 
 /// Remove `agent_id`'s claim label from `resource` without a held
@@ -334,7 +370,30 @@ fn resolve_contention(
 pub(crate) fn release(port: &dyn ClaimPort, resource: ClaimResource, agent_id: &str) -> Result<()> {
     let label = claim_label(agent_id);
     debug!("{agent_id}: Releasing claim on {resource}");
-    port.remove_label(resource, &label)
+    remove_claim_label(port, resource, &label)
+}
+
+fn remove_claim_label(port: &dyn ClaimPort, resource: ClaimResource, label: &str) -> Result<()> {
+    match port.remove_label(resource, label) {
+        Ok(()) => Ok(()),
+        Err(remove_error) => {
+            let labels = port.labels(resource).with_context(|| {
+                format!(
+                    "failed to remove claim {label:?} from {resource} ({remove_error}); verification also failed"
+                )
+            })?;
+            if labels.iter().any(|candidate| candidate == label) {
+                Err(remove_error).with_context(|| {
+                    format!("claim {label:?} is still present on {resource} after removal failed")
+                })
+            } else {
+                info!(
+                    "Claim {label:?} is absent from {resource} after an ambiguous removal failure"
+                );
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Check if a resource is already claimed by any instance.
@@ -376,9 +435,14 @@ mod tests {
     struct FakeClaimPort {
         labels: RefCell<HashMap<ClaimResource, Vec<String>>>,
         add_calls: Cell<u32>,
+        fail_add: Cell<bool>,
+        apply_failed_add: Cell<bool>,
         remove_calls: Cell<u32>,
         label_reads: Cell<u32>,
         fail_reads_from_call: Cell<Option<u32>>,
+        fail_remove: Cell<bool>,
+        apply_failed_remove: Cell<bool>,
+        claim_order: RefCell<Option<Vec<String>>>,
     }
 
     impl FakeClaimPort {
@@ -398,6 +462,21 @@ mod tests {
         /// fail, to exercise cleanup-on-read-failure.
         fn fail_reads_from(&self, call: u32) {
             self.fail_reads_from_call.set(Some(call));
+        }
+
+        fn fail_remove(&self, apply_removal: bool) {
+            self.fail_remove.set(true);
+            self.apply_failed_remove.set(apply_removal);
+        }
+
+        fn fail_add(&self, apply_addition: bool) {
+            self.fail_add.set(true);
+            self.apply_failed_add.set(apply_addition);
+        }
+
+        fn set_claim_order(&self, labels: &[&str]) {
+            *self.claim_order.borrow_mut() =
+                Some(labels.iter().map(|label| label.to_string()).collect());
         }
 
         fn current_labels(&self, resource: ClaimResource) -> Vec<String> {
@@ -420,18 +499,28 @@ mod tests {
     impl ClaimPort for FakeClaimPort {
         fn add_label(&self, resource: ClaimResource, label: &str) -> Result<()> {
             self.add_calls.set(self.add_calls.get() + 1);
-            self.labels
-                .borrow_mut()
-                .entry(resource)
-                .or_default()
-                .push(label.to_string());
+            if !self.fail_add.get() || self.apply_failed_add.get() {
+                self.labels
+                    .borrow_mut()
+                    .entry(resource)
+                    .or_default()
+                    .push(label.to_string());
+            }
+            if self.fail_add.get() {
+                anyhow::bail!("simulated add failure");
+            }
             Ok(())
         }
 
         fn remove_label(&self, resource: ClaimResource, label: &str) -> Result<()> {
             self.remove_calls.set(self.remove_calls.get() + 1);
-            if let Some(labels) = self.labels.borrow_mut().get_mut(&resource) {
+            if (!self.fail_remove.get() || self.apply_failed_remove.get())
+                && let Some(labels) = self.labels.borrow_mut().get_mut(&resource)
+            {
                 labels.retain(|l| l != label);
+            }
+            if self.fail_remove.get() {
+                anyhow::bail!("simulated remove failure");
             }
             Ok(())
         }
@@ -445,6 +534,18 @@ mod tests {
                 anyhow::bail!("simulated read failure");
             }
             Ok(self.current_labels(resource))
+        }
+
+        fn ordered_claim_labels(
+            &self,
+            _resource: ClaimResource,
+            active_claim_labels: &[String],
+        ) -> Result<Vec<String>> {
+            Ok(self
+                .claim_order
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| fallback_claim_order(active_claim_labels)))
         }
     }
 
@@ -479,13 +580,55 @@ mod tests {
         let outcome =
             acquire_with(&port, resource, "worker-0", &shutdown, never_interrupts).unwrap();
 
-        let lease = match outcome {
+        let mut lease = match outcome {
             ClaimAcquireOutcome::Won(lease) => lease,
             _ => panic!("expected Won"),
         };
         assert_eq!(lease.resource(), resource);
         assert_eq!(port.current_labels(resource), vec!["claimed:worker-0"]);
-        lease.release(&port).unwrap();
+        lease.try_release(&port).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_add_continues_when_verification_finds_the_label_present() {
+        let port = FakeClaimPort::new();
+        port.fail_add(true);
+        let resource = ClaimResource::Issue(31);
+        let shutdown = shutdown_flag();
+
+        let outcome =
+            acquire_with(&port, resource, "worker-0", &shutdown, never_interrupts).unwrap();
+        assert!(matches!(outcome, ClaimAcquireOutcome::Won(_)));
+    }
+
+    #[test]
+    fn failed_add_stops_when_verification_finds_no_label() {
+        let port = FakeClaimPort::new();
+        port.fail_add(false);
+        let resource = ClaimResource::Issue(32);
+        let shutdown = shutdown_flag();
+
+        assert!(acquire_with(&port, resource, "worker-0", &shutdown, never_interrupts).is_err());
+        assert!(port.current_labels(resource).is_empty());
+    }
+
+    #[test]
+    fn acquire_loses_when_its_own_label_never_becomes_visible() {
+        let port = FakeClaimPort::new();
+        let resource = ClaimResource::Issue(2);
+        let shutdown = shutdown_flag();
+
+        let outcome = acquire_with(&port, resource, "worker-0", &shutdown, {
+            let port = &port;
+            move |_: &AtomicBool, _: Duration| {
+                port.remove_label(resource, "claimed:worker-0").unwrap();
+                false
+            }
+        })
+        .unwrap();
+
+        assert!(matches!(outcome, ClaimAcquireOutcome::Lost));
+        assert!(port.current_labels(resource).is_empty());
     }
 
     #[test]
@@ -516,30 +659,113 @@ mod tests {
     }
 
     #[test]
-    fn acquire_order_independence_the_smallest_label_always_wins() {
-        // Two acquisitions race for the same resource on a shared port; the
-        // outcome must not depend on which one's settle-read observes
-        // contention first.
-        for (first, second) in [("worker-0", "worker-1"), ("worker-1", "worker-0")] {
-            let resource = ClaimResource::Issue(42);
-            let port = FakeClaimPort::new();
-            let shutdown = shutdown_flag();
+    fn unsuccessful_acquisition_reports_claim_cleanup_failure() {
+        let resource = ClaimResource::MergeRequest(10);
+        let port = FakeClaimPort::new();
+        port.fail_remove(false);
+        let shutdown = shutdown_flag();
 
-            port.add_label(resource, &claim_label(first)).unwrap();
-            port.add_label(resource, &claim_label(second)).unwrap();
+        let result = acquire_with(&port, resource, "worker-1", &shutdown, {
+            let port = &port;
+            let mut calls = 0u32;
+            move |_: &AtomicBool, _: Duration| {
+                calls += 1;
+                if calls == 1 {
+                    port.inject_label(resource, "claimed:worker-0");
+                }
+                false
+            }
+        });
 
-            let outcome_first =
-                acquire_with(&port, resource, first, &shutdown, never_interrupts).unwrap();
-            let outcome_second =
-                acquire_with(&port, resource, second, &shutdown, never_interrupts).unwrap();
+        assert!(result.is_err());
+        assert!(
+            port.current_labels(resource)
+                .contains(&"claimed:worker-1".to_string())
+        );
+    }
 
-            let winner_is_first = matches!(outcome_first, ClaimAcquireOutcome::Won(_));
-            let winner_is_second = matches!(outcome_second, ClaimAcquireOutcome::Won(_));
-            assert_ne!(winner_is_first, winner_is_second);
+    #[test]
+    fn earlier_label_event_wins_even_when_its_label_sorts_later() {
+        let resource = ClaimResource::MergeRequest(9);
+        let port = FakeClaimPort::new();
+        port.set_claim_order(&["claimed:worker-1", "claimed:worker-0"]);
+        let shutdown = shutdown_flag();
 
-            let expected_winner = [first, second].into_iter().min().unwrap();
-            assert_eq!(winner_is_first, first == expected_winner);
-        }
+        let outcome = acquire_with(&port, resource, "worker-1", &shutdown, {
+            let port = &port;
+            let mut calls = 0u32;
+            move |_: &AtomicBool, _: Duration| {
+                calls += 1;
+                if calls == 1 {
+                    port.inject_label(resource, "claimed:worker-0");
+                }
+                false
+            }
+        })
+        .unwrap();
+
+        let mut lease = match outcome {
+            ClaimAcquireOutcome::Won(lease) => lease,
+            _ => panic!("earliest active claim should win"),
+        };
+        assert_eq!(port.current_labels(resource).len(), 2);
+        lease.try_release(&port).unwrap();
+    }
+
+    #[test]
+    fn tiebreak_winner_keeps_its_label_through_all_settle_rounds() {
+        let resource = ClaimResource::MergeRequest(8);
+        let port = FakeClaimPort::new();
+        let shutdown = shutdown_flag();
+        let waits = Cell::new(0u32);
+
+        let outcome = acquire_with(&port, resource, "worker-0", &shutdown, {
+            let port = &port;
+            let waits = &waits;
+            move |_: &AtomicBool, _: Duration| {
+                let call = waits.get() + 1;
+                waits.set(call);
+                if call == 1 {
+                    port.inject_label(resource, "claimed:worker-1");
+                } else {
+                    port.remove_label(resource, "claimed:worker-1").unwrap();
+                }
+                false
+            }
+        })
+        .unwrap();
+
+        let mut lease = match outcome {
+            ClaimAcquireOutcome::Won(lease) => lease,
+            _ => panic!("expected tiebreak winner to retain the claim"),
+        };
+        assert_eq!(waits.get(), CLAIM_SETTLE_ROUNDS);
+        assert_eq!(port.current_labels(resource), vec!["claimed:worker-0"]);
+        lease.try_release(&port).unwrap();
+    }
+
+    #[test]
+    fn acquire_does_not_join_contention_when_a_claim_is_already_visible() {
+        let resource = ClaimResource::Issue(42);
+        let port = FakeClaimPort::with_labels(resource, &["claimed:worker-0"]);
+        let shutdown = shutdown_flag();
+        let waits = Cell::new(0u32);
+
+        let outcome = acquire_with(
+            &port,
+            resource,
+            "worker-1",
+            &shutdown,
+            |_: &AtomicBool, _: Duration| {
+                waits.set(waits.get() + 1);
+                false
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, ClaimAcquireOutcome::Lost));
+        assert_eq!(waits.get(), 0);
+        assert_eq!(port.current_labels(resource), vec!["claimed:worker-0"]);
     }
 
     // --- Cancellation / interruption ---
@@ -606,13 +832,39 @@ mod tests {
         let port = FakeClaimPort::new();
         let shutdown = shutdown_flag();
 
-        let lease =
+        let mut lease =
             match acquire_with(&port, resource, "worker-0", &shutdown, never_interrupts).unwrap() {
                 ClaimAcquireOutcome::Won(lease) => lease,
                 _ => panic!("expected Won"),
             };
 
-        lease.release(&port).unwrap();
+        lease.try_release(&port).unwrap();
+        assert!(port.current_labels(resource).is_empty());
+    }
+
+    #[test]
+    fn failed_try_release_keeps_the_lease_retryable_while_the_label_remains() {
+        let resource = ClaimResource::Issue(15);
+        let port = FakeClaimPort::with_labels(resource, &["claimed:worker-0"]);
+        port.fail_remove(false);
+        let mut lease =
+            ClaimLease::recover(resource, "worker-0", &port.current_labels(resource)).unwrap();
+
+        assert!(lease.try_release(&port).is_err());
+        assert!(!lease.settled);
+        assert_eq!(port.current_labels(resource), vec!["claimed:worker-0"]);
+    }
+
+    #[test]
+    fn ambiguous_remove_is_success_when_verification_finds_the_label_absent() {
+        let resource = ClaimResource::Issue(16);
+        let port = FakeClaimPort::with_labels(resource, &["claimed:worker-0"]);
+        port.fail_remove(true);
+        let mut lease =
+            ClaimLease::recover(resource, "worker-0", &port.current_labels(resource)).unwrap();
+
+        lease.try_release(&port).unwrap();
+        assert!(lease.settled);
         assert!(port.current_labels(resource).is_empty());
     }
 
@@ -678,10 +930,10 @@ mod tests {
             };
         lease.preserve();
 
-        let lease2 = ClaimLease::recover(resource, "worker-0", &port.current_labels(resource))
+        let mut lease2 = ClaimLease::recover(resource, "worker-0", &port.current_labels(resource))
             .expect("claim label is present");
         assert!(!lease2.settled);
-        lease2.release(&port).unwrap();
+        lease2.try_release(&port).unwrap();
     }
 
     // --- Recovered lease validation ---
@@ -698,6 +950,17 @@ mod tests {
 
         assert!(ClaimLease::recover(resource, "worker-1", &live_labels).is_none());
         assert!(ClaimLease::recover(resource, "worker-0", &[]).is_none());
+        assert!(
+            ClaimLease::recover(
+                resource,
+                "worker-0",
+                &[
+                    "claimed:worker-0".to_string(),
+                    "claimed:worker-1".to_string()
+                ]
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -705,9 +968,9 @@ mod tests {
         let resource = ClaimResource::MergeRequest(21);
         let port = FakeClaimPort::with_labels(resource, &["claimed:worker-0"]);
 
-        let lease = ClaimLease::recover(resource, "worker-0", &port.current_labels(resource))
+        let mut lease = ClaimLease::recover(resource, "worker-0", &port.current_labels(resource))
             .expect("our claim label is present");
-        lease.release(&port).unwrap();
+        lease.try_release(&port).unwrap();
 
         assert!(port.current_labels(resource).is_empty());
     }
@@ -742,44 +1005,20 @@ mod tests {
         assert!(is_claimed(&["claimed:worker-0".to_string()]));
     }
 
-    // --- Tiebreak ordering: lexicographically smallest claim label wins.
-    // This is the exact resolution rule `acquire` uses after the
-    // double-settle re-check finds more than one claim label. It is
-    // characterized directly, without a claim port, so the deadlock
-    // between two concurrently-claiming instances always resolves the same
-    // way regardless of which instance observes contention first.
-
     #[test]
-    fn claim_tiebreak_wins_when_own_label_is_lexicographically_smallest() {
-        let a = "claimed:worker-0".to_string();
-        let b = "claimed:worker-1".to_string();
-        assert!(claim_tiebreak_wins(&a, &[&a, &b]));
-        assert!(claim_tiebreak_wins(&a, &[&b, &a]));
-    }
-
-    #[test]
-    fn claim_tiebreak_loses_when_another_label_is_smaller() {
-        let a = "claimed:worker-0".to_string();
-        let b = "claimed:worker-1".to_string();
-        assert!(!claim_tiebreak_wins(&b, &[&a, &b]));
-    }
-
-    #[test]
-    fn claim_tiebreak_wins_alone_with_no_contenders() {
-        let a = "claimed:worker-0".to_string();
-        assert!(claim_tiebreak_wins(&a, &[&a]));
-    }
-
-    #[test]
-    fn claim_tiebreak_resolves_three_way_contention_deterministically() {
-        let a = "claimed:worker-0".to_string();
-        let b = "claimed:worker-1".to_string();
-        let c = "claimed:worker-2".to_string();
-        // Order of the slice must not affect the outcome.
-        assert!(claim_tiebreak_wins(&a, &[&c, &a, &b]));
-        assert!(claim_tiebreak_wins(&a, &[&b, &c, &a]));
-        assert!(!claim_tiebreak_wins(&b, &[&a, &b, &c]));
-        assert!(!claim_tiebreak_wins(&c, &[&a, &b, &c]));
+    fn fallback_claim_order_is_deterministic() {
+        assert_eq!(
+            fallback_claim_order(&[
+                "claimed:worker-2".to_string(),
+                "claimed:worker-0".to_string(),
+                "claimed:worker-1".to_string(),
+            ]),
+            vec![
+                "claimed:worker-0".to_string(),
+                "claimed:worker-1".to_string(),
+                "claimed:worker-2".to_string(),
+            ]
+        );
     }
 
     // --- Free-function release (no held lease value) ---

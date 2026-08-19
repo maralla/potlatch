@@ -473,27 +473,45 @@ impl AgentState<'_> {
         Ok(())
     }
 
-    fn release_worker_hold_pending_gitlab_only(&self, issue_iid: u64) {
+    fn release_worker_hold_pending_gitlab_only(&self, issue_iid: u64) -> bool {
         info!(
             "{}: Issue #{} has `{}` — releasing claim and session (no close)",
             &self.agent_id, issue_iid, WORKER_PENDING_LABEL
         );
 
-        let _ = claim::release(self.glab, ClaimResource::Issue(issue_iid), self.agent_id);
+        if let Err(error) =
+            claim::release(self.glab, ClaimResource::Issue(issue_iid), self.agent_id)
+        {
+            warn!(
+                "{}: Failed to release claim on issue #{}: {}",
+                self.agent_id, issue_iid, error
+            );
+            return false;
+        }
         let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
         self.cleanup_session(issue_iid);
+        true
     }
 
-    fn release_worker_hold_review_only(&self, issue_iid: u64) {
+    fn release_worker_hold_review_only(&self, issue_iid: u64) -> bool {
         info!(
             "{}: Issue #{} has `{}` — releasing claim and session (review only)",
             &self.agent_id, issue_iid, WORKER_REVIEW_ONLY_LABEL
         );
 
-        self.clear_resumed_issue_state(issue_iid);
+        self.clear_resumed_issue_state(issue_iid)
     }
 
-    fn clear_resumed_issue_state(&self, issue_iid: u64) {
+    fn clear_resumed_issue_state(&self, issue_iid: u64) -> bool {
+        if let Err(error) =
+            claim::release(self.glab, ClaimResource::Issue(issue_iid), self.agent_id)
+        {
+            warn!(
+                "{}: Failed to release claim on issue #{}: {}",
+                self.agent_id, issue_iid, error
+            );
+            return false;
+        }
         let default_branch = self
             .git_repo
             .get_default_branch()
@@ -505,17 +523,27 @@ impl AgentState<'_> {
         let _ = self.git_repo.checkout_remote_branch(&default_branch);
         let _ = self.git_repo.delete_local_branch(&branch);
 
-        let _ = claim::release(self.glab, ClaimResource::Issue(issue_iid), self.agent_id);
         let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
         self.cleanup_session(issue_iid);
+        true
     }
 
-    fn abandon_closed_issue(&self, issue_iid: u64, mr_iid: Option<u64>) {
+    fn abandon_closed_issue(&self, issue_iid: u64, mr_iid: Option<u64>) -> bool {
         info!(
             "{}: Issue #{} was closed externally, abandoning work",
             &self.agent_id, issue_iid
         );
+
+        if let Err(error) =
+            claim::release(self.glab, ClaimResource::Issue(issue_iid), self.agent_id)
+        {
+            warn!(
+                "{}: Failed to release claim on closed issue #{}: {}",
+                self.agent_id, issue_iid, error
+            );
+            return false;
+        }
 
         if let Some(mr) = mr_iid {
             let _ = self
@@ -534,10 +562,10 @@ impl AgentState<'_> {
         let _ = self.git_repo.checkout_remote_branch(&default_branch);
         let _ = self.git_repo.delete_local_branch(&branch);
         self.git_repo.delete_remote_branch_best_effort(&branch);
-        let _ = claim::release(self.glab, ClaimResource::Issue(issue_iid), self.agent_id);
         let _ = self.glab.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
         self.cleanup_session(issue_iid);
+        true
     }
 
     fn cleanup_on_shutdown(&self, active: &Option<ActiveIssue>) {
@@ -661,13 +689,10 @@ fn clear_resumed_issue_if_ignored(
         Ok(issue) => issue,
         Err(e) => {
             warn!(
-                "{}: Failed to verify resumed issue #{}: {}, dropping resume state",
+                "{}: Failed to verify resumed issue #{}: {}, retaining resume state for retry",
                 &state.agent_id, active_issue.issue_iid, e
             );
-
-            state.clear_resumed_issue_state(active_issue.issue_iid);
-
-            return None;
+            return Some(active_issue);
         }
     };
 
@@ -792,7 +817,7 @@ trait WorkerRoutingPort {
     fn checkout_branch(&mut self, branch: &str);
     fn delete_local_branch(&mut self, branch: &str);
     fn delete_remote_branch(&mut self, branch: &str);
-    fn release_issue_claim(&mut self, issue_iid: u64);
+    fn release_issue_claim(&mut self, issue_iid: u64) -> bool;
     fn remove_working_on_label(&mut self, issue_iid: u64);
     fn remove_issue_label(&mut self, issue_iid: u64, label: &str);
     fn cleanup_session(&mut self, issue_iid: u64);
@@ -801,9 +826,9 @@ trait WorkerRoutingPort {
     fn acquire_issue_claim(&mut self, issue_iid: u64) -> Result<IssueClaimAttempt>;
     fn preserve_issue_claim(&mut self, issue_iid: u64);
     fn release_acquired_claim(&mut self, issue_iid: u64);
-    fn clear_issue_state(&mut self, issue_iid: u64);
-    fn release_review_only_hold(&mut self, issue_iid: u64);
-    fn abandon_closed_issue(&mut self, issue_iid: u64, mr_iid: Option<u64>);
+    fn clear_issue_state(&mut self, issue_iid: u64) -> bool;
+    fn release_review_only_hold(&mut self, issue_iid: u64) -> bool;
+    fn abandon_closed_issue(&mut self, issue_iid: u64, mr_iid: Option<u64>) -> bool;
     fn adopt_orphaned_session(&mut self) -> Option<ActiveIssue>;
     fn handle_need_ai_worker_mr(&mut self) -> Result<bool>;
     fn run_implementation(
@@ -912,17 +937,15 @@ fn apply_active_issue_hold(
         Err(e) => {
             if watching_mr {
                 warn!(
-                    "{}: Failed to verify active issue #{}: {}, releasing worker state",
+                    "{}: Failed to verify active issue #{}: {}, retaining worker state for retry",
                     agent_id, tracked.issue_iid, e
                 );
             } else {
                 warn!(
-                    "{}: Failed to verify active issue #{}: {}, releasing",
+                    "{}: Failed to verify active issue #{}: {}, retaining claim for retry",
                     agent_id, tracked.issue_iid, e
                 );
             }
-            *active = None;
-            port.clear_issue_state(tracked.issue_iid);
             return false;
         }
     };
@@ -930,11 +953,12 @@ fn apply_active_issue_hold(
     match decide_issue_hold(&issue, scope_label) {
         IssueHold::Keep => true,
         IssueHold::AbandonClosed => {
-            *active = None;
-            port.abandon_closed_issue(
+            if port.abandon_closed_issue(
                 tracked.issue_iid,
                 watching_mr.then_some(tracked.mr_iid).flatten(),
-            );
+            ) {
+                *active = None;
+            }
             false
         }
         IssueHold::ClearState(reason) => {
@@ -956,19 +980,24 @@ fn apply_active_issue_hold(
                     agent_id, tracked.issue_iid, WORKER_PENDING_LABEL
                 ),
             }
-            *active = None;
-            port.clear_issue_state(tracked.issue_iid);
+            if port.clear_issue_state(tracked.issue_iid) {
+                *active = None;
+            }
             false
         }
         IssueHold::ReleaseReviewOnly => {
-            *active = None;
-            port.release_review_only_hold(tracked.issue_iid);
+            if port.release_review_only_hold(tracked.issue_iid) {
+                *active = None;
+            }
             false
         }
     }
 }
 
-fn cleanup_finished_mr(port: &mut dyn WorkerRoutingPort, issue_iid: u64, merged: bool) {
+fn cleanup_finished_mr(port: &mut dyn WorkerRoutingPort, issue_iid: u64, merged: bool) -> bool {
+    if !port.release_issue_claim(issue_iid) {
+        return false;
+    }
     let branch = format!("issue-{issue_iid}");
     let default_branch = port.default_branch_or_main();
     port.reset_worktree();
@@ -977,12 +1006,12 @@ fn cleanup_finished_mr(port: &mut dyn WorkerRoutingPort, issue_iid: u64, merged:
     if merged {
         port.delete_remote_branch(&branch);
     }
-    port.release_issue_claim(issue_iid);
     port.remove_working_on_label(issue_iid);
     port.cleanup_session(issue_iid);
     if merged {
         port.close_issue(issue_iid);
     }
+    true
 }
 
 fn cleanup_implementation(
@@ -991,8 +1020,10 @@ fn cleanup_implementation(
     remove_working_label: bool,
     cleanup_session: bool,
     branch: Option<&str>,
-) {
-    port.release_issue_claim(issue_iid);
+) -> bool {
+    if !port.release_issue_claim(issue_iid) {
+        return false;
+    }
     if remove_working_label {
         port.remove_working_on_label(issue_iid);
     }
@@ -1005,6 +1036,7 @@ fn cleanup_implementation(
         port.checkout_branch(&default_branch);
         port.delete_local_branch(branch);
     }
+    true
 }
 
 /// Returns whether routing should continue by looking for new work.
@@ -1031,9 +1063,11 @@ fn handle_active_mr(
             "{}: MR !{} is {}, releasing issue #{}",
             agent_id, mr.iid, mr.state, tracked.issue_iid
         );
-        cleanup_finished_mr(port, tracked.issue_iid, mr.is_merged());
-        *active = None;
-        return Ok(true);
+        if cleanup_finished_mr(port, tracked.issue_iid, mr.is_merged()) {
+            *active = None;
+            return Ok(true);
+        }
+        return Ok(false);
     }
 
     match port.run_feedback(mr_iid, Some(tracked.issue_iid), false) {
@@ -1043,10 +1077,13 @@ fn handle_active_mr(
                 "{}: Issue #{} abandoned, MR !{} closed",
                 agent_id, tracked.issue_iid, mr_iid
             );
-            port.release_issue_claim(tracked.issue_iid);
-            port.cleanup_session(tracked.issue_iid);
-            *active = None;
-            Ok(true)
+            if port.release_issue_claim(tracked.issue_iid) {
+                port.cleanup_session(tracked.issue_iid);
+                *active = None;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
         Err(e) => {
             let message = format!("{e:#}");
@@ -1099,22 +1136,26 @@ fn finish_implementation(
                 agent_id, current.issue_iid, message
             );
         }
-        *active = None;
-        cleanup_implementation(
+        if cleanup_implementation(
             port,
             current.issue_iid,
             true,
             reattempt,
             current.branch_name.as_deref(),
-        );
+        ) {
+            *active = None;
+        } else {
+            *active = Some(current);
+        }
         return;
     }
 
     if current.mr_created {
         *active = port.issue_trackable(current.issue_iid).then_some(current);
-    } else {
+    } else if cleanup_implementation(port, issue.iid, false, reattempt, None) {
         *active = None;
-        cleanup_implementation(port, issue.iid, false, reattempt, None);
+    } else {
+        *active = Some(current);
     }
 }
 
@@ -1137,12 +1178,10 @@ fn handle_active_reattempt(
         Ok(issue) => issue,
         Err(e) => {
             warn!(
-                "{}: Failed to fetch issue #{} for re-attempt: {}, releasing",
+                "{}: Failed to fetch issue #{} for re-attempt: {}, retaining claim for retry",
                 agent_id, issue_iid, e
             );
-            *active = None;
-            cleanup_implementation(port, issue_iid, true, true, None);
-            return true;
+            return false;
         }
     };
     finish_implementation(port, agent_id, active, &issue, true);
@@ -1348,12 +1387,19 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
     fn delete_remote_branch(&mut self, branch: &str) {
         self.state.git_repo.delete_remote_branch_best_effort(branch);
     }
-    fn release_issue_claim(&mut self, issue_iid: u64) {
-        let _ = claim::release(
+    fn release_issue_claim(&mut self, issue_iid: u64) -> bool {
+        claim::release(
             self.state.glab,
             ClaimResource::Issue(issue_iid),
             self.state.agent_id,
-        );
+        )
+        .map_err(|error| {
+            warn!(
+                "{}: Failed to release claim on issue #{}: {}",
+                self.state.agent_id, issue_iid, error
+            );
+        })
+        .is_ok()
     }
     fn remove_working_on_label(&mut self, issue_iid: u64) {
         let _ = self
@@ -1398,18 +1444,23 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
         }
     }
     fn release_acquired_claim(&mut self, _issue_iid: u64) {
-        if let Some(lease) = self.candidate_lease.take() {
-            let _ = lease.release(self.state.glab);
+        let Some(lease) = self.candidate_lease.as_mut() else {
+            return;
+        };
+        if lease.try_release(self.state.glab).is_ok() {
+            self.candidate_lease = None;
+        } else if let Some(lease) = self.candidate_lease.take() {
+            lease.preserve();
         }
     }
-    fn clear_issue_state(&mut self, issue_iid: u64) {
-        self.state.clear_resumed_issue_state(issue_iid);
+    fn clear_issue_state(&mut self, issue_iid: u64) -> bool {
+        self.state.clear_resumed_issue_state(issue_iid)
     }
-    fn release_review_only_hold(&mut self, issue_iid: u64) {
-        self.state.release_worker_hold_review_only(issue_iid);
+    fn release_review_only_hold(&mut self, issue_iid: u64) -> bool {
+        self.state.release_worker_hold_review_only(issue_iid)
     }
-    fn abandon_closed_issue(&mut self, issue_iid: u64, mr_iid: Option<u64>) {
-        self.state.abandon_closed_issue(issue_iid, mr_iid);
+    fn abandon_closed_issue(&mut self, issue_iid: u64, mr_iid: Option<u64>) -> bool {
+        self.state.abandon_closed_issue(issue_iid, mr_iid)
     }
     fn adopt_orphaned_session(&mut self) -> Option<ActiveIssue> {
         try_adopt_orphaned_session(self.state, self.shutdown, self.scope_label)
@@ -1511,25 +1562,33 @@ fn try_handle_need_ai_worker_mr(
         if !super::mr_in_scope(&mr, scope_label) {
             continue;
         }
-        if claim::is_mr_claimed(&mr.labels) {
+        let recovered_lease = mr.labels.as_deref().and_then(|labels| {
+            ClaimLease::recover(ClaimResource::MergeRequest(mr.iid), state.agent_id, labels)
+        });
+        if claim::is_mr_claimed(&mr.labels) && recovered_lease.is_none() {
             continue;
         }
         let unresolved = state.glab.get_unresolved_discussion_ids(mr.iid)?;
         if unresolved.is_empty() {
             continue;
         }
-        let lease = match claim::acquire(
-            state.glab,
-            ClaimResource::MergeRequest(mr.iid),
-            state.agent_id,
-            shutdown,
-        )? {
-            ClaimAcquireOutcome::Won(lease) => lease,
-            ClaimAcquireOutcome::Lost => continue,
-            ClaimAcquireOutcome::Interrupted => return Ok(false),
+        let mut lease = match recovered_lease {
+            Some(lease) => lease,
+            None => match claim::acquire(
+                state.glab,
+                ClaimResource::MergeRequest(mr.iid),
+                state.agent_id,
+                shutdown,
+            )? {
+                ClaimAcquireOutcome::Won(lease) => lease,
+                ClaimAcquireOutcome::Lost => continue,
+                ClaimAcquireOutcome::Interrupted => return Ok(false),
+            },
         };
         if shutdown.load(Ordering::SeqCst) {
-            let _ = lease.release(state.glab);
+            if lease.try_release(state.glab).is_err() {
+                lease.preserve();
+            }
             return Ok(false);
         }
         info!(
@@ -1540,8 +1599,12 @@ fn try_handle_need_ai_worker_mr(
             unresolved.len()
         );
         let result = handle_mr_comments(state, model, mr.iid, None, true);
-        let _ = lease.release(state.glab);
+        let release_result = lease.try_release(state.glab);
+        if release_result.is_err() {
+            lease.preserve();
+        }
         result?;
+        release_result?;
         return Ok(true);
     }
     Ok(false)
@@ -1786,7 +1849,7 @@ trait ImplementationPort {
     fn remove_working_on_label(&mut self);
     fn add_issue_label(&mut self, label: &str);
     fn add_issue_comment(&mut self, body: &str);
-    fn release_issue_claim(&mut self);
+    fn release_issue_claim(&mut self) -> Result<()>;
     fn cleanup_session(&mut self);
     fn close_issue(&mut self);
     fn save_session(&mut self, mr_iid: u64);
@@ -2001,7 +2064,7 @@ fn run_implementation_cycle(
                          Parking this issue until the dependency resolves.",
                         depends_on_issue
                     ));
-                    port.release_issue_claim();
+                    port.release_issue_claim()?;
                     port.cleanup_session();
                     let release_branch = port.default_branch_or_main();
                     port.reset_worktree();
@@ -2193,12 +2256,12 @@ impl ImplementationPort for LiveImplementationPort<'_> {
         let _ = self.state.glab.add_issue_comment(self.issue.iid, body);
     }
 
-    fn release_issue_claim(&mut self) {
-        let _ = claim::release(
+    fn release_issue_claim(&mut self) -> Result<()> {
+        claim::release(
             self.state.glab,
             ClaimResource::Issue(self.issue.iid),
             self.state.agent_id,
-        );
+        )
     }
 
     fn cleanup_session(&mut self) {
@@ -5947,8 +6010,9 @@ mod tests {
         fn delete_remote_branch(&mut self, branch: &str) {
             self.record(format!("delete_remote:{branch}"));
         }
-        fn release_issue_claim(&mut self, iid: u64) {
+        fn release_issue_claim(&mut self, iid: u64) -> bool {
             self.record(format!("release_claim:{iid}"));
+            !self.failures.contains(&format!("release_claim:{iid}"))
         }
         fn remove_working_on_label(&mut self, iid: u64) {
             self.record(format!("remove_working:{iid}"));
@@ -5979,14 +6043,17 @@ mod tests {
         fn release_acquired_claim(&mut self, iid: u64) {
             self.record(format!("release_acquired:{iid}"));
         }
-        fn clear_issue_state(&mut self, iid: u64) {
+        fn clear_issue_state(&mut self, iid: u64) -> bool {
             self.record(format!("clear_state:{iid}"));
+            true
         }
-        fn release_review_only_hold(&mut self, iid: u64) {
+        fn release_review_only_hold(&mut self, iid: u64) -> bool {
             self.record(format!("release_review_only:{iid}"));
+            true
         }
-        fn abandon_closed_issue(&mut self, iid: u64, mr: Option<u64>) {
+        fn abandon_closed_issue(&mut self, iid: u64, mr: Option<u64>) -> bool {
             self.record(format!("abandon_closed:{iid}:{mr:?}"));
+            true
         }
         fn adopt_orphaned_session(&mut self) -> Option<ActiveIssue> {
             self.record("adopt_orphan");
@@ -6306,12 +6373,12 @@ mod tests {
             strings(&[
                 "issue:7",
                 "mr_status:12",
+                "release_claim:7",
                 "default_branch",
                 "reset_worktree",
                 "checkout:main",
                 "delete_local:issue-7",
                 "delete_remote:issue-7",
-                "release_claim:7",
                 "remove_working:7",
                 "cleanup_session:7",
                 "close_issue:7",
@@ -6319,6 +6386,17 @@ mod tests {
             ])
         );
         assert!(run.active.is_none());
+
+        let mut release_failure = FakeWorkerPort::new()
+            .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
+            .with_mr_state(12, "merged")
+            .failing("release_claim:7");
+        let run = run_worker_routing(&mut release_failure, Some(active_with_mr(7, 12)));
+        assert_eq!(
+            run.trace,
+            strings(&["issue:7", "mr_status:12", "release_claim:7"])
+        );
+        assert_eq!(run.active, Some(active_with_mr(7, 12)));
 
         let mut closed = FakeWorkerPort::new()
             .knowing(&[issue_observation(7, &[WORKING_ON_LABEL])])
@@ -6424,7 +6502,8 @@ mod tests {
             .failing("issue:7")
             .with_shutdown_answers(&[true]);
         let run = run_worker_routing(&mut unreadable, Some(active_with_mr(7, 12)));
-        assert_eq!(run.trace[1], "clear_state:7");
+        assert_eq!(run.trace, strings(&["issue:7", "shutdown"]));
+        assert_eq!(run.active, Some(active_with_mr(7, 12)));
     }
 
     #[test]
@@ -6473,18 +6552,8 @@ mod tests {
             .failing_issue_read(7, 1)
             .with_shutdown_answers(&[true]);
         let run = run_worker_routing(&mut second_read, Some(active_without_mr(7)));
-        assert_eq!(
-            run.trace,
-            strings(&[
-                "issue:7",
-                "issue:7",
-                "release_claim:7",
-                "remove_working:7",
-                "cleanup_session:7",
-                "shutdown"
-            ])
-        );
-        assert!(run.active.is_none());
+        assert_eq!(run.trace, strings(&["issue:7", "issue:7"]));
+        assert_eq!(run.active, Some(active_without_mr(7)));
     }
 
     // -----------------------------------------------------------------
@@ -6643,8 +6712,9 @@ mod tests {
             self.record(format!("add_issue_comment({body})"));
         }
 
-        fn release_issue_claim(&mut self) {
+        fn release_issue_claim(&mut self) -> Result<()> {
             self.record("release_issue_claim");
+            Ok(())
         }
 
         fn cleanup_session(&mut self) {

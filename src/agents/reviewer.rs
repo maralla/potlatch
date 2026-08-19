@@ -889,20 +889,21 @@ fn release_mr_claim_or_warn(gitlab: &GitLabClient, mr_iid: u64, agent_id: &str) 
     }
 }
 
-/// Release the currently-held `claimed_mr` lease (if any), warning on
-/// failure. Always consumes the field, mirroring the pre-lease behavior of
-/// unconditionally clearing `claimed_mr_iid` after a release attempt.
+/// Release the currently-held `claimed_mr` lease (if any). A failed removal
+/// keeps the lease in memory so the next cycle can retry it.
 fn release_claimed_mr(claimed_mr: &mut Option<ClaimLease>, gitlab: &GitLabClient, agent_id: &str) {
-    let Some(lease) = claimed_mr.take() else {
+    let Some(lease) = claimed_mr.as_mut() else {
         return;
     };
     let mr_iid = lease.resource().iid();
-    if let Err(e) = lease.release(gitlab) {
+    if let Err(e) = lease.try_release(gitlab) {
         warn!(
             "{}: Failed to release claim on MR !{}: {}",
             agent_id, mr_iid, e
         );
+        return;
     }
+    *claimed_mr = None;
 }
 
 /// What to do with an `Approve` decision, given whether the MR still has
