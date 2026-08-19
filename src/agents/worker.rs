@@ -2385,19 +2385,19 @@ fn hand_issue_back_to_humans(
 // MR comment handling
 // ---------------------------------------------------------------------------
 
-/// Collect new MR comments since `last_seen_id` as follow-up messages.
+/// Collect new replies to the discussions currently being handled.
 ///
-/// Returns formatted messages for each comment with an id greater than
-/// `last_seen_id`, and updates `last_seen_id` to the highest id seen. Pure /
-/// network-free so it can be unit-tested without a GitLab client.
+/// New top-level comments and replies to unrelated discussions advance the
+/// observation cursor but are not injected into the active model session.
 fn collect_new_follow_ups(
     comments: &[crate::agents::gitlab::Comment],
     last_seen_id: &mut u64,
     mr_iid: u64,
+    handled_discussion_ids: &HashSet<String>,
 ) -> Vec<String> {
     let mut new_msgs = Vec::new();
     for c in comments {
-        if c.id > *last_seen_id {
+        if c.id > *last_seen_id && handled_discussion_ids.contains(&c.discussion_id) {
             new_msgs.push(format!(
                 "**New comment from @{} on MR !{} (thread {}):**\n\n{}",
                 c.author, mr_iid, c.discussion_id, c.body
@@ -2647,6 +2647,7 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
     // as follow-up context (via session/inject on the potlatch harness backend).
     let seen_comment_id =
         std::sync::Mutex::new(all_comments.iter().map(|c| c.id).max().unwrap_or(0));
+    let handled_discussion_ids: HashSet<String> = unresolved_ids.iter().cloned().collect();
     let glab_for_poll = state.glab.clone();
     let mr_iid_for_poll = latest_mr.iid;
     let follow_up_poll: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(move || {
@@ -2654,7 +2655,12 @@ Proceed with addressing the feedback autonomously. Do not ask for any user input
             return Vec::new();
         };
         let mut last = seen_comment_id.lock().unwrap();
-        collect_new_follow_ups(&comments, &mut last, mr_iid_for_poll)
+        collect_new_follow_ups(
+            &comments,
+            &mut last,
+            mr_iid_for_poll,
+            &handled_discussion_ids,
+        )
     });
 
     let agent_output = if let Some(issue_iid) = issue_number {
@@ -5650,21 +5656,23 @@ mod tests {
     }
 
     #[test]
-    fn collect_new_follow_ups_returns_only_new_comments() {
+    fn collect_new_follow_ups_returns_replies_to_any_active_discussion() {
         let comments = vec![
             mr_comment(10, "alice", "d1", "old comment"),
-            mr_comment(15, "bob", "d2", "new comment"),
+            mr_comment(15, "bob", "d2", "reply to another active discussion"),
             mr_comment(20, "carol", "d1", "another new one"),
+            mr_comment(25, "dave", "d3", "new top-level comment"),
         ];
         let mut last_seen = 10u64;
-        let msgs = collect_new_follow_ups(&comments, &mut last_seen, 42);
+        let handled = HashSet::from(["d1".to_string(), "d2".to_string()]);
+        let msgs = collect_new_follow_ups(&comments, &mut last_seen, 42, &handled);
         assert_eq!(msgs.len(), 2);
         assert!(msgs[0].contains("@bob"));
         assert!(msgs[0].contains("MR !42"));
-        assert!(msgs[0].contains("new comment"));
         assert!(msgs[1].contains("@carol"));
         assert!(msgs[1].contains("another new one"));
-        assert_eq!(last_seen, 20);
+        assert!(!msgs.iter().any(|message| message.contains("@dave")));
+        assert_eq!(last_seen, 25);
     }
 
     #[test]
@@ -5674,7 +5682,8 @@ mod tests {
             mr_comment(5, "bob", "d2", "also old"),
         ];
         let mut last_seen = 5u64;
-        let msgs = collect_new_follow_ups(&comments, &mut last_seen, 1);
+        let handled = HashSet::from(["d1".to_string(), "d2".to_string()]);
+        let msgs = collect_new_follow_ups(&comments, &mut last_seen, 1, &handled);
         assert!(msgs.is_empty());
         assert_eq!(last_seen, 5);
     }
@@ -5682,7 +5691,7 @@ mod tests {
     #[test]
     fn collect_new_follow_ups_handles_empty_comments() {
         let mut last_seen = 3u64;
-        let msgs = collect_new_follow_ups(&[], &mut last_seen, 1);
+        let msgs = collect_new_follow_ups(&[], &mut last_seen, 1, &HashSet::new());
         assert!(msgs.is_empty());
         assert_eq!(last_seen, 3);
     }
