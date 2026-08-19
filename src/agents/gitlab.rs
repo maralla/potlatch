@@ -85,6 +85,48 @@ pub struct Comment {
     pub location_details: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ResourceLabelEvent {
+    pub id: u64,
+    pub action: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub label: Option<ResourceLabelEventLabel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ResourceLabelEventLabel {
+    pub name: String,
+}
+
+pub(crate) fn order_active_claim_labels(
+    events: &[ResourceLabelEvent],
+    active_claim_labels: &[String],
+) -> Result<Vec<String>> {
+    let mut ordered = Vec::with_capacity(active_claim_labels.len());
+    for label in active_claim_labels {
+        let event = events
+            .iter()
+            .filter(|event| {
+                event
+                    .label
+                    .as_ref()
+                    .is_some_and(|event_label| event_label.name == *label)
+            })
+            .max_by_key(|event| event.id)
+            .with_context(|| format!("active claim label {label:?} has no label event"))?;
+        anyhow::ensure!(
+            event.action == "add",
+            "latest label event for active claim {label:?} is not an add"
+        );
+        let created_at = chrono::DateTime::parse_from_rfc3339(&event.created_at)
+            .with_context(|| format!("invalid timestamp for claim label {label:?}"))?;
+        ordered.push((created_at, event.id, label.clone()));
+    }
+    ordered.sort();
+    Ok(ordered.into_iter().map(|(_, _, label)| label).collect())
+}
+
 impl Comment {
     pub fn format_for_prompt(&self) -> String {
         if let Some(location) = &self.location {
@@ -497,6 +539,10 @@ impl GitLabClient {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn get_issue_label_events(&self, iid: u64) -> Result<Vec<ResourceLabelEvent>> {
+        self.get_resource_label_events(&format!("issues/{iid}/resource_label_events"))
     }
 
     pub fn add_issue_comment(&self, iid: u64, comment: &str) -> Result<()> {
@@ -1037,6 +1083,38 @@ impl GitLabClient {
         Ok(())
     }
 
+    pub(crate) fn get_mr_label_events(&self, iid: u64) -> Result<Vec<ResourceLabelEvent>> {
+        self.get_resource_label_events(&format!("merge_requests/{iid}/resource_label_events"))
+    }
+
+    fn get_resource_label_events(&self, resource_path: &str) -> Result<Vec<ResourceLabelEvent>> {
+        const PER_PAGE: usize = 100;
+        let mut page = 1usize;
+        let mut events = Vec::new();
+
+        loop {
+            let endpoint =
+                self.api_path(&format!("{resource_path}?per_page={PER_PAGE}&page={page}"));
+            let output = self.run_api(&endpoint, &[])?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "Failed to fetch resource label events: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let mut batch: Vec<ResourceLabelEvent> = serde_json::from_slice(&output.stdout)
+                .context("Failed to parse resource label events")?;
+            let batch_len = batch.len();
+            events.append(&mut batch);
+            if batch_len < PER_PAGE {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(events)
+    }
+
     pub fn merge_mr(&self, iid: u64) -> Result<()> {
         debug!("Merging merge request !{}", iid);
 
@@ -1278,8 +1356,9 @@ pub fn mr_description_closes_issue(description: &str, issue_iid: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, compact_cli_output,
-        mr_create_error_is_duplicate, mr_description_closes_issue, parse_gitlab_repo,
+        GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, ResourceLabelEvent,
+        compact_cli_output, mr_create_error_is_duplicate, mr_description_closes_issue,
+        order_active_claim_labels, parse_gitlab_repo,
     };
     use serde_json::json;
 
@@ -1321,6 +1400,40 @@ mod tests {
     #[test]
     fn parse_gitlab_repo_rejects_invalid_url() {
         assert!(parse_gitlab_repo("not-a-url").is_err());
+    }
+
+    #[test]
+    fn active_claims_are_ordered_by_their_latest_add_events() {
+        let events: Vec<ResourceLabelEvent> = serde_json::from_value(json!([
+            {
+                "id": 9,
+                "action": "add",
+                "created_at": "2026-08-19T08:03:08Z",
+                "label": {"name": "claimed:reviewer-0"}
+            },
+            {
+                "id": 4,
+                "action": "add",
+                "created_at": "2026-08-19T08:03:07Z",
+                "label": {"name": "claimed:reviewer-1"}
+            }
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            order_active_claim_labels(
+                &events,
+                &[
+                    "claimed:reviewer-0".to_string(),
+                    "claimed:reviewer-1".to_string()
+                ]
+            )
+            .unwrap(),
+            vec![
+                "claimed:reviewer-1".to_string(),
+                "claimed:reviewer-0".to_string()
+            ]
+        );
     }
 
     #[test]
