@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::{
-    claim, issue_in_scope, strip_internal_markers, strip_public_comment_blocks,
+    claim, issue_in_scope, split_parent_iid, strip_internal_markers, strip_public_comment_blocks,
     write_task_context_file,
 };
 use crate::agents::git::GitRepo;
@@ -4086,10 +4086,31 @@ fn format_issue_comments_for_worker_context(gitlab: &GitLabClient, issue_iid: u6
     }
 }
 
-fn worker_issue_context_markdown(issue: &IssueObservation, gitlab_comments_text: &str) -> String {
+fn split_parent_context(gitlab: &GitLabClient, issue: &IssueObservation) -> Result<Option<String>> {
+    let Some(parent_iid) = split_parent_iid(&issue.description) else {
+        return Ok(None);
+    };
+    let parent = gitlab
+        .get_issue(parent_iid)
+        .with_context(|| format!("failed to load parent issue #{parent_iid} for split child"))?;
+    let comments = format_issue_comments_for_worker_context(gitlab, parent_iid);
+    Ok(Some(format!(
+        "## Original parent issue context\n\nIssue: #{} {}\n\n### Description\n{}\n\n### GitLab issue comments\n\n{}",
+        parent.iid, parent.title, parent.description, comments
+    )))
+}
+
+fn worker_issue_context_markdown(
+    issue: &IssueObservation,
+    gitlab_comments_text: &str,
+    parent_context: Option<&str>,
+) -> String {
+    let parent_context = parent_context
+        .map(|context| format!("\n\n{context}"))
+        .unwrap_or_default();
     format!(
-        "# Issue Context\n\nIssue: #{} {}\n\n## Description\n{}\n\n## GitLab issue comments\n\n{}\n",
-        issue.iid, issue.title, issue.description, gitlab_comments_text
+        "# Issue Context\n\nIssue: #{} {}\n\n## Description\n{}\n\n## GitLab issue comments\n\n{}{}\n",
+        issue.iid, issue.title, issue.description, gitlab_comments_text, parent_context
     )
 }
 
@@ -4098,7 +4119,9 @@ fn build_implementation_prompt(
     issue: &IssueObservation,
     gitlab_comments_text: &str,
 ) -> Result<String> {
-    let context_content = worker_issue_context_markdown(issue, gitlab_comments_text);
+    let parent_context = split_parent_context(state.glab, issue)?;
+    let context_content =
+        worker_issue_context_markdown(issue, gitlab_comments_text, parent_context.as_deref());
     // Write to disk for archival, but inject content into the prompt.
     let _context_path = write_task_context_file(
         state.sessions_dir,
@@ -4175,7 +4198,9 @@ fn build_continuation_prompt(
     issue: &IssueObservation,
     gitlab_comments_text: &str,
 ) -> Result<String> {
-    let context_content = worker_issue_context_markdown(issue, gitlab_comments_text);
+    let parent_context = split_parent_context(state.glab, issue)?;
+    let context_content =
+        worker_issue_context_markdown(issue, gitlab_comments_text, parent_context.as_deref());
     // Write to disk for archival, but inject content into the prompt.
     let _context_path = write_task_context_file(
         state.sessions_dir,
@@ -5077,11 +5102,30 @@ mod tests {
             labels: vec![],
             state: "opened".to_string(),
         };
-        let md = worker_issue_context_markdown(&issue, "- alice: hi");
+        let md = worker_issue_context_markdown(&issue, "- alice: hi", None);
         assert!(md.contains("## GitLab issue comments"));
         assert!(md.contains("- alice: hi"));
         assert!(md.contains("#7"));
         assert!(md.contains("Do the thing"));
+    }
+
+    #[test]
+    fn worker_issue_context_includes_original_parent_context_for_split_children() {
+        let issue = IssueObservation {
+            iid: 8,
+            title: "Parser subtask".to_string(),
+            description: crate::agents::with_split_parent("Implement parsing.", 7),
+            labels: vec![],
+            state: "opened".to_string(),
+        };
+        let parent = "## Original parent issue context\n\nIssue: #7 Parent\n\n### Description\nOriginal scope";
+
+        let md = worker_issue_context_markdown(&issue, "_No comments._", Some(parent));
+
+        assert!(md.contains("Issue: #8 Parser subtask"));
+        assert!(md.contains("## Original parent issue context"));
+        assert!(md.contains("Issue: #7 Parent"));
+        assert!(md.contains("Original scope"));
     }
 
     #[test]
