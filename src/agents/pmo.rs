@@ -102,6 +102,7 @@ fn normalize_sub_issues(raw: Vec<RawSubIssue>) -> Vec<PmoSubIssue> {
 enum PmoOutput {
     GuideWorker { instructions: String },
     ProposePlan { plan_text: String },
+    KeepPlan,
     Split { sub_issues: Vec<RawSubIssue> },
     AlreadyDone { reason: String },
     NeedsClarification { question: String },
@@ -119,6 +120,10 @@ struct GuideWorkerWire {
 struct ProposePlanWire {
     plan_text: String,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeepPlanWire {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,6 +160,7 @@ const DEPENDENCY_IID_ALIASES: &[&str] = &[
 const PMO_DECISIONS: &[&str] = &[
     "guide_worker",
     "propose_plan",
+    "keep_plan",
     "split",
     "already_done",
     "needs_clarification",
@@ -178,6 +184,7 @@ impl<'de> Deserialize<'de> for PmoOutput {
                     plan_text: wire.plan_text,
                 })
             }
+            "keep_plan" => tagged::branch(fields).map(|_: KeepPlanWire| Self::KeepPlan),
             "split" => tagged::branch(fields).map(|wire: SplitWire| Self::Split {
                 sub_issues: wire.sub_issues,
             }),
@@ -224,6 +231,10 @@ structured_output! {
                             "A repository-informed implementation plan. For an issue without a bound merge request, provide the complete rewritten issue description. For an issue already bound to an MR, provide only the proposed changes and refinements relative to the existing issue description and prior comments; the system posts them as a new comment without replacing the description."
                         ),
                     })
+                ),
+                "keep_plan" => (
+                    "The issue is already pmo-pending and its current plan is clear and implementation-ready. Human feedback does not require any change to the issue description or a new comment.",
+                    object({})
                 ),
                 "split" => (
                     "The issue is too broad and must become several smaller issues.",
@@ -327,6 +338,8 @@ struct AgentState<'a> {
 #[derive(Serialize, Deserialize)]
 struct PersistedPmoState {
     claimed_issue_iid: u64,
+    #[serde(default)]
+    last_seen_comment_id: u64,
 }
 
 impl AgentState<'_> {
@@ -350,12 +363,29 @@ impl AgentState<'_> {
     }
 
     fn save_state(&self, issue_iid: u64) {
+        let last_seen_comment_id = self.last_seen_comment_id(issue_iid);
+        self.save_state_with_comment_cursor(issue_iid, last_seen_comment_id);
+    }
+
+    fn save_state_with_comment_cursor(&self, issue_iid: u64, last_seen_comment_id: u64) {
         let store = crate::agents::state::StateStore::new(self.state_path());
         if let Err(e) = store.save(&PersistedPmoState {
             claimed_issue_iid: issue_iid,
+            last_seen_comment_id,
         }) {
             warn!("Failed to save PMO state: {}", e);
         }
+    }
+
+    fn last_seen_comment_id(&self, issue_iid: u64) -> u64 {
+        let store = crate::agents::state::StateStore::new(self.state_path());
+        store
+            .load()
+            .ok()
+            .flatten()
+            .filter(|state: &PersistedPmoState| state.claimed_issue_iid == issue_iid)
+            .map(|state| state.last_seen_comment_id)
+            .unwrap_or(0)
     }
 
     fn clear_state(&self) {
@@ -630,7 +660,6 @@ fn apply_pmo_decision(
             .map_err(PmoDecisionError::Recoverable)?;
             port.add_issue_label(iid, labels::PMO_PENDING)
                 .map_err(PmoDecisionError::Recoverable)?;
-            port.save_claim_state(iid);
             Ok(DecisionDisposition::KeepClaim)
         }
         PmoOutput::ProposePlan { plan_text } => {
@@ -642,7 +671,6 @@ fn apply_pmo_decision(
             }
             port.add_issue_label(iid, labels::PMO_PENDING)
                 .map_err(PmoDecisionError::Recoverable)?;
-            port.save_claim_state(iid);
             if let Some(mr_iid) = bound_mr_iid {
                 port.add_issue_comment(
                     iid,
@@ -654,6 +682,18 @@ fn apply_pmo_decision(
             } else {
                 port.update_issue_description(iid, &plan)
                     .map_err(PmoDecisionError::KeepPending)?;
+            }
+            Ok(DecisionDisposition::KeepClaim)
+        }
+        PmoOutput::KeepPlan => {
+            if !issue
+                .labels
+                .iter()
+                .any(|label| label == labels::PMO_PENDING)
+            {
+                return Err(PmoDecisionError::Recoverable(anyhow::anyhow!(
+                    "PMO KEEP_PLAN output is only valid for an existing pmo-pending issue"
+                )));
             }
             Ok(DecisionDisposition::KeepClaim)
         }
@@ -916,6 +956,7 @@ fn run_pmo_cycle(
                 if !port.new_human_comments(iid) {
                     return Ok(());
                 }
+                port.save_claim_state(iid);
                 match process_pmo_issue(&issue, &issues, scope_label, port) {
                     Ok(DecisionDisposition::KeepClaim) => return Ok(()),
                     Ok(DecisionDisposition::ReleaseClaim) => {
@@ -1054,9 +1095,14 @@ impl PmoPort for LivePmoPort<'_> {
     }
 
     fn new_human_comments(&self, issue_iid: u64) -> bool {
-        self.gitlab.get_issue(issue_iid).ok().is_some_and(|issue| {
-            has_new_comments_since_last_pmo_comment(self.gitlab, &issue, self.state.agent_id)
-        })
+        let Ok(comments) = self.gitlab.get_issue_comments(issue_iid) else {
+            return false;
+        };
+        has_new_human_comments(
+            &comments,
+            self.state.last_seen_comment_id(issue_iid),
+            self.state.agent_id,
+        )
     }
 
     fn current_epoch(&self) -> u64 {
@@ -1090,7 +1136,14 @@ impl PmoPort for LivePmoPort<'_> {
     }
 
     fn save_claim_state(&mut self, issue_iid: u64) {
-        self.state.save_state(issue_iid);
+        let last_seen_comment_id = self
+            .gitlab
+            .get_issue_comments(issue_iid)
+            .ok()
+            .and_then(|comments| comments.iter().map(|comment| comment.id).max())
+            .unwrap_or_else(|| self.state.last_seen_comment_id(issue_iid));
+        self.state
+            .save_state_with_comment_cursor(issue_iid, last_seen_comment_id);
     }
 
     fn clear_claim_state(&mut self) {
@@ -1590,6 +1643,7 @@ PLAN PROPOSAL POLICY:
 - Propose a plan when the issue is a coherent task and the repository provides enough information to write an implementation-ready plan, but the current issue description lacks the concrete scope and steps needed for reliable execution.
 - When no MR is bound, a proposed plan is the complete rewritten issue description. Preserve the original requirements and add repository-informed code areas, ordered implementation steps, acceptance criteria, tests, assumptions, and open questions.
 - When an MR is already bound, preserve the issue description and propose only changes relative to the existing description and previous comments. The changes are posted in a new comment; do not produce a full rewritten description.
+- During pmo-pending refinement, if the current plan is already clear and implementation-ready and the latest human comment does not require a real plan change, explicitly keep the current plan unchanged. In that case Potlatch must not rewrite the description or add another comment.
 - Proposing or refining a plan keeps the issue pmo-pending so human comments can trigger another refinement cycle.
 - Do not use worker guidance as a substitute for a missing plan. Use clarification only when missing human information prevents you from writing a useful plan.
 
@@ -1665,39 +1719,21 @@ fn guidance_or_empty(instructions: &str) -> String {
     }
 }
 
-/// Check whether there are new human comments on the issue since the last
-/// PMO comment. Used by the reconcile phase to decide whether to re-triage
-/// a `pmo-pending` issue. Comments are in chronological order from the
-/// GitLab discussions API. Returns `true` if any comment after the last
-/// PMO-authored comment was written by a different author.
-fn has_new_comments_since_last_pmo_comment(
-    gitlab: &GitLabClient,
-    issue: &Issue,
+/// Whether a human added a comment after the PMO's persisted observation
+/// cursor. PMO-generated planning comments are ignored even when GitLab
+/// reports the shared service-account username instead of the agent id.
+fn has_new_human_comments(
+    comments: &[gitlab::Comment],
+    last_seen_comment_id: u64,
     pmo_agent_id: &str,
 ) -> bool {
-    let Ok(comments) = gitlab.get_issue_comments(issue.iid) else {
-        return false;
-    };
-
-    // Find the index of the last PMO-authored comment.
-    let last_pmo_idx = comments
-        .iter()
-        .rposition(|c| c.author == pmo_agent_id || c.body.contains("**PMO needs clarification"));
-
-    match last_pmo_idx {
-        Some(idx) => {
-            // Any non-system comment after the last PMO comment is a "new" human comment.
-            comments[idx + 1..]
-                .iter()
-                .any(|c| !c.author.is_empty() && c.author != pmo_agent_id)
-        }
-        None => {
-            // No PMO comment found — if there are any human comments, they're all "new".
-            comments
-                .iter()
-                .any(|c| !c.author.is_empty() && c.author != pmo_agent_id)
-        }
-    }
+    comments.iter().any(|comment| {
+        comment.id > last_seen_comment_id
+            && !comment.author.is_empty()
+            && comment.author != pmo_agent_id
+            && !comment.body.starts_with("**PMO needs clarification")
+            && !comment.body.starts_with("**PMO plan refinement")
+    })
 }
 
 /// Cap guidance length — keep it brief and actionable. Truncates at the last
@@ -2543,11 +2579,7 @@ mod tests {
         assert_eq!(disposition, DecisionDisposition::KeepClaim);
         assert_eq!(
             *clarification.trace.borrow(),
-            vec![
-                "act:comment:10",
-                "act:add:10:pmo-pending",
-                "act:save_claim:10",
-            ]
+            vec!["act:comment:10", "act:add:10:pmo-pending",]
         );
         assert!(clarification.descriptions.is_empty());
         assert!(clarification.comments[0].1.contains("Which API?"));
@@ -2566,11 +2598,7 @@ mod tests {
         assert_eq!(disposition, DecisionDisposition::KeepClaim);
         assert_eq!(
             *planning.trace.borrow(),
-            vec![
-                "act:add:10:pmo-pending",
-                "act:save_claim:10",
-                "act:description:10",
-            ]
+            vec!["act:add:10:pmo-pending", "act:description:10",]
         );
         assert_eq!(
             planning.descriptions,
@@ -2580,6 +2608,34 @@ mod tests {
             )]
         );
         assert!(planning.comments.is_empty());
+
+        let mut unchanged_issue = issue.clone();
+        unchanged_issue.labels.push(labels::PMO_PENDING.into());
+        let mut unchanged = FakePmoPort::successful();
+        let disposition = apply_pmo_decision(
+            &unchanged_issue,
+            PmoOutput::KeepPlan,
+            None,
+            Some("scope::test"),
+            &mut unchanged,
+        )
+        .unwrap();
+        assert_eq!(disposition, DecisionDisposition::KeepClaim);
+        assert!(unchanged.trace.borrow().is_empty());
+        assert!(unchanged.comments.is_empty());
+        assert!(unchanged.descriptions.is_empty());
+
+        let mut invalid_unchanged = FakePmoPort::successful();
+        assert!(matches!(
+            apply_pmo_decision(
+                &issue,
+                PmoOutput::KeepPlan,
+                None,
+                Some("scope::test"),
+                &mut invalid_unchanged,
+            ),
+            Err(PmoDecisionError::Recoverable(_))
+        ));
 
         let mut done = FakePmoPort::successful();
         apply_pmo_decision(
@@ -2737,9 +2793,76 @@ mod tests {
             .iter()
             .position(|event| event == "act:description:10")
             .unwrap();
-        assert!(pending < save && save < description);
+        assert!(save < pending && pending < description);
         assert!(!trace.contains(&"act:release".to_string()));
         assert!(!trace.contains(&"act:clear_claim".to_string()));
+    }
+
+    #[test]
+    fn pending_issue_is_not_reprocessed_without_a_new_human_comment() {
+        let mut port = FakePmoPort::successful();
+        port.issues[0].labels.push(labels::PMO_PENDING.into());
+        port.new_comments = false;
+        port.plan = PmoOutput::ProposePlan {
+            plan_text: "This must not be applied.".into(),
+        };
+
+        run_fake(&mut port, Some(10)).unwrap();
+
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"observe:comments:10".to_string()));
+        assert!(!trace.contains(&"act:model:10".to_string()));
+        assert!(!trace.contains(&"act:description:10".to_string()));
+        assert!(!trace.contains(&"act:release".to_string()));
+        assert!(!trace.contains(&"act:clear_claim".to_string()));
+    }
+
+    #[test]
+    fn clear_pending_plan_feedback_can_finish_without_gitlab_mutations() {
+        let mut port = FakePmoPort::successful();
+        port.issues[0].labels.push(labels::PMO_PENDING.into());
+        port.new_comments = true;
+        port.plan = PmoOutput::KeepPlan;
+
+        run_fake(&mut port, Some(10)).unwrap();
+
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"observe:comments:10".to_string()));
+        assert!(trace.contains(&"act:model:10".to_string()));
+        assert!(!trace.iter().any(|event| {
+            event.starts_with("act:description:")
+                || event.starts_with("act:comment:")
+                || event.starts_with("act:add:")
+                || event.starts_with("act:remove:")
+        }));
+        assert!(!trace.contains(&"act:release".to_string()));
+        assert!(!trace.contains(&"act:clear_claim".to_string()));
+    }
+
+    #[test]
+    fn comment_cursor_ignores_old_and_pmo_comments_but_detects_later_human_feedback() {
+        let comment = |id, author: &str, body: &str| gitlab::Comment {
+            id,
+            author: author.into(),
+            body: body.into(),
+            discussion_id: format!("discussion-{id}"),
+            discussion_resolvable: false,
+            location: None,
+            location_details: None,
+        };
+        let comments = vec![
+            comment(10, "alice", "Original discussion"),
+            comment(
+                11,
+                "service-account",
+                "**PMO plan refinement for merge request !5:**\n\nUpdated plan",
+            ),
+            comment(12, "bob", "Please change the validation step"),
+        ];
+
+        assert!(has_new_human_comments(&comments, 10, "pmo-0"));
+        assert!(!has_new_human_comments(&comments[..2], 10, "pmo-0"));
+        assert!(!has_new_human_comments(&comments, 12, "pmo-0"));
     }
 
     #[test]
@@ -3119,11 +3242,13 @@ mod tests {
         let sessions_dir = dir.to_string_lossy().into_owned();
         let state = pmo_test_agent_state(&sessions_dir, "pmo-0");
 
-        state.save_state(55);
+        state.save_state_with_comment_cursor(55, 99);
         let on_disk: serde_json::Value =
             serde_json::from_slice(&fs::read(state.state_path()).unwrap()).unwrap();
         assert_eq!(on_disk["version"], 1);
         assert_eq!(on_disk["state"]["claimed_issue_iid"], 55);
+        assert_eq!(on_disk["state"]["last_seen_comment_id"], 99);
+        assert_eq!(state.last_seen_comment_id(55), 99);
 
         state.clear_state();
         assert!(!state.state_path().exists());
@@ -3140,23 +3265,32 @@ mod tests {
         let path = state.state_path();
 
         // The bare pre-envelope payload written by older builds.
-        fs::write(
-            &path,
-            serde_json::to_vec(&PersistedPmoState {
-                claimed_issue_iid: 77,
-            })
-            .unwrap(),
-        )
-        .unwrap();
+        fs::write(&path, br#"{"claimed_issue_iid":77}"#).unwrap();
 
         let store: crate::agents::state::StateStore<PersistedPmoState> =
             crate::agents::state::StateStore::new(&path);
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded.claimed_issue_iid, 77);
+        assert_eq!(loaded.last_seen_comment_id, 0);
 
         let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(on_disk["version"], 1);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_comment_cursor_stays_with_the_original_pmo_claim_state() {
+        let dir = pmo_state_test_dir("pending-comment-cursor");
+        fs::create_dir_all(&dir).unwrap();
+        let sessions_dir = dir.to_string_lossy().into_owned();
+        let first = pmo_test_agent_state(&sessions_dir, "pmo-0");
+        let second = pmo_test_agent_state(&sessions_dir, "pmo-1");
+
+        first.save_state_with_comment_cursor(55, 99);
+
+        assert_eq!(first.last_seen_comment_id(55), 99);
+        assert_eq!(second.last_seen_comment_id(55), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3264,6 +3398,7 @@ mod tests {
         for marker in [
             "guide_worker",
             "propose_plan",
+            "keep_plan",
             "already_done",
             "needs_clarification",
             "wait_for_dependency",
@@ -3288,6 +3423,8 @@ mod tests {
         assert!(prompt.contains("repository already fully implements"));
         assert!(prompt.contains("complete rewritten issue description"));
         assert!(prompt.contains("keeps the issue pmo-pending"));
+        assert!(prompt.contains("explicitly keep the current plan unchanged"));
+        assert!(prompt.contains("must not rewrite the description or add another comment"));
     }
 
     #[test]
@@ -3701,6 +3838,20 @@ mod tests {
             }
             other => panic!("expected ProposePlan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pmo_output_deserializes_keep_plan_without_payload() {
+        assert_eq!(
+            conformance::assert_accepts::<PmoOutput>(serde_json::json!({
+                "decision": "keep_plan"
+            })),
+            PmoOutput::KeepPlan
+        );
+        conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+            "decision": "keep_plan",
+            "reason": "No change needed"
+        }));
     }
 
     #[test]
