@@ -683,10 +683,10 @@ mod tests {
             "params": {
                 "cwd": "/tmp",
                 "agent_tools": [{
-                    "name": "search",
+                    "name": "web_search",
                     "description": "Search.",
                     "parameters": {"type": "object"},
-                    "target": "search",
+                    "target": "web",
                     "operation": "run"
                 }]
             }
@@ -704,7 +704,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .tool_names();
-        assert!(tools.contains(&"search"));
+        assert!(tools.contains(&"web_search"));
     }
 
     #[test]

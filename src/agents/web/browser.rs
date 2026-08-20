@@ -1,4 +1,4 @@
-//! Private Chrome/Chromium controller owned by the search agent.
+//! Private Chrome/Chromium controller owned by the web agent.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -19,7 +19,7 @@ const BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
 // Defuddle 0.19.2 full browser bundle (MIT); see defuddle.LICENSE.txt.
 const DEFUDDLE_SCRIPT: &str = include_str!("defuddle.full.js");
 const RENDER_SETTLE_DELAY: Duration = Duration::from_millis(500);
-const SEARCH_PROFILE_ENV: &str = "BREEZE_SEARCH_PROFILE";
+const SEARCH_PROFILE_ENV: &str = "BREEZE_WEB_PROFILE";
 
 #[derive(Debug)]
 pub(super) struct GoogleVerificationRequired;
@@ -226,8 +226,8 @@ fn resolve_search_profile_dir(explicit: Option<PathBuf>, home: Option<PathBuf>) 
         );
         return Ok(explicit);
     }
-    let home = home.context("HOME is not set; set BREEZE_SEARCH_PROFILE explicitly")?;
-    Ok(home.join(".potlatch").join("search-chrome-profile"))
+    let home = home.context("HOME is not set; set BREEZE_WEB_PROFILE explicitly")?;
+    Ok(home.join(".potlatch").join("web-chrome-profile"))
 }
 
 fn detect_browser_executable() -> Result<PathBuf> {
@@ -381,7 +381,7 @@ mod tests {
         let home = PathBuf::from("/home/tester");
         assert_eq!(
             resolve_search_profile_dir(None, Some(home.clone())).unwrap(),
-            home.join(".potlatch/search-chrome-profile")
+            home.join(".potlatch/web-chrome-profile")
         );
         assert_eq!(
             resolve_search_profile_dir(

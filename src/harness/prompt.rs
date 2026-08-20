@@ -45,7 +45,7 @@ Your workspace is the current working directory. It is the root of the repositor
 
 {tools_section}
 
-- **Prefer rendered web access.** When both `web_fetch` and `fetch` are available, use `web_fetch` for web pages and URLs returned by `search`. Use `fetch` only when you specifically need a lightweight raw/static response or browser rendering is unnecessary.
+- **Prefer rendered web access.** When both `web_fetch` and `fetch` are available, use `web_fetch` for web pages and URLs returned by `web_search`. Use `fetch` only when you specifically need a lightweight raw/static response or browser rendering is unnecessary.
 
 ## Important Notes
 

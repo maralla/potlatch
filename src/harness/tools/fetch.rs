@@ -35,7 +35,7 @@ impl Tool for FetchTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Fetch a URL without browser rendering and convert static HTML to readable text. When `web_fetch` is available, prefer `web_fetch` for HTML pages, URLs returned by `search`, and JavaScript-generated content. Use `fetch` only for lightweight static or non-HTML responses, or when `web_fetch` is unavailable. Follows up to 5 redirects.",
+            "description": "Fetch a URL without browser rendering and convert static HTML to readable text. When `web_fetch` is available, prefer `web_fetch` for HTML pages, URLs returned by `web_search`, and JavaScript-generated content. Use `fetch` only for lightweight static or non-HTML responses, or when `web_fetch` is unavailable. Follows up to 5 redirects.",
             "parameters": {
                 "type": "object",
                 "properties": {

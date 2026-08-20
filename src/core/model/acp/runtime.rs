@@ -832,7 +832,7 @@ mod tests {
 
     fn test_tool() -> crate::core::bus::AgentToolDefinition {
         crate::core::bus::AgentToolDefinition {
-            name: "search".to_string(),
+            name: "web_search".to_string(),
             description: "Search.".to_string(),
             parameters: json!({"type": "object"}),
             operation: "run".to_string(),
@@ -882,7 +882,7 @@ mod tests {
     #[test]
     fn agent_tools_are_sent_only_to_the_potlatch_vendor() {
         let bus = crate::core::bus::AgentBus::new();
-        let _inbox = bus.register("search", vec![test_tool()]).unwrap();
+        let _inbox = bus.register("web", vec![test_tool()]).unwrap();
         let runtime_for = |model: &str| {
             AcpRuntime::new(
                 "/tmp/repo".into(),

@@ -68,5 +68,5 @@ poll_interval = "5m"
 instances = 1
 branches = ["main"]
 
-[agent.search]
+[agent.web]
 max_results = 8
