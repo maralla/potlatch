@@ -66,3 +66,6 @@ logs = [
 poll_interval_secs = 300
 instances = 1
 branches = ["main"]
+
+[agent.search]
+max_results = 8

@@ -1,6 +1,6 @@
 //! Tool trait and registry.
 
-pub mod browser;
+pub mod agent_bus;
 pub mod edit;
 pub mod fetch;
 pub mod lsp;
@@ -306,9 +306,6 @@ impl ToolRegistry {
         if allowed("fetch") {
             reg.register(Arc::new(fetch::FetchTool::new()));
         }
-        if allowed("browser") {
-            reg.register(Arc::new(browser::BrowserTool::new(states)));
-        }
         if allowed("lsp") {
             reg.register(Arc::new(lsp::LspTool::new(states, cwd)));
         }
@@ -318,6 +315,28 @@ impl ToolRegistry {
             )));
         }
         reg
+    }
+
+    pub fn register_agent_tools(
+        &mut self,
+        caller: Arc<dyn agent_bus::AgentToolCaller>,
+        definitions: Vec<crate::core::bus::RemoteAgentToolDefinition>,
+        allowed_tools: Option<&[String]>,
+    ) {
+        let allowed = |name: &str| {
+            allowed_tools
+                .map(|names| names.iter().any(|allowed| allowed == name))
+                .unwrap_or(true)
+        };
+        for definition in definitions {
+            if !allowed(&definition.name) || self.tools.contains_key(&definition.name) {
+                continue;
+            }
+            self.register(Arc::new(agent_bus::RemoteAgentTool::new(
+                Arc::clone(&caller),
+                definition,
+            )));
+        }
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
@@ -546,25 +565,5 @@ mod tests {
         let file = external.path().join("outside.txt");
         // Path outside cwd is returned as-is (absolute).
         assert_eq!(display_path(&file, dir.as_str()), file.to_string_lossy());
-    }
-
-    #[test]
-    fn browser_tool_is_registered_when_allowed() {
-        let mut states = SessionStates::new();
-        let allowed = vec!["browser".to_string()];
-        let registry =
-            ToolRegistry::with_builtin_tools(&mut states, "session", "/tmp", "", Some(&allowed));
-        assert_eq!(registry.tool_names(), vec!["browser"]);
-        states.shutdown();
-    }
-
-    #[test]
-    fn browser_tool_respects_the_session_allowlist() {
-        let mut states = SessionStates::new();
-        let allowed = vec!["fetch".to_string()];
-        let registry =
-            ToolRegistry::with_builtin_tools(&mut states, "session", "/tmp", "", Some(&allowed));
-        assert_eq!(registry.tool_names(), vec!["fetch"]);
-        states.shutdown();
     }
 }

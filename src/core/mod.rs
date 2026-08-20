@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod agent;
 pub mod banner;
+pub(crate) mod bus;
 pub mod config;
 pub mod model;
 pub mod periodic;

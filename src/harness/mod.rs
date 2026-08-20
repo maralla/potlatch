@@ -14,6 +14,7 @@ pub mod agent_loop;
 pub mod client;
 pub mod context;
 pub mod memory;
+mod parent;
 pub mod prompt;
 pub mod todo;
 pub mod tools;
@@ -177,7 +178,9 @@ pub fn run_acp_server() -> Result<()> {
     let api_key = std::env::var("BREEZE_API_KEY").unwrap_or_else(|_| "EMPTY".into());
 
     let llm_client = Arc::new(client::OpenAiClient::new(base_url, api_key));
-    let mut server = acp::AcpServer::new(llm_client);
+    let shared_stdout = parent::SharedOutput::stdout();
+    let parent_rpc = Arc::new(parent::ParentRpc::new(shared_stdout.clone()));
+    let mut server = acp::AcpServer::new(llm_client).with_agent_tool_caller(parent_rpc.clone());
 
     // Shared channels map: session_id → inject_tx + cancel flag.
     // The reader thread uses this to handle session/inject and session/cancel
@@ -185,35 +188,38 @@ pub fn run_acp_server() -> Result<()> {
     // session/prompt).
     let shared_channels = server.shared_channels();
 
-    // Shared stdout: both threads write responses/notifications to stdout.
-    let shared_stdout: Arc<Mutex<std::io::Stdout>> = Arc::new(Mutex::new(std::io::stdout()));
-
     // mpsc channel: reader thread → main thread for all non-inject/non-cancel
     // messages. Messages queue here when the main thread is blocked in
     // session/prompt.
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Value>();
 
     // Spawn the reader thread.
-    let shared_stdout_reader = Arc::clone(&shared_stdout);
+    let shared_stdout_reader = shared_stdout.clone();
+    let parent_rpc_reader = Arc::clone(&parent_rpc);
     let msg_tx_clone = msg_tx.clone();
     std::thread::Builder::new()
         .name("acp-reader".into())
         .spawn(move || {
-            run_reader_thread(shared_channels, shared_stdout_reader, msg_tx_clone);
+            run_reader_thread(
+                shared_channels,
+                shared_stdout_reader,
+                parent_rpc_reader,
+                msg_tx_clone,
+            );
         })
         .context("spawn ACP reader thread")?;
 
     // Main thread: process messages from the reader thread.
     drop(msg_tx); // Close our copy so msg_rx closes when the reader thread exits.
-    let shared_stdout_main = Arc::clone(&shared_stdout);
+    let shared_stdout_main = shared_stdout.clone();
     while let Ok(msg) = msg_rx.recv() {
         let method = msg["method"].as_str().unwrap_or("(unknown)");
         tracing::info!("ACP request: {method}");
 
         // When a session is created, switch to per-session log file
         if method == "session/new" {
-            let mut out = shared_stdout_main.lock().unwrap();
-            let response = server.handle_message(&msg, &mut *out)?;
+            let mut out = shared_stdout_main.clone();
+            let response = server.handle_message(&msg, &mut out)?;
             if let Some(ref resp) = response {
                 let line = resp.to_json_line().context("serialize response")?;
                 out.write_all(line.as_bytes())?;
@@ -228,8 +234,8 @@ pub fn run_acp_server() -> Result<()> {
             continue;
         }
 
-        let mut out = shared_stdout_main.lock().unwrap();
-        let response = server.handle_message(&msg, &mut *out)?;
+        let mut out = shared_stdout_main.clone();
+        let response = server.handle_message(&msg, &mut out)?;
         if let Some(resp) = response {
             let line = resp.to_json_line().context("serialize response")?;
             out.write_all(line.as_bytes())?;
@@ -246,7 +252,8 @@ pub fn run_acp_server() -> Result<()> {
 /// thread via the mpsc channel.
 fn run_reader_thread(
     shared_channels: acp::SharedSessionChannels,
-    shared_stdout: Arc<Mutex<std::io::Stdout>>,
+    mut shared_stdout: parent::SharedOutput,
+    parent_rpc: Arc<parent::ParentRpc>,
     msg_tx: std::sync::mpsc::Sender<Value>,
 ) {
     let stdin = std::io::stdin();
@@ -275,6 +282,9 @@ fn run_reader_thread(
 
         let method = msg["method"].as_str().unwrap_or("");
         let id = msg.get("id").cloned();
+        if parent_rpc.handle_response(&msg) {
+            continue;
+        }
 
         // Route session/inject directly via shared channels. This works
         // mid-run: the inject_tx pushes to the agent loop's inject channel,
@@ -303,9 +313,8 @@ fn run_reader_thread(
                     result,
                 };
                 if let Ok(line) = resp.to_json_line() {
-                    let mut out = shared_stdout.lock().unwrap();
-                    let _ = out.write_all(line.as_bytes());
-                    let _ = out.flush();
+                    let _ = shared_stdout.write_all(line.as_bytes());
+                    let _ = shared_stdout.flush();
                 }
             }
             continue;
@@ -338,9 +347,8 @@ fn run_reader_thread(
                     result,
                 };
                 if let Ok(line) = resp.to_json_line() {
-                    let mut out = shared_stdout.lock().unwrap();
-                    let _ = out.write_all(line.as_bytes());
-                    let _ = out.flush();
+                    let _ = shared_stdout.write_all(line.as_bytes());
+                    let _ = shared_stdout.flush();
                 }
             }
             continue;

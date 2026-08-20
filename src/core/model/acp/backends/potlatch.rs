@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -21,11 +22,40 @@ use super::{AcpVendorExtension, AcpVendorState, StructuredOutputBackend};
 /// Per-session vendor state for the potlatch backend. The harness sends no
 /// `cursor/*` requests and no mode updates that need tracking, so this is a
 /// no-op implementation.
-struct NoopVendorState;
+struct PotlatchVendorState {
+    agent_bus: Option<crate::core::bus::AgentBus>,
+}
 
-impl AcpVendorState for NoopVendorState {
-    fn handle_agent_request(&self, _method: &str, _params: &Value, _id: &Value) -> Option<Value> {
-        None
+impl AcpVendorState for PotlatchVendorState {
+    fn handle_agent_request(&self, method: &str, params: &Value, _id: &Value) -> Option<Value> {
+        if method != "potlatch/agent_tool_call" {
+            return None;
+        }
+        let result = (|| {
+            let bus = self
+                .agent_bus
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("cross-agent bus is unavailable"))?;
+            let target = params
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("agent tool target is required"))?;
+            let operation = params
+                .get("operation")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("agent tool operation is required"))?;
+            let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+            bus.request(
+                target,
+                operation.to_string(),
+                arguments,
+                Duration::from_secs(45),
+            )
+        })();
+        Some(match result {
+            Ok(value) => serde_json::json!({ "result": value }),
+            Err(error) => serde_json::json!({ "error": format!("{error:#}") }),
+        })
     }
 
     fn on_session_update(&self, _params: &Value) -> bool {
@@ -89,8 +119,9 @@ impl AcpVendorExtension for PotlatchExtension {
     fn create_state(
         &self,
         _provider: Option<Arc<dyn CapabilityProvider>>,
+        agent_bus: Option<crate::core::bus::AgentBus>,
     ) -> Arc<dyn AcpVendorState> {
-        Arc::new(NoopVendorState)
+        Arc::new(PotlatchVendorState { agent_bus })
     }
 
     fn authenticate(&self, _client: &AcpClient, _init: &InitializeResult) -> Result<()> {
@@ -153,6 +184,41 @@ mod tests {
         assert_eq!(
             PotlatchStructuredOutputBackend.extract_outputs("anything"),
             None
+        );
+    }
+
+    #[test]
+    fn potlatch_vendor_routes_agent_tool_calls_to_the_in_process_bus() {
+        let bus = crate::core::bus::AgentBus::new();
+        let inbox = bus.register("search", vec![]).unwrap();
+        let worker = std::thread::spawn(move || {
+            let request = inbox.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+            let payload = request.payload.clone();
+            request.respond(Ok(payload));
+        });
+        let state = PotlatchExtension.create_state(None, Some(bus));
+        let response = state
+            .handle_agent_request(
+                "potlatch/agent_tool_call",
+                &json!({
+                    "target": "search",
+                    "operation": "run",
+                    "arguments": {"query": "rust"}
+                }),
+                &json!(1),
+            )
+            .unwrap();
+        assert_eq!(response["result"]["query"], "rust");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn potlatch_vendor_does_not_claim_other_agent_requests() {
+        let state = PotlatchExtension.create_state(None, None);
+        assert!(
+            state
+                .handle_agent_request("cursor/ask_question", &json!({}), &json!(1))
+                .is_none()
         );
     }
 }

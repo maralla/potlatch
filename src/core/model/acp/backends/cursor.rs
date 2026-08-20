@@ -407,6 +407,7 @@ impl AcpVendorExtension for CursorExtension {
     fn create_state(
         &self,
         provider: Option<Arc<dyn CapabilityProvider>>,
+        _agent_bus: Option<crate::core::bus::AgentBus>,
     ) -> Arc<dyn AcpVendorState> {
         Arc::new(CursorPlanState::new(provider))
     }

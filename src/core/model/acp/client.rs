@@ -593,6 +593,7 @@ mod tests {
                 cwd: "/tmp".into(),
                 mcp_servers: vec![],
                 structured_output_tools: None,
+                agent_tools: None,
             })?
             .session_id;
         assert_eq!(sid, "test-session");
@@ -686,6 +687,7 @@ mod tests {
                 cwd: "/tmp".into(),
                 mcp_servers: vec![],
                 structured_output_tools: None,
+                agent_tools: None,
             })?
             .session_id;
         client.session_set_model(&sid, "composer-2")?;
@@ -779,6 +781,7 @@ mod tests {
                 cwd: "/tmp".into(),
                 mcp_servers: vec![],
                 structured_output_tools: None,
+                agent_tools: None,
             })?
             .session_id;
         client.session_set_mode(&sid, "code")?;
@@ -891,6 +894,7 @@ mod tests {
             cwd: "/tmp".into(),
             mcp_servers: vec![],
             structured_output_tools: None,
+            agent_tools: None,
         })?;
         assert!(
             session

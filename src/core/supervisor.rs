@@ -456,6 +456,7 @@ mod tests {
                 base_dir: std::env::temp_dir().to_string_lossy().into_owned(),
                 shutdown,
                 activity: Arc::new(NoopActivityReporter),
+                bus: None,
             }
         }
 

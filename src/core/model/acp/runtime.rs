@@ -93,6 +93,7 @@ pub(crate) struct AcpRuntime {
     structured_output_backend: Arc<dyn StructuredOutputBackend>,
     /// Capability provider (set by the agent at construction).
     capability_provider: Mutex<Option<Arc<dyn CapabilityProvider>>>,
+    agent_bus: Option<crate::core::bus::AgentBus>,
     /// Structured-output definitions for the task currently in flight. The
     /// selected backend either passes them to the harness via `session/new` or
     /// renders them into the marker prompt. Set per task by
@@ -113,6 +114,7 @@ impl AcpRuntime {
         acp_command: Vec<String>,
         acp_env: std::collections::HashMap<String, String>,
         preferred_session_mode: Option<&'static str>,
+        agent_bus: Option<crate::core::bus::AgentBus>,
         shutdown: Arc<AtomicBool>,
         agent_id: String,
     ) -> Self {
@@ -134,6 +136,7 @@ impl AcpRuntime {
             vendor_ext,
             structured_output_backend,
             capability_provider: Mutex::new(None),
+            agent_bus,
         }
     }
 
@@ -227,6 +230,28 @@ impl AcpRuntime {
         self.structured_output_backend.session_tools(&tools)
     }
 
+    fn session_agent_tools(&self) -> Option<Vec<Value>> {
+        let is_potlatch = self
+            .model_uri
+            .as_deref()
+            .and_then(|uri| crate::core::config::uri::ModelUri::parse(uri).ok())
+            .is_some_and(|uri| uri.vendor == "potlatch");
+        if !is_potlatch {
+            return None;
+        }
+        let tools = self
+            .agent_bus
+            .as_ref()?
+            .registered_tools(Duration::from_millis(250))
+            .ok()?;
+        (!tools.is_empty()).then(|| {
+            tools
+                .into_iter()
+                .filter_map(|tool| serde_json::to_value(tool).ok())
+                .collect()
+        })
+    }
+
     fn run_prompt_with_transport_retry(
         &self,
         prompt: &str,
@@ -283,7 +308,7 @@ impl AcpRuntime {
         hooks.clear();
         if let Some(ref ext) = self.vendor_ext {
             let provider = self.capability_provider.lock().unwrap().clone();
-            hooks.set_vendor_state(Some(ext.create_state(provider)));
+            hooks.set_vendor_state(Some(ext.create_state(provider, self.agent_bus.clone())));
         }
 
         let prompt_owned = prompt.to_string();
@@ -441,6 +466,10 @@ impl AcpRuntime {
         let (client, child) = AcpClient::from_child_stdio(child, hooks.clone())
             .context("attach ACP client to agent stdio")?;
         let client = Arc::new(client);
+        if let Some(ref ext) = self.vendor_ext {
+            let provider = self.capability_provider.lock().unwrap().clone();
+            hooks.set_vendor_state(Some(ext.create_state(provider, self.agent_bus.clone())));
+        }
 
         let init_result = client
             .initialize(&InitializeParams {
@@ -484,6 +513,7 @@ impl AcpRuntime {
                 cwd: cwd.to_string_lossy().into_owned(),
                 mcp_servers: vec![],
                 structured_output_tools: self.session_structured_output_tools(),
+                agent_tools: self.session_agent_tools(),
             })
             .context("ACP session/new")?;
 
@@ -790,6 +820,7 @@ mod tests {
             vec!["true".into()],
             std::collections::HashMap::new(),
             None,
+            None,
             Arc::new(AtomicBool::new(false)),
             "worker-0".into(),
         )
@@ -797,6 +828,15 @@ mod tests {
 
     fn test_runtime() -> AcpRuntime {
         test_runtime_with_model(None)
+    }
+
+    fn test_tool() -> crate::core::bus::AgentToolDefinition {
+        crate::core::bus::AgentToolDefinition {
+            name: "search".to_string(),
+            description: "Search.".to_string(),
+            parameters: json!({"type": "object"}),
+            operation: "run".to_string(),
+        }
     }
 
     #[test]
@@ -837,6 +877,39 @@ mod tests {
                 .prompt_with_structured_output("Do the task.")
                 .contains("BREEZE_STRUCTURED_OUTPUT_BEGIN")
         );
+    }
+
+    #[test]
+    fn agent_tools_are_sent_only_to_the_potlatch_vendor() {
+        let bus = crate::core::bus::AgentBus::new();
+        let _inbox = bus.register("search", vec![test_tool()]).unwrap();
+        let runtime_for = |model: &str| {
+            AcpRuntime::new(
+                "/tmp/repo".into(),
+                Some(model.to_string()),
+                None,
+                vec!["true".into()],
+                std::collections::HashMap::new(),
+                None,
+                Some(bus.clone()),
+                Arc::new(AtomicBool::new(false)),
+                "worker-0".into(),
+            )
+        };
+
+        assert_eq!(
+            runtime_for("acp://potlatch/model")
+                .session_agent_tools()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            runtime_for("acp://cursor/model")
+                .session_agent_tools()
+                .is_none()
+        );
+        assert!(runtime_for("model").session_agent_tools().is_none());
     }
 
     #[test]

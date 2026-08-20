@@ -35,6 +35,10 @@ pub trait CoreAgent: Sized {
     /// Role-specific settings parsed from this agent's config section.
     type Settings: DeserializeOwned;
 
+    /// Fixed process count for roles whose topology is intrinsic. When set,
+    /// the configured `instances` value is ignored.
+    const FIXED_INSTANCES: Option<usize> = None;
+
     /// Optional generic instance limit enforced by core during startup
     /// validation and every supervised construction attempt.
     const MAX_INSTANCES: Option<usize> = None;
@@ -128,12 +132,13 @@ pub trait CoreAgent: Sized {
             .config
             .agent(ctx.agent_name)
             .with_context(|| format!("[agent.{}] section required", ctx.agent_name))?;
+        let instances = Self::FIXED_INSTANCES.unwrap_or(section.core.instances);
         anyhow::ensure!(
-            ctx.instance_id < section.core.instances,
-            "[agent.{}] invalid instance id {} (configured instances: {})",
+            ctx.instance_id < instances,
+            "[agent.{}] invalid instance id {} (effective instances: {})",
             Self::name(),
             ctx.instance_id,
-            section.core.instances,
+            instances,
         );
         let settings = prepare_agent_settings::<Self>(&ctx.workflow.config, section)?;
         let agent_name = ctx.agent_name;

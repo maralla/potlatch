@@ -72,6 +72,14 @@ pub struct NewSessionParams {
         rename = "structured_output_tools"
     )]
     pub structured_output_tools: Option<Vec<Value>>,
+    /// Tools registered by in-process agents. Potlatch extension; ignored by
+    /// ACP servers that do not implement remote agent tools.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "agent_tools"
+    )]
+    pub agent_tools: Option<Vec<Value>>,
 }
 
 /// One allowed value in a `select` session config option ([`SessionConfigOptionBrief`]).

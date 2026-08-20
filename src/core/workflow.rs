@@ -9,6 +9,7 @@ use signal_hook::flag;
 use crate::core::activity::SharedActivityReporter;
 use crate::core::agent::CoreAgent;
 use crate::core::banner::Banner;
+use crate::core::bus::AgentBus;
 use crate::core::config::Config;
 use crate::core::registry::AgentRegistry;
 use crate::core::runtime::AgentRuntime;
@@ -18,6 +19,7 @@ pub struct WorkflowContext {
     pub base_dir: String,
     pub shutdown: Arc<AtomicBool>,
     pub activity: SharedActivityReporter,
+    pub(crate) bus: Option<AgentBus>,
 }
 
 /// Spawn inputs passed from workflow into a [`CoreAgent`] implementation.
@@ -62,6 +64,7 @@ impl WorkflowContext {
             base_dir: self.base_dir.clone(),
             shutdown: Arc::clone(&self.shutdown),
             activity: Arc::clone(&self.activity),
+            bus: self.bus.clone(),
         }
     }
 }
@@ -102,20 +105,26 @@ fn plan_agent_spawns(config: &Config, registry: &AgentRegistry) -> Result<Vec<Ag
         let section = config
             .agent(agent_name)
             .with_context(|| format!("missing agent section [agent.{agent_name}]"))?;
-        if section.core.instances == 0 {
+        let registration = registry.find(agent_name);
+        let instances = registration
+            .and_then(|registration| registration.fixed_instances)
+            .unwrap_or(section.core.instances);
+        if instances == 0 {
             continue;
         }
 
-        let registration = registry.find(agent_name).with_context(|| {
+        let registration = registration.with_context(|| {
             format!("no registration for configured agent [agent.{agent_name}]")
         })?;
         (registration.validate_config)(config, section)
             .with_context(|| format!("invalid config for [agent.{agent_name}]"))?;
-        config
-            .resolve_acp_spawn(section)
-            .with_context(|| format!("invalid core config for [agent.{agent_name}]"))?;
+        if section.core.model.is_some() || section.core.acp_client.is_some() {
+            config
+                .resolve_acp_spawn(section)
+                .with_context(|| format!("invalid core config for [agent.{agent_name}]"))?;
+        }
 
-        for instance_id in 0..section.core.instances {
+        for instance_id in 0..instances {
             plan.push(AgentSpawnPlan {
                 agent_name: agent_name.to_string(),
                 instance_id,
@@ -224,11 +233,13 @@ impl Workflow {
             .into_owned();
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let bus = AgentBus::new();
         let ctx = WorkflowContext {
             config: Arc::new(self.config),
             base_dir,
             shutdown: Arc::clone(&shutdown),
             activity: Arc::clone(&self.activity),
+            bus: Some(bus),
         };
 
         prepare_shutdown_handlers(&ctx)?;
@@ -275,6 +286,7 @@ mod tests {
     struct AlphaAgent;
     struct BetaAgent;
     struct InvalidAgent;
+    struct ModelFreeAgent;
 
     impl CoreAgent for AlphaAgent {
         type Settings = toml::Value;
@@ -356,6 +368,27 @@ mod tests {
         }
 
         fn on_shutdown(&mut self) {}
+    }
+
+    impl CoreAgent for ModelFreeAgent {
+        type Settings = toml::Value;
+        const FIXED_INSTANCES: Option<usize> = Some(1);
+
+        fn name() -> &'static str {
+            "model-free"
+        }
+
+        fn runtime(&self) -> &AgentRuntime {
+            unreachable!("test agent is never run")
+        }
+
+        fn run_periodic_task(&mut self, _task_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn build(_ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
+            Ok(Self)
+        }
     }
 
     #[test]
@@ -505,5 +538,27 @@ mod tests {
             format!("{error:#}").contains("unknown acp_client `missing`"),
             "core validation cause should be preserved"
         );
+    }
+
+    #[test]
+    fn fixed_agent_without_model_config_ignores_instance_config() {
+        let config = Config::from_toml_str(
+            r#"
+            [agent.model-free]
+            instances = 0
+            "#,
+        )
+        .unwrap();
+        let mut registry = AgentRegistry::new();
+        registry.register_agent::<ModelFreeAgent>();
+
+        let plan = plan_agent_spawns(&config, &registry).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].agent_name, "model-free");
+
+        let config = Config::from_toml_str("[agent.model-free]\ninstances = 99").unwrap();
+        let plan = plan_agent_spawns(&config, &registry).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].instance_id, 0);
     }
 }
