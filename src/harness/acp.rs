@@ -289,11 +289,6 @@ impl AcpServer {
             Arc::clone(&inject_queue),
         );
         agent.init_context(&cwd);
-        info!(
-            "harness ACP: session {} created, registered tools: {:?}",
-            session.id,
-            agent.tool_names()
-        );
         session.agent = Some(agent);
 
         // Register the inject channel and cancel flag in the shared channels
@@ -344,8 +339,15 @@ impl AcpServer {
         });
 
         self.sessions.insert(session_id, session);
-        info!("harness ACP: created session");
         Ok(result)
+    }
+
+    pub fn session_tool_names(&self, session_id: &str) -> Vec<String> {
+        self.sessions
+            .get(session_id)
+            .and_then(|session| session.agent.as_ref())
+            .map(|agent| agent.tool_names().into_iter().map(str::to_string).collect())
+            .unwrap_or_default()
     }
 
     fn handle_set_model(&mut self, params: &Value) -> Result<Value> {

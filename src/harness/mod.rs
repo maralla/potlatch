@@ -229,6 +229,11 @@ pub fn run_acp_server() -> Result<()> {
                     && let Some(sid) = result.get("sessionId").and_then(|v| v.as_str())
                 {
                     set_session_log(&log_writer, sid);
+                    tracing::info!(
+                        "harness ACP: session {} created, registered tools: {:?}",
+                        sid,
+                        server.session_tool_names(sid)
+                    );
                 }
             }
             continue;
