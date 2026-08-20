@@ -8,6 +8,7 @@ Potlatch runs several AI agent roles in parallel in a fully automated, non-inter
 - **Worker Agent**: Fetches issues, implements features, and creates merge requests autonomously
 - **Reviewer Agent**: Reviews merge requests and either merges them automatically or leaves an approval comment, depending on config
 - **PMO Agent**: Triages `action-required` issues (typically after a worker could not finish) and may split work or guide the worker
+- **OPS Agent**: Analyzes SSH log files and Grafana Elasticsearch log sources and files actionable issues
 
 All roles operate without requiring any user input, making autonomous decisions based on the code and project documentation.
 
@@ -146,6 +147,21 @@ The command will:
 **Key Features**: 
 - The reviewer never asks questions. It provides direct feedback and makes approval/rejection decisions autonomously.
 - Waits for worker to address comments before re-reviewing, creating an efficient feedback loop.
+
+### OPS Agent
+
+OPS accepts SSH and Grafana Elasticsearch entries in the same `logs` list. Grafana sources query the configured datasource through Grafana's `_msearch` proxy, apply the standard two-hour window, and can restrict both matching records and fields sent to the model:
+
+```toml
+[agent.ops]
+poll_interval_secs = 600
+logs = [
+  { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app/app.log" },
+  { type = "grafana", url = "https://grafana.example.com", datasource_uid = "elastic-uid", index = "application-logs", org_id = 1, username = "ops", password = "replace-me", filter = '{"term":{"service.name":"api"}}' },
+]
+```
+
+`filter` accepts either a raw Elasticsearch query object encoded as JSON, such as the `term` filter above, or a Lucene query string such as `level:ERROR`. Query DSL is required when a backend cannot resolve special characters in field names through Lucene syntax. OPS subdivides the same two-hour window used for SSH logs until every matching record is fetched, and stores each complete `_source` object as one JSON line. `org_id` defaults to `1`. Grafana credentials are HTTP Basic Auth credentials stored literally in the local `potlatch.toml`; keep that ignored file private and never commit it.
 
 ## Labels
 
