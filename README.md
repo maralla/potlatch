@@ -226,20 +226,6 @@ When scoping is enabled, merge requests created by the worker and sub-issues cre
 scope_label = "potlatch"
 ```
 
-## Browser tool
-
-The built-in Potlatch harness provides a session-scoped `browser` tool for pages that require JavaScript. Its controller is implemented in Rust and launches an existing Google Chrome or Chromium executable in headless mode; it does not download or bundle a browser and does not select Microsoft Edge.
-
-Browser discovery checks the `CHROME` environment variable first and then standard Chrome and Chromium executable names and installation paths. If neither browser is available, the tool returns an actionable error. Set an explicit executable when automatic detection is unsuitable:
-
-```bash
-export CHROME=/usr/bin/chromium
-```
-
-The tool supports `navigate`, `snapshot`, `click`, `type`, and `press_key`. `snapshot` returns the current URL, title, and JavaScript-mutated DOM serialized as HTML, truncated to protect model context. Navigation is restricted to HTTP and HTTPS, browser downloads are denied, and CSS selectors drive element interactions.
-
-One browser process and temporary profile are reused for the ACP session. Closing the session terminates that process and removes its cookies and local profile data.
-
 ## License
 
 MIT

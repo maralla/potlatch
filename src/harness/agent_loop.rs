@@ -61,7 +61,7 @@ impl AgentLoop {
         tools.register(Arc::new(super::tools::todo::TodoTool::new(Arc::clone(
             &todo,
         ))));
-        // Register the memory tool so the model can save fundamental project facts.
+        // Register the memory tool so the model can curate grounded durable facts.
         tools.register(Arc::new(super::tools::memory::MemoryTool));
         // Build tool schemas once — the tool set is fixed for the harness lifetime.
         let tool_schemas = tools.tools_schema();
@@ -99,7 +99,7 @@ impl AgentLoop {
         self.tools.tool_names()
     }
 
-    /// Initialize the context with the system prompt and project facts.
+    /// Initialize the context with the system prompt and durable project memory.
     /// Called once at session creation. Subsequent `session/prompt` calls
     /// reuse this context — true single long session.
     pub fn init_context(&mut self, cwd: &str) {
@@ -108,12 +108,15 @@ impl AgentLoop {
         self.context
             .push(Role::System, ContextKind::System, &system_prompt);
 
-        // Load persistent project facts (if any) and inject as a system message.
-        // These are fundamental facts about the project that were extracted during
-        // previous sessions' context compaction — build commands, architecture,
-        // key file locations, conventions. They survive across sessions.
+        // Load grounded durable memory (if any) and inject it as a system
+        // message. Evidence paths let the model revalidate a fact when relevant.
         if let Some(facts) = super::memory::load_facts(cwd) {
-            let facts_prompt = format!("## Project Facts\n\n{facts}");
+            let facts_prompt = format!(
+                "## Durable Project Memory\n\n\
+                 These are cross-task project facts grounded in repository files. \
+                 Treat them as durable context, but re-check their evidence when a \
+                 fact is relevant and may have become stale.\n\n{facts}"
+            );
             self.context
                 .push(Role::System, ContextKind::System, &facts_prompt);
         }
@@ -165,8 +168,6 @@ impl AgentLoop {
             // Build messages and enforce context budget. When compacting, use
             // the LLM to summarize all large entries in a single call so the
             // most important info (errors, key results, file paths) is preserved.
-            // The same call also produces a fresh, complete set of project facts
-            // that overwrites the persistent memory.
             let model = &self.model;
             let llm = &self.llm;
             let tool_schemas = &self.tool_schemas;
