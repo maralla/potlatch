@@ -80,6 +80,7 @@ impl AgentModel {
             Arc::clone(&shutdown),
             ModelSessionOptions {
                 preferred_session_mode: prefs.preferred_session_mode,
+                agent_bus: ctx.workflow.bus.clone(),
             },
         )?;
         Ok(Self {
@@ -201,6 +202,7 @@ impl AgentModel {
             Arc::clone(&shutdown),
             ModelSessionOptions {
                 preferred_session_mode: prefs.preferred_session_mode,
+                agent_bus: None,
             },
         )?;
         Ok(Self {

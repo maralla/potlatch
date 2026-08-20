@@ -74,6 +74,7 @@ struct Session {
     /// schema). The harness creates a generic `StructuredOutputTool` per
     /// definition at prompt time.
     structured_output_tools: Option<Vec<Value>>,
+    agent_tools: Vec<crate::core::bus::RemoteAgentToolDefinition>,
     /// Optional path to a transcript file. When set, the harness writes a
     /// human-readable transcript of each `session/prompt` turn (user prompt,
     /// assistant response, reasoning, tool calls) to this file in real time.
@@ -93,6 +94,7 @@ impl Session {
             states: super::tools::SessionStates::new(),
             allowed_tools: None,
             structured_output_tools: None,
+            agent_tools: Vec::new(),
             transcript_path: None,
         }
     }
@@ -106,6 +108,7 @@ pub struct AcpServer {
     /// handle `session/inject` and `session/cancel` while the main thread is
     /// blocked running `session/prompt`.
     shared_channels: SharedSessionChannels,
+    agent_tool_caller: Option<Arc<dyn super::tools::agent_bus::AgentToolCaller>>,
 }
 
 impl AcpServer {
@@ -114,7 +117,16 @@ impl AcpServer {
             llm,
             sessions: HashMap::new(),
             shared_channels: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            agent_tool_caller: None,
         }
+    }
+
+    pub fn with_agent_tool_caller(
+        mut self,
+        caller: Arc<dyn super::tools::agent_bus::AgentToolCaller>,
+    ) -> Self {
+        self.agent_tool_caller = Some(caller);
+        self
     }
 
     /// Get the shared session channels map. The reader thread uses this to
@@ -216,6 +228,12 @@ impl AcpServer {
                 session.structured_output_tools = Some(defs);
             }
         }
+        if let Some(arr) = params.get("agent_tools").and_then(Value::as_array) {
+            session.agent_tools = arr
+                .iter()
+                .filter_map(|definition| serde_json::from_value(definition.clone()).ok())
+                .collect();
+        }
         // Optional `transcript_path` extension: path to a transcript file
         // where the harness writes a human-readable log of each session/prompt
         // turn (user prompt, assistant response, reasoning, tool calls).
@@ -237,6 +255,13 @@ impl AcpServer {
             &session.model,
             session.allowed_tools.as_deref(),
         );
+        if let Some(caller) = &self.agent_tool_caller {
+            tools.register_agent_tools(
+                Arc::clone(caller),
+                session.agent_tools.clone(),
+                session.allowed_tools.as_deref(),
+            );
+        }
         if let Some(defs) = &session.structured_output_tools {
             for def in defs {
                 if let (Some(name), Some(desc), Some(params)) = (
@@ -394,7 +419,6 @@ impl AcpServer {
                 }));
             }
         };
-
         // Collect progress text; the agent loop calls this callback after each LLM response.
         // We emit notifications by writing to the writer after collection.
         let progress_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -564,6 +588,13 @@ mod tests {
     use std::io::Cursor;
 
     struct StubClient;
+    struct EchoAgentToolCaller;
+
+    impl super::super::tools::agent_bus::AgentToolCaller for EchoAgentToolCaller {
+        fn call(&self, _target: &str, _operation: &str, arguments: Value) -> Result<Value> {
+            Ok(arguments)
+        }
+    }
 
     impl ChatClient for StubClient {
         fn chat(
@@ -637,6 +668,41 @@ mod tests {
             }
             _ => panic!("expected response"),
         }
+    }
+
+    #[test]
+    fn session_new_registers_tools_supplied_by_the_potlatch_parent() {
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let mut server = AcpServer::new(llm).with_agent_tool_caller(Arc::new(EchoAgentToolCaller));
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": {
+                "cwd": "/tmp",
+                "agent_tools": [{
+                    "name": "search",
+                    "description": "Search.",
+                    "parameters": {"type": "object"},
+                    "target": "search",
+                    "operation": "run"
+                }]
+            }
+        });
+
+        let (response, _) = collect_output(&mut server, &msg);
+        let session_id = match response {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected response"),
+        };
+        let tools = server.sessions[&session_id]
+            .agent
+            .as_ref()
+            .unwrap()
+            .tool_names();
+        assert!(tools.contains(&"search"));
     }
 
     #[test]

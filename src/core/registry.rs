@@ -10,6 +10,7 @@ pub(crate) struct AgentRegistration {
     pub spawn: fn(WorkflowContext, instance_id: usize) -> Result<()>,
     pub banner: fn(&Config, &mut Banner),
     pub validate_config: fn(&Config, &AgentSection) -> Result<()>,
+    pub fixed_instances: Option<usize>,
 }
 
 pub struct AgentRegistry {
@@ -32,6 +33,7 @@ impl AgentRegistry {
             spawn: spawn_core_agent::<A>,
             banner: A::banner,
             validate_config: validate_agent_config::<A>,
+            fixed_instances: A::FIXED_INSTANCES,
         });
     }
 

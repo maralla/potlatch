@@ -97,6 +97,7 @@ pub trait AcpVendorExtension: Send + Sync {
     fn create_state(
         &self,
         provider: Option<Arc<dyn CapabilityProvider>>,
+        agent_bus: Option<crate::core::bus::AgentBus>,
     ) -> Arc<dyn AcpVendorState>;
 
     /// Authenticate after `initialize` if the vendor requires it.

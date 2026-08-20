@@ -148,6 +148,7 @@ fn live_callbacks(options: &InvokeOptions) -> LiveCallbacks<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct ModelSessionOptions {
     pub preferred_session_mode: Option<&'static str>,
+    pub(crate) agent_bus: Option<crate::core::bus::AgentBus>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +206,7 @@ impl ModelEngine {
             acp_spawn.command,
             acp_spawn.env,
             session.preferred_session_mode,
+            session.agent_bus,
             runtime.shutdown,
             runtime.agent_id,
         ))
