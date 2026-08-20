@@ -4,8 +4,8 @@ mod browser;
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
@@ -23,7 +23,10 @@ const INBOX_WAIT: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_RESULTS: usize = 8;
 const MAX_CONFIGURED_RESULTS: usize = 10;
 const MAX_QUERY_CHARS: usize = 500;
+const MAX_URL_CHARS: usize = 2_048;
+const MAX_RENDERED_MARKDOWN_BYTES: usize = 200_000;
 const SEARCH_OPERATION: &str = "google_search";
+const WEB_FETCH_OPERATION: &str = "web_fetch";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,21 +45,15 @@ struct SearchRequest {
     query: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct SearchResponse {
-    query: String,
-    results: Vec<SearchResult>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct SearchResult {
-    title: String,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebFetchRequest {
     url: String,
-    snippet: String,
 }
 
 trait SearchBackend: Send {
-    fn search(&mut self, query: &str, max_results: usize) -> Result<Vec<SearchResult>>;
+    fn search(&mut self, query: &str, max_results: usize) -> Result<String>;
+    fn fetch_rendered_markdown(&mut self, url: &str) -> Result<String>;
 }
 
 struct ChromeSearchBackend {
@@ -86,11 +83,19 @@ impl ChromeSearchBackend {
 }
 
 impl SearchBackend for ChromeSearchBackend {
-    fn search(&mut self, query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
+    fn search(&mut self, query: &str, max_results: usize) -> Result<String> {
         let result = search_google(self.browser()?, query, max_results);
         if result.as_ref().is_err_and(should_relaunch_browser) {
             // A failed CDP operation can leave the tab or process unusable.
             // Relaunch lazily for the next independent request.
+            self.browser.take();
+        }
+        result
+    }
+
+    fn fetch_rendered_markdown(&mut self, url: &str) -> Result<String> {
+        let result = self.browser()?.fetch_rendered_markdown(url);
+        if result.is_err() {
             self.browser.take();
         }
         result
@@ -103,7 +108,7 @@ fn should_relaunch_browser(error: &anyhow::Error) -> bool {
 
 impl SearchAgent {
     fn handle_request(&mut self, request: AgentRequest) {
-        let result = handle_search_request(
+        let result = handle_agent_request(
             self.backend.as_mut(),
             self.max_results,
             &request.operation,
@@ -161,7 +166,10 @@ impl CoreAgent for SearchAgent {
             .bus
             .as_ref()
             .context("search agent requires the cross-agent bus")?;
-        let inbox = bus.register(Self::name(), vec![search_tool_definition()])?;
+        let inbox = bus.register(
+            Self::name(),
+            vec![search_tool_definition(), web_fetch_tool_definition()],
+        )?;
         Ok(Self {
             runtime: ctx.runtime.clone(),
             inbox,
@@ -172,7 +180,7 @@ impl CoreAgent for SearchAgent {
 
     fn on_start(&mut self) -> Result<()> {
         info!(
-            "{}: Search agent ready; registered tool `search`",
+            "{}: Search agent ready; registered tools `search` and `web_fetch`",
             self.agent_id()
         );
         Ok(())
@@ -181,16 +189,24 @@ impl CoreAgent for SearchAgent {
     fn on_shutdown(&mut self) {}
 }
 
-fn handle_search_request(
+fn handle_agent_request(
     backend: &mut dyn SearchBackend,
     max_results: usize,
     operation: &str,
     payload: Value,
 ) -> Result<Value> {
-    ensure!(
-        operation == SEARCH_OPERATION,
-        "unsupported search operation {operation:?}"
-    );
+    match operation {
+        SEARCH_OPERATION => handle_search_request(backend, max_results, payload),
+        WEB_FETCH_OPERATION => handle_web_fetch_request(backend, payload),
+        _ => bail!("unsupported search operation {operation:?}"),
+    }
+}
+
+fn handle_search_request(
+    backend: &mut dyn SearchBackend,
+    max_results: usize,
+    payload: Value,
+) -> Result<Value> {
     let request: SearchRequest =
         serde_json::from_value(payload).context("invalid Google Search request")?;
     let query = request.query.trim();
@@ -199,18 +215,53 @@ fn handle_search_request(
         query.chars().count() <= MAX_QUERY_CHARS,
         "search query exceeds {MAX_QUERY_CHARS} characters"
     );
-    let results = backend.search(query, max_results)?;
-    serde_json::to_value(SearchResponse {
-        query: query.to_string(),
-        results,
-    })
-    .context("encode Google Search response")
+    Ok(Value::String(backend.search(query, max_results)?))
+}
+
+fn handle_web_fetch_request(backend: &mut dyn SearchBackend, payload: Value) -> Result<Value> {
+    let request: WebFetchRequest =
+        serde_json::from_value(payload).context("invalid rendered web fetch request")?;
+    let url = validate_web_url(&request.url)?;
+    let markdown = backend.fetch_rendered_markdown(&url)?;
+    Ok(Value::String(truncate_rendered_markdown(markdown)))
+}
+
+fn validate_web_url(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    ensure!(!raw.is_empty(), "web fetch URL must not be empty");
+    ensure!(
+        raw.chars().count() <= MAX_URL_CHARS,
+        "web fetch URL exceeds {MAX_URL_CHARS} characters"
+    );
+    let url = reqwest::Url::parse(raw).context("invalid web fetch URL")?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "web fetch URL must use http or https"
+    );
+    ensure!(url.host().is_some(), "web fetch URL must include a host");
+    ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "web fetch URL must not contain credentials"
+    );
+    Ok(url.to_string())
+}
+
+fn truncate_rendered_markdown(mut markdown: String) -> String {
+    if markdown.len() <= MAX_RENDERED_MARKDOWN_BYTES {
+        return markdown;
+    }
+    let mut end = MAX_RENDERED_MARKDOWN_BYTES;
+    while !markdown.is_char_boundary(end) {
+        end -= 1;
+    }
+    markdown.truncate(end);
+    markdown
 }
 
 fn search_tool_definition() -> AgentToolDefinition {
     AgentToolDefinition {
         name: "search".to_string(),
-        description: "Search Google through the dedicated browser search agent and return rendered result titles, URLs, and snippets. Use it when current public web information is needed.".to_string(),
+        description: "Search Google through the dedicated browser search agent and return Defuddle Markdown extracted directly from the rendered search results page. Use it when current public web information is needed.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -228,12 +279,29 @@ fn search_tool_definition() -> AgentToolDefinition {
     }
 }
 
-fn search_google(
-    browser: &mut ChromeBrowser,
-    query: &str,
-    max_results: usize,
-) -> Result<Vec<SearchResult>> {
-    browser.submit_google_query(query)?;
+fn web_fetch_tool_definition() -> AgentToolDefinition {
+    AgentToolDefinition {
+        name: "web_fetch".to_string(),
+        description: "Preferred tool for opening web pages and URLs returned by `search`. Use `web_fetch` instead of `fetch` whenever rendered or JavaScript-generated content may be needed. It opens the HTTP(S) address in the persistent system browser and returns only the extracted Markdown content, without a JSON wrapper or metadata.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The absolute HTTP(S) URL to render.",
+                    "minLength": 1,
+                    "maxLength": MAX_URL_CHARS
+                }
+            },
+            "required": ["url"],
+            "additionalProperties": false
+        }),
+        operation: WEB_FETCH_OPERATION.to_string(),
+    }
+}
+
+fn search_google(browser: &mut ChromeBrowser, query: &str, max_results: usize) -> Result<String> {
+    browser.submit_google_query(query, max_results)?;
 
     if browser
         .google_verification_required()
@@ -242,37 +310,14 @@ fn search_google(
         return Err(GoogleVerificationRequired.into());
     }
     browser.wait_for_google_results()?;
-
-    let expression = format!(
-        r#"(() => {{
-            const output = [];
-            const seen = new Set();
-            for (const heading of document.querySelectorAll("a h3")) {{
-                const anchor = heading.closest("a");
-                if (!anchor || !anchor.href || seen.has(anchor.href)) continue;
-                if (!anchor.href.startsWith("http://") && !anchor.href.startsWith("https://")) continue;
-                seen.add(anchor.href);
-                const container = anchor.closest("div.MjjYud, div.N54PNb, div.g") || anchor.parentElement;
-                const text = (container?.innerText || "").split("\n")
-                    .map(line => line.trim()).filter(Boolean);
-                const title = (heading.innerText || heading.textContent || "").trim();
-                const snippet = text.filter(line => line !== title).slice(0, 4).join(" ");
-                output.push({{ title, url: anchor.href, snippet }});
-                if (output.length >= {max_results}) break;
-            }}
-            return output;
-        }})()"#,
-    );
-    let value = browser
-        .evaluate_json(&expression)
-        .context("extract rendered Google search results")?;
-    let results: Vec<SearchResult> =
-        serde_json::from_value(value).context("decode rendered Google Search results")?;
+    let markdown = browser
+        .extract_rendered_markdown()
+        .context("extract Google search results page with Defuddle")?;
     ensure!(
-        !results.is_empty(),
-        "Google returned no extractable search results"
+        !markdown.trim().is_empty(),
+        "Defuddle returned no Google search result content"
     );
-    Ok(results)
+    Ok(markdown)
 }
 
 #[cfg(test)]
@@ -281,21 +326,24 @@ mod tests {
 
     struct RecordingBackend {
         queries: Vec<(String, usize)>,
-        results: Vec<SearchResult>,
+        search_markdown: Option<String>,
+        fetched_urls: Vec<String>,
+        rendered_markdown: Option<String>,
     }
 
     impl SearchBackend for RecordingBackend {
-        fn search(&mut self, query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
+        fn search(&mut self, query: &str, max_results: usize) -> Result<String> {
             self.queries.push((query.to_string(), max_results));
-            Ok(std::mem::take(&mut self.results))
+            self.search_markdown
+                .take()
+                .context("test backend has no search Markdown")
         }
-    }
 
-    fn result() -> SearchResult {
-        SearchResult {
-            title: "Rust".to_string(),
-            url: "https://www.rust-lang.org/".to_string(),
-            snippet: "A language empowering everyone.".to_string(),
+        fn fetch_rendered_markdown(&mut self, url: &str) -> Result<String> {
+            self.fetched_urls.push(url.to_string());
+            self.rendered_markdown
+                .take()
+                .context("test backend has no rendered Markdown")
         }
     }
 
@@ -303,9 +351,13 @@ mod tests {
     fn request_is_validated_and_forwarded_without_a_model() {
         let mut backend = RecordingBackend {
             queries: Vec::new(),
-            results: vec![result()],
+            search_markdown: Some(
+                "Rust\n====\n\n[Rust Programming Language](https://www.rust-lang.org/)".to_string(),
+            ),
+            fetched_urls: Vec::new(),
+            rendered_markdown: None,
         };
-        let response = handle_search_request(
+        let response = handle_agent_request(
             &mut backend,
             7,
             "google_search",
@@ -313,22 +365,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(backend.queries, vec![("rust language".to_string(), 7)]);
-        assert_eq!(response["results"][0]["title"], "Rust");
+        assert_eq!(
+            response.as_str().unwrap(),
+            "Rust\n====\n\n[Rust Programming Language](https://www.rust-lang.org/)"
+        );
     }
 
     #[test]
     fn rejects_empty_long_and_unknown_requests() {
         let mut backend = RecordingBackend {
             queries: Vec::new(),
-            results: Vec::new(),
+            search_markdown: None,
+            fetched_urls: Vec::new(),
+            rendered_markdown: None,
         };
-        assert!(handle_search_request(&mut backend, 8, "other", json!({"query": "rust"})).is_err());
+        assert!(handle_agent_request(&mut backend, 8, "other", json!({"query": "rust"})).is_err());
         assert!(
-            handle_search_request(&mut backend, 8, "google_search", json!({"query": "  "}))
-                .is_err()
+            handle_agent_request(&mut backend, 8, "google_search", json!({"query": "  "})).is_err()
         );
         assert!(
-            handle_search_request(
+            handle_agent_request(
                 &mut backend,
                 8,
                 "google_search",
@@ -337,6 +393,53 @@ mod tests {
             .is_err()
         );
         assert!(backend.queries.is_empty());
+    }
+
+    #[test]
+    fn web_fetch_validates_and_returns_rendered_markdown() {
+        let mut backend = RecordingBackend {
+            queries: Vec::new(),
+            search_markdown: None,
+            fetched_urls: Vec::new(),
+            rendered_markdown: Some("# Rendered\n\nHello **world**.".to_string()),
+        };
+        let response = handle_agent_request(
+            &mut backend,
+            8,
+            WEB_FETCH_OPERATION,
+            json!({"url": " https://example.com/start "}),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.fetched_urls,
+            vec!["https://example.com/start".to_string()]
+        );
+        assert_eq!(response.as_str().unwrap(), "# Rendered\n\nHello **world**.");
+
+        for invalid in [
+            "",
+            "not a URL",
+            "file:///etc/passwd",
+            "https://user:secret@example.com/",
+        ] {
+            assert!(
+                handle_agent_request(
+                    &mut backend,
+                    8,
+                    WEB_FETCH_OPERATION,
+                    json!({"url": invalid})
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rendered_markdown_truncation_preserves_utf8_boundaries() {
+        let markdown = format!("{}é", "x".repeat(MAX_RENDERED_MARKDOWN_BYTES - 1));
+        let markdown = truncate_rendered_markdown(markdown);
+        assert!(markdown.is_char_boundary(markdown.len()));
+        assert_eq!(markdown.len(), MAX_RENDERED_MARKDOWN_BYTES - 1);
     }
 
     #[test]
@@ -356,10 +459,20 @@ mod tests {
 
     #[test]
     fn search_agent_owns_its_remote_tool_definition() {
-        let tool = search_tool_definition();
-        assert_eq!(tool.name, "search");
-        assert_eq!(tool.operation, SEARCH_OPERATION);
-        assert_eq!(tool.parameters["required"], serde_json::json!(["query"]));
+        let search = search_tool_definition();
+        assert_eq!(search.name, "search");
+        assert_eq!(search.operation, SEARCH_OPERATION);
+        assert_eq!(search.parameters["required"], serde_json::json!(["query"]));
+
+        let fetch = web_fetch_tool_definition();
+        assert_eq!(fetch.name, "web_fetch");
+        assert_eq!(fetch.operation, WEB_FETCH_OPERATION);
+        assert_eq!(fetch.parameters["required"], serde_json::json!(["url"]));
+        assert!(
+            fetch
+                .description
+                .contains("Use `web_fetch` instead of `fetch`")
+        );
     }
 
     #[test]
@@ -377,10 +490,32 @@ mod tests {
             return;
         }
         let mut backend = ChromeSearchBackend::new();
-        let results = backend
+        let markdown = backend
             .search("Rust programming language", 3)
             .expect("Google Search through Chrome");
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|result| !result.url.is_empty()));
+        assert!(!markdown.trim().is_empty());
+        assert!(markdown.contains("http"));
+    }
+
+    #[test]
+    fn optional_smoke_test_fetches_rendered_markdown_with_the_persistent_browser() {
+        if std::env::var("BREEZE_WEB_FETCH_SMOKE").as_deref() != Ok("1") {
+            return;
+        }
+        let target = std::env::var("BREEZE_WEB_FETCH_SMOKE_URL")
+            .unwrap_or_else(|_| "https://example.com/".to_string());
+        let mut backend = ChromeSearchBackend::new();
+        let response = handle_agent_request(
+            &mut backend,
+            DEFAULT_MAX_RESULTS,
+            WEB_FETCH_OPERATION,
+            json!({"url": target}),
+        )
+        .expect("render web page through Chrome and Defuddle");
+        let markdown = response.as_str().unwrap();
+        assert!(!markdown.trim().is_empty());
+        assert!(!markdown.contains("<html"));
+        assert!(!markdown.contains(".turbo-progress-bar"));
+        assert!(!markdown.contains("\"featureFlags\""));
     }
 }

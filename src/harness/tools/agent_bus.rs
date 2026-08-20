@@ -44,7 +44,10 @@ impl Tool for RemoteAgentTool {
             &self.definition.operation,
             args.clone(),
         )?;
-        serde_json::to_string_pretty(&result).map_err(Into::into)
+        match result {
+            Value::String(text) => Ok(text),
+            other => serde_json::to_string_pretty(&other).map_err(Into::into),
+        }
     }
 }
 
@@ -53,6 +56,7 @@ mod tests {
     use super::*;
 
     struct EchoCaller;
+    struct TextCaller;
 
     impl AgentToolCaller for EchoCaller {
         fn call(&self, _target: &str, _operation: &str, arguments: Value) -> Result<Value> {
@@ -60,9 +64,15 @@ mod tests {
         }
     }
 
-    fn tool() -> RemoteAgentTool {
+    impl AgentToolCaller for TextCaller {
+        fn call(&self, _target: &str, _operation: &str, _arguments: Value) -> Result<Value> {
+            Ok(Value::String("# Rendered\n\nContent.".to_string()))
+        }
+    }
+
+    fn tool_with_caller(caller: Arc<dyn AgentToolCaller>) -> RemoteAgentTool {
         RemoteAgentTool::new(
-            Arc::new(EchoCaller),
+            caller,
             RemoteAgentToolDefinition {
                 name: "example".to_string(),
                 description: "Agent-provided description.".to_string(),
@@ -75,6 +85,10 @@ mod tests {
                 operation: "run".to_string(),
             },
         )
+    }
+
+    fn tool() -> RemoteAgentTool {
+        tool_with_caller(Arc::new(EchoCaller))
     }
 
     #[test]
@@ -94,5 +108,13 @@ mod tests {
             .execute(&serde_json::json!({"value": "hello"}), "/tmp")
             .unwrap();
         assert!(result.contains("hello"));
+    }
+
+    #[test]
+    fn proxy_returns_string_results_without_json_encoding() {
+        let result = tool_with_caller(Arc::new(TextCaller))
+            .execute(&serde_json::json!({}), "/tmp")
+            .unwrap();
+        assert_eq!(result, "# Rendered\n\nContent.");
     }
 }
