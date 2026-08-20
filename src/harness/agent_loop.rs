@@ -460,7 +460,7 @@ impl AgentLoop {
                     .take(3)
                     .collect::<Vec<_>>()
                     .join(" ⏎ ");
-                debug!(target: "harness", "harness: reasoning preview: {preview}");
+                info!(target: "harness", "harness: reasoning preview: {preview}");
             }
 
             // Also emit the full response text (for non-streaming fallback or completeness)
