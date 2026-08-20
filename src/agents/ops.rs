@@ -20,6 +20,8 @@ use crate::core::config::Config;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 
+mod grafana;
+
 pub(crate) const NAME: &str = "ops";
 const MAX_INSTANCES: usize = 1;
 
@@ -126,8 +128,14 @@ struct OpsConfig {
     log_sources: Vec<OpsLogSource>,
 }
 
-#[derive(Debug, Clone)]
-struct OpsLogSource {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpsLogSource {
+    Ssh(OpsSshLogSource),
+    GrafanaElasticsearch(Box<grafana::GrafanaLogSource>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpsSshLogSource {
     ssh_user: String,
     ssh_host: String,
     log_path: String,
@@ -145,7 +153,22 @@ pub(crate) struct OpsAgentSettings {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct OpsLogSourceSettings {
+#[serde(untagged)]
+enum OpsLogSourceSettings {
+    Ssh(OpsSshLogSourceSettings),
+    Typed(TypedOpsLogSourceSettings),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TypedOpsLogSourceSettings {
+    #[serde(rename = "grafana")]
+    GrafanaElasticsearch(grafana::GrafanaLogSourceSettings),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpsSshLogSourceSettings {
     ssh_user: String,
     ssh_host: String,
     log_path: String,
@@ -165,7 +188,7 @@ impl OpsAgentSettings {
             || settings.ssh_host.is_some()
             || settings.log_path.is_some();
         if legacy_present {
-            let source = OpsLogSourceSettings {
+            let source = OpsSshLogSourceSettings {
                 ssh_user: settings
                     .ssh_user
                     .take()
@@ -179,7 +202,7 @@ impl OpsAgentSettings {
                     .take()
                     .context("log_path is required for [agent.ops]")?,
             };
-            settings.logs.push(source);
+            settings.logs.push(OpsLogSourceSettings::Ssh(source));
         }
         ensure!(
             !settings.logs.is_empty(),
@@ -193,6 +216,26 @@ impl OpsAgentSettings {
 }
 
 impl OpsLogSourceSettings {
+    fn validate(&self, idx: usize) -> Result<()> {
+        match self {
+            Self::Ssh(source) => source.validate(idx),
+            Self::Typed(TypedOpsLogSourceSettings::GrafanaElasticsearch(source)) => {
+                source.validate(idx)
+            }
+        }
+    }
+
+    fn into_source(self) -> Result<OpsLogSource> {
+        match self {
+            Self::Ssh(source) => Ok(OpsLogSource::Ssh(source.into_source())),
+            Self::Typed(TypedOpsLogSourceSettings::GrafanaElasticsearch(source)) => Ok(
+                OpsLogSource::GrafanaElasticsearch(Box::new(source.into_source()?)),
+            ),
+        }
+    }
+}
+
+impl OpsSshLogSourceSettings {
     fn validate(&self, idx: usize) -> Result<()> {
         ensure!(
             !self.ssh_user.trim().is_empty(),
@@ -209,8 +252,8 @@ impl OpsLogSourceSettings {
         Ok(())
     }
 
-    fn into_source(self) -> OpsLogSource {
-        OpsLogSource {
+    fn into_source(self) -> OpsSshLogSource {
+        OpsSshLogSource {
             ssh_user: self.ssh_user.trim().to_string(),
             ssh_host: self.ssh_host.trim().to_string(),
             log_path: self.log_path.trim().to_string(),
@@ -346,7 +389,7 @@ impl CoreAgent for OpsAgent {
                 .logs
                 .into_iter()
                 .map(OpsLogSourceSettings::into_source)
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
         };
         Ok(Self { runtime, config })
     }
@@ -363,28 +406,39 @@ impl CoreAgent for OpsAgent {
 /// and cannot mutate the configured source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogSourceObservation {
-    ssh_user: String,
-    ssh_host: String,
-    log_path: String,
+    source: OpsLogSource,
 }
 
 impl LogSourceObservation {
     fn from_source(source: &OpsLogSource) -> Self {
         Self {
-            ssh_user: source.ssh_user.clone(),
-            ssh_host: source.ssh_host.clone(),
-            log_path: source.log_path.clone(),
+            source: source.clone(),
         }
     }
 
     fn target(&self) -> String {
-        format!("{}@{}:{}", self.ssh_user, self.ssh_host, self.log_path)
+        match &self.source {
+            OpsLogSource::Ssh(source) => {
+                format!(
+                    "{}@{}:{}",
+                    source.ssh_user, source.ssh_host, source.log_path
+                )
+            }
+            OpsLogSource::GrafanaElasticsearch(source) => source.target(),
+        }
     }
 
     /// The banner that separates this source's lines from the next one's in
     /// the joined analysis input.
     fn section(&self, window_log: &str) -> String {
         format!("===== Log source: {} =====\n{window_log}", self.target())
+    }
+
+    fn prepare_window(&self, raw_log: &str, now: DateTime<Utc>) -> (String, bool) {
+        match &self.source {
+            OpsLogSource::Ssh(_) => filter_log_to_time_window(raw_log, now),
+            OpsLogSource::GrafanaElasticsearch(_) => (raw_log.to_string(), true),
+        }
     }
 }
 
@@ -405,7 +459,7 @@ struct CycleClock {
 trait OpsPort {
     fn shutdown_requested(&self) -> bool;
     fn cycle_clock(&self) -> CycleClock;
-    fn remote_log_tail(&self, source: &LogSourceObservation) -> Result<String>;
+    fn fetch_logs(&self, source: &LogSourceObservation, clock: CycleClock) -> Result<String>;
     fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String>;
     fn write_scrape_file(&mut self, unix_ts: u64, window_log: &str) -> Result<()>;
     fn prune_scrape_files(&mut self) -> Result<()>;
@@ -471,15 +525,15 @@ fn run_ops_cycle(
             LOG_WINDOW_HOURS,
             source.target()
         );
-        let raw_tail = port.remote_log_tail(&source)?;
+        let raw_tail = port.fetch_logs(&source, clock)?;
         if port.shutdown_requested() {
             return Ok(());
         }
 
-        let (window_log, parsed_timestamps) = filter_log_to_time_window(&raw_tail, clock.now);
+        let (window_log, parsed_timestamps) = source.prepare_window(&raw_tail, clock.now);
         if !parsed_timestamps {
             warn!(
-                "{agent_id}: Could not parse timestamps in remote log tail for {}; using full tail for analysis",
+                "{agent_id}: Could not parse timestamps in SSH log tail for {}; using full tail for analysis",
                 source.target()
             );
         }
@@ -578,8 +632,17 @@ impl OpsPort for LiveOpsPort<'_> {
         }
     }
 
-    fn remote_log_tail(&self, source: &LogSourceObservation) -> Result<String> {
-        fetch_remote_log_tail(&source.ssh_user, &source.ssh_host, &source.log_path)
+    fn fetch_logs(&self, source: &LogSourceObservation, clock: CycleClock) -> Result<String> {
+        match &source.source {
+            OpsLogSource::Ssh(source) => {
+                fetch_remote_log_tail(&source.ssh_user, &source.ssh_host, &source.log_path)
+            }
+            OpsLogSource::GrafanaElasticsearch(source) => grafana::fetch_logs(
+                source,
+                clock.now - chrono::Duration::hours(LOG_WINDOW_HOURS),
+                clock.now,
+            ),
+        }
     }
 
     fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String> {
@@ -1006,15 +1069,38 @@ mod tests {
     }
 
     fn log_source(host: &str) -> OpsLogSource {
-        OpsLogSource {
+        OpsLogSource::Ssh(OpsSshLogSource {
             ssh_user: "deploy".to_string(),
             ssh_host: host.to_string(),
             log_path: "/var/log/app/app.log".to_string(),
-        }
+        })
+    }
+
+    fn grafana_source() -> OpsLogSource {
+        OpsLogSource::GrafanaElasticsearch(Box::new(
+            grafana::GrafanaLogSourceSettings {
+                url: "https://grafana.example.com".to_string(),
+                datasource_uid: "elastic-1".to_string(),
+                index: "app-logs".to_string(),
+                org_id: 1,
+                username: "ops".to_string(),
+                password: "secret".to_string(),
+                filter: "level:ERROR".to_string(),
+            }
+            .into_source()
+            .unwrap(),
+        ))
     }
 
     fn observation(host: &str) -> LogSourceObservation {
         LogSourceObservation::from_source(&log_source(host))
+    }
+
+    fn ssh_settings(source: &OpsLogSourceSettings) -> &OpsSshLogSourceSettings {
+        match source {
+            OpsLogSourceSettings::Ssh(source) => source,
+            OpsLogSourceSettings::Typed(_) => panic!("expected SSH settings"),
+        }
     }
 
     /// The joined analysis input the cycle assembles for `hosts`, in
@@ -1046,7 +1132,7 @@ mod tests {
         history: OpsIssueHistory,
         analysis: Vec<RawOpsIssue>,
         next_iid: Cell<u64>,
-        remote_log_sources: RefCell<Vec<LogSourceObservation>>,
+        fetched_log_sources: RefCell<Vec<LogSourceObservation>>,
         context_timestamps: RefCell<Vec<u64>>,
         scrape_files: RefCell<Vec<(u64, String)>>,
         analysis_files: RefCell<Vec<(u64, String)>>,
@@ -1070,7 +1156,7 @@ mod tests {
                 history: OpsIssueHistory::default(),
                 analysis,
                 next_iid: Cell::new(100),
-                remote_log_sources: RefCell::new(Vec::new()),
+                fetched_log_sources: RefCell::new(Vec::new()),
                 context_timestamps: RefCell::new(Vec::new()),
                 scrape_files: RefCell::new(Vec::new()),
                 analysis_files: RefCell::new(Vec::new()),
@@ -1141,9 +1227,9 @@ mod tests {
             self.clock
         }
 
-        fn remote_log_tail(&self, source: &LogSourceObservation) -> Result<String> {
-            self.perform("remote_log_tail")?;
-            self.remote_log_sources.borrow_mut().push(source.clone());
+        fn fetch_logs(&self, source: &LogSourceObservation, _clock: CycleClock) -> Result<String> {
+            self.perform("fetch_logs")?;
+            self.fetched_log_sources.borrow_mut().push(source.clone());
             Ok(self.log_tail.clone())
         }
 
@@ -1245,7 +1331,7 @@ mod tests {
             "shutdown_requested",
         ];
         for _ in 0..source_count {
-            operations.push("remote_log_tail");
+            operations.push("fetch_logs");
             operations.push("shutdown_requested");
         }
         operations.extend([
@@ -1353,12 +1439,12 @@ mod tests {
                 "cycle_clock",
                 "write_gitlab_context_file",
                 "shutdown_requested",
-                "remote_log_tail",
+                "fetch_logs",
                 "shutdown_requested",
             ]
         );
         assert_eq!(
-            *port.remote_log_sources.borrow(),
+            *port.fetched_log_sources.borrow(),
             vec![observation("prod-1.example.com")]
         );
         assert!(port.scrape_files.borrow().is_empty());
@@ -1373,7 +1459,7 @@ mod tests {
         // windows are joined in configuration order.
         assert_eq!(*port.trace.borrow(), operations_up_to_analysis(hosts.len()));
         assert_eq!(
-            *port.remote_log_sources.borrow(),
+            *port.fetched_log_sources.borrow(),
             vec![
                 observation("prod-1.example.com"),
                 observation("prod-2.example.com"),
@@ -1398,6 +1484,26 @@ mod tests {
     }
 
     #[test]
+    fn ops_cycle_keeps_grafana_results_already_bounded_by_the_server() {
+        let old_log = "2026-06-15 09:00:00 ERROR old SSH line";
+        let mut port = FakeOpsPort::new(Vec::new()).with_log_tail(old_log);
+        let sources = vec![log_source("prod.example.com"), grafana_source()];
+
+        run_ops_cycle(TEST_AGENT, &sources, true, &mut port).unwrap();
+
+        let observations: Vec<_> = sources
+            .iter()
+            .map(LogSourceObservation::from_source)
+            .collect();
+        assert_eq!(*port.fetched_log_sources.borrow(), observations);
+        let grafana_window = observations[1].section(old_log);
+        assert_eq!(
+            *port.scrape_files.borrow(),
+            vec![(TEST_UNIX_TS, grafana_window)]
+        );
+    }
+
+    #[test]
     fn ops_cycle_skips_the_model_entirely_when_every_log_line_predates_the_window() {
         // Filtered out by the two-hour window, so no source contributes a
         // section and the joined window stays empty.
@@ -1411,7 +1517,7 @@ mod tests {
                 "cycle_clock",
                 "write_gitlab_context_file",
                 "shutdown_requested",
-                "remote_log_tail",
+                "fetch_logs",
                 "shutdown_requested",
             ]
         );
@@ -1553,7 +1659,7 @@ mod tests {
 
     #[test]
     fn ops_cycle_aborts_when_a_required_read_fails() {
-        for failing in ["remote_log_tail", "issue_history", "history_file_path"] {
+        for failing in ["fetch_logs", "issue_history", "history_file_path"] {
             let mut port = FakeOpsPort::new(vec![proposal("Fix DB timeout", Some(1))])
                 .failing_operation(failing);
             let result = run_ops(&mut port, &["prod-1.example.com"], true);
@@ -1588,8 +1694,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings.logs.len(), 1);
-        assert_eq!(settings.logs[0].ssh_user, "deploy");
-        assert_eq!(settings.logs[0].log_path, "/var/log/app/app.log");
+        assert_eq!(ssh_settings(&settings.logs[0]).ssh_user, "deploy");
+        assert_eq!(
+            ssh_settings(&settings.logs[0]).log_path,
+            "/var/log/app/app.log"
+        );
     }
 
     #[test]
@@ -1608,8 +1717,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(settings.logs.len(), 2);
-        assert_eq!(settings.logs[0].ssh_host, "prod-1.example.com");
-        assert_eq!(settings.logs[1].log_path, "/var/log/app/worker.log");
+        assert_eq!(
+            ssh_settings(&settings.logs[0]).ssh_host,
+            "prod-1.example.com"
+        );
+        assert_eq!(
+            ssh_settings(&settings.logs[1]).log_path,
+            "/var/log/app/worker.log"
+        );
+    }
+
+    #[test]
+    fn ops_settings_accept_mixed_ssh_and_grafana_sources() {
+        let settings = OpsAgentSettings::from_raw(
+            &toml::from_str(
+                r#"
+                logs = [
+                    { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app.log" },
+                    { type = "grafana", url = "https://grafana.example.com", datasource_uid = "elastic-1", index = "app-logs", username = "ops", password = "secret", filter = "level:ERROR" },
+                ]
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(settings.logs.len(), 2);
+        let OpsLogSourceSettings::Typed(TypedOpsLogSourceSettings::GrafanaElasticsearch(grafana)) =
+            &settings.logs[1]
+        else {
+            panic!("expected Grafana Elasticsearch settings");
+        };
+        assert_eq!(grafana.org_id, 1);
+        assert_eq!(grafana.filter, "level:ERROR");
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("\"secret\""));
     }
 
     #[test]
