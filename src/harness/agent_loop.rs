@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::client::{ChatClient, ChatResponse, StreamCallback};
 use super::context::{Context, ContextEntry, ContextKind, Role};
