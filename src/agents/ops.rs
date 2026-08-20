@@ -117,14 +117,16 @@ fn normalize_ops_issues(raw: Vec<RawOpsIssue>) -> Vec<OpsIssueProposal> {
         .collect()
 }
 
-const LOG_WINDOW_HOURS: i64 = 2;
+const DEFAULT_LOG_WINDOW_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MAX_TAIL_LINES: u32 = 100_000;
 const MAX_SCRAPE_FILES_KEPT: usize = 10;
 const MIN_LOG_BYTES_FOR_ANALYSIS: usize = 20;
 
 #[derive(Debug, Clone)]
 struct OpsConfig {
-    poll_interval_secs: u64,
+    poll_interval: Duration,
+    log_window_interval: Duration,
     log_sources: Vec<OpsLogSource>,
 }
 
@@ -143,8 +145,17 @@ struct OpsSshLogSource {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct OpsAgentSettings {
-    #[serde(default = "default_ops_poll_interval")]
-    poll_interval_secs: u64,
+    #[serde(
+        default = "default_ops_poll_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    poll_interval: Duration,
+    poll_interval_secs: Option<u64>,
+    #[serde(
+        default = "default_log_window_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    log_window_interval: Duration,
     ssh_user: Option<String>,
     ssh_host: Option<String>,
     log_path: Option<String>,
@@ -174,8 +185,20 @@ struct OpsSshLogSourceSettings {
     log_path: String,
 }
 
-fn default_ops_poll_interval() -> u64 {
-    600
+fn default_ops_poll_interval() -> Duration {
+    DEFAULT_POLL_INTERVAL
+}
+
+fn default_log_window_interval() -> Duration {
+    DEFAULT_LOG_WINDOW_INTERVAL
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    humantime::parse_duration(&value).map_err(serde::de::Error::custom)
 }
 
 impl OpsAgentSettings {
@@ -208,6 +231,20 @@ impl OpsAgentSettings {
             !settings.logs.is_empty(),
             "at least one log source is required for [agent.ops]"
         );
+        ensure!(
+            settings.poll_interval_secs.is_none(),
+            "poll_interval_secs was replaced by poll_interval for [agent.ops]"
+        );
+        ensure!(
+            !settings.poll_interval.is_zero(),
+            "poll_interval must be greater than zero for [agent.ops]"
+        );
+        ensure!(
+            !settings.log_window_interval.is_zero(),
+            "log_window_interval must be greater than zero for [agent.ops]"
+        );
+        chrono::Duration::from_std(settings.log_window_interval)
+            .context("log_window_interval is too large for [agent.ops]")?;
         for (idx, source) in settings.logs.iter().enumerate() {
             source.validate(idx)?;
         }
@@ -355,7 +392,7 @@ impl CoreAgent for OpsAgent {
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
         vec![PeriodicTaskSpec::polling(
             "log_scrape",
-            Duration::from_secs(self.config.poll_interval_secs),
+            self.config.poll_interval,
         )]
     }
 
@@ -384,7 +421,8 @@ impl CoreAgent for OpsAgent {
         AgentState::from_runtime(&runtime).ensure_sessions_dir()?;
         let agent_settings = ctx.settings;
         let config = OpsConfig {
-            poll_interval_secs: agent_settings.poll_interval_secs,
+            poll_interval: agent_settings.poll_interval,
+            log_window_interval: agent_settings.log_window_interval,
             log_sources: agent_settings
                 .logs
                 .into_iter()
@@ -434,9 +472,14 @@ impl LogSourceObservation {
         format!("===== Log source: {} =====\n{window_log}", self.target())
     }
 
-    fn prepare_window(&self, raw_log: &str, now: DateTime<Utc>) -> (String, bool) {
+    fn prepare_window(
+        &self,
+        raw_log: &str,
+        now: DateTime<Utc>,
+        log_window_interval: Duration,
+    ) -> (String, bool) {
         match &self.source {
-            OpsLogSource::Ssh(_) => filter_log_to_time_window(raw_log, now),
+            OpsLogSource::Ssh(_) => filter_log_to_time_window(raw_log, now, log_window_interval),
             OpsLogSource::GrafanaElasticsearch(_) => (raw_log.to_string(), true),
         }
     }
@@ -459,7 +502,12 @@ struct CycleClock {
 trait OpsPort {
     fn shutdown_requested(&self) -> bool;
     fn cycle_clock(&self) -> CycleClock;
-    fn fetch_logs(&self, source: &LogSourceObservation, clock: CycleClock) -> Result<String>;
+    fn fetch_logs(
+        &self,
+        source: &LogSourceObservation,
+        clock: CycleClock,
+        log_window_interval: Duration,
+    ) -> Result<String>;
     fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String>;
     fn write_scrape_file(&mut self, unix_ts: u64, window_log: &str) -> Result<()>;
     fn prune_scrape_files(&mut self) -> Result<()>;
@@ -503,6 +551,7 @@ fn history_entry(
 fn run_ops_cycle(
     agent_id: &str,
     sources: &[OpsLogSource],
+    log_window_interval: Duration,
     has_scope_label: bool,
     port: &mut dyn OpsPort,
 ) -> Result<()> {
@@ -521,16 +570,17 @@ fn run_ops_cycle(
     for configured_source in sources {
         let source = LogSourceObservation::from_source(configured_source);
         info!(
-            "{agent_id}: Fetching last {}h of logs from {}",
-            LOG_WINDOW_HOURS,
+            "{agent_id}: Fetching last {} of logs from {}",
+            humantime::format_duration(log_window_interval),
             source.target()
         );
-        let raw_tail = port.fetch_logs(&source, clock)?;
+        let raw_tail = port.fetch_logs(&source, clock, log_window_interval)?;
         if port.shutdown_requested() {
             return Ok(());
         }
 
-        let (window_log, parsed_timestamps) = source.prepare_window(&raw_tail, clock.now);
+        let (window_log, parsed_timestamps) =
+            source.prepare_window(&raw_tail, clock.now, log_window_interval);
         if !parsed_timestamps {
             warn!(
                 "{agent_id}: Could not parse timestamps in SSH log tail for {}; using full tail for analysis",
@@ -632,14 +682,21 @@ impl OpsPort for LiveOpsPort<'_> {
         }
     }
 
-    fn fetch_logs(&self, source: &LogSourceObservation, clock: CycleClock) -> Result<String> {
+    fn fetch_logs(
+        &self,
+        source: &LogSourceObservation,
+        clock: CycleClock,
+        log_window_interval: Duration,
+    ) -> Result<String> {
         match &source.source {
             OpsLogSource::Ssh(source) => {
                 fetch_remote_log_tail(&source.ssh_user, &source.ssh_host, &source.log_path)
             }
             OpsLogSource::GrafanaElasticsearch(source) => grafana::fetch_logs(
                 source,
-                clock.now - chrono::Duration::hours(LOG_WINDOW_HOURS),
+                clock.now
+                    - chrono::Duration::from_std(log_window_interval)
+                        .expect("validated OPS log window interval"),
                 clock.now,
             ),
         }
@@ -732,6 +789,7 @@ fn ops_cycle(
     run_ops_cycle(
         state.agent_id,
         &config.log_sources,
+        config.log_window_interval,
         scope_label.is_some(),
         &mut port,
     )
@@ -985,8 +1043,14 @@ fn parse_line_timestamp(line: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-fn filter_log_to_time_window(log: &str, now: DateTime<Utc>) -> (String, bool) {
-    let cutoff = now - chrono::Duration::hours(LOG_WINDOW_HOURS);
+fn filter_log_to_time_window(
+    log: &str,
+    now: DateTime<Utc>,
+    log_window_interval: Duration,
+) -> (String, bool) {
+    let cutoff = now
+        - chrono::Duration::from_std(log_window_interval)
+            .expect("validated OPS log window interval");
     let mut saw_timestamp = false;
     let mut include_continuation = false;
     let mut kept = Vec::new();
@@ -1227,7 +1291,12 @@ mod tests {
             self.clock
         }
 
-        fn fetch_logs(&self, source: &LogSourceObservation, _clock: CycleClock) -> Result<String> {
+        fn fetch_logs(
+            &self,
+            source: &LogSourceObservation,
+            _clock: CycleClock,
+            _log_window_interval: Duration,
+        ) -> Result<String> {
             self.perform("fetch_logs")?;
             self.fetched_log_sources.borrow_mut().push(source.clone());
             Ok(self.log_tail.clone())
@@ -1317,7 +1386,13 @@ mod tests {
 
     fn run_ops(port: &mut FakeOpsPort, hosts: &[&str], has_scope_label: bool) -> Result<()> {
         let sources: Vec<OpsLogSource> = hosts.iter().copied().map(log_source).collect();
-        run_ops_cycle(TEST_AGENT, &sources, has_scope_label, port)
+        run_ops_cycle(
+            TEST_AGENT,
+            &sources,
+            DEFAULT_LOG_WINDOW_INTERVAL,
+            has_scope_label,
+            port,
+        )
     }
 
     /// The operations every cycle performs from the first shutdown check through
@@ -1489,7 +1564,14 @@ mod tests {
         let mut port = FakeOpsPort::new(Vec::new()).with_log_tail(old_log);
         let sources = vec![log_source("prod.example.com"), grafana_source()];
 
-        run_ops_cycle(TEST_AGENT, &sources, true, &mut port).unwrap();
+        run_ops_cycle(
+            TEST_AGENT,
+            &sources,
+            DEFAULT_LOG_WINDOW_INTERVAL,
+            true,
+            &mut port,
+        )
+        .unwrap();
 
         let observations: Vec<_> = sources
             .iter()
@@ -1694,6 +1776,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings.logs.len(), 1);
+        assert_eq!(settings.poll_interval, DEFAULT_POLL_INTERVAL);
+        assert_eq!(settings.log_window_interval, DEFAULT_LOG_WINDOW_INTERVAL);
         assert_eq!(ssh_settings(&settings.logs[0]).ssh_user, "deploy");
         assert_eq!(
             ssh_settings(&settings.logs[0]).log_path,
@@ -1706,6 +1790,8 @@ mod tests {
         let settings = OpsAgentSettings::from_raw(
             &toml::from_str(
                 r#"
+                poll_interval = "45s"
+                log_window_interval = "30m"
                 logs = [
                     { ssh_user = "deploy", ssh_host = "prod-1.example.com", log_path = "/var/log/app/app.log" },
                     { ssh_user = "deploy", ssh_host = "prod-2.example.com", log_path = "/var/log/app/worker.log" },
@@ -1717,6 +1803,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(settings.logs.len(), 2);
+        assert_eq!(settings.poll_interval, Duration::from_secs(45));
+        assert_eq!(settings.log_window_interval, Duration::from_secs(30 * 60));
         assert_eq!(
             ssh_settings(&settings.logs[0]).ssh_host,
             "prod-1.example.com"
@@ -1725,6 +1813,39 @@ mod tests {
             ssh_settings(&settings.logs[1]).log_path,
             "/var/log/app/worker.log"
         );
+    }
+
+    #[test]
+    fn ops_settings_reject_zero_log_window() {
+        let error = OpsAgentSettings::from_raw(
+            &toml::from_str(
+                r#"
+                log_window_interval = "0s"
+                logs = [
+                    { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app.log" },
+                ]
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("log_window_interval"));
+    }
+
+    #[test]
+    fn ops_settings_reject_zero_or_deprecated_poll_interval() {
+        for field in ["poll_interval = \"0s\"", "poll_interval_secs = 60"] {
+            let raw = format!(
+                r#"
+                {field}
+                logs = [
+                    {{ ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app.log" }},
+                ]
+                "#
+            );
+            let error = OpsAgentSettings::from_raw(&toml::from_str(&raw).unwrap()).unwrap_err();
+            assert!(error.to_string().contains("poll_interval"));
+        }
     }
 
     #[test]
@@ -1760,10 +1881,22 @@ mod tests {
         let recent = "2026-06-15 11:30:00 ERROR something broke\nstack line";
         let old = "2026-06-15 09:00:00 ERROR old failure";
         let log = format!("{old}\n{recent}");
-        let (filtered, parsed) = filter_log_to_time_window(&log, now);
+        let (filtered, parsed) = filter_log_to_time_window(&log, now, DEFAULT_LOG_WINDOW_INTERVAL);
         assert!(parsed);
         assert!(filtered.contains("something broke"));
         assert!(!filtered.contains("old failure"));
+    }
+
+    #[test]
+    fn filter_log_to_time_window_uses_configured_interval() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        let log = "2026-06-15 07:00:00 ERROR five hours old";
+        let (short_window, _) =
+            filter_log_to_time_window(log, now, Duration::from_secs(2 * 60 * 60));
+        let (long_window, _) =
+            filter_log_to_time_window(log, now, Duration::from_secs(6 * 60 * 60));
+        assert!(short_window.is_empty());
+        assert!(long_window.contains("five hours old"));
     }
 
     #[test]
@@ -1772,7 +1905,7 @@ mod tests {
         let recent = "2026/06/16 06:50:09 ERROR something broke\nstack line";
         let old = "2026/06/16 04:50:09 ERROR old failure";
         let log = format!("{old}\n{recent}");
-        let (filtered, parsed) = filter_log_to_time_window(&log, now);
+        let (filtered, parsed) = filter_log_to_time_window(&log, now, DEFAULT_LOG_WINDOW_INTERVAL);
         assert!(parsed);
         assert!(filtered.contains("something broke"));
         assert!(!filtered.contains("old failure"));

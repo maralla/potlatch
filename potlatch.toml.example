@@ -50,11 +50,12 @@ cursor_ask_via_gitlab = false
 [agent.ops]
 # model = "acp://cursor/composer-2"
 # Single-instance only; omit [agent.ops] entirely to disable.
-poll_interval_secs = 600
+poll_interval = "10m"
+log_window_interval = "2h"
 logs = [
   { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app/app.log" },
   # { ssh_user = "deploy", ssh_host = "worker.example.com", log_path = "/var/log/app/worker.log" },
-  # Grafana Elasticsearch sources query the same two-hour window as SSH sources.
+  # Grafana Elasticsearch sources query the same configured window as SSH sources.
   # Keep this local config uncommitted because username/password are literal credentials.
   # `filter` accepts raw Elasticsearch query DSL or a Lucene query string.
   # { type = "grafana", url = "https://grafana.example.com", datasource_uid = "elastic-uid", index = "application-logs", org_id = 1, username = "ops", password = "replace-me", filter = '{"term":{"service.name":"api"}}' },
