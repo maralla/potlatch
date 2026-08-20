@@ -14,7 +14,7 @@
 //! model is instructed to keep only a few essential bullet points.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Load project facts from the persistent memory file for the given cwd.
 ///
@@ -22,7 +22,11 @@ use std::path::PathBuf;
 /// `~/.potlatch/memory/<hash>.md`. Returns `None` if the repo has no remote or
 /// the memory file doesn't exist yet.
 pub fn load_facts(cwd: &str) -> Option<String> {
-    let memory_path = memory_path_for_cwd(cwd)?;
+    load_facts_in(&default_memory_dir(), cwd)
+}
+
+pub(crate) fn load_facts_in(memory_dir: &Path, cwd: &str) -> Option<String> {
+    let memory_path = memory_path_for_cwd_in(memory_dir, cwd)?;
     let content = fs::read_to_string(&memory_path).ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -36,7 +40,11 @@ pub fn load_facts(cwd: &str) -> Option<String> {
 /// Called during compaction — the LLM produces a merged set of existing + new
 /// facts, and this replaces the file entirely. Empty facts are filtered.
 pub fn save_facts(cwd: &str, facts: &[String]) {
-    let Some(memory_path) = memory_path_for_cwd(cwd) else {
+    save_facts_in(&default_memory_dir(), cwd, facts);
+}
+
+pub(crate) fn save_facts_in(memory_dir: &Path, cwd: &str, facts: &[String]) {
+    let Some(memory_path) = memory_path_for_cwd_in(memory_dir, cwd) else {
         return;
     };
 
@@ -68,15 +76,14 @@ pub fn save_facts(cwd: &str, facts: &[String]) {
 
 /// Build the memory file path for the repo at `cwd`.
 /// Returns `None` if the repo has no remote.origin.url.
-fn memory_path_for_cwd(cwd: &str) -> Option<PathBuf> {
+fn memory_path_for_cwd_in(memory_dir: &Path, cwd: &str) -> Option<PathBuf> {
     let remote_url = git_remote_url(cwd)?;
     let hash = hash_str(&remote_url);
-    Some(
-        home_dir()
-            .join(".potlatch")
-            .join("memory")
-            .join(format!("{hash}.md")),
-    )
+    Some(memory_dir.join(format!("{hash}.md")))
+}
+
+fn default_memory_dir() -> PathBuf {
+    home_dir().join(".potlatch").join("memory")
 }
 
 /// Get the git remote URL for the repository at `cwd`.

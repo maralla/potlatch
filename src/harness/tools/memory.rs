@@ -3,11 +3,45 @@
 
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::path::Path;
 use tracing::info;
 
 use super::Tool;
 
 pub struct MemoryTool;
+
+impl MemoryTool {
+    fn execute_in(&self, args: &Value, cwd: &str, memory_dir: Option<&Path>) -> Result<String> {
+        let facts = args["facts"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing 'facts' array argument"))?;
+
+        let facts: Vec<String> = facts
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        if facts.is_empty() {
+            return Ok("Error: 'facts' array must not be empty".into());
+        }
+
+        info!("harness: memory save {} facts", facts.len());
+        for f in &facts {
+            info!("harness: memory fact: {f}");
+        }
+
+        if let Some(memory_dir) = memory_dir {
+            crate::harness::memory::save_facts_in(memory_dir, cwd, &facts);
+        } else {
+            crate::harness::memory::save_facts(cwd, &facts);
+        }
+
+        Ok(format!(
+            "Saved {} fact(s) to persistent memory.",
+            facts.len()
+        ))
+    }
+}
 
 impl Tool for MemoryTool {
     fn name(&self) -> &str {
@@ -32,30 +66,7 @@ impl Tool for MemoryTool {
     }
 
     fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
-        let facts = args["facts"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("missing 'facts' array argument"))?;
-
-        let facts: Vec<String> = facts
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-
-        if facts.is_empty() {
-            return Ok("Error: 'facts' array must not be empty".into());
-        }
-
-        info!("harness: memory save {} facts", facts.len());
-        for f in &facts {
-            info!("harness: memory fact: {f}");
-        }
-
-        crate::harness::memory::save_facts(cwd, &facts);
-
-        Ok(format!(
-            "Saved {} fact(s) to persistent memory.",
-            facts.len()
-        ))
+        self.execute_in(args, cwd, None)
     }
 }
 
@@ -82,10 +93,14 @@ mod tests {
 
         let tool = MemoryTool;
         let args = json!({"facts": ["Go project", "Build: go build", "Test: go test ./..."]});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let memory_dir = test_util::unique_test_dir();
+        let result = tool
+            .execute_in(&args, dir.as_str(), Some(memory_dir.path()))
+            .unwrap();
         assert!(result.contains("3 fact(s)"));
 
-        let loaded = crate::harness::memory::load_facts(dir.as_str()).unwrap();
+        let loaded =
+            crate::harness::memory::load_facts_in(memory_dir.path(), dir.as_str()).unwrap();
         assert!(loaded.contains("Go project"));
         assert!(loaded.contains("Build: go build"));
     }
