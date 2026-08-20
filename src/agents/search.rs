@@ -4,7 +4,7 @@ mod browser;
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
@@ -16,7 +16,7 @@ use crate::core::bus::{AgentInbox, AgentRequest, AgentToolDefinition};
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 use crate::core::runtime::AgentRuntime;
 use crate::core::workflow::AgentBuildContext;
-use browser::ChromeBrowser;
+use browser::{ChromeBrowser, GoogleVerificationRequired};
 
 const REQUEST_TASK: &str = "requests";
 const INBOX_WAIT: Duration = Duration::from_millis(200);
@@ -88,13 +88,17 @@ impl ChromeSearchBackend {
 impl SearchBackend for ChromeSearchBackend {
     fn search(&mut self, query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
         let result = search_google(self.browser()?, query, max_results);
-        if result.is_err() {
+        if result.as_ref().is_err_and(should_relaunch_browser) {
             // A failed CDP operation can leave the tab or process unusable.
             // Relaunch lazily for the next independent request.
             self.browser.take();
         }
         result
     }
+}
+
+fn should_relaunch_browser(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<GoogleVerificationRequired>().is_none()
 }
 
 impl SearchAgent {
@@ -231,16 +235,13 @@ fn search_google(
 ) -> Result<Vec<SearchResult>> {
     browser.submit_google_query(query)?;
 
-    let blocked = browser.evaluate_json(
-        r#"(() => {
-            const text = (document.body?.innerText || "").toLowerCase();
-            return text.includes("our systems have detected unusual traffic")
-                || text.includes("verify you are not a robot");
-        })()"#,
-    )?;
-    if blocked.as_bool() == Some(true) {
-        bail!("Google blocked the automated search with a verification page");
+    if browser
+        .google_verification_required()
+        .context("check Google verification after submitting query")?
+    {
+        return Err(GoogleVerificationRequired.into());
     }
+    browser.wait_for_google_results()?;
 
     let expression = format!(
         r#"(() => {{
@@ -262,7 +263,9 @@ fn search_google(
             return output;
         }})()"#,
     );
-    let value = browser.evaluate_json(&expression)?;
+    let value = browser
+        .evaluate_json(&expression)
+        .context("extract rendered Google search results")?;
     let results: Vec<SearchResult> =
         serde_json::from_value(value).context("decode rendered Google Search results")?;
     ensure!(
@@ -357,6 +360,15 @@ mod tests {
         assert_eq!(tool.name, "search");
         assert_eq!(tool.operation, SEARCH_OPERATION);
         assert_eq!(tool.parameters["required"], serde_json::json!(["query"]));
+    }
+
+    #[test]
+    fn verification_keeps_the_visible_browser_open_for_the_user() {
+        let verification = anyhow::Error::new(GoogleVerificationRequired);
+        assert!(!should_relaunch_browser(&verification));
+        assert!(should_relaunch_browser(&anyhow::anyhow!(
+            "CDP disconnected"
+        )));
     }
 
     #[test]
