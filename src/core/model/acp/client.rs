@@ -1011,7 +1011,9 @@ mod tests {
         let (client_tp, agent_tp) = line_channel_pair();
         let hooks: Arc<dyn AcpHooks> = Arc::new(AutoAllowPermissions);
         let agent = thread::spawn(move || -> Result<()> {
-            let mut reader = BufReader::new(agent_tp.reader);
+            let LineTransport { reader, writer } = agent_tp;
+            drop(writer);
+            let mut reader = BufReader::new(reader);
             let mut line = String::new();
             reader.read_line(&mut line)?;
             let m: Value = serde_json::from_str(line.trim())?;
@@ -1021,8 +1023,8 @@ mod tests {
         });
         let client = from_line_transport(client_tp, hooks)?;
         client.session_cancel("abc")?;
-        shutdown_client(client)?;
         agent.join().expect("a")?;
+        shutdown_client(client)?;
         Ok(())
     }
 }
