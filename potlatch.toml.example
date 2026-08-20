@@ -32,18 +32,18 @@ gitlab_repo = "https://gitlab.com/group/project"
 [agent.worker]
 # model = "acp://cursor/composer-2"
 # acp_client = "cursor-local"
-poll_interval_secs = 60
+poll_interval = "1m"
 instances = 1
 
 [agent.reviewer]
 # model = "acp://cursor/gpt-5.3-codex"
-poll_interval_secs = 120
+poll_interval = "2m"
 instances = 1
 merge_when_approved = true
 
 [agent.pmo]
 # model = "acp://cursor/composer-2"
-poll_interval_secs = 180
+poll_interval = "3m"
 instances = 1
 cursor_ask_via_gitlab = false
 
@@ -64,7 +64,7 @@ logs = [
 [agent.qa]
 # QA agent: runs regression tests and security analysis on branch commits.
 # Only runs when qa.md exists in the repo root. Omit [agent.qa] to disable.
-poll_interval_secs = 300
+poll_interval = "5m"
 instances = 1
 branches = ["main"]
 

@@ -92,7 +92,7 @@ mod tests {
             [agent.alpha]
             model = "acp://cursor/gpt-5.3-codex"
             instances = 2
-            poll_interval_secs = 120
+            poll_interval = "2m"
             merge_when_approved = true
             "#,
         )
@@ -105,8 +105,8 @@ mod tests {
             "gpt-5.3-codex"
         );
         assert_eq!(
-            section.raw.get("poll_interval_secs").unwrap().as_integer(),
-            Some(120)
+            section.raw.get("poll_interval").unwrap().as_str(),
+            Some("2m")
         );
         assert!(section.raw.get("instances").is_none());
         assert!(section.raw.get("model").is_none());

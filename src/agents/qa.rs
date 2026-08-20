@@ -201,20 +201,24 @@ fn normalize_clarifications(raw: Vec<RawClarification>) -> Vec<ClarificationQues
 
 #[derive(Debug, Clone)]
 struct QaConfig {
-    poll_interval_secs: u64,
+    poll_interval: Duration,
     branches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct QaAgentSettings {
-    #[serde(default = "default_qa_poll_interval")]
-    poll_interval_secs: u64,
+    #[serde(
+        default = "default_qa_poll_interval",
+        deserialize_with = "crate::core::config::duration::deserialize"
+    )]
+    poll_interval: Duration,
+    poll_interval_secs: Option<u64>,
     #[serde(default = "default_branches")]
     branches: Vec<String>,
 }
 
-fn default_qa_poll_interval() -> u64 {
-    300
+fn default_qa_poll_interval() -> Duration {
+    Duration::from_secs(300)
 }
 
 fn default_branches() -> Vec<String> {
@@ -347,16 +351,20 @@ impl CoreAgent for QaAgent {
     fn validate_settings(
         config: &Config,
         _section: &crate::core::config::AgentSection,
-        _settings: &Self::Settings,
+        settings: &Self::Settings,
     ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        anyhow::ensure!(
+            settings.poll_interval_secs.is_none(),
+            "poll_interval_secs was replaced by poll_interval for [agent.qa]"
+        );
         Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
         vec![PeriodicTaskSpec::polling(
             "qa_poll",
-            Duration::from_secs(self.config.poll_interval_secs),
+            self.config.poll_interval,
         )]
     }
 
@@ -375,7 +383,7 @@ impl CoreAgent for QaAgent {
         let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let agent_settings = ctx.settings;
         let config = QaConfig {
-            poll_interval_secs: agent_settings.poll_interval_secs,
+            poll_interval: agent_settings.poll_interval,
             branches: agent_settings.branches,
         };
         Ok(Self { runtime, config })
@@ -1428,7 +1436,7 @@ mod tests {
     fn qa_settings_from_raw_parses_defaults() {
         let raw: toml::Value = toml::from_str("").unwrap();
         let settings = QaAgentSettings::from_raw(&raw).unwrap();
-        assert_eq!(settings.poll_interval_secs, 300);
+        assert_eq!(settings.poll_interval, Duration::from_secs(300));
         assert_eq!(settings.branches, vec!["main".to_string()]);
     }
 
@@ -1436,13 +1444,13 @@ mod tests {
     fn qa_settings_from_raw_parses_custom_values() {
         let raw: toml::Value = toml::from_str(
             r#"
-            poll_interval_secs = 120
+            poll_interval = "2m"
             branches = ["main", "develop"]
             "#,
         )
         .unwrap();
         let settings = QaAgentSettings::from_raw(&raw).unwrap();
-        assert_eq!(settings.poll_interval_secs, 120);
+        assert_eq!(settings.poll_interval, Duration::from_secs(120));
         assert_eq!(settings.branches, vec!["main", "develop"]);
     }
 

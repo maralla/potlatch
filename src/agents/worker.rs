@@ -355,17 +355,21 @@ structured_output! {
 
 #[derive(Debug, Clone)]
 struct WorkerConfig {
-    poll_interval_secs: u64,
+    poll_interval: Duration,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct WorkerAgentSettings {
-    #[serde(default = "default_worker_poll_interval")]
-    poll_interval_secs: u64,
+    #[serde(
+        default = "default_worker_poll_interval",
+        deserialize_with = "crate::core::config::duration::deserialize"
+    )]
+    poll_interval: Duration,
+    poll_interval_secs: Option<u64>,
 }
 
-fn default_worker_poll_interval() -> u64 {
-    60
+fn default_worker_poll_interval() -> Duration {
+    Duration::from_secs(60)
 }
 
 /// The single issue a worker is pinned to for its full lifecycle.
@@ -611,16 +615,20 @@ impl CoreAgent for WorkerAgent {
     fn validate_settings(
         config: &Config,
         _section: &crate::core::config::AgentSection,
-        _settings: &Self::Settings,
+        settings: &Self::Settings,
     ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        anyhow::ensure!(
+            settings.poll_interval_secs.is_none(),
+            "poll_interval_secs was replaced by poll_interval for [agent.worker]"
+        );
         Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
         vec![PeriodicTaskSpec::polling(
             "gitlab_poll",
-            Duration::from_secs(self.config.poll_interval_secs),
+            self.config.poll_interval,
         )]
     }
 
@@ -641,7 +649,7 @@ impl CoreAgent for WorkerAgent {
         let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let settings = ctx.settings;
         let config = WorkerConfig {
-            poll_interval_secs: settings.poll_interval_secs,
+            poll_interval: settings.poll_interval,
         };
         let scope = crate::agents::scope_label_filter(&runtime.scope_label);
         let active = {

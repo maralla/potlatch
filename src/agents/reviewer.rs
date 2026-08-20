@@ -118,20 +118,24 @@ structured_output! {
 
 #[derive(Debug, Clone)]
 struct ReviewerConfig {
-    poll_interval_secs: u64,
+    poll_interval: Duration,
     merge_when_approved: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct ReviewerAgentSettings {
-    #[serde(default = "default_reviewer_poll_interval")]
-    poll_interval_secs: u64,
+    #[serde(
+        default = "default_reviewer_poll_interval",
+        deserialize_with = "crate::core::config::duration::deserialize"
+    )]
+    poll_interval: Duration,
+    poll_interval_secs: Option<u64>,
     #[serde(default = "default_merge_when_approved")]
     merge_when_approved: bool,
 }
 
-fn default_reviewer_poll_interval() -> u64 {
-    120
+fn default_reviewer_poll_interval() -> Duration {
+    Duration::from_secs(120)
 }
 
 fn default_merge_when_approved() -> bool {
@@ -163,16 +167,20 @@ impl CoreAgent for ReviewerAgent {
     fn validate_settings(
         config: &Config,
         _section: &crate::core::config::AgentSection,
-        _settings: &Self::Settings,
+        settings: &Self::Settings,
     ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        anyhow::ensure!(
+            settings.poll_interval_secs.is_none(),
+            "poll_interval_secs was replaced by poll_interval for [agent.reviewer]"
+        );
         Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
         vec![PeriodicTaskSpec::polling(
             "gitlab_poll",
-            Duration::from_secs(self.config.poll_interval_secs),
+            self.config.poll_interval,
         )]
     }
 
@@ -205,7 +213,7 @@ impl CoreAgent for ReviewerAgent {
         let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let settings = ctx.settings;
         let config = ReviewerConfig {
-            poll_interval_secs: settings.poll_interval_secs,
+            poll_interval: settings.poll_interval,
             merge_when_approved: settings.merge_when_approved,
         };
         let scope = crate::agents::scope_label_filter(&runtime.scope_label);
