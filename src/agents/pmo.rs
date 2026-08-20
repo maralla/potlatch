@@ -301,23 +301,27 @@ structured_output! {
 
 #[derive(Debug, Clone)]
 struct PmoConfig {
-    poll_interval_secs: u64,
+    poll_interval: Duration,
     ask_via_gitlab: bool,
     ask_gitlab_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct PmoAgentSettings {
-    #[serde(default = "default_pmo_poll_interval")]
-    poll_interval_secs: u64,
+    #[serde(
+        default = "default_pmo_poll_interval",
+        deserialize_with = "crate::core::config::duration::deserialize"
+    )]
+    poll_interval: Duration,
+    poll_interval_secs: Option<u64>,
     #[serde(default)]
     ask_via_gitlab: bool,
     #[serde(default = "default_ask_gitlab_timeout_secs")]
     ask_gitlab_timeout_secs: u64,
 }
 
-fn default_pmo_poll_interval() -> u64 {
-    180
+fn default_pmo_poll_interval() -> Duration {
+    Duration::from_secs(180)
 }
 
 fn default_ask_gitlab_timeout_secs() -> u64 {
@@ -432,16 +436,20 @@ impl CoreAgent for PmoAgent {
     fn validate_settings(
         config: &Config,
         _section: &crate::core::config::AgentSection,
-        _settings: &Self::Settings,
+        settings: &Self::Settings,
     ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        anyhow::ensure!(
+            settings.poll_interval_secs.is_none(),
+            "poll_interval_secs was replaced by poll_interval for [agent.pmo]"
+        );
         Ok(())
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
         vec![PeriodicTaskSpec::polling(
             "gitlab_poll",
-            Duration::from_secs(self.config.poll_interval_secs),
+            self.config.poll_interval,
         )]
     }
 
@@ -471,7 +479,7 @@ impl CoreAgent for PmoAgent {
         let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let settings = ctx.settings;
         let config = PmoConfig {
-            poll_interval_secs: settings.poll_interval_secs,
+            poll_interval: settings.poll_interval,
             ask_via_gitlab: settings.ask_via_gitlab,
             ask_gitlab_timeout_secs: settings.ask_gitlab_timeout_secs,
         };

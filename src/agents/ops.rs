@@ -147,13 +147,13 @@ struct OpsSshLogSource {
 pub(crate) struct OpsAgentSettings {
     #[serde(
         default = "default_ops_poll_interval",
-        deserialize_with = "deserialize_duration"
+        deserialize_with = "crate::core::config::duration::deserialize"
     )]
     poll_interval: Duration,
     poll_interval_secs: Option<u64>,
     #[serde(
         default = "default_log_window_interval",
-        deserialize_with = "deserialize_duration"
+        deserialize_with = "crate::core::config::duration::deserialize"
     )]
     log_window_interval: Duration,
     ssh_user: Option<String>,
@@ -191,14 +191,6 @@ fn default_ops_poll_interval() -> Duration {
 
 fn default_log_window_interval() -> Duration {
     DEFAULT_LOG_WINDOW_INTERVAL
-}
-
-fn deserialize_duration<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    humantime::parse_duration(&value).map_err(serde::de::Error::custom)
 }
 
 impl OpsAgentSettings {
@@ -1829,12 +1821,18 @@ mod tests {
             .unwrap(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("log_window_interval"));
+        assert!(format!("{error:#}").contains("duration must be greater than zero"));
     }
 
     #[test]
     fn ops_settings_reject_zero_or_deprecated_poll_interval() {
-        for field in ["poll_interval = \"0s\"", "poll_interval_secs = 60"] {
+        for (field, expected) in [
+            (
+                "poll_interval = \"0s\"",
+                "duration must be greater than zero",
+            ),
+            ("poll_interval_secs = 60", "poll_interval_secs was replaced"),
+        ] {
             let raw = format!(
                 r#"
                 {field}
@@ -1844,7 +1842,7 @@ mod tests {
                 "#
             );
             let error = OpsAgentSettings::from_raw(&toml::from_str(&raw).unwrap()).unwrap_err();
-            assert!(error.to_string().contains("poll_interval"));
+            assert!(format!("{error:#}").contains(expected));
         }
     }
 

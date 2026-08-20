@@ -1,5 +1,6 @@
 mod acp;
 mod agent;
+pub(crate) mod duration;
 pub mod uri;
 
 pub use acp::{
@@ -142,7 +143,7 @@ mod tests {
             [agent.alpha]
             model = "composer-2"
             instances = 1
-            poll_interval_secs = 60
+            poll_interval = "1m"
             "#,
         )
         .unwrap();

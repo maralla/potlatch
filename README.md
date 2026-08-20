@@ -45,10 +45,10 @@ Example config:
 gitlab_repo = "https://gitlab.com/username/project"
 
 [agent.worker]
-poll_interval_secs = 60
+poll_interval = "1m"
 
 [agent.reviewer]
-poll_interval_secs = 120
+poll_interval = "2m"
 merge_when_approved = true
 ```
 
@@ -67,11 +67,11 @@ gitlab_repo = "https://gitlab.com/username/project"
 
 [agent.worker]
 # model = "acp://cursor/composer-2"
-poll_interval_secs = 60
+poll_interval = "1m"
 
 [agent.reviewer]
 # model = "acp://cursor/gpt-5.3-codex"
-poll_interval_secs = 120
+poll_interval = "2m"
 merge_when_approved = true
 ```
 
@@ -154,7 +154,7 @@ OPS accepts SSH and Grafana Elasticsearch entries in the same `logs` list. Grafa
 
 ```toml
 [agent.ops]
-poll_interval_secs = 600
+poll_interval = "10m"
 logs = [
   { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app/app.log" },
   { type = "grafana", url = "https://grafana.example.com", datasource_uid = "elastic-uid", index = "application-logs", org_id = 1, username = "ops", password = "replace-me", filter = '{"term":{"service.name":"api"}}' },
@@ -205,10 +205,10 @@ Configure how often agents check for new work:
 
 ```toml
 [worker]
-poll_interval_secs = 60      # Check for new issues every 60 seconds
+poll_interval = "1m"         # Check for new issues every minute
 
 [reviewer]
-poll_interval_secs = 120     # Check for MRs every 120 seconds
+poll_interval = "2m"         # Check for MRs every two minutes
 merge_when_approved = true   # Auto-merge approved MRs
 ```
 
