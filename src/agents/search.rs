@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
+use tracing::info;
 
 use crate::core::agent::CoreAgent;
 use crate::core::bus::{AgentInbox, AgentRequest, AgentToolDefinition};
@@ -163,6 +164,14 @@ impl CoreAgent for SearchAgent {
             backend: Box::new(ChromeSearchBackend::new()),
             max_results: ctx.settings.max_results,
         })
+    }
+
+    fn on_start(&mut self) -> Result<()> {
+        info!(
+            "{}: Search agent ready; registered tool `search`",
+            self.agent_id()
+        );
+        Ok(())
     }
 
     fn on_shutdown(&mut self) {}
