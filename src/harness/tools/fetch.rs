@@ -35,7 +35,7 @@ impl Tool for FetchTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Fetch the content of a web page by URL. Returns the text content (HTML converted to readable text). Follows up to 5 redirects. Use for looking up documentation, API references, or other web resources.",
+            "description": "Fetch a URL without browser rendering and convert static HTML to readable text. When `web_fetch` is available, prefer `web_fetch` for HTML pages, URLs returned by `search`, and JavaScript-generated content. Use `fetch` only for lightweight static or non-HTML responses, or when `web_fetch` is unavailable. Follows up to 5 redirects.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -126,5 +126,15 @@ mod tests {
         let s = "abcéfg";
         let truncated = truncate_at_char_boundary(s, 4);
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn description_defers_rendered_pages_to_web_fetch() {
+        let description = FetchTool::new().schema()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(description.contains("prefer `web_fetch`"));
+        assert!(description.contains("without browser rendering"));
     }
 }

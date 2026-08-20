@@ -16,6 +16,9 @@ use headless_chrome::{Browser, Tab};
 use serde_json::Value;
 
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
+// Defuddle 0.19.2 full browser bundle (MIT); see defuddle.LICENSE.txt.
+const DEFUDDLE_SCRIPT: &str = include_str!("defuddle.full.js");
+const RENDER_SETTLE_DELAY: Duration = Duration::from_millis(500);
 const SEARCH_PROFILE_ENV: &str = "BREEZE_SEARCH_PROFILE";
 
 #[derive(Debug)]
@@ -82,6 +85,13 @@ impl ChromeBrowser {
             run_immediately: None,
         })
         .context("install search browser compatibility script")?;
+        tab.call_method(AddScriptToEvaluateOnNewDocument {
+            source: DEFUDDLE_SCRIPT.to_string(),
+            world_name: None,
+            include_command_line_api: None,
+            run_immediately: None,
+        })
+        .context("install Defuddle page extraction script")?;
         Ok(Self {
             _browser: browser,
             tab,
@@ -97,8 +107,24 @@ impl ChromeBrowser {
         Ok(self.tab.get_url())
     }
 
-    pub(super) fn submit_google_query(&self, query: &str) -> Result<()> {
+    pub(super) fn submit_google_query(&self, query: &str, max_results: usize) -> Result<()> {
+        // Land on Google first so the region-dependent consent interstitial is
+        // handled before we open the results page directly. Opening the results
+        // URL directly avoids the slow character-by-character typing into the
+        // search box.
         self.navigate_to("https://www.google.com/")?;
+        self.dismiss_google_consent()?;
+        if self
+            .google_verification_required()
+            .context("check Google verification before submitting query")?
+        {
+            return Err(GoogleVerificationRequired.into());
+        }
+        self.navigate_to(&google_search_url(query, max_results))?;
+        Ok(())
+    }
+
+    fn dismiss_google_consent(&self) -> Result<()> {
         // Consent is region-dependent and absent in many environments.
         self.tab
             .evaluate(
@@ -111,24 +137,6 @@ impl ChromeBrowser {
                 false,
             )
             .context("handle Google consent page")?;
-        if self
-            .google_verification_required()
-            .context("check Google verification before submitting query")?
-        {
-            return Err(GoogleVerificationRequired.into());
-        }
-        let input = self
-            .tab
-            .wait_for_element("textarea[name='q'], input[name='q']")
-            .context("wait for Google search input")?;
-        input.click().context("focus Google search input")?;
-        input.type_into(query).context("type Google search query")?;
-        self.tab
-            .press_key("Enter")
-            .context("submit Google search query")?;
-        self.tab
-            .wait_until_navigated()
-            .context("wait for Google search results navigation")?;
         Ok(())
     }
 
@@ -152,6 +160,35 @@ impl ChromeBrowser {
         Ok(())
     }
 
+    pub(super) fn fetch_rendered_markdown(&self, url: &str) -> Result<String> {
+        self.navigate_to(url)?;
+        std::thread::sleep(RENDER_SETTLE_DELAY);
+        self.extract_rendered_markdown()
+    }
+
+    pub(super) fn extract_rendered_markdown(&self) -> Result<String> {
+        Ok(self
+            .evaluate_json(
+                r#"(() => {
+                    if (typeof globalThis.Defuddle !== "function") {
+                        throw new Error("Defuddle browser bundle is unavailable");
+                    }
+                    const result = new globalThis.Defuddle(document, {
+                        markdown: true,
+                        useAsync: false
+                    }).parse();
+                    if (!result || typeof result.content !== "string") {
+                        throw new Error("Defuddle returned no Markdown content");
+                    }
+                    return result.content;
+                })()"#,
+            )
+            .context("extract rendered page with Defuddle")?
+            .as_str()
+            .context("Defuddle Markdown result was not a string")?
+            .to_string())
+    }
+
     pub(super) fn evaluate_json(&self, expression: &str) -> Result<Value> {
         let serialized = self
             .tab
@@ -168,6 +205,17 @@ fn decode_evaluated_json(serialized: Value) -> Result<Value> {
         .as_str()
         .context("search browser expression did not return serialized JSON")?;
     serde_json::from_str(serialized).context("decode search browser expression JSON")
+}
+
+/// Build a Google Search results URL. Navigating directly to the results page
+/// is much faster than typing the query into the search box and submitting the
+/// form, and `num` requests the desired result count server-side.
+fn google_search_url(query: &str, max_results: usize) -> String {
+    let mut url = reqwest::Url::parse("https://www.google.com/search").expect("Google base URL");
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("num", &max_results.to_string());
+    url.to_string()
 }
 
 fn resolve_search_profile_dir(explicit: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf> {
@@ -357,5 +405,17 @@ mod tests {
             Value::Bool(false)
         );
         assert!(decode_evaluated_json(Value::Null).is_err());
+    }
+
+    #[test]
+    fn google_search_url_encodes_query_and_result_count() {
+        let url = google_search_url("rust & crates", 10);
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("www.google.com"));
+        assert_eq!(parsed.path(), "/search");
+        let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        assert_eq!(pairs.get("q").map(|v| v.as_ref()), Some("rust & crates"));
+        assert_eq!(pairs.get("num").map(|v| v.as_ref()), Some("10"));
     }
 }

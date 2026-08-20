@@ -45,6 +45,8 @@ Your workspace is the current working directory. It is the root of the repositor
 
 {tools_section}
 
+- **Prefer rendered web access.** When both `web_fetch` and `fetch` are available, use `web_fetch` for web pages and URLs returned by `search`. Use `fetch` only when you specifically need a lightweight raw/static response or browser rendering is unnecessary.
+
 ## Important Notes
 
 - Tool results may be compacted to save context. If you need exact current file state, re-read the file rather than relying on memory.
@@ -132,6 +134,13 @@ mod tests {
         assert!(p.contains("Verify your changes"));
         assert!(p.contains("Stop when the task is done"));
         assert!(p.contains("compacted"));
+    }
+
+    #[test]
+    fn system_prompt_prefers_web_fetch_for_pages() {
+        let p = system_prompt(&test_descriptions());
+        assert!(p.contains("When both `web_fetch` and `fetch` are available"));
+        assert!(p.contains("use `web_fetch` for web pages"));
     }
 
     #[test]
