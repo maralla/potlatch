@@ -11,10 +11,10 @@ pub mod ops;
 pub mod pmo;
 pub(crate) mod qa;
 pub mod reviewer;
-pub(crate) mod search;
 pub mod settings;
 pub(crate) mod ssh_util;
 pub(crate) mod state;
+pub(crate) mod web;
 pub mod worker;
 pub mod workspace;
 
@@ -138,7 +138,7 @@ pub fn register(workflow: &mut Workflow) {
     workflow.register_agent::<pmo::PmoAgent>();
     workflow.register_agent::<ops::OpsAgent>();
     workflow.register_agent::<qa::QaAgent>();
-    workflow.register_agent::<search::SearchAgent>();
+    workflow.register_agent::<web::WebAgent>();
 }
 
 #[cfg(test)]
@@ -184,10 +184,7 @@ mod scope_tests {
         register(&mut workflow);
         let mut names: Vec<_> = workflow.registered_agent_names().collect();
         names.sort_unstable();
-        assert_eq!(
-            names,
-            vec!["ops", "pmo", "qa", "reviewer", "search", "worker"]
-        );
+        assert_eq!(names, vec!["ops", "pmo", "qa", "reviewer", "web", "worker"]);
     }
 
     #[test]

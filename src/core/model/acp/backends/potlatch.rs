@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn potlatch_vendor_routes_agent_tool_calls_to_the_in_process_bus() {
         let bus = crate::core::bus::AgentBus::new();
-        let inbox = bus.register("search", vec![]).unwrap();
+        let inbox = bus.register("web", vec![]).unwrap();
         let worker = std::thread::spawn(move || {
             let request = inbox.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
             let payload = request.payload.clone();
@@ -201,7 +201,7 @@ mod tests {
             .handle_agent_request(
                 "potlatch/agent_tool_call",
                 &json!({
-                    "target": "search",
+                    "target": "web",
                     "operation": "run",
                     "arguments": {"query": "rust"}
                 }),

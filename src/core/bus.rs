@@ -289,7 +289,7 @@ mod tests {
 
     fn tool() -> AgentToolDefinition {
         AgentToolDefinition {
-            name: "search".to_string(),
+            name: "web_search".to_string(),
             description: "Search.".to_string(),
             parameters: serde_json::json!({"type": "object"}),
             operation: "run".to_string(),
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn routes_requests_in_process() {
         let bus = AgentBus::new();
-        let inbox = bus.register("search", vec![tool()]).unwrap();
+        let inbox = bus.register("web", vec![tool()]).unwrap();
         let worker = std::thread::spawn(move || {
             let request = inbox.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
             let payload = request.payload.clone();
@@ -307,7 +307,7 @@ mod tests {
         });
         let result = bus
             .request(
-                "search",
+                "web",
                 "run".to_string(),
                 serde_json::json!({"query": "rust"}),
                 Duration::from_secs(1),
@@ -321,10 +321,10 @@ mod tests {
     fn tools_exist_only_while_the_agent_is_registered() {
         let bus = AgentBus::new();
         assert!(bus.registered_tools(Duration::ZERO).unwrap().is_empty());
-        let inbox = bus.register("search", vec![tool()]).unwrap();
+        let inbox = bus.register("web", vec![tool()]).unwrap();
         assert_eq!(
             bus.registered_tools(Duration::ZERO).unwrap()[0].name,
-            "search"
+            "web_search"
         );
         drop(inbox);
         assert!(bus.registered_tools(Duration::ZERO).unwrap().is_empty());

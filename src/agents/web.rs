@@ -1,4 +1,4 @@
-//! Model-free Google Search service backed by one persistent browser instance.
+//! Model-free web agent backed by one persistent browser instance.
 
 mod browser;
 
@@ -25,12 +25,12 @@ const MAX_CONFIGURED_RESULTS: usize = 10;
 const MAX_QUERY_CHARS: usize = 500;
 const MAX_URL_CHARS: usize = 2_048;
 const MAX_RENDERED_MARKDOWN_BYTES: usize = 200_000;
-const SEARCH_OPERATION: &str = "google_search";
+const WEB_SEARCH_OPERATION: &str = "google_search";
 const WEB_FETCH_OPERATION: &str = "web_fetch";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SearchAgentSettings {
+pub struct WebAgentSettings {
     #[serde(default = "default_max_results")]
     max_results: usize,
 }
@@ -41,7 +41,7 @@ fn default_max_results() -> usize {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SearchRequest {
+struct WebSearchRequest {
     query: String,
 }
 
@@ -51,23 +51,23 @@ struct WebFetchRequest {
     url: String,
 }
 
-trait SearchBackend: Send {
+trait WebBackend: Send {
     fn search(&mut self, query: &str, max_results: usize) -> Result<String>;
     fn fetch_rendered_markdown(&mut self, url: &str) -> Result<String>;
 }
 
-struct ChromeSearchBackend {
+struct ChromeWebBackend {
     browser: Option<ChromeBrowser>,
 }
 
-pub struct SearchAgent {
+pub struct WebAgent {
     runtime: AgentRuntime,
     inbox: AgentInbox,
-    backend: Box<dyn SearchBackend>,
+    backend: Box<dyn WebBackend>,
     max_results: usize,
 }
 
-impl ChromeSearchBackend {
+impl ChromeWebBackend {
     fn new() -> Self {
         Self { browser: None }
     }
@@ -78,11 +78,11 @@ impl ChromeSearchBackend {
         }
         self.browser
             .as_mut()
-            .context("search browser failed to initialize")
+            .context("web browser failed to initialize")
     }
 }
 
-impl SearchBackend for ChromeSearchBackend {
+impl WebBackend for ChromeWebBackend {
     fn search(&mut self, query: &str, max_results: usize) -> Result<String> {
         let result = search_google(self.browser()?, query, max_results);
         if result.as_ref().is_err_and(should_relaunch_browser) {
@@ -106,7 +106,7 @@ fn should_relaunch_browser(error: &anyhow::Error) -> bool {
     error.downcast_ref::<GoogleVerificationRequired>().is_none()
 }
 
-impl SearchAgent {
+impl WebAgent {
     fn handle_request(&mut self, request: AgentRequest) {
         let result = handle_agent_request(
             self.backend.as_mut(),
@@ -118,12 +118,12 @@ impl SearchAgent {
     }
 }
 
-impl CoreAgent for SearchAgent {
-    type Settings = SearchAgentSettings;
+impl CoreAgent for WebAgent {
+    type Settings = WebAgentSettings;
     const FIXED_INSTANCES: Option<usize> = Some(1);
 
     fn name() -> &'static str {
-        "search"
+        "web"
     }
 
     fn validate_settings(
@@ -153,7 +153,7 @@ impl CoreAgent for SearchAgent {
     }
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
-        ensure!(task_id == REQUEST_TASK, "unknown search task {task_id:?}");
+        ensure!(task_id == REQUEST_TASK, "unknown web task {task_id:?}");
         if let Some(request) = self.inbox.recv_timeout(INBOX_WAIT)? {
             self.handle_request(request);
         }
@@ -165,22 +165,22 @@ impl CoreAgent for SearchAgent {
             .workflow
             .bus
             .as_ref()
-            .context("search agent requires the cross-agent bus")?;
+            .context("web agent requires the cross-agent bus")?;
         let inbox = bus.register(
             Self::name(),
-            vec![search_tool_definition(), web_fetch_tool_definition()],
+            vec![web_search_tool_definition(), web_fetch_tool_definition()],
         )?;
         Ok(Self {
             runtime: ctx.runtime.clone(),
             inbox,
-            backend: Box::new(ChromeSearchBackend::new()),
+            backend: Box::new(ChromeWebBackend::new()),
             max_results: ctx.settings.max_results,
         })
     }
 
     fn on_start(&mut self) -> Result<()> {
         info!(
-            "{}: Search agent ready; registered tools `search` and `web_fetch`",
+            "{}: Web agent ready; registered tools `web_search` and `web_fetch`",
             self.agent_id()
         );
         Ok(())
@@ -190,24 +190,24 @@ impl CoreAgent for SearchAgent {
 }
 
 fn handle_agent_request(
-    backend: &mut dyn SearchBackend,
+    backend: &mut dyn WebBackend,
     max_results: usize,
     operation: &str,
     payload: Value,
 ) -> Result<Value> {
     match operation {
-        SEARCH_OPERATION => handle_search_request(backend, max_results, payload),
+        WEB_SEARCH_OPERATION => handle_web_search_request(backend, max_results, payload),
         WEB_FETCH_OPERATION => handle_web_fetch_request(backend, payload),
-        _ => bail!("unsupported search operation {operation:?}"),
+        _ => bail!("unsupported web operation {operation:?}"),
     }
 }
 
-fn handle_search_request(
-    backend: &mut dyn SearchBackend,
+fn handle_web_search_request(
+    backend: &mut dyn WebBackend,
     max_results: usize,
     payload: Value,
 ) -> Result<Value> {
-    let request: SearchRequest =
+    let request: WebSearchRequest =
         serde_json::from_value(payload).context("invalid Google Search request")?;
     let query = request.query.trim();
     ensure!(!query.is_empty(), "search query must not be empty");
@@ -218,7 +218,7 @@ fn handle_search_request(
     Ok(Value::String(backend.search(query, max_results)?))
 }
 
-fn handle_web_fetch_request(backend: &mut dyn SearchBackend, payload: Value) -> Result<Value> {
+fn handle_web_fetch_request(backend: &mut dyn WebBackend, payload: Value) -> Result<Value> {
     let request: WebFetchRequest =
         serde_json::from_value(payload).context("invalid rendered web fetch request")?;
     let url = validate_web_url(&request.url)?;
@@ -258,10 +258,10 @@ fn truncate_rendered_markdown(mut markdown: String) -> String {
     markdown
 }
 
-fn search_tool_definition() -> AgentToolDefinition {
+fn web_search_tool_definition() -> AgentToolDefinition {
     AgentToolDefinition {
-        name: "search".to_string(),
-        description: "Search Google through the dedicated browser search agent and return Defuddle Markdown extracted directly from the rendered search results page. Use it when current public web information is needed.".to_string(),
+        name: "web_search".to_string(),
+        description: "Search Google through the dedicated browser web agent and return Defuddle Markdown extracted directly from the rendered search results page. Use it when current public web information is needed.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -275,14 +275,14 @@ fn search_tool_definition() -> AgentToolDefinition {
             "required": ["query"],
             "additionalProperties": false
         }),
-        operation: SEARCH_OPERATION.to_string(),
+        operation: WEB_SEARCH_OPERATION.to_string(),
     }
 }
 
 fn web_fetch_tool_definition() -> AgentToolDefinition {
     AgentToolDefinition {
         name: "web_fetch".to_string(),
-        description: "Preferred tool for opening web pages and URLs returned by `search`. Use `web_fetch` instead of `fetch` whenever rendered or JavaScript-generated content may be needed. It opens the HTTP(S) address in the persistent system browser and returns only the extracted Markdown content, without a JSON wrapper or metadata.".to_string(),
+        description: "Preferred tool for opening web pages and URLs returned by `web_search`. Use `web_fetch` instead of `fetch` whenever rendered or JavaScript-generated content may be needed. It opens the HTTP(S) address in the persistent system browser and returns only the extracted Markdown content, without a JSON wrapper or metadata.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -331,7 +331,7 @@ mod tests {
         rendered_markdown: Option<String>,
     }
 
-    impl SearchBackend for RecordingBackend {
+    impl WebBackend for RecordingBackend {
         fn search(&mut self, query: &str, max_results: usize) -> Result<String> {
             self.queries.push((query.to_string(), max_results));
             self.search_markdown
@@ -360,7 +360,7 @@ mod tests {
         let response = handle_agent_request(
             &mut backend,
             7,
-            "google_search",
+            WEB_SEARCH_OPERATION,
             json!({"query": "  rust language  "}),
         )
         .unwrap();
@@ -381,13 +381,19 @@ mod tests {
         };
         assert!(handle_agent_request(&mut backend, 8, "other", json!({"query": "rust"})).is_err());
         assert!(
-            handle_agent_request(&mut backend, 8, "google_search", json!({"query": "  "})).is_err()
+            handle_agent_request(
+                &mut backend,
+                8,
+                WEB_SEARCH_OPERATION,
+                json!({"query": "  "})
+            )
+            .is_err()
         );
         assert!(
             handle_agent_request(
                 &mut backend,
                 8,
-                "google_search",
+                WEB_SEARCH_OPERATION,
                 json!({"query": "x".repeat(MAX_QUERY_CHARS + 1)})
             )
             .is_err()
@@ -443,25 +449,25 @@ mod tests {
     }
 
     #[test]
-    fn search_settings_have_a_bounded_result_count() {
+    fn web_settings_have_a_bounded_result_count() {
         let valid =
-            crate::core::config::Config::from_toml_str("[agent.search]\nmax_results = 10").unwrap();
-        let section = valid.agent("search").unwrap();
-        let settings = SearchAgent::parse_settings(&valid, section).unwrap();
-        SearchAgent::validate_settings(&valid, section, &settings).unwrap();
+            crate::core::config::Config::from_toml_str("[agent.web]\nmax_results = 10").unwrap();
+        let section = valid.agent("web").unwrap();
+        let settings = WebAgent::parse_settings(&valid, section).unwrap();
+        WebAgent::validate_settings(&valid, section, &settings).unwrap();
 
         let invalid =
-            crate::core::config::Config::from_toml_str("[agent.search]\nmax_results = 0").unwrap();
-        let section = invalid.agent("search").unwrap();
-        let settings = SearchAgent::parse_settings(&invalid, section).unwrap();
-        assert!(SearchAgent::validate_settings(&invalid, section, &settings).is_err());
+            crate::core::config::Config::from_toml_str("[agent.web]\nmax_results = 0").unwrap();
+        let section = invalid.agent("web").unwrap();
+        let settings = WebAgent::parse_settings(&invalid, section).unwrap();
+        assert!(WebAgent::validate_settings(&invalid, section, &settings).is_err());
     }
 
     #[test]
-    fn search_agent_owns_its_remote_tool_definition() {
-        let search = search_tool_definition();
-        assert_eq!(search.name, "search");
-        assert_eq!(search.operation, SEARCH_OPERATION);
+    fn web_agent_owns_its_remote_tool_definition() {
+        let search = web_search_tool_definition();
+        assert_eq!(search.name, "web_search");
+        assert_eq!(search.operation, WEB_SEARCH_OPERATION);
         assert_eq!(search.parameters["required"], serde_json::json!(["query"]));
 
         let fetch = web_fetch_tool_definition();
@@ -489,7 +495,7 @@ mod tests {
         if std::env::var("BREEZE_GOOGLE_SEARCH_SMOKE").as_deref() != Ok("1") {
             return;
         }
-        let mut backend = ChromeSearchBackend::new();
+        let mut backend = ChromeWebBackend::new();
         let markdown = backend
             .search("Rust programming language", 3)
             .expect("Google Search through Chrome");
@@ -504,7 +510,7 @@ mod tests {
         }
         let target = std::env::var("BREEZE_WEB_FETCH_SMOKE_URL")
             .unwrap_or_else(|_| "https://example.com/".to_string());
-        let mut backend = ChromeSearchBackend::new();
+        let mut backend = ChromeWebBackend::new();
         let response = handle_agent_request(
             &mut backend,
             DEFAULT_MAX_RESULTS,
