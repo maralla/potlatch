@@ -130,18 +130,15 @@ pub fn init() {
     let use_color = io::stdout().is_terminal();
     init_spinner(use_color);
 
-    let filter = EnvFilter::builder()
-        .with_default_directive(Level::INFO.into())
-        .from_env_lossy()
-        .add_directive("potlatch::acp_fs=warn".parse().expect("valid directive"))
-        .add_directive("potlatch::acp_modes=warn".parse().expect("valid directive"))
-        .add_directive("potlatch::acp_slash=warn".parse().expect("valid directive"))
-        .add_directive(
-            "potlatch::agent_stderr=warn"
-                .parse()
-                .expect("valid directive"),
-        )
-        .add_directive("hyper_util=warn".parse().expect("valid directive"));
+    // Silence all third-party crate logs (e.g. `headless_chrome`,
+    // `hyper_util`) by default; only `potlatch` surfaces at info+. Directives
+    // are matched most-specific first, so `potlatch=info` overrides the bare
+    // `off` for `potlatch::*`. When `RUST_LOG` is set, respect it instead.
+    let default = "off,potlatch=info,potlatch::acp_fs=warn,potlatch::acp_modes=warn,potlatch::acp_slash=warn,potlatch::agent_stderr=warn";
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(var) if !var.trim().is_empty() => EnvFilter::builder().parse_lossy(var),
+        _ => EnvFilter::builder().parse_lossy(default),
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -511,6 +508,66 @@ fn should_suppress(target: &str, level: Level) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_filter_silences_third_party_and_allows_potlatch() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl<'a> MakeWriter<'a> for Captured {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(self.0.clone())
+            }
+        }
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let filter = EnvFilter::builder().parse_lossy(
+            "off,potlatch=info,potlatch::acp_fs=warn,potlatch::acp_modes=warn,potlatch::acp_slash=warn,potlatch::agent_stderr=warn",
+        );
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(Captured(buf.clone()))
+            .with_ansi(false)
+            .finish();
+
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::info!(target: "potlatch::agents::worker", "potlatch info should appear");
+        tracing::warn!(target: "headless_chrome::browser::transport", "chrome warn should be hidden");
+        tracing::error!(target: "headless_chrome::browser::transport", "chrome error should be hidden");
+        tracing::info!(target: "hyper_util", "hyper info should be hidden");
+
+        drop(guard);
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            out.contains("potlatch info should appear"),
+            "potlatch line missing: {out}"
+        );
+        assert!(
+            !out.contains("chrome warn should be hidden"),
+            "chrome warn leaked: {out}"
+        );
+        assert!(
+            !out.contains("chrome error should be hidden"),
+            "chrome error leaked: {out}"
+        );
+        assert!(
+            !out.contains("hyper info should be hidden"),
+            "hyper leaked: {out}"
+        );
+    }
 
     #[test]
     fn split_badge_prefix_extracts_agent_id() {

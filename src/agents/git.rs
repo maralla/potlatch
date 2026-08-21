@@ -21,6 +21,25 @@ impl GitRepo {
         Path::new(&self.path).join(".git").exists()
     }
 
+    /// Returns the `remote.origin.url` of this repo, or `None` if there is no
+    /// origin remote (e.g. not a git repo, or no origin configured).
+    pub fn remote_url(&self) -> Result<Option<String>> {
+        let output = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to execute git remote get-url")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if url.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(url))
+        }
+    }
+
     fn command_error(output: &std::process::Output) -> String {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -775,6 +794,60 @@ mod tests {
         assert!(repo.stage_resolved_unmerged_paths().unwrap());
         assert!(repo.list_unmerged_paths().unwrap().is_empty());
         assert!(repo.complete_merge_if_ready("Merge feature").unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_url_returns_origin_url() {
+        let dir =
+            std::env::temp_dir().join(format!("potlatch-git-remote-url-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        run_git(&dir, &["init", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "test@example.com"]);
+        run_git(&dir, &["config", "user.name", "test"]);
+        run_git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.example.com/group/project",
+            ],
+        );
+
+        let repo = GitRepo::new(
+            dir.to_string_lossy().into_owned(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(
+            repo.remote_url().unwrap(),
+            Some("https://gitlab.example.com/group/project".to_string())
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_url_returns_none_without_origin() {
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-git-remote-none-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        run_git(&dir, &["init", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "test@example.com"]);
+        run_git(&dir, &["config", "user.name", "test"]);
+
+        let repo = GitRepo::new(
+            dir.to_string_lossy().into_owned(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(repo.remote_url().unwrap(), None);
 
         let _ = fs::remove_dir_all(&dir);
     }

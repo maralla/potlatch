@@ -1875,6 +1875,15 @@ fn try_resume_pmo_state(
             Some(lease)
         }
         Err(e) => {
+            if crate::agents::gitlab::is_not_found(&e) {
+                info!(
+                    "{}: Previously claimed issue #{} no longer exists (404), \
+                     discarding state",
+                    &state.agent_id, issue_iid
+                );
+                state.clear_state();
+                return None;
+            }
             warn!(
                 "{}: Failed to verify issue #{}: {}, retaining state and scanning live claims",
                 &state.agent_id, issue_iid, e
