@@ -3,10 +3,7 @@
 This file provides guidance to AI agents working on this project.
 
 ### Code Quality
-- Write tests for all new features
-- Maintain test coverage above 85%
 - Run linters before committing
-- Document public APIs
 - Never add `allow(dead_code)` to suppress dead code warning, just delete the code
 
 ### For Worker Agent
@@ -14,7 +11,6 @@ This file provides guidance to AI agents working on this project.
 When implementing issues:
 1. Read the issue carefully and all comments
 2. Check existing code for similar patterns
-3. Write tests first (TDD approach preferred)
 4. Implement the feature following project conventions
 5. Run all tests and linters
 6. Update documentation if needed
