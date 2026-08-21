@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::core::retry::with_backoff_retries;
+use crate::core::retry::{NonRetryable, with_backoff_retries};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -11,6 +11,14 @@ use tracing::{debug, info};
 
 pub const PRIORITY_LABEL_PREFIX: &str = "priority::";
 pub const DEFAULT_PRIORITY: u8 = 3;
+
+/// Returns true if `err` wraps a [`NonRetryable`] error (e.g. a permanent
+/// `404 Not Found` for a deleted issue or MR). Callers that fetch a specific
+/// resource by IID should check this and abandon the stale resource (e.g.
+/// clear persisted claim state) instead of treating it as a transient failure.
+pub fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<NonRetryable>())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Issue {
@@ -333,13 +341,22 @@ impl GitLabClient {
         with_backoff_retries(&self.shutdown, &format!("glab api GET {endpoint}"), || {
             let output = self.run_api_once(endpoint, extra_args)?;
             if !output.status.success() {
-                anyhow::bail!(
-                    "glab api GET {endpoint} failed: {}",
-                    Self::glab_api_error_message(&output)
-                );
+                let message = Self::glab_api_error_message(&output);
+                // A 404 is permanent (deleted issue/MR); don't retry forever.
+                if Self::is_404(&message) {
+                    return Err(
+                        NonRetryable(format!("glab api GET {endpoint} failed: {message}")).into(),
+                    );
+                }
+                anyhow::bail!("glab api GET {endpoint} failed: {message}");
             }
             Ok(output)
         })
+    }
+
+    /// Returns true if a glab api error message indicates HTTP 404.
+    fn is_404(message: &str) -> bool {
+        message.contains("404 Not found") || message.contains("HTTP 404")
     }
 
     fn run_api_once(&self, endpoint: &str, extra_args: &[&str]) -> Result<std::process::Output> {
@@ -1606,5 +1623,39 @@ mod tests {
         assert!(mr_description_closes_issue("Text\n\nCloses #99\n", 99));
         assert!(!mr_description_closes_issue("Closes #42", 43));
         assert!(!mr_description_closes_issue("Refs #42", 42));
+    }
+
+    #[test]
+    fn is_404_detects_glab_not_found_messages() {
+        assert!(GitLabClient::is_404(
+            "glab: 404 Not found (HTTP 404) {\"message\":\"404 Not found\"}"
+        ));
+        assert!(GitLabClient::is_404("404 Not found"));
+        assert!(GitLabClient::is_404(
+            "HTTP 404 {\"message\":\"404 Not found\"}"
+        ));
+        assert!(!GitLabClient::is_404("HTTP 500 Internal Server Error"));
+        assert!(!GitLabClient::is_404(
+            "glab: HTTP 400\n{\"error\":\"target_branch is missing\"}"
+        ));
+        assert!(!GitLabClient::is_404("connection refused"));
+    }
+
+    #[test]
+    fn is_not_found_detects_non_retryable_in_error_chain() {
+        use super::is_not_found;
+        use crate::core::retry::NonRetryable;
+
+        let err: anyhow::Error =
+            NonRetryable("glab api GET .../issues/957 failed: 404".to_string()).into();
+        assert!(is_not_found(&err));
+
+        let err: anyhow::Error = anyhow::anyhow!("transient failure");
+        assert!(!is_not_found(&err));
+
+        // Wrapped in a context chain — should still detect it.
+        let err: anyhow::Error =
+            anyhow::Error::from(NonRetryable("404".to_string())).context("fetching issue");
+        assert!(is_not_found(&err));
     }
 }

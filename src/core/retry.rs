@@ -23,6 +23,20 @@ impl fmt::Display for RetryCancelled {
 
 impl std::error::Error for RetryCancelled {}
 
+/// Non-retryable error for a permanent failure (e.g. HTTP 404 for a deleted
+/// GitLab resource). [`with_backoff_retries`] returns this immediately
+/// instead of looping with backoff. Wraps a human-readable detail message.
+#[derive(Debug)]
+pub struct NonRetryable(pub String);
+
+impl fmt::Display for NonRetryable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NonRetryable {}
+
 /// Retry an operation indefinitely with capped exponential backoff.
 pub fn with_backoff_retries<T, F>(shutdown: &AtomicBool, context: &str, operation: F) -> Result<T>
 where
@@ -77,6 +91,7 @@ where
                 return Ok(value);
             }
             Err(error) if error.downcast_ref::<RetryCancelled>().is_some() => return Err(error),
+            Err(error) if error.downcast_ref::<NonRetryable>().is_some() => return Err(error),
             Err(error) => {
                 if shutdown.load(Ordering::SeqCst) {
                     return Err(RetryCancelled.into());
@@ -176,5 +191,20 @@ mod tests {
 
         assert!(!called);
         assert!(error.downcast_ref::<RetryCancelled>().is_some());
+    }
+
+    #[test]
+    fn non_retryable_error_returns_immediately_without_retrying() {
+        let shutdown = AtomicBool::new(false);
+        let mut attempts = 0;
+
+        let result: anyhow::Result<()> = with_backoff_retries(&shutdown, "test operation", || {
+            attempts += 1;
+            Err(NonRetryable("permanent failure".to_string()).into())
+        });
+        let error = result.unwrap_err();
+
+        assert_eq!(attempts, 1, "NonRetryable should not be retried");
+        assert!(error.downcast_ref::<NonRetryable>().is_some());
     }
 }

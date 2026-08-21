@@ -696,6 +696,14 @@ fn clear_resumed_issue_if_ignored(
     let issue = match state.glab.get_issue(active_issue.issue_iid) {
         Ok(issue) => issue,
         Err(e) => {
+            if crate::agents::gitlab::is_not_found(&e) {
+                info!(
+                    "{}: Resumed issue #{} no longer exists (404), dropping resume state",
+                    &state.agent_id, active_issue.issue_iid
+                );
+                state.abandon_closed_issue(active_issue.issue_iid, active_issue.mr_iid);
+                return None;
+            }
             warn!(
                 "{}: Failed to verify resumed issue #{}: {}, retaining resume state for retry",
                 &state.agent_id, active_issue.issue_iid, e
