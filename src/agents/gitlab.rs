@@ -355,7 +355,7 @@ impl GitLabClient {
     }
 
     /// Returns true if a glab api error message indicates HTTP 404.
-    fn is_404(message: &str) -> bool {
+    pub fn is_404(message: &str) -> bool {
         message.contains("404 Not found") || message.contains("HTTP 404")
     }
 
@@ -1633,6 +1633,13 @@ mod tests {
         assert!(GitLabClient::is_404("404 Not found"));
         assert!(GitLabClient::is_404(
             "HTTP 404 {\"message\":\"404 Not found\"}"
+        ));
+        // The truncated format seen in worker logs (e.g. "Failed to verify
+        // issue #956 for session resume: ... Not found (HTTP 404)
+        // {"message":"404 Not found"}, skipping") must also be detected so a
+        // deleted issue's stale session is cleaned up rather than retried.
+        assert!(GitLabClient::is_404(
+            "glab api GET projects/26962/issues/956 failed: Not found (HTTP 404) {\"message\":\"404 Not found\"}"
         ));
         assert!(!GitLabClient::is_404("HTTP 500 Internal Server Error"));
         assert!(!GitLabClient::is_404(
