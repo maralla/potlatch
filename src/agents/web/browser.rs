@@ -14,6 +14,7 @@ use headless_chrome::protocol::cdp::Page::{
 };
 use headless_chrome::{Browser, Tab};
 use serde_json::Value;
+use tracing::info;
 
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
 // Defuddle 0.19.2 full browser bundle (MIT); see defuddle.LICENSE.txt.
@@ -99,6 +100,7 @@ impl ChromeBrowser {
     }
 
     pub(super) fn navigate_to(&self, url: &str) -> Result<String> {
+        info!("opening {url}");
         self.tab
             .navigate_to(url)
             .with_context(|| format!("navigate search browser to {url}"))?
