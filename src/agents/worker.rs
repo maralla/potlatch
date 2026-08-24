@@ -3312,10 +3312,22 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                 let issue = match state.glab.get_issue(issue_iid) {
                     Ok(i) => i,
                     Err(e) => {
-                        warn!(
-                            "{}: Failed to verify issue #{} for session resume: {}, skipping",
-                            &state.agent_id, issue_iid, e
-                        );
+                        if GitLabClient::is_404(&e.to_string()) {
+                            // The issue no longer exists on GitLab (deleted or
+                            // moved). Drop the stale session so we stop
+                            // retrying a 404 on every cycle.
+                            info!(
+                                "{}: Issue #{} no longer exists on GitLab (404), \
+                                 discarding stale session",
+                                &state.agent_id, issue_iid
+                            );
+                            state.cleanup_session(issue_iid);
+                        } else {
+                            warn!(
+                                "{}: Failed to verify issue #{} for session resume: {}, skipping",
+                                &state.agent_id, issue_iid, e
+                            );
+                        }
                         continue;
                     }
                 };
@@ -3474,10 +3486,19 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                 );
             }
             Err(e) => {
-                warn!(
-                    "{}: Failed to verify issue #{} on GitLab: {}, skipping",
-                    &state.agent_id, issue_iid, e
-                );
+                if GitLabClient::is_404(&e.to_string()) {
+                    info!(
+                        "{}: Issue #{} no longer exists on GitLab (404), \
+                         discarding stale session",
+                        &state.agent_id, issue_iid
+                    );
+                    state.cleanup_session(issue_iid);
+                } else {
+                    warn!(
+                        "{}: Failed to verify issue #{} on GitLab: {}, skipping",
+                        &state.agent_id, issue_iid, e
+                    );
+                }
             }
         }
     }
