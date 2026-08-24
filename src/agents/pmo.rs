@@ -1211,9 +1211,22 @@ impl PmoPort for LivePmoPort<'_> {
             None
         };
         self.model.set_capability_provider(provider);
+
+        // Follow-up poll: while the PMO works on this issue, watch for new
+        // human comments and forward them into the running session (via
+        // session/inject) so the model can react without waiting for the next
+        // poll cycle. The cursor is seeded from the last persisted comment id
+        // and advanced in lock-step with the model turn.
+        let (follow_up_poll, follow_up_cursor) = build_pmo_comment_follow_up_poll(
+            self.gitlab.clone(),
+            issue.iid,
+            self.state.last_seen_comment_id(issue.iid),
+            self.state.agent_id.to_string(),
+        );
         let result = self.model.complete_typed::<PmoOutput>(
             &prompt,
             &InvokeOptions {
+                follow_up_poll: Some(follow_up_poll),
                 activity_label: Some(format!(
                     "{} triaging issue #{}",
                     self.state.agent_id, issue.iid
@@ -1222,7 +1235,17 @@ impl PmoPort for LivePmoPort<'_> {
             },
         );
         self.model.set_capability_provider(None);
-        Ok(result?.output)
+        let output = result?.output;
+
+        // Persist the cursor advanced by the live poll so the next cycle does
+        // not re-detect comments already injected into this session. If the poll
+        // never actually ran (no turns elapsed), the seed value is written back
+        // unchanged, which matches the pre-existing per-cycle snapshot.
+        if let Ok(advanced) = follow_up_cursor.lock() {
+            self.state
+                .save_state_with_comment_cursor(issue.iid, *advanced);
+        }
+        Ok(output)
     }
 
     fn update_issue_description(&mut self, issue_iid: u64, body: &str) -> Result<()> {
@@ -1605,7 +1628,7 @@ fn build_split_prompt(
         .iter()
         .any(|label| label == labels::PMO_PENDING)
     {
-        "This issue is already pmo-pending. Human comments are refinement feedback: produce the requested plan update rather than only worker guidance or an unrelated clarification question."
+        "This issue is already pmo-pending. Human comments are refinement feedback: prefer producing the requested plan update. You may still ask for clarification when a human reply surfaces a genuinely blocking question you cannot answer from the repository — restate your current plan briefly and ask that specific question, rather than restating the whole plan or taking an unapproved final action."
     } else {
         "This issue is not currently in PMO plan refinement."
     };
@@ -1747,6 +1770,83 @@ fn has_new_human_comments(
             && !comment.body.starts_with("**PMO needs clarification")
             && !comment.body.starts_with("**PMO plan refinement")
     })
+}
+
+/// Whether a comment counts as a new human reply worth surfacing to the PMO.
+/// Mirrors the predicate in [`has_new_human_comments`] so live mid-session
+/// injection and the per-cycle re-triage trigger agree on what is "new".
+fn is_new_human_comment(
+    comment: &gitlab::Comment,
+    last_seen_comment_id: u64,
+    pmo_agent_id: &str,
+) -> bool {
+    comment.id > last_seen_comment_id
+        && !comment.author.is_empty()
+        && comment.author != pmo_agent_id
+        && !comment.body.starts_with("**PMO needs clarification")
+        && !comment.body.starts_with("**PMO plan refinement")
+}
+
+/// Collect the new human comments to inject into the PMO's running model
+/// session, and advance the observation cursor to the highest comment id seen
+/// so far (human or otherwise). Comments from the PMO itself and its own
+/// clarification/plan-refinement postings are never injected; everything that
+/// [`has_new_human_comments`] would re-trigger on is surfaced live instead.
+///
+/// Pure — no GitLab call — so the live follow-up poll and its tests can run
+/// without a real client. Returns the formatted injection messages and the
+/// new cursor value to persist.
+fn collect_new_human_comment_follow_ups(
+    comments: &[gitlab::Comment],
+    last_seen_comment_id: &mut u64,
+    issue_iid: u64,
+    pmo_agent_id: &str,
+) -> Vec<String> {
+    let mut new_msgs = Vec::new();
+    for comment in comments {
+        if is_new_human_comment(comment, *last_seen_comment_id, pmo_agent_id) {
+            new_msgs.push(format!(
+                "**New comment from @{} on issue #{}:**\n\n{}",
+                comment.author, issue_iid, comment.body
+            ));
+        }
+    }
+    if let Some(max_id) = comments.iter().map(|comment| comment.id).max() {
+        *last_seen_comment_id = max_id;
+    }
+    new_msgs
+}
+
+/// Shared follow-up poll cursor. Wrapped in a type alias so the closure handed
+/// to [`InvokeOptions::follow_up_poll`] and its post-turn read-back share one
+/// canonical shape, and so tests can construct it without a GitLab client.
+type FollowUpCursor = Arc<std::sync::Mutex<u64>>;
+
+/// Build the live follow-up poll closure the PMO hands to the model while
+/// triaging an issue. On each invocation it re-fetches the issue's comments,
+/// collects new human replies via [`collect_new_human_comment_follow_ups`], and
+/// advances the shared cursor. The same cursor handle is returned so the caller
+/// can persist the high-water mark after the model turn completes — that keeps
+/// the next cycle's [`AgentState::last_seen_comment_id`] check from re-tripping
+/// on comments already injected live.
+fn build_pmo_comment_follow_up_poll(
+    gitlab: GitLabClient,
+    issue_iid: u64,
+    seed_cursor: u64,
+    pmo_agent_id: String,
+) -> (Arc<dyn Fn() -> Vec<String> + Send + Sync>, FollowUpCursor) {
+    let cursor: FollowUpCursor = Arc::new(std::sync::Mutex::new(seed_cursor));
+    let cursor_for_closure = Arc::clone(&cursor);
+    let poll = Arc::new(move || {
+        let Ok(comments) = gitlab.get_issue_comments(issue_iid) else {
+            return Vec::new();
+        };
+        let mut last = cursor_for_closure
+            .lock()
+            .expect("follow-up cursor poisoned");
+        collect_new_human_comment_follow_ups(&comments, &mut last, issue_iid, &pmo_agent_id)
+    }) as Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+    (poll, cursor)
 }
 
 /// Cap guidance length — keep it brief and actionable. Truncates at the last
@@ -2942,6 +3042,102 @@ mod tests {
     }
 
     #[test]
+    fn collect_new_human_comment_follow_ups_formats_only_new_human_replies() {
+        let comment = |id, author: &str, body: &str| gitlab::Comment {
+            id,
+            author: author.into(),
+            body: body.into(),
+            discussion_id: format!("discussion-{id}"),
+            discussion_resolvable: false,
+            location: None,
+            location_details: None,
+        };
+        let comments = vec![
+            comment(10, "alice", "Original discussion"),
+            comment(
+                11,
+                "service-account",
+                "**PMO plan refinement for merge request !5:**\n\nUpdated plan",
+            ),
+            comment(12, "bob", "Please change the validation step"),
+            comment(13, "pmo-0", "I already answered this"),
+            comment(14, "carol", "Second human reply"),
+        ];
+
+        // Seeded past the first human comment: only the later human reply (and
+        // carol's) should be surfaced; the PMO's own clarification/plan posts
+        // and the PMO agent's own notes are never injected.
+        let mut cursor = 10u64;
+        let msgs = collect_new_human_comment_follow_ups(&comments, &mut cursor, 42, "pmo-0");
+        assert_eq!(
+            msgs,
+            vec![
+                "**New comment from @bob on issue #42:**\n\nPlease change the validation step",
+                "**New comment from @carol on issue #42:**\n\nSecond human reply",
+            ]
+        );
+        // The cursor advances to the highest comment id regardless of author.
+        assert_eq!(cursor, 14);
+    }
+
+    #[test]
+    fn collect_new_human_comment_follow_ups_advances_cursor_even_when_nothing_is_injected() {
+        let comments = vec![
+            gitlab::Comment {
+                id: 7,
+                author: "pmo-0".into(),
+                body: "**PMO needs clarification before proceeding:**\n\nWhich scope?".into(),
+                discussion_id: "d-7".into(),
+                discussion_resolvable: false,
+                location: None,
+                location_details: None,
+            },
+            gitlab::Comment {
+                id: 9,
+                author: "service-account".into(),
+                body: "**PMO plan refinement for merge request !5:**\n\nplan".into(),
+                discussion_id: "d-9".into(),
+                discussion_resolvable: false,
+                location: None,
+                location_details: None,
+            },
+        ];
+
+        let mut cursor = 5u64;
+        let msgs = collect_new_human_comment_follow_ups(&comments, &mut cursor, 1, "pmo-0");
+        assert!(msgs.is_empty(), "no human reply to inject: {msgs:?}");
+        // Still advances so the next poll doesn't rescan the same PMO posts.
+        assert_eq!(cursor, 9);
+    }
+
+    #[test]
+    fn collect_new_human_comment_follow_ups_is_idempotent_across_polls() {
+        let mk = |id: u64| gitlab::Comment {
+            id,
+            author: "alice".into(),
+            body: format!("reply {id}"),
+            discussion_id: format!("d-{id}"),
+            discussion_resolvable: false,
+            location: None,
+            location_details: None,
+        };
+        let comments = vec![mk(20), mk(21)];
+
+        let mut cursor = 20u64;
+        let first = collect_new_human_comment_follow_ups(&comments, &mut cursor, 5, "pmo-0");
+        assert_eq!(
+            first,
+            vec!["**New comment from @alice on issue #5:**\n\nreply 21"]
+        );
+        assert_eq!(cursor, 21);
+
+        // A second poll with the advanced cursor surfaces nothing new.
+        let second = collect_new_human_comment_follow_ups(&comments, &mut cursor, 5, "pmo-0");
+        assert!(second.is_empty());
+        assert_eq!(cursor, 21);
+    }
+
+    #[test]
     fn pmo_cycle_retries_checkout_and_stops_after_first_won_claim() {
         let mut port = FakePmoPort::successful();
         port.checkout_failures.set(1);
@@ -3534,6 +3730,85 @@ mod tests {
         assert!(prompt.contains("only the plan changes and refinements"));
         assert!(prompt.contains("posted as a new issue comment"));
         assert!(prompt.contains("do not produce a full rewritten description"));
+        // Pending mode still permits asking for clarification when a human reply
+        // surfaces a genuinely blocking question the repository cannot answer.
+        assert!(prompt.contains("You may still ask for clarification"));
+        assert!(prompt.contains("genuinely blocking question"));
+    }
+
+    #[test]
+    fn build_split_prompt_pending_mode_restates_clarification_policy() {
+        let state = AgentState {
+            sessions_dir: "/tmp",
+            agent_id: "pmo-test",
+            project_name: "test-proj",
+        };
+        let issue = Issue {
+            iid: 42,
+            title: "Refine parser design".into(),
+            description: "## Existing plan".into(),
+            labels: vec![labels::PMO_PENDING.into()],
+            state: "opened".into(),
+            created_at: None,
+            updated_at: None,
+        };
+
+        let pending_prompt =
+            build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2, None).unwrap();
+        assert!(pending_prompt.contains("You may still ask for clarification"));
+        assert!(pending_prompt.contains("genuinely blocking question"));
+
+        let mut non_pending = issue.clone();
+        non_pending.labels = vec![];
+        let fresh_prompt =
+            build_split_prompt(&state, &non_pending, "/abs/pmo-issue-42.md", 2, None).unwrap();
+        // The pending-only clarification allowance is only emitted in pending mode.
+        assert!(!fresh_prompt.contains("You may still ask for clarification"));
+        assert!(!fresh_prompt.contains("genuinely blocking question"));
+    }
+
+    #[test]
+    fn needs_clarification_keeps_claim_and_pending_label_in_refinement_mode() {
+        let issue = PmoIssueObservation {
+            iid: 10,
+            title: "Broad parent".into(),
+            description: "Split this work".into(),
+            labels: vec![
+                ACTION_REQUIRED_LABEL.into(),
+                labels::PMO_PENDING.into(),
+                "scope::test".into(),
+            ],
+            state: "opened".into(),
+            created_at: None,
+            updated_at: None,
+        };
+
+        let mut port = FakePmoPort::successful();
+        let disposition = apply_pmo_decision(
+            &issue,
+            PmoOutput::NeedsClarification {
+                question: "Which API should the worker target?".into(),
+            },
+            Some(77),
+            Some("scope::test"),
+            &mut port,
+        )
+        .unwrap();
+
+        // The claim is kept so the PMO can refine on the next human reply, and
+        // the pending label stays (idempotent add) so the refinement loop holds.
+        assert_eq!(disposition, DecisionDisposition::KeepClaim);
+        assert_eq!(
+            *port.trace.borrow(),
+            vec!["act:comment:10", "act:add:10:pmo-pending"]
+        );
+        assert_eq!(port.comments.len(), 1);
+        assert!(
+            port.comments[0]
+                .1
+                .contains("Which API should the worker target?")
+        );
+        assert!(port.comments[0].1.contains("PMO needs clarification"));
     }
 
     #[test]
