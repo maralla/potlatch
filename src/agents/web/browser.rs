@@ -19,7 +19,6 @@ use tracing::info;
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
 // Defuddle 0.19.2 full browser bundle (MIT); see defuddle.LICENSE.txt.
 const DEFUDDLE_SCRIPT: &str = include_str!("defuddle.full.js");
-const RENDER_SETTLE_DELAY: Duration = Duration::from_millis(500);
 const SEARCH_PROFILE_ENV: &str = "BREEZE_WEB_PROFILE";
 
 #[derive(Debug)]
@@ -156,15 +155,32 @@ impl ChromeBrowser {
     }
 
     pub(super) fn wait_for_google_results(&self) -> Result<()> {
-        self.tab
-            .wait_for_element("a h3")
-            .context("wait for rendered Google search results")?;
-        Ok(())
+        self.wait_for_render()
+            .context("wait for Google results page to finish rendering")?;
+        let state = self
+            .evaluate_json(GOOGLE_RESULTS_STATE_SCRIPT)
+            .context("classify Google results page")?;
+        match state.as_str() {
+            Some("results") | Some("no_results") => Ok(()),
+            Some("verification") => Err(GoogleVerificationRequired.into()),
+            Some(other) => anyhow::bail!("unexpected Google results state {other:?}"),
+            None => anyhow::bail!("Google results state was not a string: {state}"),
+        }
+    }
+
+    /// Wait until the page's client-side rendering has settled. Page-agnostic
+    /// and selector-free: a `MutationObserver` resolves once the DOM has been
+    /// quiet for a settling window, with a bounded timeout. Use after
+    /// [`navigate_to`] (which waits for `networkAlmostIdle`) on any page whose
+    /// content is produced by post-load JS.
+    pub(super) fn wait_for_render(&self) -> Result<()> {
+        self.evaluate_await_void(RENDER_SETTLED_SCRIPT)
+            .context("wait for page render to settle")
     }
 
     pub(super) fn fetch_rendered_markdown(&self, url: &str) -> Result<String> {
         self.navigate_to(url)?;
-        std::thread::sleep(RENDER_SETTLE_DELAY);
+        self.wait_for_render()?;
         self.extract_rendered_markdown()
     }
 
@@ -200,7 +216,63 @@ impl ChromeBrowser {
             .context("search browser expression returned no value")?;
         decode_evaluated_json(serialized)
     }
+
+    /// Evaluate an expression expected to return a `Promise` and block until it
+    /// resolves, discarding the resolved value. Used by [`wait_for_render`] so
+    /// the DOM — via a `MutationObserver` injected inside the expression —
+    /// drives completion instead of Rust-side polling.
+    fn evaluate_await_void(&self, expression: &str) -> Result<()> {
+        self.tab
+            .evaluate(expression, true)
+            .context("evaluate await expression")?;
+        Ok(())
+    }
 }
+
+/// Resolve once the page's client-side rendering has settled: a
+/// [`MutationObserver`] watches `document.body` and the Promise resolves after
+/// the DOM has been **quiet** (no mutations) for `SETTLE_MS`. This is
+/// selector-free and page-agnostic — it works for any site that renders with
+/// JS after `networkAlmostIdle` (what `wait_until_navigated` waits for), which
+/// a fixed sleep cannot reliably cover.
+///
+/// A `MAX_WAIT_MS` `setTimeout` rejects so the Promise never hangs forever on a
+/// page that keeps churning. The settle window restarts on every mutation, so
+/// only a *sustained* pause counts as "done".
+const RENDER_SETTLED_SCRIPT: &str = r##"new Promise((resolve, reject) => {
+    const SETTLE_MS = 500;
+    const MAX_WAIT_MS = 15000;
+    let settleTimer;
+    const done = () => { observer.disconnect(); clearTimeout(maxTimer); resolve(); };
+    const observer = new MutationObserver(() => {
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(done, SETTLE_MS);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    settleTimer = setTimeout(done, SETTLE_MS);
+    const maxTimer = setTimeout(() => {
+        observer.disconnect();
+        clearTimeout(settleTimer);
+        reject(new Error("timed out waiting for the page to finish rendering"));
+    }, MAX_WAIT_MS);
+})"##;
+
+/// One-shot, selector-free structural classification of a Google results page
+/// **after** rendering has settled (see [`RENDER_SETTLED_SCRIPT`]). Returns
+/// `"results"`, `"no_results"`, or `"verification"` — never `"loading"`, since
+/// by this point the DOM is stable. Purely structural (no text matching) so it
+/// is robust to Google copy/locale changes. Verification is checked first so a
+/// stale `a h3` from a previous page cannot mask a wall.
+const GOOGLE_RESULTS_STATE_SCRIPT: &str = r##"(() => {
+    if (document.querySelector("#captcha-form, form[action*='sorry'], #recaptcha")) {
+        return "verification";
+    }
+    const search = document.querySelector("#search");
+    if (search) {
+        return search.querySelector("a h3") ? "results" : "no_results";
+    }
+    return "no_results";
+})()"##;
 
 fn decode_evaluated_json(serialized: Value) -> Result<Value> {
     let serialized = serialized
@@ -361,6 +433,45 @@ mod tests {
         assert!(is_chrome_or_chromium(Path::new("/usr/bin/chromium")));
         assert!(!is_chrome_or_chromium(Path::new("/usr/bin/msedge")));
         assert!(!is_chrome_or_chromium(Path::new("/usr/bin/firefox")));
+    }
+
+    #[test]
+    fn render_settled_script_is_a_promise_driven_by_dom_stability() {
+        // The expression must evaluate to a Promise so CDP's `awaitPromise`
+        // blocks until the DOM-driven observer resolves it.
+        assert!(
+            RENDER_SETTLED_SCRIPT.starts_with("new Promise("),
+            "script must return a Promise"
+        );
+        // A MutationObserver drives completion from the DOM side.
+        assert!(RENDER_SETTLED_SCRIPT.contains("new MutationObserver"));
+        // The settle window restarts on every mutation so only a sustained
+        // quiet pause counts as "done".
+        assert!(RENDER_SETTLED_SCRIPT.contains("clearTimeout(settleTimer)"));
+        // A max-timeout rejects so the Promise never hangs forever on a page
+        // that keeps churning.
+        assert!(RENDER_SETTLED_SCRIPT.contains("reject("));
+        // Selector-free: no element IDs or tags drive the wait.
+        assert!(!RENDER_SETTLED_SCRIPT.contains("querySelector"));
+        assert!(!RENDER_SETTLED_SCRIPT.contains("getElementById"));
+    }
+
+    #[test]
+    fn google_results_state_script_is_structural_and_checks_verification_first() {
+        // Purely structural — no text matching — so it is robust to Google
+        // copy/locale changes.
+        assert!(!GOOGLE_RESULTS_STATE_SCRIPT.contains("innerText"));
+        assert!(!GOOGLE_RESULTS_STATE_SCRIPT.contains("did not match"));
+        // The verification wall is checked before results so a stale `a h3`
+        // from a previous page cannot mask it.
+        assert!(GOOGLE_RESULTS_STATE_SCRIPT.contains(r#""verification""#));
+        assert!(GOOGLE_RESULTS_STATE_SCRIPT.contains(r#"#search"#));
+        assert!(GOOGLE_RESULTS_STATE_SCRIPT.contains(r#""no_results""#));
+        let vpos = GOOGLE_RESULTS_STATE_SCRIPT
+            .find(r#""verification""#)
+            .unwrap();
+        let spos = GOOGLE_RESULTS_STATE_SCRIPT.find(r#"#search"#).unwrap();
+        assert!(vpos < spos);
     }
 
     #[test]
