@@ -274,6 +274,25 @@ impl AcpServer {
             }
         }
 
+        // Optional `context_channels` extension: named context strings
+        // registered by in-process agents on the bus. Each has `name` and
+        // `content`; the harness injects each as a system message at session
+        // init. Potlatch extension — enables agents like the memory agent to
+        // publish context into other agents' sessions.
+        let context_channels: Vec<(String, String)> = params
+            .get("context_channels")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|entry| {
+                        let name = entry.get("name").and_then(Value::as_str)?;
+                        let content = entry.get("content").and_then(Value::as_str)?;
+                        Some((name.to_string(), content.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // Create the inject channel and the persistent AgentLoop. The agent
         // loop owns the Context and is reused across all session/prompt calls
         // — true single long session. The inject_tx is stored in the shared
@@ -288,7 +307,7 @@ impl AcpServer {
             Arc::clone(&session.cancel),
             Arc::clone(&inject_queue),
         );
-        agent.init_context(&cwd);
+        agent.init_context(&cwd, &context_channels);
         session.agent = Some(agent);
 
         // Register the inject channel and cancel flag in the shared channels

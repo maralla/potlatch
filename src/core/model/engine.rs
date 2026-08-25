@@ -153,7 +153,7 @@ pub struct ModelSessionOptions {
 
 #[derive(Debug, Clone)]
 pub struct ModelRuntimeContext {
-    pub repo_path: String,
+    pub working_dir: String,
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
     pub agent_id: String,
 }
@@ -166,7 +166,7 @@ pub(crate) struct ModelEngine {
 pub(crate) fn spawn_model_engine(
     config: &Config,
     section: &crate::core::config::AgentSection,
-    repo_path: impl Into<String>,
+    working_dir: impl Into<String>,
     agent_id: impl Into<String>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     session: ModelSessionOptions,
@@ -175,7 +175,7 @@ pub(crate) fn spawn_model_engine(
         config,
         section,
         ModelRuntimeContext {
-            repo_path: repo_path.into(),
+            working_dir: working_dir.into(),
             shutdown,
             agent_id: agent_id.into(),
         },
@@ -200,7 +200,7 @@ impl ModelEngine {
         runtime: ModelRuntimeContext,
     ) -> Self {
         Self::wrap_runtime(AcpRuntime::new(
-            runtime.repo_path,
+            runtime.working_dir,
             acp_spawn.model_uri,
             acp_spawn.endpoint_model,
             acp_spawn.command,
@@ -279,7 +279,7 @@ mod tests {
 
     fn runtime(agent_id: &str) -> ModelRuntimeContext {
         ModelRuntimeContext {
-            repo_path: "/tmp/repo".into(),
+            working_dir: "/tmp/repo".into(),
             shutdown: Arc::new(AtomicBool::new(false)),
             agent_id: agent_id.into(),
         }

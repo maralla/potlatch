@@ -15,10 +15,41 @@ struct Route {
     tools: Vec<AgentToolDefinition>,
 }
 
+/// A named context provider registered by an agent on the bus. Other agents'
+/// ACP sessions read these at `session/new` time and inject each channel's
+/// content as a system message — a general mechanism for one agent to publish
+/// context (e.g. durable project memory) into other agents' sessions.
+pub(crate) type ContextProvider = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// A snapshot of a registered context channel: its name and current content.
+#[derive(Debug, Clone)]
+pub(crate) struct ContextChannel {
+    pub name: String,
+    pub content: String,
+}
+
+/// Guard returned by [`AgentBus::register_context`]. Dropping it unregisters
+/// the context channel, mirroring how [`AgentInbox`] unregisters a route.
+pub(crate) struct ContextChannelGuard {
+    name: String,
+    bus: Weak<BusInner>,
+}
+
+impl Drop for ContextChannelGuard {
+    fn drop(&mut self) {
+        if let Some(bus) = self.bus.upgrade()
+            && let Ok(mut channels) = bus.context_channels.lock()
+        {
+            channels.remove(&self.name);
+        }
+    }
+}
+
 struct BusInner {
     routes: Mutex<HashMap<String, Route>>,
     route_changed: Condvar,
     next_route_id: AtomicU64,
+    context_channels: Mutex<HashMap<String, ContextProvider>>,
 }
 
 #[derive(Clone)]
@@ -71,6 +102,7 @@ impl AgentBus {
                 routes: Mutex::new(HashMap::new()),
                 route_changed: Condvar::new(),
                 next_route_id: AtomicU64::new(1),
+                context_channels: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -216,6 +248,43 @@ impl AgentBus {
             .collect())
     }
 
+    /// Register a named context provider on the bus. The provider is called
+    /// at `session/new` time by the ACP runtime to collect context that other
+    /// agents' sessions inject as system messages. Dropping the returned guard
+    /// unregisters the provider.
+    pub fn register_context(
+        &self,
+        name: impl Into<String>,
+        provider: ContextProvider,
+    ) -> ContextChannelGuard {
+        let name = name.into();
+        if let Ok(mut channels) = self.inner.context_channels.lock() {
+            channels.insert(name.clone(), provider);
+        }
+        ContextChannelGuard {
+            name,
+            bus: Arc::downgrade(&self.inner),
+        }
+    }
+
+    /// Snapshot all registered context channels: calls each provider and
+    /// returns its name + current content. Used by the ACP runtime at
+    /// `session/new` to ship context into other agents' harness sessions.
+    pub fn context_channels(&self) -> Result<Vec<ContextChannel>> {
+        let channels = self
+            .inner
+            .context_channels
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent bus context channel lock poisoned"))?;
+        Ok(channels
+            .iter()
+            .map(|(name, provider)| ContextChannel {
+                name: name.clone(),
+                content: provider(),
+            })
+            .collect())
+    }
+
     fn wait_for_route(
         &self,
         target: &str,
@@ -328,5 +397,41 @@ mod tests {
         );
         drop(inbox);
         assert!(bus.registered_tools(Duration::ZERO).unwrap().is_empty());
+    }
+
+    #[test]
+    fn context_channels_snapshot_calls_providers() {
+        let bus = AgentBus::new();
+        assert!(bus.context_channels().unwrap().is_empty());
+
+        let guard = bus.register_context("memory", Arc::new(|| "project facts here".to_string()));
+        let channels = bus.context_channels().unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name, "memory");
+        assert_eq!(channels[0].content, "project facts here");
+
+        drop(guard);
+        assert!(bus.context_channels().unwrap().is_empty());
+    }
+
+    #[test]
+    fn context_channels_reflect_live_provider_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let bus = AgentBus::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_provider = Arc::clone(&counter);
+        let _guard = bus.register_context(
+            "live",
+            Arc::new(move || {
+                let n = counter_for_provider.fetch_add(1, Ordering::SeqCst);
+                format!("call {n}")
+            }),
+        );
+
+        // Each snapshot calls the provider fresh.
+        let first = bus.context_channels().unwrap();
+        let second = bus.context_channels().unwrap();
+        assert_eq!(first[0].content, "call 0");
+        assert_eq!(second[0].content, "call 1");
     }
 }

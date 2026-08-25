@@ -7,6 +7,7 @@ pub(crate) mod claim;
 pub mod git;
 pub mod gitlab;
 pub mod labels;
+pub(crate) mod memory;
 pub mod ops;
 pub mod pmo;
 pub(crate) mod qa;
@@ -139,6 +140,7 @@ pub fn register(workflow: &mut Workflow) {
     workflow.register_agent::<ops::OpsAgent>();
     workflow.register_agent::<qa::QaAgent>();
     workflow.register_agent::<web::WebAgent>();
+    workflow.register_agent::<memory::MemoryAgent>();
 }
 
 #[cfg(test)]
@@ -184,7 +186,10 @@ mod scope_tests {
         register(&mut workflow);
         let mut names: Vec<_> = workflow.registered_agent_names().collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["ops", "pmo", "qa", "reviewer", "web", "worker"]);
+        assert_eq!(
+            names,
+            vec!["memory", "ops", "pmo", "qa", "reviewer", "web", "worker"]
+        );
     }
 
     #[test]

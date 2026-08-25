@@ -61,8 +61,6 @@ impl AgentLoop {
         tools.register(Arc::new(super::tools::todo::TodoTool::new(Arc::clone(
             &todo,
         ))));
-        // Register the memory tool so the model can curate grounded durable facts.
-        tools.register(Arc::new(super::tools::memory::MemoryTool));
         // Build tool schemas once — the tool set is fixed for the harness lifetime.
         let tool_schemas = tools.tools_schema();
         Self {
@@ -99,26 +97,25 @@ impl AgentLoop {
         self.tools.tool_names()
     }
 
-    /// Initialize the context with the system prompt and durable project memory.
-    /// Called once at session creation. Subsequent `session/prompt` calls
-    /// reuse this context — true single long session.
-    pub fn init_context(&mut self, cwd: &str) {
+    /// Initialize the context with the system prompt and any context channels
+    /// registered by in-process agents on the bus (e.g. durable project memory
+    /// from the memory agent). Called once at session creation. Subsequent
+    /// `session/prompt` calls reuse this context — true single long session.
+    pub fn init_context(&mut self, _cwd: &str, context_channels: &[(String, String)]) {
         let descriptions = self.tools.tool_descriptions();
         let system_prompt = prompt::system_prompt(&descriptions);
         self.context
             .push(Role::System, ContextKind::System, &system_prompt);
 
-        // Load grounded durable memory (if any) and inject it as a system
-        // message. Evidence paths let the model revalidate a fact when relevant.
-        if let Some(facts) = super::memory::load_facts(cwd) {
-            let facts_prompt = format!(
-                "## Durable Project Memory\n\n\
-                 These are cross-task project facts grounded in repository files. \
-                 Treat them as durable context, but re-check their evidence when a \
-                 fact is relevant and may have become stale.\n\n{facts}"
-            );
-            self.context
-                .push(Role::System, ContextKind::System, &facts_prompt);
+        // Inject each context channel as a system message. These are
+        // published by in-process agents (e.g. the memory agent registers a
+        // "memory" channel whose content is the current durable memory).
+        for (name, content) in context_channels {
+            if content.trim().is_empty() {
+                continue;
+            }
+            let msg = format!("## {name}\n\n{content}");
+            self.context.push(Role::System, ContextKind::System, &msg);
         }
     }
 
@@ -568,11 +565,11 @@ impl AgentLoop {
         };
 
         for (name, tc_id, result) in tool_results {
-            // Skip storing todo/plan/memory tool results in context — the todo
-            // list is already injected as a system message every turn, the plan
-            // output lives in the side-channel cell, and memory is loaded from
-            // disk. Storing these tool responses would be pure duplication.
-            if name == "todo" || name == "memory" || name == "plan" {
+            // Skip storing todo/plan tool results in context — the todo
+            // list is already injected as a system message every turn and
+            // the plan output lives in the side-channel cell. Storing these
+            // tool responses would be pure duplication.
+            if name == "todo" || name == "plan" {
                 continue;
             }
             // Compress empty search results to a short note — the full
@@ -890,7 +887,7 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context("/tmp");
+        agent.init_context("/tmp", &[]);
 
         let result = agent.run("run echo hi", "/tmp", None).unwrap();
         assert!(result.contains("Done"));
@@ -939,7 +936,7 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context("/tmp");
+        agent.init_context("/tmp", &[]);
 
         let result = agent.run("test error recovery", "/tmp", None).unwrap();
         assert!(result.contains("Recovered"));
@@ -988,7 +985,7 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context("/tmp");
+        agent.init_context("/tmp", &[]);
 
         let result = agent.run("test cancel", "/tmp", None).unwrap();
         assert!(result.contains("cancelled"));
@@ -1050,7 +1047,7 @@ mod tests {
             cancel,
             Arc::clone(&inject_queue),
         );
-        agent.init_context("/tmp");
+        agent.init_context("/tmp", &[]);
 
         // Push an injected message before running — it will be drained on
         // the first iteration and appear in the first LLM call.
@@ -1226,7 +1223,7 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context(dir.as_str());
+        agent.init_context(dir.as_str(), &[]);
 
         let result = agent.run("write then read", dir.as_str(), None).unwrap();
         assert!(result.contains("Done"));
@@ -1352,7 +1349,7 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context(dir.as_str());
+        agent.init_context(dir.as_str(), &[]);
 
         let result = agent.run("read target.txt", dir.as_str(), None).unwrap();
         // The file content should appear in the context (via tool result) even
@@ -1470,7 +1467,7 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context("/tmp");
+        agent.init_context("/tmp", &[]);
 
         let result = agent.run("do something", "/tmp", None);
         // The 400 propagates because sanitization found nothing to fix

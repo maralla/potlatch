@@ -13,7 +13,6 @@ pub mod acp;
 pub mod agent_loop;
 pub mod client;
 pub mod context;
-pub mod memory;
 mod parent;
 pub mod prompt;
 pub mod todo;

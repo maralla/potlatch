@@ -1,0 +1,414 @@
+//! Memory agent: maintains durable project memory as a plain markdown file.
+//!
+//! Bus-served: exposes a `memory` tool that other agents call to replace the
+//! full memory content. Also registers a context channel on the bus so other
+//! agents' harness sessions receive the current memory at session init as a
+//! system message.
+//!
+//! Model-backed: after each write, the agent asks the model to reorganize,
+//! deduplicate, and filter the memory down to stable, project-wide facts.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, ensure};
+use serde::Deserialize;
+use serde_json::Value;
+use tracing::{info, warn};
+
+use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
+use crate::core::agent::{InvokeOptions, structured_output};
+use crate::core::banner::Banner;
+use crate::core::bus::{
+    AgentInbox, AgentRequest, AgentToolDefinition, ContextChannelGuard, ContextProvider,
+};
+use crate::core::config::Config;
+use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
+use crate::core::runtime::AgentRuntime;
+
+const REQUEST_TASK: &str = "requests";
+const INBOX_WAIT: Duration = Duration::from_millis(200);
+const MEMORY_OPERATION: &str = "memory_write";
+const MAX_MEMORY_BYTES: usize = 16_384;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryAgentSettings {}
+
+pub struct MemoryAgent {
+    runtime: AgentRuntime,
+    inbox: AgentInbox,
+    model: AgentModel,
+    memory_path: PathBuf,
+    _context_guard: ContextChannelGuard,
+}
+
+impl CoreAgent for MemoryAgent {
+    type Settings = MemoryAgentSettings;
+    const FIXED_INSTANCES: Option<usize> = Some(1);
+
+    fn name() -> &'static str {
+        "memory"
+    }
+
+    fn runtime(&self) -> &AgentRuntime {
+        &self.runtime
+    }
+
+    fn banner(_config: &Config, _banner: &mut Banner) {}
+
+    fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
+        vec![PeriodicTaskSpec {
+            id: REQUEST_TASK,
+            interval: Duration::ZERO,
+            jitter: JitterPolicy::BeforeEachCycle,
+            jitter_max_ms: 0,
+            autostart: true,
+        }]
+    }
+
+    fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
+        ensure!(task_id == REQUEST_TASK, "unknown memory task {task_id:?}");
+        if let Some(request) = self.inbox.recv_timeout(INBOX_WAIT)? {
+            self.handle_request(request);
+        }
+        Ok(())
+    }
+
+    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+        let bus = ctx
+            .workflow
+            .bus
+            .as_ref()
+            .context("memory agent requires the cross-agent bus")?;
+        let inbox = bus.register(Self::name(), vec![memory_tool_definition()])?;
+        let working_dir = ctx.workflow.base_dir.clone();
+        let model = AgentModel::connect(&ctx, &working_dir, ModelPreferences::default())?;
+        let memory_path = memory_file_path(&working_dir);
+        let memory_path_for_provider = memory_path.clone();
+        let context_guard = bus.register_context(
+            "memory",
+            Arc::new(move || fs::read_to_string(&memory_path_for_provider).unwrap_or_default())
+                as ContextProvider,
+        );
+        Ok(Self {
+            runtime: ctx.runtime.clone(),
+            inbox,
+            model,
+            memory_path,
+            _context_guard: context_guard,
+        })
+    }
+
+    fn on_start(&mut self) -> Result<()> {
+        info!("Memory agent ready");
+        Ok(())
+    }
+}
+
+impl MemoryAgent {
+    fn handle_request(&mut self, request: AgentRequest) {
+        let payload = request.payload.clone();
+        let write_result = handle_memory_request(&self.memory_path, &request.operation, payload);
+        // Respond immediately after the append so the caller is not blocked by
+        // the model-driven reorganization. The reorg runs after the response
+        // is sent; new requests arriving during reorg are queued in the inbox
+        // and processed on the next periodic tick.
+        let success = write_result.is_ok();
+        let response: Result<Value> = match write_result {
+            Ok(()) => fs::read_to_string(&self.memory_path)
+                .map(Value::String)
+                .context("read memory after write"),
+            Err(error) => Err(error),
+        };
+        request.respond(response);
+        // After responding, reorganize the full memory with the model to merge
+        // the new content, deduplicate, and keep only stable project-wide facts.
+        if success && let Err(error) = self.reorganize() {
+            warn!("memory reorganization after write failed: {error}");
+        }
+    }
+
+    fn reorganize(&mut self) -> Result<()> {
+        let current = fs::read_to_string(&self.memory_path).unwrap_or_default();
+        if current.trim().is_empty() {
+            return Ok(());
+        }
+        let prompt = build_reorganize_prompt(&current);
+        let result = self.model.complete_typed::<MemoryReorgOutput>(
+            &prompt,
+            &InvokeOptions {
+                activity_label: Some(format!("{} reorganizing memory", self.runtime.agent_id())),
+                ..InvokeOptions::default()
+            },
+        );
+        match result {
+            Ok(completion) => {
+                let reorganized = completion.output.content;
+                if !reorganized.trim().is_empty()
+                    && reorganized.len() <= MAX_MEMORY_BYTES
+                    && reorganized != current
+                {
+                    save_memory(&self.memory_path, &reorganized)?;
+                    info!(
+                        "memory reorganized ({} -> {} bytes)",
+                        current.len(),
+                        reorganized.len()
+                    );
+                }
+            }
+            Err(error) => {
+                warn!("memory reorganization failed: {error}");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn handle_memory_request(memory_path: &Path, operation: &str, payload: Value) -> Result<()> {
+    ensure!(
+        operation == MEMORY_OPERATION,
+        "unsupported memory operation {operation:?}"
+    );
+    let content = payload
+        .get("content")
+        .and_then(Value::as_str)
+        .context("memory write requires a 'content' string")?;
+    ensure!(
+        !content.trim().is_empty(),
+        "memory content must not be empty"
+    );
+    ensure!(
+        content.len() <= MAX_MEMORY_BYTES,
+        "memory content exceeds {MAX_MEMORY_BYTES} bytes"
+    );
+    // Append the new content to the existing memory. The model-driven
+    // reorganization step merges, deduplicates, and filters the combined
+    // content into the final memory.
+    let existing = fs::read_to_string(memory_path).unwrap_or_default();
+    let combined = if existing.trim().is_empty() {
+        content.to_string()
+    } else {
+        format!("{existing}\n\n{content}")
+    };
+    save_memory(memory_path, &combined)?;
+    Ok(())
+}
+
+fn save_memory(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create memory directory {}", parent.display()))?;
+    }
+    let temp_path = path.with_extension("md.tmp");
+    fs::write(&temp_path, content)
+        .with_context(|| format!("write temporary memory {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| format!("replace memory {}", path.display()))?;
+    Ok(())
+}
+
+fn build_reorganize_prompt(current: &str) -> String {
+    format!(
+        r#"You are a memory curator for a software project. Below is the durable project memory — a collection of facts about architecture, invariants, conventions, integrations, and domain knowledge. New facts have just been appended.
+
+Your job: merge, reorganize, deduplicate, and filter this memory into a single clean collection. Keep only stable, project-wide facts that are useful across unrelated future tasks. Remove:
+- Duplicates and near-duplicates (merge into one)
+- Task-specific or temporary notes
+- Facts already clearly documented in project guidance files
+- Stale or outdated information
+
+Preserve the good facts as-is (do not rewrite them). Organize by category if not already. Return the complete reorganized memory as markdown.
+
+## Current memory
+
+{current}
+"#
+    )
+}
+
+/// The structured output of a memory reorganization: the full reorganized
+/// markdown content.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryReorgOutput {
+    content: String,
+}
+
+structured_output! {
+    impl MemoryReorgOutput {
+        tool_name: "memory_reorganize";
+        tool_description: "Return the reorganized durable project memory as markdown.";
+        schema: object("The reorganized memory content.", {
+            required content: string("The full reorganized memory content as markdown."),
+        });
+    }
+}
+
+fn memory_tool_definition() -> AgentToolDefinition {
+    AgentToolDefinition {
+        name: "memory".to_string(),
+        description: "Store new facts in durable project memory. Store only stable, project-wide facts (architecture, invariants, conventions, domain knowledge) useful across unrelated future tasks. Do not store task progress, implementation notes, or temporary state. The current memory is shown as '## memory' in your context.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The new facts to add to memory, as markdown."
+                }
+            },
+            "required": ["content"],
+            "additionalProperties": false
+        }),
+        operation: MEMORY_OPERATION.to_string(),
+    }
+}
+
+/// Derive the memory file path from the working directory.
+/// `~/.potlatch/memory/<hash>/memory.md` where `<hash>` is a stable hash of the
+/// working directory path.
+fn memory_file_path(working_dir: &str) -> PathBuf {
+    let hash = hash_str(working_dir);
+    home_dir()
+        .join(".potlatch")
+        .join("memory")
+        .join(&hash)
+        .join("memory.md")
+}
+
+fn hash_str(value: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn home_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home);
+    }
+    PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_is_deterministic_and_path_specific() {
+        assert_eq!(
+            hash_str("/home/user/project-a"),
+            hash_str("/home/user/project-a")
+        );
+        assert_ne!(
+            hash_str("/home/user/project-a"),
+            hash_str("/home/user/project-b")
+        );
+    }
+
+    #[test]
+    fn memory_file_path_is_under_potlatch_memory_with_hash() {
+        let path = memory_file_path("/home/user/project");
+        assert!(path.starts_with(home_dir().join(".potlatch/memory")));
+        assert!(path.ends_with("memory.md"));
+    }
+
+    #[test]
+    fn save_and_read_memory_round_trips() {
+        let dir = std::env::temp_dir().join(format!("potlatch-memory-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.md");
+        save_memory(&path, "# Project Memory\n\nFact one.").unwrap();
+        let read = fs::read_to_string(&path).unwrap();
+        assert_eq!(read, "# Project Memory\n\nFact one.");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_memory_creates_parent_directories() {
+        let dir =
+            std::env::temp_dir().join(format!("potlatch-memory-test-nested-{}", std::process::id()));
+        let path = dir.join("sub").join("memory.md");
+        save_memory(&path, "content").unwrap();
+        assert!(path.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn memory_tool_definition_has_content_parameter() {
+        let def = memory_tool_definition();
+        assert_eq!(def.name, "memory");
+        let params = &def.parameters;
+        assert_eq!(params["required"], serde_json::json!(["content"]));
+        assert_eq!(params["properties"]["content"]["type"], "string");
+    }
+
+    #[test]
+    fn handle_memory_request_appends_content() {
+        let dir =
+            std::env::temp_dir().join(format!("potlatch-memory-test-req-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.md");
+        // First write.
+        handle_memory_request(
+            &path,
+            MEMORY_OPERATION,
+            serde_json::json!({"content": "fact one"}),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fact one");
+        // Second write appends.
+        handle_memory_request(
+            &path,
+            MEMORY_OPERATION,
+            serde_json::json!({"content": "fact two"}),
+        )
+        .unwrap();
+        let combined = fs::read_to_string(&path).unwrap();
+        assert!(combined.contains("fact one"));
+        assert!(combined.contains("fact two"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handle_memory_request_rejects_empty_content() {
+        let dir =
+            std::env::temp_dir().join(format!("potlatch-memory-test-empty-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.md");
+        let result = handle_memory_request(
+            &path,
+            MEMORY_OPERATION,
+            serde_json::json!({"content": "   "}),
+        );
+        assert!(result.is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handle_memory_request_rejects_oversized_content() {
+        let dir =
+            std::env::temp_dir().join(format!("potlatch-memory-test-big-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.md");
+        let big = "x".repeat(MAX_MEMORY_BYTES + 1);
+        let result =
+            handle_memory_request(&path, MEMORY_OPERATION, serde_json::json!({"content": big}));
+        assert!(result.is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handle_memory_request_rejects_unknown_operation() {
+        let dir =
+            std::env::temp_dir().join(format!("potlatch-memory-test-op-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.md");
+        let result = handle_memory_request(&path, "unknown", serde_json::json!({}));
+        assert!(result.is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+}
