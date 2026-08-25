@@ -82,7 +82,7 @@ fn close_acp_session_best_effort(client: &AcpClient, session_id: &str) {
 }
 
 pub(crate) struct AcpRuntime {
-    repo_path: String,
+    working_dir: String,
     model_uri: Option<String>,
     endpoint_model: Option<String>,
     acp_command: Vec<String>,
@@ -108,7 +108,7 @@ pub(crate) struct AcpRuntime {
 impl AcpRuntime {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        repo_path: String,
+        working_dir: String,
         model_uri: Option<String>,
         endpoint_model: Option<String>,
         acp_command: Vec<String>,
@@ -123,7 +123,7 @@ impl AcpRuntime {
         let structured_output_backend =
             super::backends::resolve_structured_output_backend(model_uri.as_deref());
         Self {
-            repo_path,
+            working_dir,
             model_uri,
             endpoint_model,
             acp_command,
@@ -248,6 +248,33 @@ impl AcpRuntime {
             tools
                 .into_iter()
                 .filter_map(|tool| serde_json::to_value(tool).ok())
+                .collect()
+        })
+    }
+
+    /// Context channels registered by in-process agents on the bus. Each is
+    /// shipped to the potlatch harness via `session/new` and injected as a
+    /// system message at session init. Potlatch extension — `None` for non-potlatch
+    /// backends or when no channels are registered.
+    fn session_context_channels(&self) -> Option<Vec<Value>> {
+        let is_potlatch = self
+            .model_uri
+            .as_deref()
+            .and_then(|uri| crate::core::config::uri::ModelUri::parse(uri).ok())
+            .is_some_and(|uri| uri.vendor == "potlatch");
+        if !is_potlatch {
+            return None;
+        }
+        let channels = self.agent_bus.as_ref()?.context_channels().ok()?;
+        (!channels.is_empty()).then(|| {
+            channels
+                .into_iter()
+                .map(|ch| {
+                    serde_json::json!({
+                        "name": ch.name,
+                        "content": ch.content,
+                    })
+                })
                 .collect()
         })
     }
@@ -437,7 +464,7 @@ impl AcpRuntime {
             .with_context(|| format!("build ACP spawn command for {program}"))?;
 
         let mut child = cmd
-            .current_dir(&self.repo_path)
+            .current_dir(&self.working_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -461,7 +488,7 @@ impl AcpRuntime {
         }
 
         let hooks = Arc::new(StreamTextHooks::with_workspace(PathBuf::from(
-            self.repo_path.clone(),
+            self.working_dir.clone(),
         )));
         let (client, child) = AcpClient::from_child_stdio(child, hooks.clone())
             .context("attach ACP client to agent stdio")?;
@@ -506,14 +533,15 @@ impl AcpRuntime {
         client: &Arc<AcpClient>,
         hooks: &Arc<StreamTextHooks>,
     ) -> Result<String> {
-        let cwd: PathBuf = std::fs::canonicalize(&self.repo_path)
-            .unwrap_or_else(|_| PathBuf::from(&self.repo_path));
+        let cwd: PathBuf = std::fs::canonicalize(&self.working_dir)
+            .unwrap_or_else(|_| PathBuf::from(&self.working_dir));
         let session = client
             .session_new(&NewSessionParams {
                 cwd: cwd.to_string_lossy().into_owned(),
                 mcp_servers: vec![],
                 structured_output_tools: self.session_structured_output_tools(),
                 agent_tools: self.session_agent_tools(),
+                context_channels: self.session_context_channels(),
             })
             .context("ACP session/new")?;
 

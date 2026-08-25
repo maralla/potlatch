@@ -61,7 +61,7 @@ impl AgentModel {
     /// Connect a model for a configured agent role at spawn time.
     pub fn connect(
         ctx: &AgentSpawnContext,
-        repo_path: impl Into<String>,
+        working_dir: impl Into<String>,
         prefs: ModelPreferences,
     ) -> Result<Self> {
         let section = ctx
@@ -75,7 +75,7 @@ impl AgentModel {
         let engine = spawn_model_engine(
             &ctx.workflow.config,
             section,
-            repo_path,
+            working_dir,
             agent_id.clone(),
             Arc::clone(&shutdown),
             ModelSessionOptions {
@@ -188,7 +188,7 @@ impl AgentModel {
         config: &crate::core::config::Config,
         section: &crate::core::config::AgentSection,
         agent_id: &str,
-        repo_path: &str,
+        working_dir: &str,
         prefs: ModelPreferences,
     ) -> Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -197,7 +197,7 @@ impl AgentModel {
         let engine = spawn_model_engine(
             config,
             section,
-            repo_path,
+            working_dir,
             agent_id,
             Arc::clone(&shutdown),
             ModelSessionOptions {

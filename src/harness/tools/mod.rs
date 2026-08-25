@@ -4,7 +4,6 @@ pub mod agent_bus;
 pub mod edit;
 pub mod http;
 pub mod lsp;
-pub mod memory;
 pub mod read;
 pub mod search;
 pub mod shell;

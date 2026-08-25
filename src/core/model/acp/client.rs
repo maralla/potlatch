@@ -594,6 +594,7 @@ mod tests {
                 mcp_servers: vec![],
                 structured_output_tools: None,
                 agent_tools: None,
+                context_channels: None,
             })?
             .session_id;
         assert_eq!(sid, "test-session");
@@ -688,6 +689,7 @@ mod tests {
                 mcp_servers: vec![],
                 structured_output_tools: None,
                 agent_tools: None,
+                context_channels: None,
             })?
             .session_id;
         client.session_set_model(&sid, "composer-2")?;
@@ -782,6 +784,7 @@ mod tests {
                 mcp_servers: vec![],
                 structured_output_tools: None,
                 agent_tools: None,
+                context_channels: None,
             })?
             .session_id;
         client.session_set_mode(&sid, "code")?;
@@ -895,6 +898,7 @@ mod tests {
             mcp_servers: vec![],
             structured_output_tools: None,
             agent_tools: None,
+            context_channels: None,
         })?;
         assert!(
             session

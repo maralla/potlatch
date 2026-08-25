@@ -80,6 +80,16 @@ pub struct NewSessionParams {
         rename = "agent_tools"
     )]
     pub agent_tools: Option<Vec<Value>>,
+    /// Context channels registered by in-process agents on the bus. Each
+    /// entry has a `name` and `content` string; the harness injects each as a
+    /// system message at session init. Potlatch extension; ignored by non-potlatch
+    /// backends.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "context_channels"
+    )]
+    pub context_channels: Option<Vec<Value>>,
 }
 
 /// One allowed value in a `select` session config option ([`SessionConfigOptionBrief`]).
