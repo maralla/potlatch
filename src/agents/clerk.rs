@@ -1,4 +1,4 @@
-//! Memory agent: maintains durable project memory as a plain markdown file.
+//! Clerk agent: maintains durable project memory as a plain markdown file.
 //!
 //! Bus-served: exposes a `memory` tool that other agents call to replace the
 //! full memory content. Also registers a context channel on the bus so other
@@ -35,9 +35,9 @@ const MAX_MEMORY_BYTES: usize = 16_384;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct MemoryAgentSettings {}
+pub struct ClerkAgentSettings {}
 
-pub struct MemoryAgent {
+pub struct ClerkAgent {
     runtime: AgentRuntime,
     inbox: AgentInbox,
     model: AgentModel,
@@ -45,12 +45,12 @@ pub struct MemoryAgent {
     _context_guard: ContextChannelGuard,
 }
 
-impl CoreAgent for MemoryAgent {
-    type Settings = MemoryAgentSettings;
+impl CoreAgent for ClerkAgent {
+    type Settings = ClerkAgentSettings;
     const FIXED_INSTANCES: Option<usize> = Some(1);
 
     fn name() -> &'static str {
-        "memory"
+        "clerk"
     }
 
     fn runtime(&self) -> &AgentRuntime {
@@ -70,7 +70,7 @@ impl CoreAgent for MemoryAgent {
     }
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
-        ensure!(task_id == REQUEST_TASK, "unknown memory task {task_id:?}");
+        ensure!(task_id == REQUEST_TASK, "unknown clerk task {task_id:?}");
         if let Some(request) = self.inbox.recv_timeout(INBOX_WAIT)? {
             self.handle_request(request);
         }
@@ -82,7 +82,7 @@ impl CoreAgent for MemoryAgent {
             .workflow
             .bus
             .as_ref()
-            .context("memory agent requires the cross-agent bus")?;
+            .context("clerk agent requires the cross-agent bus")?;
         let inbox = bus.register(Self::name(), vec![memory_tool_definition()])?;
         let working_dir = ctx.workflow.base_dir.clone();
         let model = AgentModel::connect(&ctx, &working_dir, ModelPreferences::default())?;
@@ -103,12 +103,12 @@ impl CoreAgent for MemoryAgent {
     }
 
     fn on_start(&mut self) -> Result<()> {
-        info!("Memory agent ready");
+        info!("Clerk agent ready");
         Ok(())
     }
 }
 
-impl MemoryAgent {
+impl ClerkAgent {
     fn handle_request(&mut self, request: AgentRequest) {
         let payload = request.payload.clone();
         let write_result = handle_memory_request(&self.memory_path, &request.operation, payload);
