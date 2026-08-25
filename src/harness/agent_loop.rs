@@ -599,9 +599,9 @@ impl AgentLoop {
     /// `(tool_name, tool_call_id, result_string)`.
     ///
     /// Concurrency is only used when **every** call is to a read-only tool
-    /// (`read`, `grep`, `glob`, `fetch`). If any call is to a mutating
-    /// tool (`write`, `edit`, `shell`), all calls run sequentially in
-    /// order to preserve dependencies.
+    /// (`read`, `grep`, `glob`). If any call is to a mutating tool (`write`,
+    /// `edit`, `shell`, `http`), all calls run sequentially in order to
+    /// preserve dependencies.
     fn execute_tool_calls_concurrent(
         &self,
         tool_calls: &[Value],
@@ -705,7 +705,7 @@ fn classify_tool_result(tool_name: &str, _result: &str) -> ContextKind {
         "edit" => ContextKind::EditResult,
         "write" => ContextKind::EditResult,
         "grep" | "glob" => ContextKind::Exploration,
-        "fetch" => ContextKind::WebFetch,
+        "http" => ContextKind::WebFetch,
         "plan" | "todo" | "memory" => ContextKind::ToolResult,
         _ => ContextKind::ToolResult,
     }
@@ -720,7 +720,7 @@ const MAX_TOOL_RESULT_CHARS: usize = 4_000;
 /// executed concurrently safely; mutating tools must run in order to preserve
 /// dependencies (e.g. `mkdir` before `write`).
 fn is_read_only_tool(name: &str) -> bool {
-    matches!(name, "read" | "grep" | "glob" | "fetch")
+    matches!(name, "read" | "grep" | "glob")
 }
 
 /// Check whether an LLM API error is caused by malformed tool call arguments
@@ -1082,8 +1082,8 @@ mod tests {
         assert!(is_read_only_tool("read"));
         assert!(is_read_only_tool("grep"));
         assert!(is_read_only_tool("glob"));
-        assert!(is_read_only_tool("fetch"));
 
+        assert!(!is_read_only_tool("http"));
         assert!(!is_read_only_tool("write"));
         assert!(!is_read_only_tool("edit"));
         assert!(!is_read_only_tool("shell"));
