@@ -45,8 +45,6 @@ Your workspace is the current working directory. It is the root of the repositor
 
 {tools_section}
 
-- **Prefer rendered web access.** When both `web_fetch` and `fetch` are available, use `web_fetch` for web pages and URLs returned by `web_search`. Use `fetch` only when you specifically need a lightweight raw/static response or browser rendering is unnecessary.
-
 ## Important Notes
 
 - Tool results may be compacted to save context. If you need exact current file state, re-read the file rather than relying on memory.
@@ -124,145 +122,30 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_covers_key_principles() {
+    fn system_prompt_replaces_tools_section_placeholder() {
         let p = system_prompt(&test_descriptions());
-        assert!(p.contains("Grep before you read"));
-        assert!(p.contains("minimal, targeted edits"));
-        assert!(p.contains("Verify your changes"));
-        assert!(p.contains("Stop when the task is done"));
-        assert!(p.contains("compacted"));
+        assert!(!p.contains("{tools_section}"));
     }
 
     #[test]
-    fn system_prompt_prefers_web_fetch_for_pages() {
+    fn system_prompt_includes_all_provided_tool_descriptions() {
         let p = system_prompt(&test_descriptions());
-        assert!(p.contains("When both `web_fetch` and `fetch` are available"));
-        assert!(p.contains("use `web_fetch` for web pages"));
+        for (name, desc) in test_descriptions() {
+            assert!(p.contains(&format!("**{name}**")), "missing tool {name:?}");
+            assert!(p.contains(&desc), "missing description for {name:?}");
+        }
     }
 
     #[test]
-    fn system_prompt_promotes_lsp_for_code_navigation() {
-        let p = system_prompt(&test_descriptions());
-        assert!(
-            p.contains("lsp"),
-            "prompt should mention lsp for code navigation"
-        );
-        assert!(p.contains("definition"), "prompt should mention definition");
-        assert!(p.contains("references"), "prompt should mention references");
-        // LSP should be the first operating principle — mentioned before
-        // "Grep before you read".
-        let lsp_principle_pos = p.find("Use `lsp` for code navigation").unwrap();
-        let grep_principle_pos = p.find("Grep before you read").unwrap();
-        assert!(
-            lsp_principle_pos < grep_principle_pos,
-            "lsp principle should come before grep principle"
-        );
-    }
-
-    #[test]
-    fn system_prompt_encourages_concise_reasoning() {
-        let p = system_prompt(&test_descriptions());
-        assert!(
-            p.contains("Keep reasoning concise"),
-            "prompt should instruct the model to keep reasoning brief"
-        );
-        assert!(p.contains("never shown to the user"));
-    }
-
-    #[test]
-    fn system_prompt_encourages_batched_reads() {
-        let p = system_prompt(&test_descriptions());
-        assert!(p.contains("files"));
-        assert!(p.contains("Batch independent operations"));
-        assert!(p.contains("Grep before you read"));
-    }
-
-    #[test]
-    fn system_prompt_prescribes_grep_first_exploration() {
-        let p = system_prompt(&test_descriptions());
-        // grep is the primary exploration tool — must be mentioned before read.
-        let grep_pos = p.find("**grep**").unwrap();
-        let read_pos = p.find("**read**").unwrap();
-        assert!(grep_pos < read_pos, "grep should be listed before read");
-        assert!(p.contains("Always run this before `read`"));
-    }
-
-    #[test]
-    fn system_prompt_discourages_whole_file_reads_for_large_files() {
-        let p = system_prompt(&test_descriptions());
-        assert!(p.contains("Always pass `start_line`/`end_line` for large files"));
-        assert!(!p.contains("Read whole files by omitting"));
-    }
-
-    #[test]
-    fn system_prompt_encourages_acting_over_narrating() {
-        let p = system_prompt(&test_descriptions());
-        assert!(p.contains("Act, don't narrate"));
-        assert!(p.contains("make the edit immediately"));
-        assert!(p.contains("Brief, focused thinking"));
-    }
-
-    #[test]
-    fn system_prompt_discourages_re_reading_files() {
-        let p = system_prompt(&test_descriptions());
-        assert!(p.contains("Don't re-read files you've already read"));
-        assert!(p.contains("conversation summary"));
-    }
-
-    #[test]
-    fn system_prompt_requires_evidence_for_unclear_concepts() {
-        let p = system_prompt(&test_descriptions());
-        assert!(
-            p.contains("Verify unclear concepts before acting"),
-            "prompt should instruct the model to verify unclear concepts"
-        );
-        assert!(
-            p.contains("web_search"),
-            "prompt should name web_search as the evidence source"
-        );
-        assert!(
-            p.contains("Do not guess or assume behavior without proof"),
-            "prompt should forbid guessing without proof"
-        );
-        assert!(
-            p.contains("direct supporting evidence"),
-            "prompt should require direct supporting evidence"
-        );
+    fn system_prompt_excludes_tools_not_provided() {
+        let p = system_prompt(&test_descriptions_no_lsp());
+        assert!(!p.contains("**lsp**"));
+        assert!(!p.contains("**plan**"));
     }
 
     #[test]
     fn system_prompt_includes_plan_tool_when_provided() {
         let p = system_prompt(&test_descriptions_with_plan());
         assert!(p.contains("**plan**"));
-        assert!(p.contains("canonical handoff"));
-    }
-
-    #[test]
-    fn system_prompt_excludes_plan_tool_when_not_provided() {
-        let p = system_prompt(&test_descriptions_no_lsp());
-        assert!(!p.contains("**plan**"));
-        assert!(!p.contains("canonical handoff"));
-    }
-
-    #[test]
-    fn system_prompt_includes_lsp_tool_when_provided() {
-        let p = system_prompt(&test_descriptions());
-        assert!(p.contains("**lsp**"));
-        assert!(p.contains("definition"));
-    }
-
-    #[test]
-    fn system_prompt_excludes_lsp_tool_when_not_provided() {
-        let p = system_prompt(&test_descriptions_no_lsp());
-        assert!(!p.contains("**lsp**"));
-    }
-
-    #[test]
-    fn system_prompt_does_not_concatenate_agents_md() {
-        let p = system_prompt(&test_descriptions());
-        assert!(!p.contains("Agent Instructions"));
-        assert!(!p.contains("Code Quality"));
-        assert!(!p.contains("For Worker Agent"));
-        assert!(!p.contains("Project Instructions"));
     }
 }

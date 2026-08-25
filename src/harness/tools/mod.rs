@@ -2,7 +2,7 @@
 
 pub mod agent_bus;
 pub mod edit;
-pub mod fetch;
+pub mod http;
 pub mod lsp;
 pub mod memory;
 pub mod read;
@@ -303,8 +303,8 @@ impl ToolRegistry {
         if allowed("glob") {
             reg.register(Arc::new(search::GlobTool));
         }
-        if allowed("fetch") {
-            reg.register(Arc::new(fetch::FetchTool::new()));
+        if allowed("http") {
+            reg.register(Arc::new(http::HttpTool::new()));
         }
         if allowed("lsp") {
             reg.register(Arc::new(lsp::LspTool::new(states, cwd)));

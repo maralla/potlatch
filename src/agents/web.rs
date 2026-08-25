@@ -282,7 +282,7 @@ fn web_search_tool_definition() -> AgentToolDefinition {
 fn web_fetch_tool_definition() -> AgentToolDefinition {
     AgentToolDefinition {
         name: "web_fetch".to_string(),
-        description: "Preferred tool for opening web pages and URLs returned by `web_search`. Use `web_fetch` instead of `fetch` whenever rendered or JavaScript-generated content may be needed. It opens the HTTP(S) address in the persistent system browser and returns only the extracted Markdown content, without a JSON wrapper or metadata.".to_string(),
+        description: "Preferred tool for opening web pages and URLs returned by `web_search` whenever rendered or JavaScript-generated content may be needed. It opens the HTTP(S) address in the persistent system browser and returns only the extracted Markdown content, without a JSON wrapper or metadata.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -474,11 +474,7 @@ mod tests {
         assert_eq!(fetch.name, "web_fetch");
         assert_eq!(fetch.operation, WEB_FETCH_OPERATION);
         assert_eq!(fetch.parameters["required"], serde_json::json!(["url"]));
-        assert!(
-            fetch
-                .description
-                .contains("Use `web_fetch` instead of `fetch`")
-        );
+        assert!(!fetch.description.is_empty());
     }
 
     #[test]

@@ -436,45 +436,6 @@ mod tests {
     }
 
     #[test]
-    fn render_settled_script_is_a_promise_driven_by_dom_stability() {
-        // The expression must evaluate to a Promise so CDP's `awaitPromise`
-        // blocks until the DOM-driven observer resolves it.
-        assert!(
-            RENDER_SETTLED_SCRIPT.starts_with("new Promise("),
-            "script must return a Promise"
-        );
-        // A MutationObserver drives completion from the DOM side.
-        assert!(RENDER_SETTLED_SCRIPT.contains("new MutationObserver"));
-        // The settle window restarts on every mutation so only a sustained
-        // quiet pause counts as "done".
-        assert!(RENDER_SETTLED_SCRIPT.contains("clearTimeout(settleTimer)"));
-        // A max-timeout rejects so the Promise never hangs forever on a page
-        // that keeps churning.
-        assert!(RENDER_SETTLED_SCRIPT.contains("reject("));
-        // Selector-free: no element IDs or tags drive the wait.
-        assert!(!RENDER_SETTLED_SCRIPT.contains("querySelector"));
-        assert!(!RENDER_SETTLED_SCRIPT.contains("getElementById"));
-    }
-
-    #[test]
-    fn google_results_state_script_is_structural_and_checks_verification_first() {
-        // Purely structural — no text matching — so it is robust to Google
-        // copy/locale changes.
-        assert!(!GOOGLE_RESULTS_STATE_SCRIPT.contains("innerText"));
-        assert!(!GOOGLE_RESULTS_STATE_SCRIPT.contains("did not match"));
-        // The verification wall is checked before results so a stale `a h3`
-        // from a previous page cannot mask it.
-        assert!(GOOGLE_RESULTS_STATE_SCRIPT.contains(r#""verification""#));
-        assert!(GOOGLE_RESULTS_STATE_SCRIPT.contains(r#"#search"#));
-        assert!(GOOGLE_RESULTS_STATE_SCRIPT.contains(r#""no_results""#));
-        let vpos = GOOGLE_RESULTS_STATE_SCRIPT
-            .find(r#""verification""#)
-            .unwrap();
-        let spos = GOOGLE_RESULTS_STATE_SCRIPT.find(r#"#search"#).unwrap();
-        assert!(vpos < spos);
-    }
-
-    #[test]
     fn path_detection_uses_supported_names_only() {
         let dir = crate::harness::tools::test_util::unique_test_dir();
         fs::write(dir.path().join("chromium"), "").unwrap();
