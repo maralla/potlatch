@@ -4,10 +4,10 @@ use crate::core::workflow::Workflow;
 
 pub(crate) mod artifact;
 pub(crate) mod claim;
+pub(crate) mod clerk;
 pub mod git;
 pub mod gitlab;
 pub mod labels;
-pub(crate) mod memory;
 pub mod ops;
 pub mod pmo;
 pub(crate) mod qa;
@@ -140,7 +140,7 @@ pub fn register(workflow: &mut Workflow) {
     workflow.register_agent::<ops::OpsAgent>();
     workflow.register_agent::<qa::QaAgent>();
     workflow.register_agent::<web::WebAgent>();
-    workflow.register_agent::<memory::MemoryAgent>();
+    workflow.register_agent::<clerk::ClerkAgent>();
 }
 
 #[cfg(test)]
@@ -188,7 +188,7 @@ mod scope_tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            vec!["memory", "ops", "pmo", "qa", "reviewer", "web", "worker"]
+            vec!["clerk", "ops", "pmo", "qa", "reviewer", "web", "worker"]
         );
     }
 

@@ -71,7 +71,7 @@ branches = ["main"]
 [agent.web]
 max_results = 8
 
-[agent.memory]
-# Memory agent: maintains durable project memory as plain markdown.
+[agent.clerk]
+# Clerk agent: maintains durable project memory as plain markdown.
 # Requires a model for reorganization and deduplication after each write.
 # model = "acp://cursor/composer-2"
