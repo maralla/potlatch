@@ -353,6 +353,7 @@ trait ReviewerPort {
     fn invoke_review_model(&mut self, subject: &ReviewSubject) -> Result<ReviewerOutput>;
     fn post_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()>;
     fn post_resolved_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()>;
+    fn create_issue(&mut self, title: &str, description: &str) -> Result<u64>;
     fn add_approved_label(&mut self, mr_iid: u64) -> Result<()>;
     fn merge_merge_request(&mut self, mr_iid: u64) -> Result<()>;
 }
@@ -609,12 +610,30 @@ fn review_claimed_merge_request(
     };
     match decide_pre_review_gate(mr, &subject) {
         PreReviewGate::MissingIssueLink => {
-            warn!(
-                "MR !{} does not reference any issue, requesting fix",
-                mr.iid
-            );
-            port.post_discussion(mr.iid, MISSING_ISSUE_LINK_BODY)?;
-            return Ok(ReviewOutcome::NeedsChanges);
+            // The MR has no linked issue. Create one that corresponds to the
+            // MR so the review can proceed against a real issue context.
+            let description = if mr.description.trim().is_empty() {
+                format!("Review of merge request !{}: {}", mr.iid, mr.title)
+            } else {
+                mr.description.clone()
+            };
+            match port.create_issue(&mr.title, &description) {
+                Ok(issue_iid) => {
+                    info!(
+                        "MR !{} has no linked issue; created issue #{} from the MR title/description",
+                        mr.iid, issue_iid
+                    );
+                    subject.issue_iid = Some(issue_iid);
+                }
+                Err(error) => {
+                    warn!(
+                        "MR !{} does not reference any issue and creating one failed: {error}; requesting fix",
+                        mr.iid
+                    );
+                    port.post_discussion(mr.iid, MISSING_ISSUE_LINK_BODY)?;
+                    return Ok(ReviewOutcome::NeedsChanges);
+                }
+            }
         }
         PreReviewGate::BadMetadata(body) => {
             warn!(
@@ -848,6 +867,9 @@ impl ReviewerPort for LiveReviewerPort<'_> {
     }
     fn post_resolved_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
         self.gitlab.add_resolved_mr_discussion(mr_iid, body)
+    }
+    fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
+        self.gitlab.create_issue(title, description)
     }
     fn add_approved_label(&mut self, mr_iid: u64) -> Result<()> {
         self.gitlab
@@ -1348,6 +1370,7 @@ mod tests {
         discussions: Vec<(u64, String)>,
         resolved_discussions: Vec<(u64, String)>,
         reviewed_subjects: Vec<ReviewSubject>,
+        created_issues: RefCell<Vec<(String, String)>>,
     }
 
     impl FakeReviewerPort {
@@ -1367,6 +1390,7 @@ mod tests {
                 discussions: Vec::new(),
                 resolved_discussions: Vec::new(),
                 reviewed_subjects: Vec::new(),
+                created_issues: RefCell::new(Vec::new()),
             }
         }
 
@@ -1513,6 +1537,14 @@ mod tests {
             self.trace(format!("post_resolved:{mr_iid}"));
             self.resolved_discussions.push((mr_iid, body.into()));
             Ok(())
+        }
+        fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
+            self.trace(format!("create_issue:{title}"));
+            self.fails("create_issue")?;
+            self.created_issues
+                .borrow_mut()
+                .push((title.to_string(), description.to_string()));
+            Ok(self.merge_requests.len() as u64 + 1000)
         }
         fn add_approved_label(&mut self, mr_iid: u64) -> Result<()> {
             self.trace(format!("label:{mr_iid}"));

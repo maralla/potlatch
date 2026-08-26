@@ -1002,21 +1002,20 @@ fn run_pmo_cycle(
                         if port.release_claim().is_ok() {
                             port.clear_claim_state();
                         }
-                        let still_planning = port
-                            .issue(iid)
-                            .is_some_and(|issue| {
-                                issue
-                                    .labels
-                                    .iter()
-                                    .any(|label| label == labels::PMO_PLANNING)
-                            });
+                        let still_planning = port.issue(iid).is_some_and(|issue| {
+                            issue
+                                .labels
+                                .iter()
+                                .any(|label| label == labels::PMO_PLANNING)
+                        });
                         if !still_planning {
                             // The pmo-planning label was removed — the human
                             // approved the plan. For an MR-attached issue, clear
                             // action-required and post a comment for the worker.
                             if mr_iid.is_some() {
                                 let _ = port.remove_issue_label(iid, ACTION_REQUIRED_LABEL);
-                                let _ = port.add_issue_comment(iid, "Plan refined. Continue working.");
+                                let _ =
+                                    port.add_issue_comment(iid, "Plan refined. Continue working.");
                             }
                         }
                         // If the claim label was removed but pmo-planning is
@@ -1056,10 +1055,7 @@ fn run_pmo_cycle(
                 }
                 if mr_iid.is_some() {
                     let _ = port.remove_issue_label(iid, ACTION_REQUIRED_LABEL);
-                    let _ = port.add_issue_comment(
-                        iid,
-                        "Plan refined. Continue working.",
-                    );
+                    let _ = port.add_issue_comment(iid, "Plan refined. Continue working.");
                 }
                 return Ok(());
             }
