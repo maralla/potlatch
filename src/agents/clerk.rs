@@ -211,15 +211,21 @@ fn save_memory(path: &Path, content: &str) -> Result<()> {
 
 fn build_reorganize_prompt(current: &str) -> String {
     format!(
-        r#"You are a memory curator for a software project. Below is the durable project memory — a collection of facts about architecture, invariants, conventions, integrations, and domain knowledge. New facts have just been appended.
+        r#"You are the memory curator for THIS software project. The durable project memory is not a log of what happened — it is the project's wisdom: the fundamental, broadly applicable knowledge that holds across unrelated future tasks, like the wisdom a seasoned engineer carries from one project to the next.
 
-Your job: merge, reorganize, deduplicate, and filter this memory into a single clean collection. Keep only stable, project-wide facts that are useful across unrelated future tasks. Remove:
-- Duplicates and near-duplicates (merge into one)
-- Task-specific or temporary notes
-- Facts already clearly documented in project guidance files
-- Stale or outdated information
+Think of memory as wisdom, not notes. Wisdom is:
+- Fundamental principles and invariants of the project ("the data model guarantees X", "module Y is the sole owner of Z", "this system cannot do W").
+- Conventions and constraints that shape every change ("always validate at the boundary", "never bypass layer A to reach layer B").
+- Hard-won non-obvious truths ("integration with S silently fails when Q is unset", "the build caches at P, so edits there need a clean").
+- Cross-cutting domain knowledge a new contributor must absorb before contributing effectively.
 
-Preserve the good facts as-is (do not rewrite them). Organize by category if not already. Return the complete reorganized memory as markdown.
+Wisdom is NOT:
+- Transient task recordings: what you did, saw, or found while working one issue ("function F does X", "file G contains H", "while debugging I noticed J"). These describe one moment, not the project.
+- Facts copied from another codebase, language, or framework. Wisdom is about THIS project only.
+- Restatements of what is already documented in project guidance files (README, AGENTS.md, CONTRIBUTING).
+- Duplicates, stale facts, or anything that could change in the next refactor.
+
+Track wisdom, drop transient task recordings. Rewrite the surviving knowledge into concise, declarative wisdom entries — do NOT preserve note text verbatim. Each entry should state a durable truth about the project, not describe what you once observed. Organize by category. If nothing rises to the level of wisdom, return empty content — an empty memory is better than a clutter of notes that will mislead future tasks.
 
 ## Current memory
 
