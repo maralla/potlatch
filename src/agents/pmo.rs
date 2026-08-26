@@ -100,13 +100,29 @@ fn normalize_sub_issues(raw: Vec<RawSubIssue>) -> Vec<PmoSubIssue> {
 /// [`AgentModel::complete_typed`]).
 #[derive(Debug, Clone, PartialEq)]
 enum PmoOutput {
-    GuideWorker { instructions: String },
-    ProposePlan { plan_text: String },
+    GuideWorker {
+        instructions: String,
+    },
+    ProposePlan {
+        plan_text: String,
+        /// When true, rewrite the issue description with `plan_text`. When
+        /// false, post `plan_text` as a comment. The model chooses: a complete
+        /// plan rewrites the description; a refinement or addendum is a comment.
+        update_description: bool,
+    },
     KeepPlan,
-    Split { sub_issues: Vec<RawSubIssue> },
-    AlreadyDone { reason: String },
-    NeedsClarification { question: String },
-    WaitForDependency { dependency_issue_iid: u64 },
+    Split {
+        sub_issues: Vec<RawSubIssue>,
+    },
+    AlreadyDone {
+        reason: String,
+    },
+    NeedsClarification {
+        question: String,
+    },
+    WaitForDependency {
+        dependency_issue_iid: u64,
+    },
 }
 
 #[derive(Deserialize)]
@@ -119,6 +135,8 @@ struct GuideWorkerWire {
 #[serde(deny_unknown_fields)]
 struct ProposePlanWire {
     plan_text: String,
+    #[serde(default)]
+    update_description: bool,
 }
 
 #[derive(Deserialize)]
@@ -182,6 +200,7 @@ impl<'de> Deserialize<'de> for PmoOutput {
             "propose_plan" => {
                 tagged::branch(fields).map(|wire: ProposePlanWire| Self::ProposePlan {
                     plan_text: wire.plan_text,
+                    update_description: wire.update_description,
                 })
             }
             "keep_plan" => tagged::branch(fields).map(|_: KeepPlanWire| Self::KeepPlan),
@@ -228,7 +247,10 @@ structured_output! {
                     "The issue needs a detailed implementation plan in its description before work proceeds or while an existing PMO plan is being refined.",
                     object({
                         required plan_text: string(
-                            "A repository-informed implementation plan. For an issue without a bound merge request, provide the complete rewritten issue description. For an issue already bound to an MR, provide only the proposed changes and refinements relative to the existing issue description and prior comments; the system posts them as a new comment without replacing the description."
+                            "A repository-informed implementation plan. Write the plan about the KEY SOLUTION, not a framework or scaffold: state the core approach and the decisive design decisions, name the exact module/function/boundary the change touches, and omit boilerplate, directory layouts, and step-by-step implementation minutiae the worker can derive from the code. Every idea must have a reference or proof of concept: for code in this repo cite the file, function, existing pattern, or concrete repo state; for concepts, methods, libraries, or protocols search the web and cite the authoritative source (documentation, RFC, spec, changelog). If you cannot ground an idea in the repository or a cited external source, it is a question for the human, not a plan item."
+                        ),
+                        optional update_description: boolean(
+                            "Choose how to deliver the plan. Set true to REWRITE the issue description with the full plan (use when proposing a complete plan). Set false (or omit) to post the plan as a NEW COMMENT (use when refining an existing plan or adding an addendum). When an issue is already bound to a merge request, prefer false so the existing description is preserved."
                         ),
                     })
                 ),
@@ -652,7 +674,6 @@ fn issue_in_pmo_scope(issue: &PmoIssueObservation, scope_label: Option<&str>) ->
 fn apply_pmo_decision(
     issue: &PmoIssueObservation,
     decision: PmoOutput,
-    bound_mr_iid: Option<u64>,
     scope_label: Option<&str>,
     port: &mut dyn PmoPort,
 ) -> std::result::Result<DecisionDisposition, PmoDecisionError> {
@@ -663,33 +684,31 @@ fn apply_pmo_decision(
             port.add_issue_comment(
                 iid,
                 &format!(
-                    "**PMO needs clarification before proceeding:**\n\n{question}\n\nPlease reply to this comment with the requested information. The PMO will refine the plan based on your feedback. Remove the `pmo-pending` label when you are satisfied with the plan to let the PMO proceed."
+                    "**PMO needs clarification before proceeding:**\n\n{question}\n\nPlease reply to this comment with the requested information. The PMO is blocked until you answer — it will not re-process this issue while the `pmo-pending` label is present. Reply and remove the `pmo-pending` label to let the PMO proceed."
                 ),
             )
             .map_err(PmoDecisionError::Recoverable)?;
             port.add_issue_label(iid, labels::PMO_PENDING)
                 .map_err(PmoDecisionError::Recoverable)?;
-            Ok(DecisionDisposition::KeepClaim)
+            Ok(DecisionDisposition::ReleaseClaim)
         }
-        PmoOutput::ProposePlan { plan_text } => {
+        PmoOutput::ProposePlan {
+            plan_text,
+            update_description,
+        } => {
             let plan = strip_internal_markers(plan_text.trim());
             if plan.trim().is_empty() {
                 return Err(PmoDecisionError::Recoverable(anyhow::anyhow!(
                     "PMO PROPOSE_PLAN output for issue #{iid} had no usable implementation plan; retrying later"
                 )));
             }
-            port.add_issue_label(iid, labels::PMO_PENDING)
+            port.add_issue_label(iid, labels::PMO_PLANNING)
                 .map_err(PmoDecisionError::Recoverable)?;
-            if let Some(mr_iid) = bound_mr_iid {
-                port.add_issue_comment(
-                    iid,
-                    &format!(
-                        "**PMO plan refinement for merge request !{mr_iid}:**\n\n{plan}\n\n_The existing issue description was preserved because this issue is already associated with an MR._"
-                    ),
-                )
-                .map_err(PmoDecisionError::KeepPending)?;
-            } else {
+            if update_description {
                 port.update_issue_description(iid, &plan)
+                    .map_err(PmoDecisionError::KeepPending)?;
+            } else {
+                port.add_issue_comment(iid, &format!("**PMO plan:**\n\n{plan}"))
                     .map_err(PmoDecisionError::KeepPending)?;
             }
             Ok(DecisionDisposition::KeepClaim)
@@ -698,10 +717,10 @@ fn apply_pmo_decision(
             if !issue
                 .labels
                 .iter()
-                .any(|label| label == labels::PMO_PENDING)
+                .any(|label| label == labels::PMO_PLANNING)
             {
                 return Err(PmoDecisionError::Recoverable(anyhow::anyhow!(
-                    "PMO KEEP_PLAN output is only valid for an existing pmo-pending issue"
+                    "PMO KEEP_PLAN output is only valid for an issue already in pmo-planning"
                 )));
             }
             Ok(DecisionDisposition::KeepClaim)
@@ -793,7 +812,7 @@ fn process_pmo_issue(
     let decision = port
         .invoke_plan(issue, &path, bound_mr_iid)
         .map_err(PmoDecisionError::Recoverable)?;
-    apply_pmo_decision(issue, decision, bound_mr_iid, scope_label, port)
+    apply_pmo_decision(issue, decision, scope_label, port)
 }
 
 fn resume_split(
@@ -959,7 +978,7 @@ fn run_pmo_cycle(
                     && issue
                         .labels
                         .iter()
-                        .any(|label| label == labels::PMO_PENDING) =>
+                        .any(|label| label == labels::PMO_PLANNING) =>
             {
                 let issues = port.issues()?;
                 let _ = port.prepare_issue_context(&issue, &issues);
@@ -980,7 +999,7 @@ fn run_pmo_cycle(
                     }
                     Err(PmoDecisionError::KeepPending(error)) => {
                         warn!(
-                            "{agent_id}: PMO could not rewrite the plan for issue #{iid}; keeping it pmo-pending: {error}"
+                            "{agent_id}: PMO could not rewrite the plan for issue #{iid}; keeping it pmo-planning: {error}"
                         );
                         return Ok(());
                     }
@@ -1373,8 +1392,13 @@ fn should_process_issue(issue: &Issue, scope_label: Option<&str>) -> bool {
         return false;
     }
 
-    // Skip if PMO is waiting for human clarification
+    // Skip if PMO is blocked waiting for human clarification
     if issue.labels.contains(&labels::PMO_PENDING.to_string()) {
+        return false;
+    }
+
+    // Skip if PMO is already actively planning this issue (it holds the claim)
+    if issue.labels.contains(&labels::PMO_PLANNING.to_string()) {
         return false;
     }
 
@@ -1626,17 +1650,17 @@ fn build_split_prompt(
     let planning_state = if issue
         .labels
         .iter()
-        .any(|label| label == labels::PMO_PENDING)
+        .any(|label| label == labels::PMO_PLANNING)
     {
-        "This issue is already pmo-pending. Human comments are refinement feedback: prefer producing the requested plan update. You may still ask for clarification when a human reply surfaces a genuinely blocking question you cannot answer from the repository — restate your current plan briefly and ask that specific question, rather than restating the whole plan or taking an unapproved final action."
+        "This issue is already in pmo-planning. The PMO holds the claim and refines the plan whenever new human comments arrive. Treat new comments as refinement feedback: prefer producing the requested plan update. You may still ask for clarification when a human reply surfaces a genuinely blocking question you cannot answer from the repository — restate your current plan briefly and ask that specific question, rather than restating the whole plan or taking an unapproved final action."
     } else {
         "This issue is not currently in PMO plan refinement."
     };
     let plan_destination = match bound_mr_iid {
         Some(mr_iid) => format!(
-            "This issue is already bound to merge request !{mr_iid}. Do not rewrite or restate the full issue description. Provide only the plan changes and refinements relative to the existing description and previous comments; they will be posted as a new issue comment."
+            "This issue is already bound to merge request !{mr_iid}. Factor this into your plan: the worker already has an MR open, so a full description rewrite may lose context the worker has already built. Prefer posting refinements as a comment unless the description itself is the problem."
         ),
-        None => "This issue is not bound to a merge request. A proposed plan must be the complete rewritten issue description.".to_string(),
+        None => "This issue is not bound to a merge request. You choose how to deliver the plan: set `update_description: true` to rewrite the issue description with the full plan, or set `update_description: false` (or omit it) to post the plan as a new comment. A complete plan rewrites the description; a refinement or addendum is a comment.".to_string(),
     };
     let prompt = format!(
         r#"You are a Project Management Office (PMO) agent responsible for triaging issues that an automated worker agent could not implement.
@@ -1660,13 +1684,6 @@ Potlatch wrote the path above as a markdown file: **full issue description**, **
 - The **Closed merge request context** section is especially important when the worker closed an MR after failing to resolve reviewer feedback — the MR comments and diff show what the reviewer asked for and what the worker tried.
 Your job is to analyze the failure reason (from the file + repo when needed) and take the appropriate action.
 
-CRITICAL REQUIREMENTS:
-- This is a NON-INTERACTIVE automated system
-- You do NOT write new production code — you inspect the existing project state, then write comments and create issue descriptions as needed
-- The worker agent has FULL ACCESS to shell commands (rm, mv, git, etc.) and all build/test tools
-- If the worker claimed it "cannot run commands" or "cannot delete files", that is WRONG — it CAN. Instruct it clearly.
-- Before giving guidance or decomposing the work, verify whether the required behavior, tests, or code already exist when the issue or comments make that plausible. If the repository already satisfies the issue, report it as complete so Potlatch can close it.
-
 TRIAGE POLICY:
 - Give focused worker guidance only for a single focused task blocked by one specific misunderstanding, wrong command, or simple technical obstacle. The guidance should be one clear action.
 - Decompose broad task containers, work spanning multiple independent modules/files/components, lists of distinct tasks, or work estimated above roughly 500 non-test lines or 1500 total lines. Auto-generated code does not count. Prefer focused sub-issues over a laundry-list instruction.
@@ -1674,13 +1691,16 @@ TRIAGE POLICY:
 - If the repository already fully implements the requested behavior, report that fact instead of guiding or decomposing.
 - Park work behind an existing open issue only when that issue is a real build-order prerequisite. Merely related or parallel work is not a dependency.
 - Produce one triage result; do not combine alternatives.
+- Before giving guidance or decomposing the work, verify whether the required behavior, tests, or code already exist when the issue or comments make that plausible. If the repository already satisfies the issue, report it as complete.
 
 PLAN PROPOSAL POLICY:
 - Propose a plan when the issue is a coherent task and the repository provides enough information to write an implementation-ready plan, but the current issue description lacks the concrete scope and steps needed for reliable execution.
-- When no MR is bound, a proposed plan is the complete rewritten issue description. Preserve the original requirements and add repository-informed code areas, ordered implementation steps, acceptance criteria, tests, assumptions, and open questions.
-- When an MR is already bound, preserve the issue description and propose only changes relative to the existing description and previous comments. The changes are posted in a new comment; do not produce a full rewritten description.
-- During pmo-pending refinement, if the current plan is already clear and implementation-ready and the latest human comment does not require a real plan change, explicitly keep the current plan unchanged. In that case Potlatch must not rewrite the description or add another comment.
-- Proposing or refining a plan keeps the issue pmo-pending so human comments can trigger another refinement cycle.
+- You choose how to deliver the plan: set `update_description: true` to rewrite the issue description with the full plan (use when proposing a complete plan), or set `update_description: false` (or omit it) to post the plan as a new comment (use when refining an existing plan or adding an addendum). When an issue is already bound to a merge request, always post as a comment so the existing description is preserved.
+- Write the plan about the KEY SOLUTION, not a framework or scaffold. State the core approach and the decisive design decisions; do not reproduce boilerplate, directory layouts, file-by-file outlines, or generic "create a module that does X" scaffolding.
+- Be specific about the solution, not about incidental details. Name the exact module/function/boundary the change touches and the concrete approach, but omit step-by-step implementation minutiae the worker can derive from the code.
+- Every idea in the plan must have a reference or proof of concept. For code in this repository, cite the file, function, existing pattern, or concrete repo state that substantiates it. For concepts, methods, libraries, protocols, or any external knowledge the plan relies on, search the web and cite the authoritative source (documentation, RFC, spec, changelog) that backs the claim — do not assert an approach from memory. If you cannot ground an idea in either the repository or a cited external source, it is a question for the human, not a plan item.
+- During pmo-planning refinement, if the current plan is already clear and implementation-ready and the latest human comment does not require a real plan change, explicitly keep the current plan unchanged (KEEP_PLAN). In that case Potlatch must not post another comment or rewrite the description.
+- Proposing or refining a plan keeps the issue in pmo-planning so human comments can trigger another refinement cycle.
 - Do not use worker guidance as a substitute for a missing plan. Use clarification only when missing human information prevents you from writing a useful plan.
 
 DECOMPOSITION POLICY:
@@ -1694,7 +1714,7 @@ DECOMPOSITION POLICY:
 CLARIFICATION POLICY:
 - Ask for human input only after reading the entire task context and inspecting the repository when needed.
 - Include the best current scope and approach with the specific unresolved questions. On later triage cycles, refine that plan from the human replies.
-- The pending label remains until a human removes it; during refinement, state your recommendation and questions rather than taking an unapproved final action.
+- Clarification sets the `pmo-pending` label: the PMO is blocked and will not re-grab the issue until a human replies and removes the label. During active planning (`pmo-planning`), state your recommendation and questions rather than taking an unapproved final action.
 
 INSTRUCTIONS:
 1. Open and read the **entire** TASK CONTEXT FILE at the absolute path above (description, GitLab comments, closed MR context, existing issues). Do this first.
@@ -1702,7 +1722,6 @@ INSTRUCTIONS:
 3. Review the EXISTING OPEN ISSUES section in that same file to see what is already tracked.
 4. Verify whether the repository already satisfies the issue.
 5. Apply the triage, decomposition, dependency, duplicate, and clarification policies above.
-Proceed with analyzing the issue autonomously.
 "#,
         project = &state.project_name,
         iid = issue.iid,
@@ -2747,12 +2766,11 @@ mod tests {
             PmoOutput::NeedsClarification {
                 question: "Which API?".into(),
             },
-            None,
             Some("scope::test"),
             &mut clarification,
         )
         .unwrap();
-        assert_eq!(disposition, DecisionDisposition::KeepClaim);
+        assert_eq!(disposition, DecisionDisposition::ReleaseClaim);
         assert_eq!(
             *clarification.trace.borrow(),
             vec!["act:comment:10", "act:add:10:pmo-pending",]
@@ -2765,8 +2783,8 @@ mod tests {
             &issue,
             PmoOutput::ProposePlan {
                 plan_text: "## Implementation plan\n\nUpdate the parser and its tests.".into(),
+                update_description: true,
             },
-            None,
             Some("scope::test"),
             &mut planning,
         )
@@ -2774,24 +2792,23 @@ mod tests {
         assert_eq!(disposition, DecisionDisposition::KeepClaim);
         assert_eq!(
             *planning.trace.borrow(),
-            vec!["act:add:10:pmo-pending", "act:description:10",]
+            vec!["act:add:10:pmo-planning", "act:description:10",]
         );
+        assert!(planning.comments.is_empty());
         assert_eq!(
             planning.descriptions,
             vec![(
                 10,
-                "## Implementation plan\n\nUpdate the parser and its tests.".into()
+                "## Implementation plan\n\nUpdate the parser and its tests.".to_string()
             )]
         );
-        assert!(planning.comments.is_empty());
 
         let mut unchanged_issue = issue.clone();
-        unchanged_issue.labels.push(labels::PMO_PENDING.into());
+        unchanged_issue.labels.push(labels::PMO_PLANNING.into());
         let mut unchanged = FakePmoPort::successful();
         let disposition = apply_pmo_decision(
             &unchanged_issue,
             PmoOutput::KeepPlan,
-            None,
             Some("scope::test"),
             &mut unchanged,
         )
@@ -2806,7 +2823,6 @@ mod tests {
             apply_pmo_decision(
                 &issue,
                 PmoOutput::KeepPlan,
-                None,
                 Some("scope::test"),
                 &mut invalid_unchanged,
             ),
@@ -2819,7 +2835,6 @@ mod tests {
             PmoOutput::AlreadyDone {
                 reason: "Already shipped".into(),
             },
-            None,
             Some("scope::test"),
             &mut done,
         )
@@ -2841,7 +2856,6 @@ mod tests {
             PmoOutput::WaitForDependency {
                 dependency_issue_iid: 77,
             },
-            None,
             Some("scope::test"),
             &mut waiting,
         )
@@ -2863,7 +2877,6 @@ mod tests {
             PmoOutput::GuideWorker {
                 instructions: "Implement the parser first.".into(),
             },
-            None,
             Some("scope::test"),
             &mut guidance,
         )
@@ -2892,8 +2905,8 @@ mod tests {
             &issue,
             PmoOutput::ProposePlan {
                 plan_text: " \n\t ".into(),
+                update_description: false,
             },
-            None,
             Some("scope::test"),
             &mut port,
         );
@@ -2910,35 +2923,41 @@ mod tests {
         let mut fresh = FakePmoPort::successful();
         fresh.plan = PmoOutput::ProposePlan {
             plan_text: plan.into(),
+            update_description: true,
         };
         run_fake(&mut fresh, None).unwrap();
         let trace = fresh.trace.borrow();
-        assert!(trace.contains(&"act:add:10:pmo-pending".to_string()));
+        assert!(trace.contains(&"act:add:10:pmo-planning".to_string()));
         assert!(trace.contains(&"act:description:10".to_string()));
+        assert!(!trace.contains(&"act:comment:10".to_string()));
         assert!(!trace.contains(&"act:release".to_string()));
         assert!(!trace.contains(&"act:clear_claim".to_string()));
         drop(trace);
-        assert_eq!(fresh.descriptions, vec![(10, plan.into())]);
         assert!(fresh.comments.is_empty());
+        assert_eq!(fresh.descriptions.len(), 1);
+        assert_eq!(fresh.descriptions[0].0, 10);
+        assert!(fresh.descriptions[0].1.contains(plan));
 
         let mut refinement = FakePmoPort::successful();
-        refinement.issues[0].labels.push(labels::PMO_PENDING.into());
+        refinement.issues[0]
+            .labels
+            .push(labels::PMO_PLANNING.into());
         refinement.bound_mr_iid = Some(88);
         refinement.plan = PmoOutput::ProposePlan {
             plan_text: "Change the parser validation step to cover empty arrays.".into(),
+            update_description: false,
         };
         run_fake(&mut refinement, Some(10)).unwrap();
         let trace = refinement.trace.borrow();
         assert!(trace.contains(&"observe:comments:10".to_string()));
         assert!(trace.contains(&"observe:bound_mr:10".to_string()));
-        assert!(trace.contains(&"act:add:10:pmo-pending".to_string()));
+        assert!(trace.contains(&"act:add:10:pmo-planning".to_string()));
         assert!(trace.contains(&"act:comment:10".to_string()));
         assert!(!trace.contains(&"act:description:10".to_string()));
         assert!(!trace.contains(&"act:release".to_string()));
         assert!(!trace.contains(&"act:clear_claim".to_string()));
         drop(trace);
         assert!(refinement.descriptions.is_empty());
-        assert!(refinement.comments[0].1.contains("merge request !88"));
         assert!(
             refinement.comments[0]
                 .1
@@ -2947,40 +2966,61 @@ mod tests {
     }
 
     #[test]
-    fn propose_plan_description_failure_preserves_pending_claim_state() {
+    fn propose_plan_comment_form_posts_comment_without_rewriting_description() {
+        let plan = "## Plan\n\nRefine the validation step.";
+        let mut port = FakePmoPort::successful();
+        port.plan = PmoOutput::ProposePlan {
+            plan_text: plan.into(),
+            update_description: false,
+        };
+        run_fake(&mut port, None).unwrap();
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"act:add:10:pmo-planning".to_string()));
+        assert!(trace.contains(&"act:comment:10".to_string()));
+        assert!(!trace.contains(&"act:description:10".to_string()));
+        drop(trace);
+        assert!(port.descriptions.is_empty());
+        assert_eq!(port.comments.len(), 1);
+        assert!(port.comments[0].1.contains(plan));
+    }
+
+    #[test]
+    fn propose_plan_comment_failure_preserves_planning_claim_state() {
         let mut port = FakePmoPort::successful();
         port.plan = PmoOutput::ProposePlan {
             plan_text: "## Plan\n\nImplement and test the change.".into(),
+            update_description: false,
         };
-        port.failures = vec!["description"];
+        port.failures = vec!["comment"];
 
         run_fake(&mut port, None).unwrap();
 
         let trace = port.trace.borrow();
-        let pending = trace
+        let planning = trace
             .iter()
-            .position(|event| event == "act:add:10:pmo-pending")
+            .position(|event| event == "act:add:10:pmo-planning")
             .unwrap();
         let save = trace
             .iter()
             .rposition(|event| event == "act:save_claim:10")
             .unwrap();
-        let description = trace
+        let comment = trace
             .iter()
-            .position(|event| event == "act:description:10")
+            .position(|event| event == "act:comment:10")
             .unwrap();
-        assert!(save < pending && pending < description);
+        assert!(save < planning && planning < comment);
         assert!(!trace.contains(&"act:release".to_string()));
         assert!(!trace.contains(&"act:clear_claim".to_string()));
     }
 
     #[test]
-    fn pending_issue_is_not_reprocessed_without_a_new_human_comment() {
+    fn planning_issue_is_not_reprocessed_without_a_new_human_comment() {
         let mut port = FakePmoPort::successful();
-        port.issues[0].labels.push(labels::PMO_PENDING.into());
+        port.issues[0].labels.push(labels::PMO_PLANNING.into());
         port.new_comments = false;
         port.plan = PmoOutput::ProposePlan {
             plan_text: "This must not be applied.".into(),
+            update_description: true,
         };
 
         run_fake(&mut port, Some(10)).unwrap();
@@ -2996,7 +3036,7 @@ mod tests {
     #[test]
     fn clear_pending_plan_feedback_can_finish_without_gitlab_mutations() {
         let mut port = FakePmoPort::successful();
-        port.issues[0].labels.push(labels::PMO_PENDING.into());
+        port.issues[0].labels.push(labels::PMO_PLANNING.into());
         port.new_comments = true;
         port.plan = PmoOutput::KeepPlan;
 
@@ -3651,124 +3691,7 @@ mod tests {
     }
 
     #[test]
-    fn build_split_prompt_contains_policy_without_structured_output_markers() {
-        let state = AgentState {
-            sessions_dir: "/tmp",
-            agent_id: "pmo-test",
-            project_name: "test-proj",
-        };
-        let issue = Issue {
-            iid: 42,
-            title: "Worker could not complete".into(),
-            description: "Details".into(),
-            labels: vec![],
-            state: "opened".into(),
-            created_at: None,
-            updated_at: None,
-        };
-        let prompt = build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2, None).unwrap();
-        // Structured-output presentation belongs to the backend vendor, not
-        // the role prompt.
-        assert!(!prompt.contains("`plan` tool"));
-        assert!(!prompt.contains("output contract"));
-        assert!(!prompt.contains("The tool's parameters are"));
-        assert!(!prompt.contains("JSON shape above"));
-        for marker in [
-            "guide_worker",
-            "propose_plan",
-            "keep_plan",
-            "already_done",
-            "needs_clarification",
-            "wait_for_dependency",
-            "depends_on",
-            "plan_text",
-            "dependency_issue_iid",
-            "SUB_ISSUE_N:",
-            "GUIDE_WORKER",
-            "ALREADY_DONE",
-            "NEEDS_CLARIFICATION",
-            "WAIT_FOR_DEPENDENCY",
-            "PUBLIC_COMMENT_BEGIN",
-            "text-marker",
-        ] {
-            assert!(!prompt.contains(marker), "unexpected marker {marker:?}");
-        }
-        // No text-marker fallback.
-        assert!(!prompt.contains("SUB_ISSUE_N:"));
-        // Reasoning guidance is intact.
-        assert!(prompt.contains("broad task containers"));
-        assert!(prompt.contains("Never duplicate or substantially overlap existing work"));
-        assert!(prompt.contains("repository already fully implements"));
-        assert!(prompt.contains("complete rewritten issue description"));
-        assert!(prompt.contains("keeps the issue pmo-pending"));
-        assert!(prompt.contains("explicitly keep the current plan unchanged"));
-        assert!(prompt.contains("must not rewrite the description or add another comment"));
-    }
-
-    #[test]
-    fn build_split_prompt_treats_human_comments_as_plan_refinement_while_pending() {
-        let state = AgentState {
-            sessions_dir: "/tmp",
-            agent_id: "pmo-test",
-            project_name: "test-proj",
-        };
-        let issue = Issue {
-            iid: 42,
-            title: "Refine parser design".into(),
-            description: "## Existing plan".into(),
-            labels: vec![labels::PMO_PENDING.into()],
-            state: "opened".into(),
-            created_at: None,
-            updated_at: None,
-        };
-
-        let prompt =
-            build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2, Some(77)).unwrap();
-
-        assert!(prompt.contains("Human comments are refinement feedback"));
-        assert!(prompt.contains("already bound to merge request !77"));
-        assert!(prompt.contains("only the plan changes and refinements"));
-        assert!(prompt.contains("posted as a new issue comment"));
-        assert!(prompt.contains("do not produce a full rewritten description"));
-        // Pending mode still permits asking for clarification when a human reply
-        // surfaces a genuinely blocking question the repository cannot answer.
-        assert!(prompt.contains("You may still ask for clarification"));
-        assert!(prompt.contains("genuinely blocking question"));
-    }
-
-    #[test]
-    fn build_split_prompt_pending_mode_restates_clarification_policy() {
-        let state = AgentState {
-            sessions_dir: "/tmp",
-            agent_id: "pmo-test",
-            project_name: "test-proj",
-        };
-        let issue = Issue {
-            iid: 42,
-            title: "Refine parser design".into(),
-            description: "## Existing plan".into(),
-            labels: vec![labels::PMO_PENDING.into()],
-            state: "opened".into(),
-            created_at: None,
-            updated_at: None,
-        };
-
-        let pending_prompt =
-            build_split_prompt(&state, &issue, "/abs/pmo-issue-42.md", 2, None).unwrap();
-        assert!(pending_prompt.contains("You may still ask for clarification"));
-        assert!(pending_prompt.contains("genuinely blocking question"));
-
-        let mut non_pending = issue.clone();
-        non_pending.labels = vec![];
-        let fresh_prompt =
-            build_split_prompt(&state, &non_pending, "/abs/pmo-issue-42.md", 2, None).unwrap();
-        // The pending-only clarification allowance is only emitted in pending mode.
-        assert!(!fresh_prompt.contains("You may still ask for clarification"));
-        assert!(!fresh_prompt.contains("genuinely blocking question"));
-    }
-
-    #[test]
-    fn needs_clarification_keeps_claim_and_pending_label_in_refinement_mode() {
+    fn needs_clarification_releases_claim_and_sets_pending_label() {
         let issue = PmoIssueObservation {
             iid: 10,
             title: "Broad parent".into(),
@@ -3789,15 +3712,15 @@ mod tests {
             PmoOutput::NeedsClarification {
                 question: "Which API should the worker target?".into(),
             },
-            Some(77),
             Some("scope::test"),
             &mut port,
         )
         .unwrap();
 
-        // The claim is kept so the PMO can refine on the next human reply, and
-        // the pending label stays (idempotent add) so the refinement loop holds.
-        assert_eq!(disposition, DecisionDisposition::KeepClaim);
+        // The claim is released: the PMO is blocked waiting for a human reply
+        // and must not re-grab the issue while the pmo-pending label is present.
+        // A human removes the label to unblock the PMO.
+        assert_eq!(disposition, DecisionDisposition::ReleaseClaim);
         assert_eq!(
             *port.trace.borrow(),
             vec!["act:comment:10", "act:add:10:pmo-pending"]
@@ -4186,12 +4109,17 @@ mod tests {
     fn pmo_output_deserializes_propose_plan() {
         let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
             "decision": "propose_plan",
-            "plan_text": "## Plan Draft\n\n1. Implement X\n2. Test X\n\nOpen question: which config?"
+            "plan_text": "## Plan Draft\n\n1. Implement X\n2. Test X\n\nOpen question: which config?",
+            "update_description": true
         }));
         match output {
-            PmoOutput::ProposePlan { plan_text } => {
+            PmoOutput::ProposePlan {
+                plan_text,
+                update_description,
+            } => {
                 assert!(plan_text.contains("## Plan Draft"));
                 assert!(plan_text.contains("Implement X"));
+                assert!(update_description);
             }
             other => panic!("expected ProposePlan, got {other:?}"),
         }
