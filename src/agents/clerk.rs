@@ -227,6 +227,11 @@ Wisdom is NOT:
 
 Track wisdom, drop transient task recordings. Rewrite the surviving knowledge into concise, declarative wisdom entries — do NOT preserve note text verbatim. Each entry should state a durable truth about the project, not describe what you once observed. Organize by category. If nothing rises to the level of wisdom, return empty content — an empty memory is better than a clutter of notes that will mislead future tasks.
 
+Recency and forgetting. The memory below has the most recently added facts at the end (after the last separator). Treat recency as priority:
+- KEEP recently added facts verbatim or lightly cleaned — they are fresh and likely still relevant.
+- For OLDER facts, gradually summarize multiple fine-grained entries into fewer coarser-grained ones, or drop them entirely, when the memory grows too large. Prefer forgetting over clutter: a short memory of high-signal wisdom is better than a long memory of diminishing details.
+- Never drop a recent fact to make room for an old one. If the memory is too large, trim from the oldest end first.
+
 ## Current memory
 
 {current}
