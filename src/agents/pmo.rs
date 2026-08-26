@@ -25,6 +25,8 @@ use crate::core::runtime::AgentRuntime;
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
+/// ACP runtime message when `cancel_check` returns true.
+const PMO_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
 
 /// One sub-issue as the model described it via the `plan` tool's `sub_issues`
 /// array, before the empty-title/description defensive filtering in
@@ -993,6 +995,35 @@ fn run_pmo_cycle(
                         port.clear_claim_state();
                         return Ok(());
                     }
+                    Err(PmoDecisionError::Recoverable(error)) if is_pmo_agent_cancelled(&error) => {
+                        // A label the cancel check watches was removed
+                        // mid-session. Re-fetch the issue to decide what to do.
+                        let mr_iid = port.bound_merge_request(iid).unwrap_or(None);
+                        if port.release_claim().is_ok() {
+                            port.clear_claim_state();
+                        }
+                        let still_planning = port
+                            .issue(iid)
+                            .is_some_and(|issue| {
+                                issue
+                                    .labels
+                                    .iter()
+                                    .any(|label| label == labels::PMO_PLANNING)
+                            });
+                        if !still_planning {
+                            // The pmo-planning label was removed — the human
+                            // approved the plan. For an MR-attached issue, clear
+                            // action-required and post a comment for the worker.
+                            if mr_iid.is_some() {
+                                let _ = port.remove_issue_label(iid, ACTION_REQUIRED_LABEL);
+                                let _ = port.add_issue_comment(iid, "Plan refined. Continue working.");
+                            }
+                        }
+                        // If the claim label was removed but pmo-planning is
+                        // still present, the issue was taken over — release the
+                        // claim silently with no comment.
+                        return Ok(());
+                    }
                     Err(PmoDecisionError::Recoverable(error)) => {
                         warn!("{agent_id}: PMO refinement failed for issue #{iid}: {error}");
                         return handle_processing_failure(port, &issues, scope_label);
@@ -1005,6 +1036,32 @@ fn run_pmo_cycle(
                     }
                     Err(PmoDecisionError::Immediate(error)) => return Err(error),
                 }
+            }
+            Some(issue)
+                if issue_in_pmo_scope(&issue, scope_label)
+                    && !issue
+                        .labels
+                        .iter()
+                        .any(|label| label == labels::PMO_PLANNING) =>
+            {
+                // The pmo-planning label was removed — the human approved the
+                // plan. Hand off to the worker. For an issue with an attached
+                // MR, clear the claim and the action-required label and post a
+                // comment so the worker picks up the refined plan. For an issue
+                // without an MR, just release the claim and leave the
+                // action-required label so the worker re-claims it normally.
+                let mr_iid = port.bound_merge_request(iid).unwrap_or(None);
+                if port.release_claim().is_ok() {
+                    port.clear_claim_state();
+                }
+                if mr_iid.is_some() {
+                    let _ = port.remove_issue_label(iid, ACTION_REQUIRED_LABEL);
+                    let _ = port.add_issue_comment(
+                        iid,
+                        "Plan refined. Continue working.",
+                    );
+                }
+                return Ok(());
             }
             _ => {
                 if port.release_claim().is_ok() {
@@ -1245,12 +1302,16 @@ impl PmoPort for LivePmoPort<'_> {
         let result = self.model.complete_typed::<PmoOutput>(
             &prompt,
             &InvokeOptions {
+                cancel_check: Some(pmo_planning_label_cancel_check(
+                    self.gitlab.clone(),
+                    issue.iid,
+                    self.state.agent_id.to_string(),
+                )),
                 follow_up_poll: Some(follow_up_poll),
                 activity_label: Some(format!(
                     "{} triaging issue #{}",
                     self.state.agent_id, issue.iid
                 )),
-                ..InvokeOptions::default()
             },
         );
         self.model.set_capability_provider(None);
@@ -1839,7 +1900,34 @@ fn collect_new_human_comment_follow_ups(
 /// Shared follow-up poll cursor. Wrapped in a type alias so the closure handed
 /// to [`InvokeOptions::follow_up_poll`] and its post-turn read-back share one
 /// canonical shape, and so tests can construct it without a GitLab client.
+fn is_pmo_agent_cancelled(err: &anyhow::Error) -> bool {
+    err.to_string().contains(PMO_AGENT_CANCELLED_MSG)
+}
+
 type FollowUpCursor = Arc<std::sync::Mutex<u64>>;
+
+/// Build a cancel check that closes the PMO's model session when the
+/// `pmo-planning` label or the PMO's own claim label is removed from the
+/// issue. A human removing `pmo-planning` signals the plan is approved — the
+/// session should stop so the next cycle hands off to the worker. A human
+/// removing the claim label means the issue was taken over — the session
+/// should stop silently, with no handoff comment.
+fn pmo_planning_label_cancel_check(
+    gitlab: GitLabClient,
+    issue_iid: u64,
+    agent_id: String,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let claim_label = super::claim::claim_label(&agent_id);
+    Arc::new(move || {
+        gitlab.get_issue(issue_iid).ok().is_some_and(|issue| {
+            !issue
+                .labels
+                .iter()
+                .any(|label| label == labels::PMO_PLANNING)
+                || !issue.labels.iter().any(|label| label == &claim_label)
+        })
+    })
+}
 
 /// Build the live follow-up poll closure the PMO hands to the model while
 /// triaging an issue. On each invocation it re-fetches the issue's comments,
