@@ -377,7 +377,11 @@ fn decide_candidate(
     agent_id: &str,
     scope_label: Option<&str>,
 ) -> CandidateDecision {
-    if mr.state != "opened" || !mr.in_scope(scope_label) || mr.has_label(REVIEWER_APPROVED_LABEL) {
+    if mr.state != "opened"
+        || !mr.in_scope(scope_label)
+        || mr.has_label(REVIEWER_APPROVED_LABEL)
+        || mr.title.starts_with("Draft:")
+    {
         return CandidateDecision::Skip;
     }
     if claim::has_our_mr_claim(&mr.labels, agent_id) {
