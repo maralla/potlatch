@@ -87,7 +87,7 @@ impl Session {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             cwd,
-            model: std::env::var("BREEZE_MODEL").unwrap_or_default(),
+            model: std::env::var("POTLATCH_MODEL").unwrap_or_default(),
             mode: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             agent: None,

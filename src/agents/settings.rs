@@ -92,7 +92,10 @@ mod tests {
         let s = AgentSettings::default();
         assert_eq!(super::super::scope_label_filter(&s.scope_label), None);
         assert_eq!(super::super::scope_label_filter("  "), None);
-        assert_eq!(super::super::scope_label_filter("potlatch"), Some("potlatch"));
+        assert_eq!(
+            super::super::scope_label_filter("potlatch"),
+            Some("potlatch")
+        );
     }
 
     #[test]

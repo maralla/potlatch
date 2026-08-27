@@ -55,7 +55,6 @@ fn main() -> Result<()> {
         Ok(Cli { command: Some(cmd) }) => Some(cmd),
         Ok(Cli { command: None }) => None,
         Err(_) => {
-            // Legacy fallback: `potlatch --config X` without a subcommand
             let args = Args::parse();
             return run_workflow(args.config);
         }
@@ -72,12 +71,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Run { config }) => run_workflow(config),
-        Some(Commands::Harness) => {
-            // Do NOT call ui::init() — the harness speaks JSON-RPC on stdout.
-            // All non-JSON output must go to stderr or the file logger.
-            // Config is passed via env vars only (BREEZE_BASE_URL, BREEZE_API_KEY).
-            harness::run_acp_server()
-        }
+        Some(Commands::Harness) => harness::run_acp_server(),
         None => run_workflow(None),
     }
 }

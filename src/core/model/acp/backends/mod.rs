@@ -7,9 +7,9 @@
 //!
 //! Vendor selection lives here; generic runtime code sees only the traits.
 
-pub mod potlatch;
 pub mod cursor;
 pub mod default;
+pub mod potlatch;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -185,7 +185,7 @@ mod tests {
             assert!(
                 backend
                     .prepare_prompt("Task.", &tools)
-                    .contains("BREEZE_STRUCTURED_OUTPUT_BEGIN")
+                    .contains("POTLATCH_STRUCTURED_OUTPUT_BEGIN")
             );
         }
     }

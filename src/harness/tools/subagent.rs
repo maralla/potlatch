@@ -902,9 +902,9 @@ mod tests {
     #[test]
     fn spawn_and_poll_real_subagent() {
         // The test harness sets up a real LLM client via env vars. Skip if no
-        // BREEZE_BASE_URL is configured — the subagent needs an LLM to run.
-        if std::env::var("BREEZE_BASE_URL").is_err() {
-            eprintln!("skipping spawn_and_poll_real_subagent: no BREEZE_BASE_URL");
+        // POTLATCH_BASE_URL is configured — the subagent needs an LLM to run.
+        if std::env::var("POTLATCH_BASE_URL").is_err() {
+            eprintln!("skipping spawn_and_poll_real_subagent: no POTLATCH_BASE_URL");
             return;
         }
 

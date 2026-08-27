@@ -344,8 +344,10 @@ mod tests {
 
     #[test]
     fn save_memory_creates_parent_directories() {
-        let dir =
-            std::env::temp_dir().join(format!("potlatch-memory-test-nested-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-memory-test-nested-{}",
+            std::process::id()
+        ));
         let path = dir.join("sub").join("memory.md");
         save_memory(&path, "content").unwrap();
         assert!(path.exists());

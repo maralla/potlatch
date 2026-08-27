@@ -2020,8 +2020,10 @@ mod tests {
 
     #[test]
     fn load_history_reads_the_legacy_unversioned_format_and_migrates_it() {
-        let dir =
-            std::env::temp_dir().join(format!("potlatch-ops-history-legacy-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-ops-history-legacy-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("history.json");
@@ -2047,8 +2049,10 @@ mod tests {
 
     #[test]
     fn load_history_treats_a_missing_file_as_empty_default() {
-        let dir =
-            std::env::temp_dir().join(format!("potlatch-ops-history-missing-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-ops-history-missing-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("history.json");
 
@@ -2076,8 +2080,10 @@ mod tests {
 
     #[test]
     fn load_history_is_strict_and_quarantines_malformed_json() {
-        let dir =
-            std::env::temp_dir().join(format!("potlatch-ops-history-corrupt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-ops-history-corrupt-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("history.json");
@@ -2133,8 +2139,10 @@ mod tests {
 
     #[test]
     fn ensure_history_file_creates_file_only_when_absent() {
-        let dir =
-            std::env::temp_dir().join(format!("potlatch-ops-ensure-history-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-ops-ensure-history-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let sessions_dir = dir.to_string_lossy().into_owned();

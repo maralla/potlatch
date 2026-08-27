@@ -4,7 +4,7 @@
 //! existing `AcpClient`, but runs its own tool-calling loop against a self-hosted
 //! OpenAI-compatible LLM endpoint. No Cursor cloud dependency.
 //!
-//! Config arrives via env vars (`BREEZE_BASE_URL`, `BREEZE_API_KEY`) and the ACP
+//! Config arrives via env vars (`POTLATCH_BASE_URL`, `POTLATCH_API_KEY`) and the ACP
 //! protocol (`session/set_model`, `session/new` with cwd).
 //!
 //! Per-session logs are written to `~/.potlatch/sessions/<session-id>.log`.
@@ -102,7 +102,8 @@ impl Write for SwappableWriterWriter {
 /// Starts logging to a temporary file; switches to `~/.potlatch/sessions/<session-id>.log`
 /// when a session is created (see [`set_session_log`]).
 fn init_logging() -> Arc<SwappableWriter> {
-    let temp_path = std::env::temp_dir().join(format!("potlatch-harness-{}.log", std::process::id()));
+    let temp_path =
+        std::env::temp_dir().join(format!("potlatch-harness-{}.log", std::process::id()));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -172,9 +173,11 @@ pub fn run_acp_server() -> Result<()> {
     let log_writer = init_logging();
     tracing::info!("potlatch harness starting (pid={})", std::process::id());
 
-    let base_url = std::env::var("BREEZE_BASE_URL")
-        .context("BREEZE_BASE_URL env var is required for potlatch harness")?;
-    let api_key = std::env::var("BREEZE_API_KEY").unwrap_or_else(|_| "EMPTY".into());
+    let base_url = std::env::var("POTLATCH_BASE_URL").unwrap_or_else(|_| {
+        eprintln!("POTLATCH_BASE_URL is not set");
+        std::process::exit(1);
+    });
+    let api_key = std::env::var("POTLATCH_API_KEY").unwrap_or_else(|_| "EMPTY".into());
 
     let llm_client = Arc::new(client::OpenAiClient::new(base_url, api_key));
     let shared_stdout = parent::SharedOutput::stdout();

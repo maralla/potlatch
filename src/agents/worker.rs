@@ -5621,10 +5621,7 @@ mod tests {
         let desc = extract_mr_description(Some(
             "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\nPOST_PLAIN_COMMENT: yes\n## Testing\ncargo test",
         ));
-        assert_eq!(
-            desc,
-            "## Goal\nDescribe change.\n## Testing\ncargo test"
-        );
+        assert_eq!(desc, "## Goal\nDescribe change.\n## Testing\ncargo test");
     }
 
     #[test]

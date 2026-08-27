@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn optional_smoke_test_searches_google_with_the_persistent_browser() {
-        if std::env::var("BREEZE_GOOGLE_SEARCH_SMOKE").as_deref() != Ok("1") {
+        if std::env::var("POTLATCH_GOOGLE_SEARCH_SMOKE").as_deref() != Ok("1") {
             return;
         }
         let mut backend = ChromeWebBackend::new();
@@ -501,10 +501,10 @@ mod tests {
 
     #[test]
     fn optional_smoke_test_fetches_rendered_markdown_with_the_persistent_browser() {
-        if std::env::var("BREEZE_WEB_FETCH_SMOKE").as_deref() != Ok("1") {
+        if std::env::var("POTLATCH_WEB_FETCH_SMOKE").as_deref() != Ok("1") {
             return;
         }
-        let target = std::env::var("BREEZE_WEB_FETCH_SMOKE_URL")
+        let target = std::env::var("POTLATCH_WEB_FETCH_SMOKE_URL")
             .unwrap_or_else(|_| "https://example.com/".to_string());
         let mut backend = ChromeWebBackend::new();
         let response = handle_agent_request(

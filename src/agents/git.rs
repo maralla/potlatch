@@ -800,8 +800,10 @@ mod tests {
 
     #[test]
     fn remote_url_returns_origin_url() {
-        let dir =
-            std::env::temp_dir().join(format!("potlatch-git-remote-url-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-git-remote-url-test-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
