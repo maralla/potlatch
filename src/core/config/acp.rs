@@ -5,18 +5,6 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use toml::Value;
 
-/// Default Cursor Agent ACP invocation (matches pre-config behavior).
-pub fn default_acp_command() -> Vec<String> {
-    vec![
-        "agent".into(),
-        "--print".into(),
-        "--trust".into(),
-        "--force".into(),
-        "--approve-mcps".into(),
-        "acp".into(),
-    ]
-}
-
 #[derive(Debug, Clone)]
 pub struct AcpClientProfile {
     pub base_url: Option<String>,
@@ -167,12 +155,8 @@ pub fn build_acp_spawn_command(
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_command_includes_acp_subcommand() {
-        let cmd = default_acp_command();
-        validate_acp_command(&cmd).unwrap();
-        assert_eq!(cmd[0], "agent");
-        assert_eq!(cmd.last().map(String::as_str), Some("acp"));
+    fn test_command() -> Vec<String> {
+        vec!["agent".into(), "acp".into()]
     }
 
     #[test]
@@ -200,7 +184,7 @@ mod tests {
             "http://example/v1".to_string(),
         );
         env.insert("EXAMPLE_API_KEY".to_string(), "secret".to_string());
-        let cmd = build_acp_spawn_command(&default_acp_command(), &env).unwrap();
+        let cmd = build_acp_spawn_command(&test_command(), &env).unwrap();
         assert_eq!(
             cmd.get_envs()
                 .find(|(k, _)| *k == "EXAMPLE_BASE_URL")
@@ -292,7 +276,7 @@ mod tests {
         let profile = AcpClientProfile {
             base_url: None,
             api_key: None,
-            acp_command: default_acp_command(),
+            acp_command: test_command(),
             env: vec!["SOME_KEY={base_url}".into()],
         };
         let err = resolve_profile_env(&profile).unwrap_err();

@@ -5,7 +5,7 @@ pub mod uri;
 
 pub use acp::{
     AcpClientProfile, AcpSpawnConfig, build_acp_spawn_command, build_profile_command,
-    default_acp_command, parse_acp_profiles, resolve_profile_env,
+    parse_acp_profiles, resolve_profile_env,
 };
 pub use agent::{AgentSection, parse_agent_sections};
 
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::de::DeserializeOwned;
 use toml::Value;
 use tracing::{debug, info};
@@ -49,6 +49,15 @@ impl Config {
         let root: Value = toml::from_str(content).context("Failed to parse config file")?;
         let agents = parse_agent_sections(&root)?;
         let acp_clients = parse_acp_profiles(&root)?;
+
+        for (name, section) in &agents {
+            if let Some(client_name) = &section.core.acp_client {
+                ensure!(
+                    acp_clients.contains_key(client_name),
+                    "[agent.{name}] references acp_client `{client_name}` but no [acp.{client_name}] section is defined"
+                );
+            }
+        }
 
         debug!(
             "Config loaded: {} agent section(s), {} acp client profile(s)",
@@ -109,14 +118,11 @@ impl Config {
             .as_ref()
             .map(|uri| uri.endpoint_model_name().to_string());
 
-        let Some(client_name) = section.core.acp_client.as_deref() else {
-            return Ok(AcpSpawnConfig {
-                command: default_acp_command(),
-                model_uri,
-                endpoint_model,
-                env: HashMap::new(),
-            });
-        };
+        let client_name = section
+            .core
+            .acp_client
+            .as_deref()
+            .context("no acp_client configured for this agent")?;
 
         let profile = self
             .acp_clients
@@ -141,7 +147,6 @@ mod tests {
         let cfg = Config::from_toml_str(
             r#"
             [agent.alpha]
-            model = "composer-2"
             instances = 1
             poll_interval = "1m"
             "#,
@@ -182,21 +187,29 @@ mod tests {
     }
 
     #[test]
-    fn agent_without_acp_client_uses_default_command() {
+    fn agent_without_acp_client_errors_on_resolve() {
         let cfg = Config::from_toml_str(
             r#"
             [agent.worker]
-            model = "acp://cursor/composer-2"
             instances = 1
             "#,
         )
         .unwrap();
         let section = cfg.agent("worker").unwrap();
-        let spawn = cfg.resolve_acp_spawn(section).unwrap();
-        assert_eq!(spawn.command[0], "agent");
-        assert_eq!(spawn.model_uri.as_deref(), Some("acp://cursor/composer-2"));
-        assert_eq!(spawn.endpoint_model.as_deref(), Some("composer-2"));
-        assert!(spawn.env.is_empty());
+        let result = cfg.resolve_acp_spawn(section);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn agent_with_model_requires_acp_client() {
+        let result = Config::from_toml_str(
+            r#"
+            [agent.worker]
+            model = "acp://cursor/composer-2"
+            instances = 1
+            "#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -248,16 +261,13 @@ mod tests {
 
     #[test]
     fn unknown_acp_client_errors() {
-        let cfg = Config::from_toml_str(
+        let result = Config::from_toml_str(
             r#"
             [agent.worker]
             acp_client = "missing"
             instances = 1
             "#,
-        )
-        .unwrap();
-        let section = cfg.agent("worker").unwrap();
-        let err = cfg.resolve_acp_spawn(section).unwrap_err();
-        assert!(err.to_string().contains("unknown acp_client"));
+        );
+        assert!(result.is_err());
     }
 }

@@ -60,6 +60,12 @@ pub fn parse_agent_sections(root: &Value) -> Result<HashMap<String, AgentSection
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        if model.is_some() && acp_client.is_none() {
+            anyhow::bail!(
+                "[agent.{name}] has a `model` but no `acp_client` — `acp_client` is required when `model` is set"
+            );
+        }
+
         let mut raw_table = section_table.clone();
         raw_table.remove("instances");
         raw_table.remove("model");
@@ -91,6 +97,7 @@ mod tests {
             r#"
             [agent.alpha]
             model = "acp://cursor/gpt-5.3-codex"
+            acp_client = "cursor"
             instances = 2
             poll_interval = "2m"
             merge_when_approved = true

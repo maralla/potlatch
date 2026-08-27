@@ -516,28 +516,14 @@ mod tests {
 
     #[test]
     fn spawn_plan_validates_shared_core_config_before_execution() {
-        let config = Config::from_toml_str(
+        let result = Config::from_toml_str(
             r#"
             [agent.alpha]
             instances = 1
             acp_client = "missing"
             "#,
-        )
-        .unwrap();
-        let mut registry = AgentRegistry::new();
-        registry.register_agent::<AlphaAgent>();
-
-        let error = plan_agent_spawns(&config, &registry).err().unwrap();
-
-        assert!(
-            error
-                .to_string()
-                .contains("invalid core config for [agent.alpha]")
         );
-        assert!(
-            format!("{error:#}").contains("unknown acp_client `missing`"),
-            "core validation cause should be preserved"
-        );
+        assert!(result.is_err());
     }
 
     #[test]
