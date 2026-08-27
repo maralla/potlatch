@@ -18,37 +18,32 @@ gitlab_repo = "https://gitlab.com/group/project"
 #   "POTLATCH_BASE_URL={base_url}",
 #   "POTLATCH_API_KEY={api_key}",
 # ]
-#
-# agent-local (Cursor CLI, requires explicit CLI args in acp_command):
-# [acp.cursor-local]
-# base_url = "http://localhost:8080/v1"
-# api_key = "EMPTY"
-# acp_command = ["agent-local", "--base-url", "{base_url}", "--local-agent-api-key", "{api_key}", "--print", "--trust", "--force", "--approve-mcps", "acp"]
-# env = [
-#   "CURSOR_LOCAL_AGENT_BASE_URL={base_url}",
-#   "CURSOR_LOCAL_AGENT_API_KEY={api_key}",
-# ]
+
+[acp.cursor]
+acp_command = ["agent", "acp"]
 
 [agent.worker]
-# model = "acp://cursor/composer-2"
-# acp_client = "cursor-local"
+model = "acp://cursor/claude-sonnet-4-5"
+acp_client = "cursor"
 poll_interval = "1m"
 instances = 1
 
 [agent.reviewer]
-# model = "acp://cursor/gpt-5.3-codex"
+model = "acp://cursor/claude-sonnet-4-5"
+acp_client = "cursor"
 poll_interval = "2m"
 instances = 1
 merge_when_approved = true
 
 [agent.pmo]
-# model = "acp://cursor/composer-2"
+model = "acp://cursor/claude-sonnet-4-5"
+acp_client = "cursor"
 poll_interval = "3m"
 instances = 1
-cursor_ask_via_gitlab = false
 
 [agent.ops]
-# model = "acp://cursor/composer-2"
+model = "acp://cursor/claude-sonnet-4-5"
+acp_client = "cursor"
 # Single-instance only; omit [agent.ops] entirely to disable.
 poll_interval = "10m"
 log_window_interval = "2h"
@@ -64,6 +59,8 @@ logs = [
 [agent.qa]
 # QA agent: runs regression tests and security analysis on branch commits.
 # Only runs when qa.md exists in the repo root. Omit [agent.qa] to disable.
+model = "acp://cursor/claude-sonnet-4-5"
+acp_client = "cursor"
 poll_interval = "5m"
 instances = 1
 branches = ["main"]
@@ -74,4 +71,5 @@ max_results = 8
 [agent.clerk]
 # Clerk agent: maintains durable project memory as plain markdown.
 # Requires a model for reorganization and deduplication after each write.
-# model = "acp://cursor/composer-2"
+model = "acp://cursor/claude-sonnet-4-5"
+acp_client = "cursor"
