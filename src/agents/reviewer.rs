@@ -116,6 +116,26 @@ structured_output! {
     }
 }
 
+/// The model-generated brief of a merge request, used as the description of an
+/// issue created when the MR has no linked issue.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MrBriefOutput {
+    description: String,
+}
+
+structured_output! {
+    impl MrBriefOutput {
+        tool_name: "mr_brief";
+        tool_description: "A brief issue description summarizing what the merge request changes.";
+        schema: object("A concise issue description for the merge request.", {
+            required description: string(
+                "A concise issue description (2-5 sentences) summarizing what the merge request changes: the goal, the approach, and the affected area. Base it on the MR title, description, and diff. Do not include review verdicts or implementation steps."
+            ),
+        });
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReviewerConfig {
     poll_interval: Duration,
@@ -354,6 +374,12 @@ trait ReviewerPort {
     fn post_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()>;
     fn post_resolved_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()>;
     fn create_issue(&mut self, title: &str, description: &str) -> Result<u64>;
+    fn generate_issue_brief(
+        &mut self,
+        mr: &MrObservation,
+        diff_stat: &str,
+        changed_files: &[String],
+    ) -> Result<String>;
     fn add_approved_label(&mut self, mr_iid: u64) -> Result<()>;
     fn merge_merge_request(&mut self, mr_iid: u64) -> Result<()>;
 }
@@ -610,30 +636,9 @@ fn review_claimed_merge_request(
     };
     match decide_pre_review_gate(mr, &subject) {
         PreReviewGate::MissingIssueLink => {
-            // The MR has no linked issue. Create one that corresponds to the
-            // MR so the review can proceed against a real issue context.
-            let description = if mr.description.trim().is_empty() {
-                format!("Review of merge request !{}: {}", mr.iid, mr.title)
-            } else {
-                mr.description.clone()
-            };
-            match port.create_issue(&mr.title, &description) {
-                Ok(issue_iid) => {
-                    info!(
-                        "MR !{} has no linked issue; created issue #{} from the MR title/description",
-                        mr.iid, issue_iid
-                    );
-                    subject.issue_iid = Some(issue_iid);
-                }
-                Err(error) => {
-                    warn!(
-                        "MR !{} does not reference any issue and creating one failed: {error}; requesting fix",
-                        mr.iid
-                    );
-                    port.post_discussion(mr.iid, MISSING_ISSUE_LINK_BODY)?;
-                    return Ok(ReviewOutcome::NeedsChanges);
-                }
-            }
+            // The MR has no linked issue. Proceed with the review — after the
+            // diff is computed below, a brief is generated and an issue is
+            // created so the review has a real issue context.
         }
         PreReviewGate::BadMetadata(body) => {
             warn!(
@@ -665,6 +670,41 @@ fn review_claimed_merge_request(
     }
 
     (subject.diff_stat, subject.changed_files) = port.local_diff(&mr.target_branch)?;
+
+    // If the MR has no linked issue, generate a brief from the diff and create
+    // one so the review has a real issue context.
+    if subject.issue_iid.is_none() && !subject.is_need_ai_worker_mr {
+        match port.generate_issue_brief(mr, &subject.diff_stat, &subject.changed_files) {
+            Ok(brief) => match port.create_issue(&mr.title, &brief) {
+                Ok(issue_iid) => {
+                    info!(
+                        "MR !{} has no linked issue; created issue #{} with a model-generated brief",
+                        mr.iid, issue_iid
+                    );
+                    subject.issue_iid = Some(issue_iid);
+                }
+                Err(error) => {
+                    warn!(
+                        "MR !{} does not reference any issue and creating one failed: {error}; requesting fix",
+                        mr.iid
+                    );
+                    port.post_discussion(mr.iid, MISSING_ISSUE_LINK_BODY)?;
+                    port.checkout_branch(&mr.target_branch)?;
+                    return Ok(ReviewOutcome::NeedsChanges);
+                }
+            },
+            Err(error) => {
+                warn!(
+                    "MR !{} does not reference any issue and generating a brief failed: {error}; requesting fix",
+                    mr.iid
+                );
+                port.post_discussion(mr.iid, MISSING_ISSUE_LINK_BODY)?;
+                port.checkout_branch(&mr.target_branch)?;
+                return Ok(ReviewOutcome::NeedsChanges);
+            }
+        }
+    }
+
     let decision = port.invoke_review_model(&subject)?;
     info!("{agent_id}: Reviewer agent finished MR !{}", mr.iid);
     // The model inspects the merged source worktree; restore the target before
@@ -861,6 +901,50 @@ impl ReviewerPort for LiveReviewerPort<'_> {
                 },
             )?
             .output)
+    }
+    fn generate_issue_brief(
+        &mut self,
+        mr: &MrObservation,
+        diff_stat: &str,
+        changed_files: &[String],
+    ) -> Result<String> {
+        let prompt = format!(
+            r#"You are writing a brief issue description for a merge request that has no linked issue. Summarize what the MR changes so the issue can stand on its own.
+
+MR title: {title}
+MR description: {description}
+MR source branch: {source_branch}
+MR target branch: {target_branch}
+
+Diff stat:
+{diff_stat}
+
+Changed files:
+{changed_files}
+
+Inspect the actual code changes in the repository (the source branch is checked out and merged with the target). Write a concise issue description (2-5 sentences) covering the goal, the approach, and the affected area. Do not include review verdicts or implementation steps. Return the description as plain markdown."#,
+            title = mr.title,
+            description = mr.description,
+            source_branch = mr.source_branch,
+            target_branch = mr.target_branch,
+            diff_stat = diff_stat,
+            changed_files = changed_files.join("\n"),
+        );
+        Ok(self
+            .model
+            .complete_typed::<MrBriefOutput>(
+                &prompt,
+                &InvokeOptions {
+                    activity_label: Some(format!(
+                        "{} briefing MR !{}",
+                        self.model.agent_id(),
+                        mr.iid
+                    )),
+                    ..InvokeOptions::default()
+                },
+            )?
+            .output
+            .description)
     }
     fn post_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
         self.gitlab.add_mr_discussion(mr_iid, body)
@@ -1545,6 +1629,16 @@ mod tests {
                 .borrow_mut()
                 .push((title.to_string(), description.to_string()));
             Ok(self.merge_requests.len() as u64 + 1000)
+        }
+        fn generate_issue_brief(
+            &mut self,
+            mr: &MrObservation,
+            _diff_stat: &str,
+            _changed_files: &[String],
+        ) -> Result<String> {
+            self.trace(format!("brief:{}", mr.iid));
+            self.fails("brief")?;
+            Ok(format!("Brief for MR !{}: {}", mr.iid, mr.title))
         }
         fn add_approved_label(&mut self, mr_iid: u64) -> Result<()> {
             self.trace(format!("label:{mr_iid}"));

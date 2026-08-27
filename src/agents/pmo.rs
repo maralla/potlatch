@@ -645,6 +645,7 @@ trait PmoPort {
         issue: &PmoIssueObservation,
         context_path: &str,
         bound_mr_iid: Option<u64>,
+        was_planning: bool,
     ) -> Result<PmoOutput>;
     fn update_issue_description(&mut self, issue_iid: u64, body: &str) -> Result<()>;
     fn add_issue_comment(&mut self, issue_iid: u64, body: &str) -> Result<()>;
@@ -811,8 +812,12 @@ fn process_pmo_issue(
             PmoDecisionError::Recoverable(error)
         }
     })?;
+    let was_planning = issue
+        .labels
+        .iter()
+        .any(|label| label == labels::PMO_PLANNING);
     let decision = port
-        .invoke_plan(issue, &path, bound_mr_iid)
+        .invoke_plan(issue, &path, bound_mr_iid, was_planning)
         .map_err(PmoDecisionError::Recoverable)?;
     apply_pmo_decision(issue, decision, scope_label, port)
 }
@@ -1262,6 +1267,7 @@ impl PmoPort for LivePmoPort<'_> {
         issue: &PmoIssueObservation,
         context_path: &str,
         bound_mr_iid: Option<u64>,
+        was_planning: bool,
     ) -> Result<PmoOutput> {
         let prompt = build_split_prompt(
             self.state,
@@ -1302,6 +1308,7 @@ impl PmoPort for LivePmoPort<'_> {
                     self.gitlab.clone(),
                     issue.iid,
                     self.state.agent_id.to_string(),
+                    was_planning,
                 )),
                 follow_up_poll: Some(follow_up_poll),
                 activity_label: Some(format!(
@@ -1902,25 +1909,29 @@ fn is_pmo_agent_cancelled(err: &anyhow::Error) -> bool {
 
 type FollowUpCursor = Arc<std::sync::Mutex<u64>>;
 
-/// Build a cancel check that closes the PMO's model session when the
-/// `pmo-planning` label or the PMO's own claim label is removed from the
-/// issue. A human removing `pmo-planning` signals the plan is approved — the
-/// session should stop so the next cycle hands off to the worker. A human
-/// removing the claim label means the issue was taken over — the session
-/// should stop silently, with no handoff comment.
+/// Build a cancel check that closes the PMO's model session when a label the
+/// session depends on is removed from the issue. When the session started on
+/// an issue already in `pmo-planning`, a human removing that label signals the
+/// plan is approved — the session should stop so the next cycle hands off to
+/// the worker. A human removing the claim label means the issue was taken over
+/// — the session should stop silently, with no handoff comment. For a fresh
+/// issue that never had `pmo-planning`, only the claim label is watched.
 fn pmo_planning_label_cancel_check(
     gitlab: GitLabClient,
     issue_iid: u64,
     agent_id: String,
+    was_planning: bool,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
     let claim_label = super::claim::claim_label(&agent_id);
     Arc::new(move || {
         gitlab.get_issue(issue_iid).ok().is_some_and(|issue| {
-            !issue
-                .labels
-                .iter()
-                .any(|label| label == labels::PMO_PLANNING)
-                || !issue.labels.iter().any(|label| label == &claim_label)
+            let lost_planning = was_planning
+                && !issue
+                    .labels
+                    .iter()
+                    .any(|label| label == labels::PMO_PLANNING);
+            let lost_claim = !issue.labels.iter().any(|label| label == &claim_label);
+            lost_planning || lost_claim
         })
     })
 }
@@ -2652,6 +2663,7 @@ mod tests {
             issue: &PmoIssueObservation,
             _context_path: &str,
             _bound_mr_iid: Option<u64>,
+            _was_planning: bool,
         ) -> Result<PmoOutput> {
             self.record(format!("act:model:{}", issue.iid));
             self.fail("model")?;
