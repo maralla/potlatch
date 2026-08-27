@@ -1131,23 +1131,18 @@ TASK CONTEXT FILE:
 {}
 
 CRITICAL REQUIREMENTS:
-- This is a NON-INTERACTIVE automated system
-- NEVER ask the user for input, confirmation, or decisions
-- NEVER prompt for additional information interactively
-- Make all review decisions autonomously based on the code and information provided
 - Provide clear, actionable feedback in comments (do not ask questions)
 - Review the full comment history to understand what feedback was already given and addressed
 - Do NOT repeat feedback that has already been addressed
 - Treat comments after the original issue description as requirement updates when they clarify, narrow, expand, or supersede earlier constraints
 - Do NOT request changes for outdated requirements from the original issue when later issue or MR comments clearly changed the accepted scope
 
-GITLAB COMMENT STYLE (STRICT — for requesting changes and any posted feedback):
+COMMENT STYLE (STRICT — for requesting changes and any posted feedback):
 - Do NOT start with a long paragraph of hollow praise or thanks that only restates the diff or issue number (e.g. listing routes, files, or "aligns with #N" without adding a review decision). That adds no value and wastes the reader's time.
 - Lead with what matters: **what must change before merge**, or **why you approve**. Use a direct lead-in such as `Request before merge:` or `Blocking:` when the MR must not merge until the item is addressed.
-- For approvals, the posted GitLab comment is "LGTM" by default (no summary or description).
 - Only request MR description updates after you have read the full `## MR description` section in the task context file (including everything after any `Closes #N` line). Do **not** treat an opening `Closes #N` as “description is only the closing line” when the rest of that section documents the work. If it already states goal, implementation approach, and verification, do not ask to expand the description.
-- Public GitLab comments must use reader-facing wording only. Do NOT mention internal field names such as `decision`, `feedback`, or `public_comment`. For example, say "Please update the MR description to include the actual verification and testing performed", not "Update MR_DESCRIPTION with the actual verification/testing performed."
-- Keep the public comment focused: one short optional line of genuine substance is OK, but **never** pad with a multi-sentence "thanks for the thorough coverage" preface that duplicates the diff.
+- Comments must use reader-facing wording only. Do NOT mention internal field names such as `decision`, `feedback`, or `public_comment`. For example, say "Update the MR description to include the actual verification and testing performed", not "Update MR_DESCRIPTION with the actual verification/testing performed."
+- Keep the comment focused: one short optional line of genuine substance is OK, but **never** pad with a multi-sentence "thanks for the thorough coverage" preface that duplicates the diff.
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before starting the review. Treat it as authoritative project policy.
@@ -1164,7 +1159,6 @@ INSTRUCTIONS:
 12. Check code quality, best practices, and potential issues
 13. Only raise NEW issues not already covered in previous comments
 14. Readability and maintainability must be ensured
-15. Make autonomous decisions about approval or requesting changes
 
 MR TITLE AND DESCRIPTION (STRICT — reject if violated):
 - The MR title MUST be a concise, meaningful summary of the code changes. Reject if the title is generic (e.g. "Implementation changes", "Update", "Fix"), just an issue number, or contains markdown formatting like ** or backticks.
@@ -1196,8 +1190,6 @@ FILE HYGIENE (STRICT — reject if violated):
 - Files must be placed in the correct directory according to the project's conventions. A test file must live in the designated test directory, configuration files in the config directory, etc. If a file is in the wrong location, request it be moved before approving.
 - Do NOT allow leftover artifacts: generated files that should be gitignored, editor config files, OS-specific metadata files (e.g. .DS_Store, Thumbs.db), or log files.
 - If unsure whether a file belongs, check the project structure and AGENTS.md for conventions.
-
-Proceed with the review autonomously. Do not ask for any user input.
 "#,
         input.project_name,
         input.mr.iid,
