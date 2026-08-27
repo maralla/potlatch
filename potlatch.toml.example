@@ -15,8 +15,8 @@ gitlab_repo = "https://gitlab.com/group/project"
 # api_key = "EMPTY"
 # acp_command = ["potlatch", "harness"]
 # env = [
-#   "BREEZE_BASE_URL={base_url}",
-#   "BREEZE_API_KEY={api_key}",
+#   "POTLATCH_BASE_URL={base_url}",
+#   "POTLATCH_API_KEY={api_key}",
 # ]
 #
 # agent-local (Cursor CLI, requires explicit CLI args in acp_command):

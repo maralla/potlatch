@@ -19,7 +19,7 @@ use tracing::info;
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
 // Defuddle 0.19.2 full browser bundle (MIT); see defuddle.LICENSE.txt.
 const DEFUDDLE_SCRIPT: &str = include_str!("defuddle.full.js");
-const SEARCH_PROFILE_ENV: &str = "BREEZE_WEB_PROFILE";
+const SEARCH_PROFILE_ENV: &str = "POTLATCH_WEB_PROFILE";
 
 #[derive(Debug)]
 pub(super) struct GoogleVerificationRequired;
@@ -300,7 +300,7 @@ fn resolve_search_profile_dir(explicit: Option<PathBuf>, home: Option<PathBuf>) 
         );
         return Ok(explicit);
     }
-    let home = home.context("HOME is not set; set BREEZE_WEB_PROFILE explicitly")?;
+    let home = home.context("HOME is not set; set POTLATCH_WEB_PROFILE explicitly")?;
     Ok(home.join(".potlatch").join("web-chrome-profile"))
 }
 

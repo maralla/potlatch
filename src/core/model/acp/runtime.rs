@@ -480,7 +480,9 @@ impl AcpRuntime {
                 if n > 0 {
                     let preview = String::from_utf8_lossy(&buf[..n.min(2048)]);
                     debug!(target: "potlatch::agent_stderr", agent_id = %aid, "stderr: {}", preview);
-                    if preview.contains("Cannot use this model") {
+                    if preview.contains("Cannot use this model")
+                        || preview.contains("is not set")
+                    {
                         warn!(target: "potlatch::agent_stderr", agent_id = %aid, "ACP server stderr: {}", preview);
                     }
                 }
@@ -903,7 +905,7 @@ mod tests {
         assert!(
             runtime
                 .prompt_with_structured_output("Do the task.")
-                .contains("BREEZE_STRUCTURED_OUTPUT_BEGIN")
+                .contains("POTLATCH_STRUCTURED_OUTPUT_BEGIN")
         );
     }
 
@@ -1064,9 +1066,9 @@ mod tests {
         let hooks = StreamTextHooks::new();
         let pr: PromptResult = serde_json::from_value(json!({
             "stopReason": "end_turn",
-            "message": "done\nBREEZE_STRUCTURED_OUTPUT_BEGIN\n\
+            "message": "done\nPOTLATCH_STRUCTURED_OUTPUT_BEGIN\n\
                 {\"plan\":{\"decision\":\"split\",\"sub_issues\":[]}}\n\
-                BREEZE_STRUCTURED_OUTPUT_END"
+                POTLATCH_STRUCTURED_OUTPUT_END"
         }))
         .unwrap();
         let backend = crate::core::model::acp::backends::resolve_structured_output_backend(None);

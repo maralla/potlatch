@@ -7,8 +7,8 @@ use serde_json::{Map, Value, json};
 
 use super::StructuredOutputBackend;
 
-const STRUCTURED_OUTPUT_BEGIN: &str = "BREEZE_STRUCTURED_OUTPUT_BEGIN";
-const STRUCTURED_OUTPUT_END: &str = "BREEZE_STRUCTURED_OUTPUT_END";
+const STRUCTURED_OUTPUT_BEGIN: &str = "POTLATCH_STRUCTURED_OUTPUT_BEGIN";
+const STRUCTURED_OUTPUT_END: &str = "POTLATCH_STRUCTURED_OUTPUT_END";
 
 pub(super) struct DefaultBackend;
 

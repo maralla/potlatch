@@ -1537,7 +1537,7 @@ fn pmo_gitlab_comments_section(gitlab: &GitLabClient, issue_iid: u64) -> (String
     }
 }
 
-/// Rewrites `pmo-issue-<iid>.md` under [`BREEZE_CONTEXT_DIR`]. Call whenever PMO holds or resumes
+/// Rewrites `pmo-issue-<iid>.md` under [`POTLATCH_CONTEXT_DIR`]. Call whenever PMO holds or resumes
 /// work on an issue (new claim, resumed claim, pmo-pending poll, pending split).
 fn refresh_pmo_issue_context_file(
     state: &AgentState,
