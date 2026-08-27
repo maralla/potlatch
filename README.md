@@ -54,9 +54,9 @@ The config file uses `[acp.<name>]` sections to define ACP backends and `[agent.
 ```toml
 # ACP backend: the built-in harness talks to an OpenAI-compatible endpoint.
 [acp.potlatch]
-base_url = "https://api.deepseek.com/v1"   # LLM endpoint URL
-api_key = "YOUR_DEEPSEEK_API_KEY"           # API key for the endpoint
-acp_command = ["potlatch", "harness"]       # command to spawn the ACP server
+base_url = "https://api.deepseek.com/v1"     # LLM endpoint URL
+api_key = "YOUR_DEEPSEEK_API_KEY"            # API key for the endpoint
+acp_command = ["potlatch", "harness"]        # command to spawn the ACP server
 env = [                                      # env vars passed to the subprocess ({base_url}/{api_key} are interpolated)
   "POTLATCH_BASE_URL={base_url}",
   "POTLATCH_API_KEY={api_key}",
