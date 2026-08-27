@@ -213,6 +213,8 @@ fn build_reorganize_prompt(current: &str) -> String {
     format!(
         r#"You are the memory curator for THIS software project. The durable project memory is not a log of what happened — it is the project's wisdom: fundamental knowledge that guides future action across unrelated tasks, like the judgment a seasoned engineer carries from one project to the next.
 
+Do NOT inspect the filesystem. The working directory may contain stale agent worktrees and checkout directories that do not reflect the current project state. Work ONLY from the memory text provided below — your job is to curate it, not to verify it against the codebase.
+
 Think of memory as wisdom, not notes. Wisdom is knowledge that, once learned, changes how you approach ALL future work on the project — not just the task that surfaced it. Test each entry against this question: "If I forgot this, would I make a wrong decision on an unrelated future task?" If the answer is no, it is not wisdom.
 
 Wisdom is:
