@@ -211,26 +211,26 @@ fn save_memory(path: &Path, content: &str) -> Result<()> {
 
 fn build_reorganize_prompt(current: &str) -> String {
     format!(
-        r#"You are the memory curator for THIS software project. The durable project memory is not a log of what happened — it is the project's wisdom: the fundamental, broadly applicable knowledge that holds across unrelated future tasks, like the wisdom a seasoned engineer carries from one project to the next.
+        r#"You are the memory curator for THIS software project. The durable project memory is not a log of what happened — it is the project's wisdom: fundamental knowledge that guides future action across unrelated tasks, like the judgment a seasoned engineer carries from one project to the next.
 
-Think of memory as wisdom, not notes. Wisdom is:
-- Fundamental principles and invariants of the project ("the data model guarantees X", "module Y is the sole owner of Z", "this system cannot do W").
-- Conventions and constraints that shape every change ("always validate at the boundary", "never bypass layer A to reach layer B").
-- Hard-won non-obvious truths ("integration with S silently fails when Q is unset", "the build caches at P, so edits there need a clean").
-- Cross-cutting domain knowledge a new contributor must absorb before contributing effectively.
+Think of memory as wisdom, not notes. Wisdom is knowledge that, once learned, changes how you approach ALL future work on the project — not just the task that surfaced it. Test each entry against this question: "If I forgot this, would I make a wrong decision on an unrelated future task?" If the answer is no, it is not wisdom.
+
+Wisdom is:
+- Principles and invariants that constrain design choices ("the data model forbids X", "module Y is the sole authority for Z — all writes must go through it").
+- Conventions that prevent recurring mistakes ("never commit generated code", "all public APIs require integration tests").
+- Cross-cutting constraints that surprise newcomers ("the build system caches at P; a stale cache causes silent test failures — always clean after switching branches").
 
 Wisdom is NOT:
-- Transient task recordings: what you did, saw, or found while working one issue ("function F does X", "file G contains H", "while debugging I noticed J"). These describe one moment, not the project.
-- Facts copied from another codebase, language, or framework. Wisdom is about THIS project only.
+- Implementation details of specific functions, types, or files. "Function F calls G" or "struct S has field X" describes the current code, not a durable principle. These are notes, not wisdom — they become stale on the next refactor and mislead.
+- Debugging findings or issue-specific observations. "While working on issue #42, the breaker tripped because threshold X was too low" is a task recording, not wisdom. The wisdom would be "breaker thresholds below N cause false trips on transient 500s" — IF that generalizes.
+- Code structure descriptions. "Package A imports B but not C" or "handler H resolves its sink via the registry" describes the current tree; it is not a guiding principle.
+- Anything that names specific identifiers (function names, struct fields, variable names, error codes) as the subject of the fact. Wisdom is phrased as principles, not as code readings.
+- Facts about other codebases. Wisdom is about THIS project only.
 - Restatements of what is already documented in project guidance files (README, AGENTS.md, CONTRIBUTING).
-- Duplicates, stale facts, or anything that could change in the next refactor.
 
-Track wisdom, drop transient task recordings. Rewrite the surviving knowledge into concise, declarative wisdom entries — do NOT preserve note text verbatim. Each entry should state a durable truth about the project, not describe what you once observed. Organize by category. If nothing rises to the level of wisdom, return empty content — an empty memory is better than a clutter of notes that will mislead future tasks.
+Be ruthless. The memory above is almost certainly full of task recordings disguised as architecture notes — entries like "the X handler does Y via the Z registry" or "breaker threshold N causes M" are implementation details, not wisdom. Drop them. If a genuine principle is buried inside a detailed note, extract ONLY the principle and discard the implementation detail. Prefer a short memory of real wisdom over a long memory of accurate-but-irrelevant code readings. If nothing in the memory rises to the level of guiding future action, return empty content — an empty memory is better than a clutter of stale code descriptions.
 
-Recency and forgetting. The memory below has the most recently added facts at the end (after the last separator). Treat recency as priority:
-- KEEP recently added facts verbatim or lightly cleaned — they are fresh and likely still relevant.
-- For OLDER facts, gradually summarize multiple fine-grained entries into fewer coarser-grained ones, or drop them entirely, when the memory grows too large. Prefer forgetting over clutter: a short memory of high-signal wisdom is better than a long memory of diminishing details.
-- Never drop a recent fact to make room for an old one. If the memory is too large, trim from the oldest end first.
+Recency: recently added facts (at the end of the memory) are more likely to still be relevant. When the memory is too large, drop the oldest, most detailed, most implementation-specific entries first. Never drop a recent genuine principle to keep an old code reading.
 
 ## Current memory
 
@@ -260,13 +260,13 @@ structured_output! {
 fn memory_tool_definition() -> AgentToolDefinition {
     AgentToolDefinition {
         name: "memory".to_string(),
-        description: "Store new facts in durable project memory. Store only stable, project-wide facts (architecture, invariants, conventions, domain knowledge) useful across unrelated future tasks. Do not store task progress, implementation notes, or temporary state. The current memory is shown as '## memory' in your context.".to_string(),
+        description: "Store durable project wisdom — knowledge that guides future action across unrelated tasks. Store only principles, invariants, and conventions that, if forgotten, would cause a wrong decision on an unrelated future task. Do NOT store implementation details (what a function does, how a struct is shaped), debugging findings, code structure descriptions, or task-specific observations. The current memory is shown as '## memory' in your context.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "The new facts to add to memory, as markdown."
+                    "description": "The new wisdom to add to memory, as markdown. State the principle, not the code reading."
                 }
             },
             "required": ["content"],
