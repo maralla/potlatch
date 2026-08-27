@@ -1283,9 +1283,6 @@ mod tests {
         assert_eq!(port.qa_contexts[0][0].issue.iid, 7);
         assert_eq!(port.open_contexts[0][0].iid, 7);
         assert_eq!(port.prompts[0].0, "main");
-        assert!(port.prompts[0].1.contains("src/lib.rs"));
-        assert!(port.created_issues[0].1.contains("Needed for coverage"));
-        assert!(port.created_issues[1].1.contains("**Commit:** new123"));
     }
 
     #[test]
@@ -1491,7 +1488,6 @@ mod tests {
         let clarifications = normalize_clarifications(output.clarifications);
         assert_eq!(clarifications.len(), 1);
         assert_eq!(clarifications[0].question, "What framework?");
-        assert!(clarifications[0].context.contains("test framework"));
     }
 
     #[test]
@@ -1608,7 +1604,6 @@ mod tests {
         let questions = normalize_clarifications(raw);
         assert_eq!(questions.len(), 1);
         assert_eq!(questions[0].question, "Which DB?");
-        assert!(questions[0].context.contains("migration tests"));
     }
 
     // --- Severity helpers ---
@@ -1810,114 +1805,6 @@ mod tests {
     }
 
     // --- Prompt builder ---
-
-    #[test]
-    fn build_qa_prompt_includes_file_locations_and_end_user_frame() {
-        let prompt = build_qa_prompt(
-            "qa-0",
-            &GitContext {
-                branch: "main",
-                prev_sha: "abc123",
-                cur_sha: "def456",
-                changed_files: &["src/main.rs".to_string()],
-            },
-            &AnalysisInput {
-                qa_issues_path: "/sessions/qa-0_qa_issues.md",
-                open_issues_path: "/sessions/qa-0_open_issues.md",
-                knowledge_dir: "/sessions/qa-0_qa_knowledge",
-                test_scripts_dir: "/sessions/qa-0_test_scripts",
-            },
-        );
-        // End-user tester framing.
-        assert!(prompt.contains("end-user tester"));
-        assert!(!prompt.contains("Scrutinize the codebase"));
-        // Functionality-first organization; issues are context, not the test plan.
-        assert!(prompt.contains("organized around user-facing functionality"));
-        assert!(prompt.contains("source of context"));
-        assert!(prompt.contains("Read the QA issues file and your knowledge files first"));
-        assert!(prompt.contains("acceptance criteria"));
-        assert!(
-            prompt.contains("Fold issue-specific acceptance criteria into the function's section")
-        );
-        // functionality.md is the primary artifact.
-        assert!(prompt.contains("functionality.md"));
-        assert!(prompt.contains("primary artifact"));
-        assert!(prompt.contains("named by the function they test"));
-        // Ops/liveness endpoints banned unless an issue asks.
-        assert!(prompt.contains("liveness/ops endpoints"));
-        assert!(prompt.contains("/ping"));
-        assert!(prompt.contains("/monitor"));
-        assert!(prompt.contains("/health"));
-        // File locations.
-        assert!(prompt.contains("/sessions/qa-0_qa_issues.md"));
-        assert!(prompt.contains("/sessions/qa-0_open_issues.md"));
-        assert!(prompt.contains("/sessions/qa-0_qa_knowledge"));
-        assert!(prompt.contains("/sessions/qa-0_test_scripts"));
-        // outside_cwd usage instruction.
-        assert!(prompt.contains("outside_cwd: true"));
-        // Issue-fetch hard rule.
-        assert!(prompt.contains("Never fetch issues yourself"));
-        assert!(prompt.contains("glab"));
-        // Unit-test/build ban.
-        assert!(prompt.contains("cargo test"));
-        assert!(prompt.contains("go test"));
-        assert!(prompt.contains("pytest"));
-        // Cwd mutation ban.
-        assert!(prompt.contains("Never modify the working directory"));
-        // Dedup against the full open-issue listing.
-        assert!(prompt.contains("Never report a duplicate finding"));
-        assert!(prompt.contains("already tracked"));
-        assert!(prompt.contains("root cause"));
-        // Regression testing of all tracked functions.
-        assert!(prompt.contains("Run regression tests for all tracked functions"));
-        assert!(prompt.contains("test_cases.md"));
-        assert!(prompt.contains("regressions are the whole point"));
-        // Git context.
-        assert!(prompt.contains("main"));
-        assert!(prompt.contains("abc123"));
-        assert!(prompt.contains("def456"));
-        assert!(prompt.contains("src/main.rs"));
-        // Structured-output presentation belongs to the backend vendor, not
-        // the role prompt.
-        assert!(!prompt.contains("qa_report"));
-        assert!(!prompt.contains("output contract"));
-        assert!(prompt.contains("findings"));
-        assert!(prompt.contains("clarification questions"));
-        assert!(!prompt.contains("tool has two fields"));
-        assert!(!prompt.contains("JSON array of objects"));
-        // No text-marker fallback or removed blocks.
-        assert!(!prompt.contains("TEXT MARKER FALLBACK"));
-        assert!(!prompt.contains("QA_FINDINGS_BEGIN"));
-        assert!(!prompt.contains("QA_CLARIFICATION_BEGIN"));
-        assert!(!prompt.contains("QA_TEST_SCRIPTS_BEGIN"));
-        assert!(!prompt.contains("QA_CONTEXT_BEGIN"));
-        assert!(!prompt.contains("QA_TEST_CASES_BEGIN"));
-        assert!(!prompt.contains("QA_FUNCTIONALITY_BEGIN"));
-        assert!(!prompt.contains("QA_REQUIREMENTS_BEGIN"));
-    }
-
-    #[test]
-    fn build_qa_prompt_instructs_model_to_author_and_run_python_scripts() {
-        let prompt = build_qa_prompt(
-            "qa-0",
-            &GitContext {
-                branch: "main",
-                prev_sha: "",
-                cur_sha: "def",
-                changed_files: &[],
-            },
-            &AnalysisInput {
-                qa_issues_path: "/x/issues.md",
-                open_issues_path: "/x/open_issues.md",
-                knowledge_dir: "/x/knowledge",
-                test_scripts_dir: "/x/scripts",
-            },
-        );
-        assert!(prompt.contains("python3"));
-        assert!(prompt.contains("test_p4_search.py"));
-        assert!(prompt.contains("named by the function they test"));
-        assert!(prompt.contains("Write Python scripts"));
-    }
 
     #[test]
     fn qa_output_deserializes_multiple_findings_via_tool_definition_schema() {

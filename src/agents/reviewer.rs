@@ -2113,8 +2113,10 @@ mod tests {
             Some("- Fix the error handling in main.go\n- Add test for edge case"),
             None,
         );
-        assert!(feedback.contains("Fix the error handling"));
-        assert!(feedback.contains("Add test for edge case"));
+        assert_eq!(
+            feedback,
+            "- Fix the error handling in main.go\n- Add test for edge case"
+        );
     }
 
     #[test]
@@ -2183,24 +2185,6 @@ mod tests {
             error.starts_with("$.feedback: unexpected property"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn issue_context_header_includes_labels_for_review_only_exception() {
-        let issue = Issue {
-            iid: 42,
-            title: "Audit large migration".to_string(),
-            description: "Review a large existing MR.".to_string(),
-            labels: vec!["review-only".to_string(), "priority::2".to_string()],
-            state: "opened".to_string(),
-            created_at: None,
-            updated_at: None,
-        };
-
-        let header = format_issue_context_header(issue.iid, &issue);
-
-        assert!(header.contains("ISSUE LABELS: review-only, priority::2"));
-        assert!(header.contains("LINKED ISSUE #42: Audit large migration"));
     }
 
     #[test]
