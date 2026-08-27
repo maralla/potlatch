@@ -2704,9 +2704,7 @@ fn handle_mr_comments(
 
     let feedback_scope_rules = get_feedback_scope_rules();
     let prompt = format!(
-        r#"SYSTEM: You are an autonomous coding agent.
-
-You are addressing reviewer feedback on a merge request in a fully automated, non-interactive environment.
+        r#"SYSTEM: You are addressing reviewer feedback on a merge request in a fully automated, non-interactive environment.
 
 PROJECT: {}
 
@@ -2716,8 +2714,6 @@ TASK CONTEXT (already included below — do NOT read it from disk):
 {}
 
 CRITICAL REQUIREMENTS:
-- This is a NON-INTERACTIVE automated system
-- You MUST delete, rename, or move files as needed — do not ask permission or suggest it
 - Leave staging, committing, pushing, and merge request creation to the system
 - The task context above includes all comments and the diff — review it, then act directly
 - Address all unresolved thread feedback and actionable plain MR comments autonomously
@@ -2725,8 +2721,7 @@ CRITICAL REQUIREMENTS:
 - Keep the original issue requirements in mind while addressing feedback
 - If the workspace has merge conflict markers (<<<<<<< / ======= / >>>>>>>), resolve ALL of them before doing anything else. Edit each conflicted file to keep the correct version.
 - The **Merge conflict status** section in the task context above is verified by Potlatch. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
-- Potlatch will refuse to mark review threads resolved while GitLab still reports merge conflicts or conflict markers remain in the branch.
-- Potlatch already fetched `origin/{}` and merged it into your workspace when conflicts were reported. Edit the listed conflicted files, remove all conflict markers, and leave committing/pushing to Potlatch. Do not claim the conflict is fixed until the **Merge conflict status** section shows a clean merge with the fetched target tip.
+- `origin/{}` already fetched and merged it into your workspace when conflicts were reported. Edit the listed conflicted files, remove all conflict markers, and leave committing/pushing to Potlatch. Do not claim the conflict is fixed until the **Merge conflict status** section shows a clean merge with the fetched target tip.
 
 {}
 
@@ -2749,8 +2744,6 @@ INSTRUCTIONS:
 13. Keep the MR title stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
 14. Report only changes and metadata updates actually completed in this run; never imply a concern was fixed when the final branch does not fix it.
 15. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR metadata or GitLab comments.
-
-Proceed with addressing the feedback autonomously. Do not ask for any user input.
 "#,
         &state.project_name,
         latest_mr.iid,
@@ -4279,9 +4272,7 @@ fn build_implementation_prompt(
     let notes_rules = get_notes_rules();
 
     let prompt = format!(
-        r#"SYSTEM: You are an autonomous coding agent.
-
-You are implementing a feature for a software project in a fully automated, non-interactive environment.
+        r#"SYSTEM: You are implementing a feature for a software project in a fully automated, non-interactive environment.
 
 PROJECT: {}
 
@@ -4358,9 +4349,7 @@ fn build_continuation_prompt(
     let notes_rules = get_notes_rules();
 
     let prompt = format!(
-        r#"SYSTEM: You are an autonomous coding agent.
-
-You are continuing work on an existing feature branch in a fully automated, non-interactive environment.
+        r#"SYSTEM: You are continuing work on an existing feature branch in a fully automated, non-interactive environment.
 
 PROJECT: {}
 
@@ -4424,10 +4413,6 @@ Proceed with continuing the implementation autonomously. Do not ask for any user
 
 fn get_common_requirements() -> &'static str {
     r#"CRITICAL REQUIREMENTS:
-- This is a NON-INTERACTIVE automated system
-- You MUST delete, rename, move, or create files as needed — do not ask permission or suggest it
-- You MUST NOT ask the user for input, confirmation, or decisions — decide autonomously
-- You MUST NOT produce output that suggests actions for a human to take — YOU take those actions
 - Leave staging, committing, pushing, and merge request creation to the system
 - If information is missing, document what's needed in your response (do not ask interactively)
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
