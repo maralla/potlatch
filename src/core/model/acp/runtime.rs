@@ -480,9 +480,7 @@ impl AcpRuntime {
                 if n > 0 {
                     let preview = String::from_utf8_lossy(&buf[..n.min(2048)]);
                     debug!(target: "potlatch::agent_stderr", agent_id = %aid, "stderr: {}", preview);
-                    if preview.contains("Cannot use this model")
-                        || preview.contains("is not set")
-                    {
+                    if preview.contains("Cannot use this model") || preview.contains("is not set") {
                         warn!(target: "potlatch::agent_stderr", agent_id = %aid, "ACP server stderr: {}", preview);
                     }
                 }
