@@ -267,8 +267,22 @@ mod tests {
 
     fn sample_config(model: Option<&str>) -> Config {
         let toml = match model {
-            Some(m) => format!("[agent.alpha]\nmodel = \"{m}\"\ninstances = 1"),
-            None => "[agent.alpha]\ninstances = 1".to_string(),
+            Some(m) => format!(
+                r#"[agent.alpha]
+model = "{m}"
+acp_client = "cursor"
+instances = 1
+
+[acp.cursor]
+acp_command = ["agent", "acp"]"#
+            ),
+            None => r#"[agent.alpha]
+acp_client = "cursor"
+instances = 1
+
+[acp.cursor]
+acp_command = ["agent", "acp"]"#
+                .to_string(),
         };
         Config::from_toml_str(&toml).unwrap()
     }
