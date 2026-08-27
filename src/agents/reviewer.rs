@@ -91,7 +91,7 @@ structured_output! {
                     "The merge request is ready to merge as-is.",
                     object({
                         optional summary: string(
-                            "Optional one-line note. The posted GitLab comment is always just 'LGTM', so this is only for the log."
+                            "Optional one-line note. The posted comment is always just 'LGTM', so this is only for the log."
                         ),
                     })
                 ),
@@ -99,10 +99,10 @@ structured_output! {
                     "The merge request needs work before it can merge.",
                     object({
                         required feedback: string(
-                            "Specific issues that must be addressed, one bullet per line. Posted as GitLab discussion threads."
+                            "Specific issues that must be addressed, one bullet per line. Posted as discussion threads."
                         ),
                         optional public_comment: string(
-                            "Human-facing GitLab comment text (separate from feedback). Use for explanations, context, or recommendations that don't require code changes."
+                            "Human-facing comment text (separate from feedback). Use for explanations, context, or recommendations that don't require code changes."
                         ),
                     })
                 ),
