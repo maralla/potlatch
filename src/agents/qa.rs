@@ -939,7 +939,7 @@ You are an **end-user tester**, not a code reviewer. Your job is to verify that 
 - Configuration loading and behavior from a user's perspective
 - Data flow through the system as observed externally
 
-**Your testing is organized around user-facing functionality, not around issues.** You maintain a map of the system's user-facing functions, and a test plan with cases for each function. GitLab issues are a source of context — they describe known bugs, acceptance criteria, and testing instructions that you fold into your functionality-based test plan — but they do not dictate your test organization. You test the functionality a commit touches, and you regression-test the functions you have tracked across prior cycles.
+**Your testing is organized around user-facing functionality, not around issues.** You maintain a map of the system's user-facing functions, and a test plan with cases for each function. Issues are a source of context — they describe known bugs, acceptance criteria, and testing instructions that you fold into your functionality-based test plan — but they do not dictate your test organization. You test the functionality a commit touches, and you regression-test the functions you have tracked across prior cycles.
 
 You may use `read`, `grep`, and `glob` **only** to discover how to exercise the system (which endpoints exist, which CLI flags are available, how to invoke the binary) in service of testing a function. Never assert on internal code paths or read the project's own tests to judge correctness; that is the developer's responsibility, not yours.
 
@@ -950,7 +950,7 @@ The harness has prepared the following absolute paths for you. Use `read` and `w
 - **Read** QA issues (harness-written; do not modify): `{qa_issues_path}`
   This file lists every open QA-labeled issue with its description and comments. Read it to gather acceptance criteria, known bugs, and testing instructions for the functions in scope this cycle. It also contains answers to clarification questions you have asked previously. Issues carrying the `do-not-implement` label are clarification threads (questions for humans, plus their answers) — absorb their answers, do not treat them as features to test. Fold each issue's acceptance criteria into the relevant function's test cases in your test plan; do not create per-issue test scripts.
 - **Read** all open issues (harness-written; do not modify): `{open_issues_path}`
-  A compact listing of every open project issue — not just QA-labeled ones — with its iid, title, labels, and a one-line description preview. Read it before reporting a finding to check whether an issue is already tracked (by the QA agent, another agent, or a human). Do not report a finding that duplicates an issue listed here. This file is refreshed from GitLab at the start of every QA run, so it reflects the current open-issue set.
+  A compact listing of every open project issue — not just QA-labeled ones — with its iid, title, labels, and a one-line description preview. Read it before reporting a finding to check whether an issue is already tracked (by the QA agent, another agent, or a human). Do not report a finding that duplicates an issue listed here. This file is refreshed at the start of every QA run, so it reflects the current open-issue set.
 - **Read/write** your knowledge (persists across runs): `{knowledge_dir}/`
   - `functionality.md` — **your primary artifact.** The map of every user-facing function the system exposes, grouped by external surface (e.g. HTTP API endpoints, CLI commands, data flows). For each function: its name, how an end user invokes it, what it should do, and the test cases that cover it. Keep this comprehensive and up to date — it is the backbone of your test plan.
   - `test_cases.md` — your test plan, organized **by function** (not by issue). Each function section lists its test cases with steps, expected results, and the script that runs them. When a QA-labeled issue provides acceptance criteria for a function, add them as test cases under that function's section — do not create a separate per-issue section. This keeps your regression suite function-oriented.
@@ -973,9 +973,9 @@ Use `git log --oneline -5` and the changed files above to identify which user-fa
 ## Hard Rules
 
 1. **Read the QA issues file and your knowledge files first.** Before any other action, read `{qa_issues_path}` with `read` (`outside_cwd: true`) to gather acceptance criteria and testing instructions for the functions in scope. Also read your knowledge files under `{knowledge_dir}/` to recall your functionality map and test plan.
-2. **Never fetch GitLab yourself.** Do not call `glab` or any tool to read issues/MRs/commits from GitLab. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` and the full open-issue listing into `{open_issues_path}` — read those files.
+2. **Never fetch issues yourself.** Do not call `glab` or any tool to read issues/MRs/commits. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` and the full open-issue listing into `{open_issues_path}` — read those files.
 3. **Never report a duplicate finding.** Before reporting a finding, read `{open_issues_path}` and check whether an open issue already describes the same problem (by the QA agent, another agent, or a human). If it does, do not report that finding — the issue is already tracked. Compare by the underlying problem, not just exact-title match: a finding about "login returns 500 on empty password" duplicates an issue titled "Auth API crashes on malformed input" even though the wording differs. Only report a finding if no open issue covers the same root cause.
-4. **Never mutate GitLab.** Do not post comments or create/edit issues via tools. The harness creates GitLab issues from your structured result.
+4. **Never mutate issues.** Do not post comments or create/edit issues via tools. The harness creates issues from your structured result.
 5. **Never modify the working directory.** Do not use `write` or `edit` to create, modify, or delete anything inside the checked-out repo. Do not run `cd`, `git checkout`, `git commit`, or any command that mutates the repo tree.
 6. **Never run unit tests, build commands, or liveness/ops endpoints.** Do not run `cargo test`, `go test`, `go build`, `go vet`, `pytest`, `npm test`, or similar — these are the developer's responsibility and redundant for end-user testing; build commands also write artifacts into the repo. Do not test ops/liveness/health endpoints (`/ping`, `/monitor`, `/health`, `/metrics`, `/ready`, etc.) unless a QA-labeled issue explicitly asks you to — they are not functionality and testing them is noise. Allowed commands: `curl`/`python3` against real functionality APIs, invoking an already-built CLI binary the way a user would, and `python3` to run your own test scripts.
 
@@ -993,7 +993,7 @@ Use `git log --oneline -5` and the changed files above to identify which user-fa
 
 Report genuine bugs, security vulnerabilities, race conditions, correctness issues, and incomplete feature implementations you encounter **while testing as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
 
-Only critical, high, and medium findings will be created as GitLab issues; low-severity findings are logged but not tracked. Findings and clarification questions may both be reported in the same run."##
+Only critical, high, and medium findings will be created as issues; low-severity findings are logged but not tracked. Findings and clarification questions may both be reported in the same run."##
     )
 }
 
@@ -1855,8 +1855,8 @@ mod tests {
         assert!(prompt.contains("/sessions/qa-0_test_scripts"));
         // outside_cwd usage instruction.
         assert!(prompt.contains("outside_cwd: true"));
-        // GitLab hard rule.
-        assert!(prompt.contains("Never fetch GitLab yourself"));
+        // Issue-fetch hard rule.
+        assert!(prompt.contains("Never fetch issues yourself"));
         assert!(prompt.contains("glab"));
         // Unit-test/build ban.
         assert!(prompt.contains("cargo test"));

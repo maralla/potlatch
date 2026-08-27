@@ -232,7 +232,7 @@ fn blocked_properties(schema: ObjectSchema, reason: &str) -> ObjectSchema {
         .property(
             "public_comment",
             Schema::string(
-                "Human-facing GitLab comment text to post instead of `reason`. Omit to post `reason` as-is.",
+                "Human-facing comment text to post instead of `reason`. Omit to post `reason` as-is.",
             ),
         )
 }
@@ -2743,7 +2743,7 @@ INSTRUCTIONS:
 12. If the feedback cannot be resolved without additional human input (for example ambiguous requirements, out-of-scope requests, or missing information), report that clearly and identify the needed input.
 13. Keep the MR title stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
 14. Report only changes and metadata updates actually completed in this run; never imply a concern was fixed when the final branch does not fix it.
-15. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR metadata or GitLab comments.
+15. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR metadata or issue comments.
 "#,
         &state.project_name,
         latest_mr.iid,
@@ -4417,7 +4417,7 @@ fn get_common_requirements() -> &'static str {
 - If information is missing, document what's needed in your response (do not ask interactively)
 - If you are making code changes you MUST stick to AGENTS.md in the project strictly
 - Read the issue comments carefully — they may contain guidance from the PMO agent on how to proceed. PMO guidance appears as a comment starting with **PMO guidance for the worker agent:** — treat the body of that comment as authoritative worker instructions and follow it exactly.
-- Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules below: not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or GitLab comments
+- Before finishing, update repo-root notes.md only when you have bullets that pass the NOTES.MD rules below: not a recap of your MR, not generic best-practice slides, not meta about notes — if nothing qualifies, leave the file unchanged. Never paste notes.md into MR metadata or issue comments
 
 NO WORKAROUNDS — STRICTLY PROHIBITED:
 - NEVER apply a workaround, hack, or shortcut to make code "work" without addressing the root cause.
