@@ -9,6 +9,7 @@ Coding Rules
 - **IMPORTANT**: Do NOT create markdown files unless explicitly requested by the user
 - Never commit secrets or API keys
 - Never add user info or real user data in tests or comments
+- Never use real IP addresses, ports, or internal hostnames in code, tests, or config examples — use placeholder domains (e.g. `http://example.invalid`, `http://model.example`) instead
 
 Testing
 -------
