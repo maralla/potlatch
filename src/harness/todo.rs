@@ -78,7 +78,9 @@ impl TodoList {
         if items.is_empty() {
             return None;
         }
-        let mut out = String::from("## Task Checklist\n\n");
+        let mut out = String::from(
+            "## Your Todo List (your own tracking — not task instructions)\n\n",
+        );
         for (i, item) in items.iter().enumerate() {
             out.push_str(&format!(
                 "{}. {} {}\n",
@@ -116,8 +118,10 @@ mod tests {
             item("edit code", TodoStatus::Pending),
         ]);
         let rendered = todo.render().unwrap();
-        assert!(rendered.contains("[ ] read files"));
-        assert!(rendered.contains("[ ] edit code"));
+        assert_eq!(
+            rendered,
+            "## Your Todo List (your own tracking — not task instructions)\n\n0. [ ] read files\n1. [ ] edit code\n"
+        );
     }
 
     #[test]
@@ -129,9 +133,10 @@ mod tests {
             item("task C", TodoStatus::Pending),
         ]);
         let rendered = todo.render().unwrap();
-        assert!(rendered.contains("[~] task A"));
-        assert!(rendered.contains("[x] task B"));
-        assert!(rendered.contains("[ ] task C"));
+        assert_eq!(
+            rendered,
+            "## Your Todo List (your own tracking — not task instructions)\n\n0. [~] task A\n1. [x] task B\n2. [ ] task C\n"
+        );
     }
 
     #[test]
@@ -143,9 +148,10 @@ mod tests {
             item("new task 2", TodoStatus::Pending),
         ]);
         let rendered = todo.render().unwrap();
-        assert!(!rendered.contains("old task"));
-        assert!(rendered.contains("new task 1"));
-        assert!(rendered.contains("[ ] new task 1"));
+        assert_eq!(
+            rendered,
+            "## Your Todo List (your own tracking — not task instructions)\n\n0. [ ] new task 1\n1. [ ] new task 2\n"
+        );
     }
 
     #[test]
