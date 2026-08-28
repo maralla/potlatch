@@ -90,12 +90,8 @@ impl Tool for TodoTool {
         }
 
         self.todo.replace_all(parsed);
-        let rendered = self.todo.render().unwrap_or_default();
-        let count = rendered
-            .lines()
-            .filter(|l| l.starts_with(|c: char| c.is_numeric()))
-            .count();
-        Ok(format!("Todo list updated ({count} item(s)).\n{rendered}"))
+        let count = items.len();
+        Ok(format!("Todo list updated ({count} item(s))."))
     }
 }
 
@@ -116,6 +112,9 @@ mod tests {
         });
         let result = tool.execute(&args, "/tmp").unwrap();
         assert!(result.contains("2 item(s)"));
+        // The tool result should NOT include the rendered checklist —
+        // the agent loop injects it as a system message every turn.
+        assert!(!result.contains("Task Checklist"));
         let rendered = todo.render().unwrap();
         assert!(rendered.contains("[~] task A"));
         assert!(rendered.contains("[ ] task B"));
