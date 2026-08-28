@@ -60,6 +60,16 @@ impl ModelUri {
     pub fn endpoint_model_name(&self) -> &str {
         &self.model_name
     }
+
+    /// `<model-name>` with any `?query` suffix stripped, for matching against
+    /// the `endpoints` table of an ACP profile (e.g. `model1-fp8` from
+    /// `acp://potlatch/model1-fp8?thinking=true`).
+    pub fn bare_model_name(&self) -> &str {
+        self.model_name
+            .split('?')
+            .next()
+            .unwrap_or(&self.model_name)
+    }
 }
 
 #[cfg(test)]
@@ -91,5 +101,19 @@ mod tests {
         assert_eq!(u.vendor, "cursor");
         assert_eq!(u.model_name, "gpt-5.3-codex");
         assert_eq!(u.endpoint_model_name(), "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn bare_model_name_strips_query_suffix() {
+        let u = ModelUri::parse("acp://potlatch/model1-fp8?thinking=true").unwrap();
+        assert_eq!(u.model_name, "model1-fp8?thinking=true");
+        assert_eq!(u.endpoint_model_name(), "model1-fp8?thinking=true");
+        assert_eq!(u.bare_model_name(), "model1-fp8");
+    }
+
+    #[test]
+    fn bare_model_name_without_query() {
+        let u = ModelUri::parse("acp://cursor/composer-2").unwrap();
+        assert_eq!(u.bare_model_name(), "composer-2");
     }
 }

@@ -9,7 +9,10 @@ gitlab_repo = "https://gitlab.com/group/project"
 
 # Self-hosted / custom ACP client profile (referenced by agent `acp_client`).
 #
-# Potlatch harness (built-in, talks directly to OpenAI-compatible endpoints):
+# Potlatch harness (built-in, talks directly to OpenAI-compatible endpoints).
+# Two config styles are supported:
+#
+# 1. Single endpoint via base_url / api_key:
 # [acp.potlatch]
 # base_url = "http://localhost:11434/v1"
 # api_key = "EMPTY"
@@ -17,6 +20,22 @@ gitlab_repo = "https://gitlab.com/group/project"
 # env = [
 #   "POTLATCH_BASE_URL={base_url}",
 #   "POTLATCH_API_KEY={api_key}",
+# ]
+#
+# 2. Multiple endpoints selected by model name. The `endpoints` table maps
+#    each model name (the last path segment of the agent's model URI, with
+#    any `?query` stripped) to its own endpoint and key. The `{endpoint}`
+#    and `{key}` placeholders in `env` are resolved per-agent based on the
+#    model in its [agent.<name>] section:
+# [acp.potlatch]
+# acp_command = ["potlatch", "harness"]
+# endpoints = [
+#   { model = "model1",       endpoint = "http://prod-model1.example", key = "EMPTY" },
+#   { model = "model2-flash", endpoint = "http://prod-model2.example", key = "EMPTY" },
+# ]
+# env = [
+#   "POTLATCH_BASE_URL={endpoint}",
+#   "POTLATCH_API_KEY={key}",
 # ]
 
 [acp.cursor]

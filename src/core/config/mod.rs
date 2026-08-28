@@ -129,11 +129,17 @@ impl Config {
             .get(client_name)
             .with_context(|| format!("unknown acp_client `{client_name}`"))?;
 
+        let bare_model = section
+            .core
+            .model
+            .as_ref()
+            .map(|uri| uri.bare_model_name().to_string());
+
         Ok(AcpSpawnConfig {
             command: build_profile_command(profile),
             model_uri,
             endpoint_model,
-            env: resolve_profile_env(profile)?,
+            env: resolve_profile_env(profile, bare_model.as_deref())?,
         })
     }
 }
