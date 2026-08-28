@@ -7,12 +7,13 @@ gitlab_repo = "https://gitlab.com/group/project"
 # Optional: only process issues/MRs that include this label (exact name).
 # scope_label = "potlatch"
 
-# Self-hosted / custom ACP client profile (referenced by agent `acp_client`).
+# ACP client profiles are defined under [acp.<vendor>] sections. The `<vendor>`
+# part of the model URI (`acp://<vendor>/<model>`) selects which profile is used.
 #
 # Potlatch harness (built-in, talks directly to OpenAI-compatible endpoints).
 # Two config styles are supported:
 #
-# 1. Single endpoint via base_url / api_key:
+# 1. Single endpoint via top-level fields:
 # [acp.potlatch]
 # base_url = "http://localhost:11434/v1"
 # api_key = "EMPTY"
@@ -23,10 +24,9 @@ gitlab_repo = "https://gitlab.com/group/project"
 # ]
 #
 # 2. Multiple endpoints selected by model name. The `endpoints` table maps
-#    each model name (the last path segment of the agent's model URI, with
-#    any `?query` stripped) to its own endpoint and key. The `{endpoint}`
-#    and `{key}` placeholders in `env` are resolved per-agent based on the
-#    model in its [agent.<name>] section:
+#    each model name (the last path segment of the model URI, with any
+#    `?query` stripped) to its own fields. The `{field}` placeholders in
+#    `env` are resolved from the matching endpoint entry:
 # [acp.potlatch]
 # acp_command = ["potlatch", "harness"]
 # endpoints = [
@@ -43,26 +43,22 @@ acp_command = ["agent", "acp"]
 
 [agent.worker]
 model = "acp://cursor/claude-sonnet-4-5"
-acp_client = "cursor"
 poll_interval = "1m"
 instances = 1
 
 [agent.reviewer]
 model = "acp://cursor/claude-sonnet-4-5"
-acp_client = "cursor"
 poll_interval = "2m"
 instances = 1
 merge_when_approved = true
 
 [agent.pmo]
 model = "acp://cursor/claude-sonnet-4-5"
-acp_client = "cursor"
 poll_interval = "3m"
 instances = 1
 
 [agent.ops]
 model = "acp://cursor/claude-sonnet-4-5"
-acp_client = "cursor"
 # Single-instance only; omit [agent.ops] entirely to disable.
 poll_interval = "10m"
 log_window_interval = "2h"
@@ -79,7 +75,6 @@ logs = [
 # QA agent: runs regression tests and security analysis on branch commits.
 # Only runs when qa.md exists in the repo root. Omit [agent.qa] to disable.
 model = "acp://cursor/claude-sonnet-4-5"
-acp_client = "cursor"
 poll_interval = "5m"
 instances = 1
 branches = ["main"]
@@ -91,4 +86,3 @@ max_results = 8
 # Clerk agent: maintains durable project memory as plain markdown.
 # Requires a model for reorganization and deduplication after each write.
 model = "acp://cursor/claude-sonnet-4-5"
-acp_client = "cursor"

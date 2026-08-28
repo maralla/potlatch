@@ -537,7 +537,6 @@ mod tests {
 
             [agent.worker]
             model = "acp://potlatch/model2-flash?thinking=true"
-            acp_client = "potlatch"
             instances = 1
             "#,
         )
