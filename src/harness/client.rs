@@ -67,25 +67,28 @@ pub trait ChatClient: Send + Sync {
 
 /// Parsed model specification from an `acp://` URL.
 ///
-/// Format: `acp://<vendor>/<model>?thinking=false&param=value`
+/// Format: `acp://<vendor>/<model>?thinking=false&reasoning_effort=high`
 ///
 /// When the model string is a plain name (no `acp://` prefix), it's treated as
 /// the model name with default options. The `thinking` query param controls
-/// whether the backend sends `chat_template_kwargs.enable_thinking`.
+/// whether reasoning is enabled. The `reasoning_effort` query param controls
+/// the effort level (e.g. `low`, `high`, `max`) for models that support it
+/// (currently DeepSeek).
 ///
 /// Examples:
-/// - `"model1-fp8"` → `ModelSpec { model: "model1-fp8", thinking: true }`
-/// - `"acp://zhipu/model1-fp8?thinking=false"` → `ModelSpec { model: "model1-fp8", thinking: false }`
+/// - `"model1-fp8"` → `ModelSpec { model: "model1-fp8", thinking: false, .. }`
+/// - `"acp://zhipu/model1-fp8?thinking=true"` → `ModelSpec { model: "model1-fp8", thinking: true, .. }`
+/// - `"acp://deepseek/deepseek-v4-flash?thinking=true&reasoning_effort=high"`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
     /// The actual model name to send to the API (e.g. `"model1-fp8"`).
     pub model: String,
     /// Whether to enable thinking/reasoning tokens. Defaults to `false`.
-    /// When `false`, the client sends `chat_template_kwargs.enable_thinking = false`
-    /// to suppress reasoning tokens (they dominate decode time without improving
-    /// output quality for coding tasks). Set `thinking=true` via the URL query
-    /// param to enable reasoning for tasks that benefit from it.
     pub thinking: bool,
+    /// Reasoning effort level (e.g. `"low"`, `"high"`, `"max"`). Only
+    /// meaningful when `thinking` is true and the model supports effort
+    /// control (currently DeepSeek). `None` leaves the backend default.
+    pub reasoning_effort: Option<String>,
 }
 
 impl ModelSpec {
@@ -102,7 +105,18 @@ impl ModelSpec {
         // Extract model name: take the last path segment after `/`.
         let model = path.rsplit('/').next().unwrap_or(path).to_string();
         let thinking = parse_query_bool(query, "thinking").unwrap_or(false);
-        ModelSpec { model, thinking }
+        let reasoning_effort = parse_query_str(query, "reasoning_effort");
+        ModelSpec {
+            model,
+            thinking,
+            reasoning_effort,
+        }
+    }
+
+    /// Whether this model uses the DeepSeek thinking-mode API (the model name
+    /// starts with `deepseek`).
+    fn is_deepseek(&self) -> bool {
+        self.model.to_lowercase().starts_with("deepseek")
     }
 }
 
@@ -118,6 +132,20 @@ fn parse_query_bool(query: &str, key: &str) -> Option<bool> {
                 "true" | "1" | "yes" | "on" => Some(true),
                 _ => None,
             };
+        }
+    }
+    None
+}
+
+/// Parse a string query parameter from a query string like `reasoning_effort=high`.
+/// Returns `None` when the parameter is absent or empty.
+fn parse_query_str(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+        {
+            let v = v.trim();
+            return (!v.is_empty()).then(|| v.to_string());
         }
     }
     None
@@ -540,15 +568,24 @@ fn build_chat_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
         // Ask the backend to include token usage in the final SSE chunk.
         "stream_options": {"include_usage": true},
     });
-    if !spec.thinking {
-        // Disable thinking/reasoning tokens. Model1 (and other reasoning
-        // models served via sglang/vLLM) honor this chat-template kwarg to
-        // skip the reasoning phase entirely. This eliminates reasoning_tokens
-        // (typically 100-500 per turn) that dominate decode time without
-        // improving output quality for coding tasks. Harmless on backends
-        // that don't recognize it.
+
+    if spec.is_deepseek() {
+        // DeepSeek uses `{"thinking": {"type": "enabled/disabled"}}` in the
+        // request body (OpenAI extra_body format). When thinking is enabled,
+        // send `reasoning_effort` — defaulting to "max" when unspecified.
+        if !spec.thinking {
+            body["thinking"] = json!({"type": "disabled"});
+        } else {
+            let effort = spec.reasoning_effort.as_deref().unwrap_or("max");
+            body["reasoning_effort"] = json!(effort);
+        }
+    } else if !spec.thinking {
+        // Non-DeepSeek reasoning models (Model1, etc.) served via
+        // sglang/vLLM honor this chat-template kwarg to skip the reasoning
+        // phase entirely. Harmless on backends that don't recognize it.
         body["chat_template_kwargs"] = json!({"enable_thinking": false});
     }
+
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
@@ -836,6 +873,101 @@ mod tests {
         let spec = ModelSpec::parse("");
         assert_eq!(spec.model, "");
         assert!(!spec.thinking);
+    }
+
+    // --- reasoning_effort query param tests ---
+
+    #[test]
+    fn model_spec_parses_reasoning_effort() {
+        let spec = ModelSpec::parse(
+            "acp://deepseek/deepseek-v4-flash?thinking=true&reasoning_effort=high",
+        );
+        assert_eq!(spec.model, "deepseek-v4-flash");
+        assert!(spec.thinking);
+        assert_eq!(spec.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn model_spec_reasoning_effort_defaults_to_none() {
+        let spec = ModelSpec::parse("acp://deepseek/deepseek-v4-flash?thinking=true");
+        assert!(spec.thinking);
+        assert!(spec.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn model_spec_detects_deepseek_model() {
+        assert!(ModelSpec::parse("deepseek-v4-flash").is_deepseek());
+        assert!(ModelSpec::parse("acp://deepseek/deepseek-v4-pro").is_deepseek());
+        assert!(!ModelSpec::parse("model1-fp8").is_deepseek());
+        assert!(!ModelSpec::parse("acp://cursor/gpt-4o").is_deepseek());
+    }
+
+    // --- build_chat_body thinking format tests ---
+
+    #[test]
+    fn build_chat_body_deepseek_disabled_thinking() {
+        let body = build_chat_body(
+            "acp://deepseek/deepseek-v4-flash?thinking=false",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+        );
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(
+            body.get("chat_template_kwargs").is_none(),
+            "deepseek should not use chat_template_kwargs"
+        );
+    }
+
+    #[test]
+    fn build_chat_body_deepseek_enabled_thinking_with_effort() {
+        let body = build_chat_body(
+            "acp://deepseek/deepseek-v4-flash?thinking=true&reasoning_effort=high",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+        );
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert!(
+            body.get("thinking").is_none(),
+            "no explicit thinking toggle when enabled (default)"
+        );
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_deepseek_enabled_thinking_without_effort() {
+        let body = build_chat_body(
+            "acp://deepseek/deepseek-v4-flash?thinking=true",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+        );
+        assert_eq!(body["reasoning_effort"], json!("max"));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_non_deepseek_disabled_thinking() {
+        let body = build_chat_body(
+            "acp://zhipu/model1-fp8?thinking=false",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+        );
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"enable_thinking": false})
+        );
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_non_deepseek_enabled_thinking() {
+        let body = build_chat_body(
+            "acp://zhipu/model1-fp8?thinking=true",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+        );
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("thinking").is_none());
     }
 
     // --- is_transient_llm_error classifier tests ---
