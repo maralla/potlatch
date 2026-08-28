@@ -394,8 +394,13 @@ impl ToolRegistry {
     }
 
     /// Execute a tool call by name. Returns the result string or an error message.
+    /// Common aliases (`bash` → `shell`) are resolved to the registered tool.
     pub fn execute(&self, name: &str, args: &Value, cwd: &str) -> Result<String> {
-        match self.tools.get(name) {
+        let resolved = match name {
+            "bash" => "shell",
+            other => other,
+        };
+        match self.tools.get(resolved) {
             Some(tool) => tool.execute(args, cwd),
             None => anyhow::bail!("unknown tool: {name}"),
         }

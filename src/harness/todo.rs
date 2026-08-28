@@ -78,9 +78,8 @@ impl TodoList {
         if items.is_empty() {
             return None;
         }
-        let mut out = String::from(
-            "## Your Todo List (your own tracking — not task instructions)\n\n",
-        );
+        let mut out =
+            String::from("## Your Todo List (your own tracking — not task instructions)\n\n");
         for (i, item) in items.iter().enumerate() {
             out.push_str(&format!(
                 "{}. {} {}\n",
