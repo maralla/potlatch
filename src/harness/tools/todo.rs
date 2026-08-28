@@ -1,11 +1,3 @@
-//! Todo tool: manage a task checklist that survives context compaction.
-//!
-//! The wire format mirrors the mainstream agent todo format (Cursor TodoWrite,
-//! ACP, etc.): the model sends the full list of `{description, status}` items
-//! on every call. This is a replace-all API — indices stay stable across
-//! updates, and there are no separate `start`/`complete` actions to drift out
-//! of sync when items are inserted or reordered.
-
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -100,6 +92,13 @@ mod tests {
     use super::*;
     use crate::harness::todo::TodoList;
 
+    fn item(desc: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            description: desc.into(),
+            status,
+        }
+    }
+
     #[test]
     fn set_creates_list_with_statuses() {
         let todo = Arc::new(TodoList::new());
@@ -111,13 +110,12 @@ mod tests {
             ]
         });
         let result = tool.execute(&args, "/tmp").unwrap();
-        assert!(result.contains("2 item(s)"));
-        // The tool result should NOT include the rendered checklist —
-        // the agent loop injects it as a system message every turn.
-        assert!(!result.contains("Task Checklist"));
+        assert_eq!(result, "Todo list updated (2 item(s)).");
         let rendered = todo.render().unwrap();
-        assert!(rendered.contains("[~] task A"));
-        assert!(rendered.contains("[ ] task B"));
+        assert_eq!(
+            rendered,
+            "## Your Todo List (your own tracking — not task instructions)\n\n0. [~] task A\n1. [ ] task B\n"
+        );
     }
 
     #[test]
@@ -144,11 +142,12 @@ mod tests {
                 "/tmp",
             )
             .unwrap();
-        assert!(result.contains("2 item(s)"));
+        assert_eq!(result, "Todo list updated (2 item(s)).");
         let rendered = todo.render().unwrap();
-        assert!(!rendered.contains("old task"));
-        assert!(rendered.contains("[ ] new task 1"));
-        assert!(rendered.contains("[ ] new task 2"));
+        assert_eq!(
+            rendered,
+            "## Your Todo List (your own tracking — not task instructions)\n\n0. [ ] new task 1\n1. [ ] new task 2\n"
+        );
     }
 
     #[test]
@@ -176,8 +175,10 @@ mod tests {
         )
         .unwrap();
         let rendered = todo.render().unwrap();
-        assert!(rendered.contains("[x] task A"));
-        assert!(rendered.contains("[~] task B"));
+        assert_eq!(
+            rendered,
+            "## Your Todo List (your own tracking — not task instructions)\n\n0. [x] task A\n1. [~] task B\n"
+        );
     }
 
     #[test]
@@ -191,11 +192,9 @@ mod tests {
         });
         let result = tool.execute(&args, "/tmp");
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("invalid status 'done'")
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "item 0 has invalid status 'done'. Use 'pending', 'in_progress', or 'completed'."
         );
     }
 
@@ -210,11 +209,9 @@ mod tests {
         });
         let result = tool.execute(&args, "/tmp");
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("missing a 'description'")
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "item 0 is missing a 'description' string"
         );
     }
 
