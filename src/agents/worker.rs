@@ -2730,20 +2730,19 @@ INSTRUCTIONS:
 2. The task context is already included above. Review the "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context" sections. Do NOT use read on the task context — it's already in your prompt.
 3. Use inline comment locations (`path:line` or `path:start-end`) from the comments to find the corresponding code and make targeted fixes. Grep for the relevant symbol, read only the surrounding lines, then edit.
 4. First, check for merge conflicts using the **Merge conflict status** section and your workspace. If any exist, resolve ALL conflicts in every file, commit the resolution, and verify the target branch merges cleanly before claiming completion.
-5. Review the original issue and what was implemented
-6. Review ALL comments to understand the full conversation and context, including simple comments that do not require resolution.
-7. Identify which feedback items still need action. Treat comments in "Unresolved MR comments to address" as actionable threaded feedback. Also consider comments in "Plain MR comments to consider" actionable when they ask for changes, but remember they are plain MR comments and cannot be marked resolved. Use the full comment history only for context, clarification, and avoiding stale assumptions.
-8. Make the necessary code changes to address all unresolved threaded feedback and any actionable plain MR comments
-9. If the reviewer asked you to delete, rename, or move files, make those file changes.
-10. Ensure changes align with both the original requirements and reviewer feedback
-11. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
+5. Focus on the **content** of each comment. Comments are always made by a reviewer (a user) — do not investigate who the author is, cross-reference their git history, or research their past commits or other MRs. The comment text is the instruction; act on it directly.
+6. Identify which feedback items still need action. Treat comments in "Unresolved MR comments to address" as actionable threaded feedback. Also consider comments in "Plain MR comments to consider" actionable when they ask for changes, but remember they are plain MR comments and cannot be marked resolved.
+7. Make the necessary code changes to address all unresolved threaded feedback and any actionable plain MR comments.
+8. If the reviewer asked you to delete, rename, or move files, make those file changes.
+9. Ensure changes align with both the original requirements and reviewer feedback.
+10. If the reviewer says code changes are too large (above ~1500 lines total or ~500 non-test lines), you have TWO options:
    a) Adjust your implementation to reduce changed lines — simplify, remove unnecessary changes, trim scope
    b) If you cannot reasonably reduce the size, report that the feedback cannot be resolved autonomously
    Do NOT try to split the issue yourself — that is handled by the PMO agent, not you.
-12. If the feedback cannot be resolved without additional human input (for example ambiguous requirements, out-of-scope requests, or missing information), report that clearly and identify the needed input.
-13. Keep the MR title stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
-14. Report only changes and metadata updates actually completed in this run; never imply a concern was fixed when the final branch does not fix it.
-15. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR metadata or issue comments.
+11. If the feedback cannot be resolved without additional human input (for example ambiguous requirements, out-of-scope requests, or missing information), report that clearly and identify the needed input.
+12. Keep the MR title stable unless the reviewer explicitly asks for a title fix or the current title is clearly wrong for the whole MR.
+13. Report only changes and metadata updates actually completed in this run; never imply a concern was fixed when the final branch does not fix it.
+14. Before you finish, edit repo-root notes.md only if you can add lines that pass the **NOTES.MD** rules in your main worker instructions (same as implementation runs): **no** backticks, **no** file paths, **no** repo-specific symbol names, **no** code tours — and **no** bullets that merely **summarize what you did** this run in "timeless" wording (that still belongs in the MR, not notes). **No** lines about how to write notes or what notes are for. If nothing meets that bar, leave notes.md unchanged. Never copy notes.md into MR metadata or issue comments.
 "#,
         &state.project_name,
         latest_mr.iid,
