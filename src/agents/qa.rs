@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -18,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::agents::git::GitRepo;
-use crate::agents::gitlab::{self, GitLabClient};
-use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
+use crate::agents::hosting::{self, CodeHostingClient};
+use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 #[cfg(test)]
 use crate::core::agent::StructuredOutput;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
@@ -243,25 +244,25 @@ impl QaAgentSettings {
 // Agent state
 // ---------------------------------------------------------------------------
 
-/// A borrowing view over the [`GitLabAgentRuntime`] fields the QA cycle
-/// needs. Built fresh from `&GitLabAgentRuntime` at each use site rather
-/// than stored, so QA never owns a second `GitRepo`/`GitLabClient` — and,
+/// A borrowing view over the [`AgentWorkspace`] fields the QA cycle
+/// needs. Built fresh from `&AgentWorkspace` at each use site rather
+/// than stored, so QA never owns a second `GitRepo`/hosting client — and,
 /// since it is never stored alongside the runtime it borrows from, it
 /// can't become self-referential.
 struct AgentState<'a> {
     agent_id: &'a str,
     sessions_dir: &'a str,
     git_repo: &'a GitRepo,
-    glab: &'a GitLabClient,
+    hosting: &'a Arc<dyn CodeHostingClient>,
 }
 
 impl AgentState<'_> {
-    fn from_runtime(runtime: &GitLabAgentRuntime) -> AgentState<'_> {
+    fn from_runtime(runtime: &AgentWorkspace) -> AgentState<'_> {
         AgentState {
             agent_id: &runtime.agent_id,
             sessions_dir: &runtime.sessions_dir,
             git_repo: &runtime.git_repo,
-            glab: &runtime.gitlab,
+            hosting: &runtime.hosting,
         }
     }
 
@@ -292,7 +293,7 @@ impl AgentState<'_> {
 }
 
 pub(crate) struct QaAgent {
-    runtime: GitLabAgentRuntime,
+    runtime: AgentWorkspace,
     config: QaConfig,
 }
 
@@ -338,7 +339,7 @@ impl CoreAgent for QaAgent {
     }
 
     fn banner(config: &Config, banner: &mut Banner) {
-        gitlab_banner(config, banner);
+        repo_banner(config, banner);
     }
 
     fn parse_settings(
@@ -353,7 +354,7 @@ impl CoreAgent for QaAgent {
         _section: &crate::core::config::AgentSection,
         settings: &Self::Settings,
     ) -> Result<()> {
-        super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        super::settings::AgentSettings::from_config(config)?.require_repo_url()?;
         anyhow::ensure!(
             settings.poll_interval_secs.is_none(),
             "poll_interval_secs was replaced by poll_interval for [agent.qa]"
@@ -380,7 +381,7 @@ impl CoreAgent for QaAgent {
     }
 
     fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
-        let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
+        let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let agent_settings = ctx.settings;
         let config = QaConfig {
             poll_interval: agent_settings.poll_interval,
@@ -404,8 +405,8 @@ struct IssueObservation {
     labels: Vec<String>,
 }
 
-impl From<&gitlab::Issue> for IssueObservation {
-    fn from(issue: &gitlab::Issue) -> Self {
+impl From<&hosting::Issue> for IssueObservation {
+    fn from(issue: &hosting::Issue) -> Self {
         Self {
             iid: issue.iid,
             title: issue.title.clone(),
@@ -421,8 +422,8 @@ struct CommentObservation {
     body: String,
 }
 
-impl From<&gitlab::Comment> for CommentObservation {
-    fn from(comment: &gitlab::Comment) -> Self {
+impl From<&hosting::Comment> for CommentObservation {
+    fn from(comment: &hosting::Comment) -> Self {
         Self {
             author: comment.author.clone(),
             body: comment.body.clone(),
@@ -570,7 +571,7 @@ fn run_qa_cycle(
         let Ok(iid) = port.create_issue(&finding.title, &description) else {
             continue;
         };
-        let _ = port.add_issue_label(iid, &gitlab::priority_label(finding.severity.priority()));
+        let _ = port.add_issue_label(iid, &hosting::priority_label(finding.severity.priority()));
         let _ = port.add_issue_label(iid, QA_LABEL);
         if let Some(label) = scope_label {
             let _ = port.add_issue_label(iid, label);
@@ -617,7 +618,7 @@ impl QaPort for LiveQaPort<'_> {
     fn open_issues(&self) -> Result<Vec<IssueObservation>> {
         Ok(self
             .state
-            .glab
+            .hosting
             .list_issues()?
             .iter()
             .map(IssueObservation::from)
@@ -625,7 +626,7 @@ impl QaPort for LiveQaPort<'_> {
     }
 
     fn issue_comments(&self, issue_iid: u64) -> Option<Vec<CommentObservation>> {
-        match self.state.glab.get_issue_comments(issue_iid) {
+        match self.state.hosting.get_issue_comments(issue_iid) {
             Ok(comments) => Some(comments.iter().map(CommentObservation::from).collect()),
             Err(error) => {
                 warn!("Failed to fetch comments for issue #{issue_iid}: {error}");
@@ -666,15 +667,15 @@ impl QaPort for LiveQaPort<'_> {
     }
 
     fn close_answered_clarification(&mut self, issue_iid: u64) -> Result<()> {
-        self.state.glab.close_issue(issue_iid)
+        self.state.hosting.close_issue(issue_iid)
     }
 
     fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
-        self.state.glab.create_issue(title, description)
+        self.state.hosting.create_issue(title, description)
     }
 
     fn add_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()> {
-        self.state.glab.add_issue_label(issue_iid, label)
+        self.state.hosting.add_issue_label(issue_iid, label)
     }
 
     fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
@@ -1007,6 +1008,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+    use crate::agents::hosting::gitlab::GitLabClient;
     use crate::core::agent::schema::conformance;
 
     struct FakeQaPort {
@@ -1649,12 +1651,12 @@ mod tests {
     // exercises the real `AgentState` methods without touching git or GitLab.
 
     /// Owns the resources a test [`AgentState`] borrows from, standing in
-    /// for the [`GitLabAgentRuntime`] fields QA's cycle needs.
+    /// for the [`AgentWorkspace`] fields QA's cycle needs.
     struct TestRuntime {
         agent_id: String,
         sessions_dir: String,
         git_repo: GitRepo,
-        glab: GitLabClient,
+        hosting: Arc<dyn CodeHostingClient>,
     }
 
     fn test_runtime(sessions_dir: &str, agent_id: &str) -> TestRuntime {
@@ -1665,7 +1667,7 @@ mod tests {
                 std::env::temp_dir().to_string_lossy().into_owned(),
                 Arc::new(AtomicBool::new(false)),
             ),
-            glab: GitLabClient::for_test("/tmp/unused-repo"),
+            hosting: Arc::new(GitLabClient::for_test("/tmp/unused-repo")),
         }
     }
 
@@ -1674,7 +1676,7 @@ mod tests {
             agent_id: &rt.agent_id,
             sessions_dir: &rt.sessions_dir,
             git_repo: &rt.git_repo,
-            glab: &rt.glab,
+            hosting: &rt.hosting,
         }
     }
 

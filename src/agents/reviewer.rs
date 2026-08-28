@@ -9,8 +9,8 @@ use tracing::{debug, error, info, warn};
 use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::{claim, mr_in_scope, write_task_context_file};
 use crate::agents::git::GitRepo;
-use crate::agents::gitlab::{self, GitLabClient, Issue, MergeRequest};
-use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
+use crate::agents::hosting::{self, CodeHostingClient, Issue, MergeRequest};
+use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::schema::tagged;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
@@ -163,7 +163,7 @@ fn default_merge_when_approved() -> bool {
 }
 
 pub(crate) struct ReviewerAgent {
-    runtime: GitLabAgentRuntime,
+    runtime: AgentWorkspace,
     config: ReviewerConfig,
     merged_mrs: HashSet<u64>,
     claimed_mr: Option<ClaimLease>,
@@ -181,7 +181,7 @@ impl CoreAgent for ReviewerAgent {
     }
 
     fn banner(config: &Config, banner: &mut Banner) {
-        gitlab_banner(config, banner);
+        repo_banner(config, banner);
     }
 
     fn validate_settings(
@@ -217,7 +217,7 @@ impl CoreAgent for ReviewerAgent {
                     &self.runtime.sessions_dir,
                     &self.config,
                     &self.runtime.git_repo,
-                    &self.runtime.gitlab,
+                    &self.runtime.hosting,
                     model,
                     &mut self.merged_mrs,
                     &mut self.claimed_mr,
@@ -230,14 +230,14 @@ impl CoreAgent for ReviewerAgent {
     }
 
     fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
-        let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
+        let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let settings = ctx.settings;
         let config = ReviewerConfig {
             poll_interval: settings.poll_interval,
             merge_when_approved: settings.merge_when_approved,
         };
         let scope = crate::agents::scope_label_filter(&runtime.scope_label);
-        let claimed_mr = find_claimed_mr(&runtime.agent_id, &runtime.gitlab, scope);
+        let claimed_mr = find_claimed_mr(&runtime.agent_id, &runtime.hosting, scope);
         Ok(Self {
             runtime,
             config,
@@ -431,12 +431,12 @@ fn sort_review_candidates(candidates: &mut [MrObservation], priorities: &[(u64, 
         if aa != bb {
             return bb.cmp(&aa);
         }
-        let pa = gitlab::issue_iid_from_branch(&a.source_branch)
+        let pa = hosting::issue_iid_from_branch(&a.source_branch)
             .and_then(|iid| priority_map.get(&iid).copied())
-            .unwrap_or(gitlab::DEFAULT_PRIORITY);
-        let pb = gitlab::issue_iid_from_branch(&b.source_branch)
+            .unwrap_or(hosting::DEFAULT_PRIORITY);
+        let pb = hosting::issue_iid_from_branch(&b.source_branch)
             .and_then(|iid| priority_map.get(&iid).copied())
-            .unwrap_or(gitlab::DEFAULT_PRIORITY);
+            .unwrap_or(hosting::DEFAULT_PRIORITY);
         pa.cmp(&pb).then_with(|| a.iid.cmp(&b.iid))
     });
 }
@@ -449,7 +449,7 @@ fn linked_issue_iid(mr: &MrObservation) -> Option<u64> {
         r.captures(&mr.description)
             .and_then(|c| c.get(1)?.as_str().parse().ok())
     })
-    .or_else(|| gitlab::issue_iid_from_branch(&mr.source_branch))
+    .or_else(|| hosting::issue_iid_from_branch(&mr.source_branch))
 }
 
 /// Whether the MR can be reviewed at all, or must be handed straight back
@@ -767,7 +767,7 @@ struct LiveReviewerPort<'a> {
     project_name: &'a str,
     sessions_dir: &'a str,
     git_repo: &'a GitRepo,
-    gitlab: &'a GitLabClient,
+    hosting: &'a Arc<dyn CodeHostingClient>,
     model: &'a AgentModel,
     claimed_mr: &'a mut Option<ClaimLease>,
     shutdown: &'a AtomicBool,
@@ -792,7 +792,7 @@ impl ReviewerPort for LiveReviewerPort<'_> {
     }
     fn recover_claim(&mut self) {
         if self.claimed_mr.is_none() {
-            *self.claimed_mr = find_claimed_mr(self.agent_id, self.gitlab, self.scope_label);
+            *self.claimed_mr = find_claimed_mr(self.agent_id, self.hosting, self.scope_label);
         }
     }
     fn try_release_held_claim(&mut self) -> Result<()> {
@@ -804,26 +804,26 @@ impl ReviewerPort for LiveReviewerPort<'_> {
             "{}: Releasing held claim on MR !{} from previous cycle",
             self.agent_id, iid
         );
-        lease.try_release(self.gitlab)?;
+        lease.try_release(self.hosting.as_ref())?;
         *self.claimed_mr = None;
         Ok(())
     }
     fn release_held_claim(&mut self) {
-        release_claimed_mr(self.claimed_mr, self.gitlab, self.agent_id);
+        release_claimed_mr(self.claimed_mr, self.hosting, self.agent_id);
     }
     fn release_stale_claim_label(&mut self, mr_iid: u64) {
-        release_mr_claim_or_warn(self.gitlab, mr_iid, self.agent_id);
+        release_mr_claim_or_warn(self.hosting, mr_iid, self.agent_id);
     }
     fn merge_requests(&self) -> Result<Vec<MrObservation>> {
         Ok(self
-            .gitlab
+            .hosting
             .list_merge_requests()?
             .iter()
             .map(MrObservation::from_merge_request)
             .collect())
     }
     fn issue_priorities(&self) -> Vec<(u64, u8)> {
-        self.gitlab
+        self.hosting
             .list_issues()
             .unwrap_or_default()
             .iter()
@@ -832,7 +832,7 @@ impl ReviewerPort for LiveReviewerPort<'_> {
     }
     fn unresolved_discussions(&self, mr_iid: u64) -> Result<DiscussionCounts> {
         let (unresolved, total) = self
-            .gitlab
+            .hosting
             .get_unresolved_discussion_count(mr_iid)
             .map_err(|error| {
                 error.context(format!("Failed to fetch discussions for MR !{mr_iid}"))
@@ -847,7 +847,7 @@ impl ReviewerPort for LiveReviewerPort<'_> {
     }
     fn acquire_claim(&mut self, mr_iid: u64) -> Result<ClaimAttempt> {
         match claim::acquire(
-            self.gitlab,
+            self.hosting.as_ref(),
             ClaimResource::MergeRequest(mr_iid),
             self.agent_id,
             self.shutdown,
@@ -879,7 +879,7 @@ impl ReviewerPort for LiveReviewerPort<'_> {
     fn invoke_review_model(&mut self, subject: &ReviewSubject) -> Result<ReviewerOutput> {
         let prompt = build_review_prompt(ReviewPromptInput {
             project_name: self.project_name,
-            gitlab: self.gitlab,
+            hosting: self.hosting.as_ref(),
             mr: &subject.mr,
             diff_stat: &subject.diff_stat,
             changed_files: &subject.changed_files,
@@ -947,20 +947,20 @@ Inspect the actual code changes in the repository (the source branch is checked 
             .description)
     }
     fn post_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
-        self.gitlab.add_mr_discussion(mr_iid, body)
+        self.hosting.add_mr_discussion(mr_iid, body)
     }
     fn post_resolved_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
-        self.gitlab.add_resolved_mr_discussion(mr_iid, body)
+        self.hosting.add_resolved_mr_discussion(mr_iid, body)
     }
     fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
-        self.gitlab.create_issue(title, description)
+        self.hosting.create_issue(title, description)
     }
     fn add_approved_label(&mut self, mr_iid: u64) -> Result<()> {
-        self.gitlab
+        self.hosting
             .add_mr_label_with_retries(mr_iid, REVIEWER_APPROVED_LABEL)
     }
     fn merge_merge_request(&mut self, mr_iid: u64) -> Result<()> {
-        self.gitlab.merge_mr(mr_iid)
+        self.hosting.merge_mr(mr_iid)
     }
 }
 
@@ -972,7 +972,7 @@ fn reviewer_cycle(
     sessions_dir: &str,
     config: &ReviewerConfig,
     git_repo: &GitRepo,
-    gitlab: &GitLabClient,
+    hosting: &Arc<dyn CodeHostingClient>,
     model: &AgentModel,
     merged_mrs: &mut HashSet<u64>,
     claimed_mr: &mut Option<ClaimLease>,
@@ -984,7 +984,7 @@ fn reviewer_cycle(
         project_name,
         sessions_dir,
         git_repo,
-        gitlab,
+        hosting,
         model,
         claimed_mr,
         shutdown,
@@ -998,8 +998,12 @@ fn reviewer_cycle(
     Ok(())
 }
 
-fn release_mr_claim_or_warn(gitlab: &GitLabClient, mr_iid: u64, agent_id: &str) {
-    if let Err(e) = claim::release(gitlab, ClaimResource::MergeRequest(mr_iid), agent_id) {
+fn release_mr_claim_or_warn(hosting: &Arc<dyn CodeHostingClient>, mr_iid: u64, agent_id: &str) {
+    if let Err(e) = claim::release(
+        hosting.as_ref(),
+        ClaimResource::MergeRequest(mr_iid),
+        agent_id,
+    ) {
         warn!(
             "{}: Failed to release claim on MR !{}: {}",
             agent_id, mr_iid, e
@@ -1009,12 +1013,16 @@ fn release_mr_claim_or_warn(gitlab: &GitLabClient, mr_iid: u64, agent_id: &str) 
 
 /// Release the currently-held `claimed_mr` lease (if any). A failed removal
 /// keeps the lease in memory so the next cycle can retry it.
-fn release_claimed_mr(claimed_mr: &mut Option<ClaimLease>, gitlab: &GitLabClient, agent_id: &str) {
+fn release_claimed_mr(
+    claimed_mr: &mut Option<ClaimLease>,
+    hosting: &Arc<dyn CodeHostingClient>,
+    agent_id: &str,
+) {
     let Some(lease) = claimed_mr.as_mut() else {
         return;
     };
     let mr_iid = lease.resource().iid();
-    if let Err(e) = lease.try_release(gitlab) {
+    if let Err(e) = lease.try_release(hosting.as_ref()) {
         warn!(
             "{}: Failed to release claim on MR !{}: {}",
             agent_id, mr_iid, e
@@ -1049,7 +1057,7 @@ fn plan_approval(has_unresolved: bool, merge_when_approved: bool) -> ApprovalPla
 
 struct ReviewPromptInput<'a> {
     project_name: &'a str,
-    gitlab: &'a GitLabClient,
+    hosting: &'a dyn CodeHostingClient,
     mr: &'a MrObservation,
     diff_stat: &'a str,
     changed_files: &'a [String],
@@ -1060,7 +1068,7 @@ struct ReviewPromptInput<'a> {
 
 fn build_review_prompt(input: ReviewPromptInput<'_>) -> Result<String> {
     let comments = input
-        .gitlab
+        .hosting
         .get_mr_comments(input.mr.iid)
         .unwrap_or_default();
 
@@ -1087,7 +1095,7 @@ fn build_review_prompt(input: ReviewPromptInput<'_>) -> Result<String> {
     };
 
     let issue_context = if let Some(iid) = input.issue_iid {
-        build_issue_context(input.gitlab, iid)
+        build_issue_context(input.hosting, iid)
     } else {
         String::new()
     };
@@ -1203,10 +1211,10 @@ FILE HYGIENE (STRICT — reject if violated):
     Ok(prompt)
 }
 
-fn build_issue_context(gitlab: &GitLabClient, issue_iid: u64) -> String {
+fn build_issue_context(hosting: &dyn CodeHostingClient, issue_iid: u64) -> String {
     let mut ctx = String::new();
 
-    match gitlab.get_issue(issue_iid) {
+    match hosting.get_issue(issue_iid) {
         Ok(issue) => {
             ctx.push_str(&format_issue_context_header(issue_iid, &issue));
         }
@@ -1216,7 +1224,7 @@ fn build_issue_context(gitlab: &GitLabClient, issue_iid: u64) -> String {
         }
     }
 
-    match gitlab.get_issue_comments(issue_iid) {
+    match hosting.get_issue_comments(issue_iid) {
         Ok(comments) if !comments.is_empty() => {
             ctx.push_str("\nISSUE COMMENTS (read as possible updates to requirements):\n");
             for c in &comments {
@@ -1367,10 +1375,10 @@ fn mr_labels_has(labels: Option<&[String]>, label: &str) -> bool {
 /// this scan finds the label live on GitLab, per [`ClaimLease::recover`].
 fn find_claimed_mr(
     agent_id: &str,
-    gitlab: &GitLabClient,
+    hosting: &Arc<dyn CodeHostingClient>,
     scope_label: Option<&str>,
 ) -> Option<ClaimLease> {
-    match gitlab.list_merge_requests() {
+    match hosting.list_merge_requests() {
         Ok(mrs) => {
             for mr in &mrs {
                 if mr.state != "opened" || !mr_in_scope(mr, scope_label) {

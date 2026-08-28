@@ -51,7 +51,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::agents::gitlab::GitLabClient;
+use crate::agents::hosting::gitlab::GitLabClient;
+use crate::agents::hosting::{CodeHostingClient, order_active_claim_labels};
 use crate::util::sleep;
 
 /// Settle time in seconds. After adding a claim label, we wait this long
@@ -143,8 +144,33 @@ impl ClaimPort for GitLabClient {
             ClaimResource::Issue(iid) => self.get_issue_label_events(iid)?,
             ClaimResource::MergeRequest(iid) => self.get_mr_label_events(iid)?,
         };
-        crate::agents::gitlab::order_active_claim_labels(&events, active_claim_labels)
+        order_active_claim_labels(&events, active_claim_labels)
             .with_context(|| format!("could not order active claims on {resource}"))
+    }
+}
+
+impl ClaimPort for dyn CodeHostingClient {
+    fn add_label(&self, resource: ClaimResource, label: &str) -> Result<()> {
+        match resource {
+            ClaimResource::Issue(iid) => self.add_issue_label(iid, label),
+            ClaimResource::MergeRequest(iid) => self.add_mr_label_with_retries(iid, label),
+        }
+    }
+
+    fn remove_label(&self, resource: ClaimResource, label: &str) -> Result<()> {
+        match resource {
+            ClaimResource::Issue(iid) => self.remove_issue_label(iid, label),
+            ClaimResource::MergeRequest(iid) => self.remove_mr_label(iid, label),
+        }
+    }
+
+    fn labels(&self, resource: ClaimResource) -> Result<Vec<String>> {
+        match resource {
+            ClaimResource::Issue(iid) => Ok(self.get_issue(iid)?.labels),
+            ClaimResource::MergeRequest(iid) => {
+                Ok(self.get_merge_request(iid)?.labels.unwrap_or_default())
+            }
+        }
     }
 }
 
@@ -197,7 +223,7 @@ impl ClaimLease {
     /// same lease rather than losing track of held ownership. On success
     /// the lease is marked settled; on failure it is left unsettled, still
     /// owned by the caller.
-    pub(crate) fn try_release(&mut self, port: &dyn ClaimPort) -> Result<()> {
+    pub(crate) fn try_release<T: ClaimPort + ?Sized>(&mut self, port: &T) -> Result<()> {
         debug!("{}: Releasing claim on {}", self.agent_id, self.resource);
         remove_claim_label(port, self.resource, &self.label)?;
         self.settled = true;
@@ -240,8 +266,8 @@ pub(crate) enum ClaimAcquireOutcome {
 
 /// Attempt to atomically claim `resource` using the claim-and-verify
 /// protocol with double-check (see module docs).
-pub(crate) fn acquire(
-    port: &dyn ClaimPort,
+pub(crate) fn acquire<T: ClaimPort + ?Sized>(
+    port: &T,
     resource: ClaimResource,
     agent_id: &str,
     shutdown: &AtomicBool,
@@ -251,8 +277,8 @@ pub(crate) fn acquire(
 
 /// Core of [`acquire`], parameterized over the shutdown-aware settle wait so
 /// it can be exercised deterministically in tests without a real sleep.
-fn acquire_with(
-    port: &dyn ClaimPort,
+fn acquire_with<T: ClaimPort + ?Sized>(
+    port: &T,
     resource: ClaimResource,
     agent_id: &str,
     shutdown: &AtomicBool,
@@ -297,8 +323,8 @@ fn acquire_with(
     outcome
 }
 
-fn settle_and_check(
-    port: &dyn ClaimPort,
+fn settle_and_check<T: ClaimPort + ?Sized>(
+    port: &T,
     resource: ClaimResource,
     agent_id: &str,
     label: &str,
@@ -367,13 +393,21 @@ fn fallback_claim_order(active_claim_labels: &[String]) -> Vec<String> {
 /// [`ClaimLease`] — for call sites that only ever tracked a resource's IID
 /// across cycles (GitLab's label is the single source of truth for those),
 /// never an in-memory lease value.
-pub(crate) fn release(port: &dyn ClaimPort, resource: ClaimResource, agent_id: &str) -> Result<()> {
+pub(crate) fn release<T: ClaimPort + ?Sized>(
+    port: &T,
+    resource: ClaimResource,
+    agent_id: &str,
+) -> Result<()> {
     let label = claim_label(agent_id);
     debug!("{agent_id}: Releasing claim on {resource}");
     remove_claim_label(port, resource, &label)
 }
 
-fn remove_claim_label(port: &dyn ClaimPort, resource: ClaimResource, label: &str) -> Result<()> {
+fn remove_claim_label<T: ClaimPort + ?Sized>(
+    port: &T,
+    resource: ClaimResource,
+    label: &str,
+) -> Result<()> {
     match port.remove_label(resource, label) {
         Ok(()) => Ok(()),
         Err(remove_error) => {
