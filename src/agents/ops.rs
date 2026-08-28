@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use crate::agents::gitlab::{self, GitLabClient};
+use crate::agents::hosting::{self, CodeHostingClient};
 use crate::agents::ssh_util::{shell_single_quote, validate_remote_path, validate_ssh_identity};
-use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
+use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::agents::write_task_context_file;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
@@ -290,8 +290,8 @@ impl OpsSshLogSourceSettings {
     }
 }
 
-/// A borrowing view over the [`GitLabAgentRuntime`] fields ops's path
-/// helpers need. Built fresh from `&GitLabAgentRuntime` at each use site
+/// A borrowing view over the [`AgentWorkspace`] fields ops's path
+/// helpers need. Built fresh from `&AgentWorkspace` at each use site
 /// rather than stored — ops never owns a second copy of `sessions_dir`
 /// or `agent_id`, and this is never stored alongside the runtime it
 /// borrows from, so it can't become self-referential.
@@ -301,7 +301,7 @@ struct AgentState<'a> {
 }
 
 impl AgentState<'_> {
-    fn from_runtime(runtime: &GitLabAgentRuntime) -> AgentState<'_> {
+    fn from_runtime(runtime: &AgentWorkspace) -> AgentState<'_> {
         AgentState {
             sessions_dir: &runtime.sessions_dir,
             agent_id: &runtime.agent_id,
@@ -345,7 +345,7 @@ struct OpsIssueProposal {
 }
 
 pub(crate) struct OpsAgent {
-    runtime: GitLabAgentRuntime,
+    runtime: AgentWorkspace,
     config: OpsConfig,
 }
 
@@ -362,7 +362,7 @@ impl CoreAgent for OpsAgent {
     }
 
     fn banner(config: &Config, banner: &mut Banner) {
-        gitlab_banner(config, banner);
+        repo_banner(config, banner);
     }
 
     fn parse_settings(
@@ -377,7 +377,7 @@ impl CoreAgent for OpsAgent {
         _section: &crate::core::config::AgentSection,
         _settings: &Self::Settings,
     ) -> Result<()> {
-        super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        super::settings::AgentSettings::from_config(config)?.require_repo_url()?;
         Ok(())
     }
 
@@ -398,7 +398,7 @@ impl CoreAgent for OpsAgent {
                 ops_cycle(
                     &state,
                     &self.config,
-                    &self.runtime.gitlab,
+                    self.runtime.hosting.as_ref(),
                     model,
                     Arc::clone(&shutdown),
                     scope,
@@ -409,7 +409,7 @@ impl CoreAgent for OpsAgent {
     }
 
     fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
-        let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
+        let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         AgentState::from_runtime(&runtime).ensure_sessions_dir()?;
         let agent_settings = ctx.settings;
         let config = OpsConfig {
@@ -653,7 +653,7 @@ fn run_ops_cycle(
 /// ops decision meets ssh, the filesystem, GitLab, or the model.
 struct LiveOpsPort<'a> {
     state: &'a AgentState<'a>,
-    gitlab: &'a GitLabClient,
+    hosting: &'a dyn CodeHostingClient,
     model: &'a AgentModel,
     shutdown: &'a AtomicBool,
     scope_label: Option<&'a str>,
@@ -695,7 +695,7 @@ impl OpsPort for LiveOpsPort<'_> {
     }
 
     fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String> {
-        write_gitlab_context_file(self.state, self.gitlab, unix_ts)
+        write_gitlab_context_file(self.state, self.hosting, unix_ts)
     }
 
     fn write_scrape_file(&mut self, unix_ts: u64, window_log: &str) -> Result<()> {
@@ -743,17 +743,17 @@ impl OpsPort for LiveOpsPort<'_> {
     }
 
     fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
-        self.gitlab.create_issue(title, description)
+        self.hosting.create_issue(title, description)
     }
 
     fn add_priority_label(&mut self, issue_iid: u64, priority: u8) -> Result<()> {
-        self.gitlab
-            .add_issue_label(issue_iid, &gitlab::priority_label(priority))
+        self.hosting
+            .add_issue_label(issue_iid, &hosting::priority_label(priority))
     }
 
     fn add_scope_label(&mut self, issue_iid: u64) -> Result<()> {
         match self.scope_label {
-            Some(label) => self.gitlab.add_issue_label(issue_iid, label),
+            Some(label) => self.hosting.add_issue_label(issue_iid, label),
             None => Ok(()),
         }
     }
@@ -766,14 +766,14 @@ impl OpsPort for LiveOpsPort<'_> {
 fn ops_cycle(
     state: &AgentState,
     config: &OpsConfig,
-    gitlab: &GitLabClient,
+    hosting: &dyn CodeHostingClient,
     model: &AgentModel,
     shutdown: Arc<AtomicBool>,
     scope_label: Option<&str>,
 ) -> Result<()> {
     let mut port = LiveOpsPort {
         state,
-        gitlab,
+        hosting,
         model,
         shutdown: shutdown.as_ref(),
         scope_label,
@@ -847,10 +847,10 @@ fn ensure_history_file(state: &AgentState, history: &OpsIssueHistory) -> Result<
 
 fn write_gitlab_context_file(
     state: &AgentState,
-    gitlab: &GitLabClient,
+    hosting: &dyn CodeHostingClient,
     unix_ts: u64,
 ) -> Result<String> {
-    let content = build_gitlab_context(gitlab)?;
+    let content = build_gitlab_context(hosting)?;
     write_task_context_file(
         state.sessions_dir,
         &format!("{}-gitlab-context-{unix_ts}.md", state.agent_id),
@@ -858,26 +858,26 @@ fn write_gitlab_context_file(
     )
 }
 
-fn build_gitlab_context(gitlab: &GitLabClient) -> Result<String> {
+fn build_gitlab_context(hosting: &dyn CodeHostingClient) -> Result<String> {
     let mut out = String::from("# Current GitLab issues and merge requests\n\n");
 
-    let issues = gitlab.list_issues()?;
+    let issues = hosting.list_issues()?;
     out.push_str("## Open issues\n\n");
     if issues.is_empty() {
         out.push_str("(none)\n\n");
     } else {
         for issue in &issues {
-            append_issue_context(&mut out, gitlab, issue)?;
+            append_issue_context(&mut out, hosting, issue)?;
         }
     }
 
-    let mrs = gitlab.list_merge_requests()?;
+    let mrs = hosting.list_merge_requests()?;
     out.push_str("## Open merge requests\n\n");
     if mrs.is_empty() {
         out.push_str("(none)\n");
     } else {
         for mr in &mrs {
-            append_mr_context(&mut out, gitlab, mr)?;
+            append_mr_context(&mut out, hosting, mr)?;
         }
     }
 
@@ -886,8 +886,8 @@ fn build_gitlab_context(gitlab: &GitLabClient) -> Result<String> {
 
 fn append_issue_context(
     out: &mut String,
-    gitlab: &GitLabClient,
-    issue: &gitlab::Issue,
+    hosting: &dyn CodeHostingClient,
+    issue: &hosting::Issue,
 ) -> Result<()> {
     let labels = if issue.labels.is_empty() {
         "none".to_string()
@@ -899,7 +899,7 @@ fn append_issue_context(
         issue.iid, issue.title, labels, issue.description
     ));
 
-    match gitlab.get_issue_comments(issue.iid) {
+    match hosting.get_issue_comments(issue.iid) {
         Ok(comments) if !comments.is_empty() => {
             out.push_str("\nComments:\n");
             for comment in &comments {
@@ -921,8 +921,8 @@ fn append_issue_context(
 
 fn append_mr_context(
     out: &mut String,
-    gitlab: &GitLabClient,
-    mr: &gitlab::MergeRequest,
+    hosting: &dyn CodeHostingClient,
+    mr: &hosting::MergeRequest,
 ) -> Result<()> {
     let labels = mr
         .labels
@@ -935,7 +935,7 @@ fn append_mr_context(
         mr.iid, mr.title, labels, mr.source_branch, mr.target_branch, mr.description
     ));
 
-    match gitlab.get_mr_comments(mr.iid) {
+    match hosting.get_mr_comments(mr.iid) {
         Ok(comments) if !comments.is_empty() => {
             out.push_str("\nComments:\n");
             for comment in &comments {
@@ -1917,7 +1917,7 @@ mod tests {
 
     #[test]
     fn gitlab_context_markdown_sections_are_structured() {
-        use crate::agents::gitlab::{Comment, Issue, MergeRequest};
+        use crate::agents::hosting::{Comment, Issue, MergeRequest};
 
         let issue = Issue {
             iid: 7,

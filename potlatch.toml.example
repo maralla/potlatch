@@ -1,8 +1,10 @@
 # Potlatch Configuration File
 # Configure agents under [agent.<name>] sections. Only agents with a section are started.
 
-# GitLab repository URL (HTTPS). Required by GitLab agents (worker, reviewer, pmo, ops).
-gitlab_repo = "https://gitlab.com/group/project"
+# Repository URL (HTTPS or SSH). Required by GitLab/GitHub agents (worker, reviewer, pmo, ops).
+# Supports GitLab and GitHub. Auto-detected from the URL hostname.
+# Accepted config keys: `repo_url` (preferred) or `gitlab_repo` (legacy alias).
+repo_url = "https://gitlab.com/group/project"
 
 # Optional: only process issues/MRs that include this label (exact name).
 # scope_label = "potlatch"

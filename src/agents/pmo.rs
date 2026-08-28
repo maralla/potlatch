@@ -12,8 +12,8 @@ use tracing::{info, warn};
 use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::{claim, issue_in_scope, labels, strip_internal_markers, with_split_parent};
 use crate::agents::git::GitRepo;
-use crate::agents::gitlab::{self, GitLabClient, Issue, IssueThreadNote};
-use crate::agents::workspace::{GitLabAgentBootstrap, GitLabAgentRuntime, gitlab_banner};
+use crate::agents::hosting::{self, CodeHostingClient, Issue, IssueThreadNote};
+use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::schema::tagged;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
@@ -352,8 +352,8 @@ fn default_ask_gitlab_timeout_secs() -> u64 {
     600
 }
 
-/// A borrowing view over the [`GitLabAgentRuntime`] identity/path fields
-/// the PMO cycle needs. Built fresh from `&GitLabAgentRuntime` at each use
+/// A borrowing view over the [`AgentWorkspace`] identity/path fields
+/// the PMO cycle needs. Built fresh from `&AgentWorkspace` at each use
 /// site rather than stored, so PMO never keeps a second copy of these
 /// fields — and, since it is never stored alongside the runtime it borrows
 /// from, it can't become self-referential.
@@ -371,7 +371,7 @@ struct PersistedPmoState {
 }
 
 impl AgentState<'_> {
-    fn from_runtime(runtime: &GitLabAgentRuntime) -> AgentState<'_> {
+    fn from_runtime(runtime: &AgentWorkspace) -> AgentState<'_> {
         AgentState {
             sessions_dir: &runtime.sessions_dir,
             agent_id: &runtime.agent_id,
@@ -437,7 +437,7 @@ impl AgentState<'_> {
 }
 
 pub(crate) struct PmoAgent {
-    runtime: GitLabAgentRuntime,
+    runtime: AgentWorkspace,
     config: PmoConfig,
     claimed_issue: Option<ClaimLease>,
 }
@@ -454,7 +454,7 @@ impl CoreAgent for PmoAgent {
     }
 
     fn banner(config: &Config, banner: &mut Banner) {
-        gitlab_banner(config, banner);
+        repo_banner(config, banner);
     }
 
     fn validate_settings(
@@ -462,7 +462,7 @@ impl CoreAgent for PmoAgent {
         _section: &crate::core::config::AgentSection,
         settings: &Self::Settings,
     ) -> Result<()> {
-        super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
+        super::settings::AgentSettings::from_config(config)?.require_repo_url()?;
         anyhow::ensure!(
             settings.poll_interval_secs.is_none(),
             "poll_interval_secs was replaced by poll_interval for [agent.pmo]"
@@ -487,7 +487,7 @@ impl CoreAgent for PmoAgent {
                 pmo_cycle(
                     &state,
                     &self.runtime.git_repo,
-                    &self.runtime.gitlab,
+                    Arc::clone(&self.runtime.hosting),
                     model,
                     &mut self.claimed_issue,
                     Arc::clone(&shutdown),
@@ -500,7 +500,7 @@ impl CoreAgent for PmoAgent {
     }
 
     fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
-        let runtime = GitLabAgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
+        let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let settings = ctx.settings;
         let config = PmoConfig {
             poll_interval: settings.poll_interval,
@@ -511,15 +511,21 @@ impl CoreAgent for PmoAgent {
         let claimed_issue = {
             let state = AgentState::from_runtime(&runtime);
             state.ensure_sessions_dir()?;
-            let claimed_issue = try_resume_pmo_state(&state, &runtime.gitlab, scope)
-                .or_else(|| find_claimed_pmo_issue(&state, &runtime.gitlab, scope));
+            let claimed_issue = try_resume_pmo_state(&state, Arc::clone(&runtime.hosting), scope)
+                .or_else(|| find_claimed_pmo_issue(&state, Arc::clone(&runtime.hosting), scope));
             if let Some(ref lease) = claimed_issue {
                 let iid = lease.resource().iid();
-                match (runtime.gitlab.get_issue(iid), runtime.gitlab.list_issues()) {
+                match (
+                    runtime.hosting.get_issue(iid),
+                    runtime.hosting.list_issues(),
+                ) {
                     (Ok(issue), Ok(issues)) => {
-                        if let Err(e) =
-                            refresh_pmo_issue_context_file(&state, &runtime.gitlab, &issue, &issues)
-                        {
+                        if let Err(e) = refresh_pmo_issue_context_file(
+                            &state,
+                            runtime.hosting.as_ref(),
+                            &issue,
+                            &issues,
+                        ) {
                             warn!(
                                 "{}: Could not refresh PMO context file after resuming claim on #{}: {}",
                                 &state.agent_id, iid, e
@@ -595,7 +601,7 @@ impl From<&Issue> for PmoIssueObservation {
 
 impl PmoIssueObservation {
     fn priority(&self) -> u8 {
-        gitlab::priority_from_labels(&self.labels)
+        hosting::priority_from_labels(&self.labels)
     }
 
     fn as_issue(&self) -> Issue {
@@ -841,7 +847,7 @@ fn resume_split(
         let description = with_split_parent(&child.description, pending.parent_issue_iid);
         let child_iid = port.create_child(title, &description)?;
         let priority = child.priority.unwrap_or(pending.parent_priority);
-        let _ = port.add_issue_label(child_iid, &gitlab::priority_label(priority));
+        let _ = port.add_issue_label(child_iid, &hosting::priority_label(priority));
         if let Some(label) = scope_label {
             let _ = port.add_issue_label(child_iid, label);
         }
@@ -905,10 +911,12 @@ fn run_pmo_maintenance(
             && !issue
                 .labels
                 .iter()
-                .any(|label| label.starts_with(gitlab::PRIORITY_LABEL_PREFIX))
+                .any(|label| label.starts_with(hosting::PRIORITY_LABEL_PREFIX))
         {
-            let _ =
-                port.add_issue_label(issue.iid, &gitlab::priority_label(gitlab::DEFAULT_PRIORITY));
+            let _ = port.add_issue_label(
+                issue.iid,
+                &hosting::priority_label(hosting::DEFAULT_PRIORITY),
+            );
         }
     }
     if port.shutdown_requested() {
@@ -1133,7 +1141,7 @@ fn run_pmo_cycle(
 struct LivePmoPort<'a> {
     state: &'a AgentState<'a>,
     git_repo: &'a GitRepo,
-    gitlab: &'a GitLabClient,
+    hosting: Arc<dyn CodeHostingClient>,
     model: &'a AgentModel,
     claimed_issue: &'a mut Option<ClaimLease>,
     shutdown: Arc<AtomicBool>,
@@ -1166,7 +1174,7 @@ impl PmoPort for LivePmoPort<'_> {
     }
 
     fn issue(&self, issue_iid: u64) -> Option<PmoIssueObservation> {
-        self.gitlab
+        self.hosting
             .get_issue(issue_iid)
             .ok()
             .as_ref()
@@ -1175,7 +1183,7 @@ impl PmoPort for LivePmoPort<'_> {
 
     fn issues(&self) -> Result<Vec<PmoIssueObservation>> {
         Ok(self
-            .gitlab
+            .hosting
             .list_issues()?
             .iter()
             .map(PmoIssueObservation::from)
@@ -1183,7 +1191,7 @@ impl PmoPort for LivePmoPort<'_> {
     }
 
     fn new_human_comments(&self, issue_iid: u64) -> bool {
-        let Ok(comments) = self.gitlab.get_issue_comments(issue_iid) else {
+        let Ok(comments) = self.hosting.get_issue_comments(issue_iid) else {
             return false;
         };
         has_new_human_comments(
@@ -1202,7 +1210,7 @@ impl PmoPort for LivePmoPort<'_> {
 
     fn acquire_claim(&mut self, issue_iid: u64) -> Result<PmoClaimOutcome> {
         match claim::acquire(
-            self.gitlab,
+            self.hosting.as_ref(),
             ClaimResource::Issue(issue_iid),
             self.state.agent_id,
             self.shutdown.as_ref(),
@@ -1220,14 +1228,14 @@ impl PmoPort for LivePmoPort<'_> {
         let Some(lease) = self.claimed_issue.as_mut() else {
             return Ok(());
         };
-        lease.try_release(self.gitlab)?;
+        lease.try_release(self.hosting.as_ref())?;
         *self.claimed_issue = None;
         Ok(())
     }
 
     fn save_claim_state(&mut self, issue_iid: u64) {
         let last_seen_comment_id = self
-            .gitlab
+            .hosting
             .get_issue_comments(issue_iid)
             .ok()
             .and_then(|comments| comments.iter().map(|comment| comment.id).max())
@@ -1250,13 +1258,13 @@ impl PmoPort for LivePmoPort<'_> {
             .iter()
             .map(PmoIssueObservation::as_issue)
             .collect();
-        refresh_pmo_issue_context_file(self.state, self.gitlab, &issue, &all_issues)
+        refresh_pmo_issue_context_file(self.state, self.hosting.as_ref(), &issue, &all_issues)
     }
 
     fn bound_merge_request(&self, issue_iid: u64) -> Result<Option<u64>> {
         let branch_name = format!("issue-{issue_iid}");
         Ok(self
-            .gitlab
+            .hosting
             .find_mrs_by_source_branch(&branch_name)?
             .into_iter()
             .next())
@@ -1281,7 +1289,7 @@ impl PmoPort for LivePmoPort<'_> {
                 .then(|| Duration::from_secs(self.config.ask_gitlab_timeout_secs));
             Some(Arc::new(GitLabIssueAskHandler::new(
                 issue.iid,
-                self.gitlab.clone(),
+                Arc::clone(&self.hosting),
                 Arc::clone(&self.shutdown),
                 timeout,
             )))
@@ -1296,7 +1304,7 @@ impl PmoPort for LivePmoPort<'_> {
         // poll cycle. The cursor is seeded from the last persisted comment id
         // and advanced in lock-step with the model turn.
         let (follow_up_poll, follow_up_cursor) = build_pmo_comment_follow_up_poll(
-            self.gitlab.clone(),
+            Arc::clone(&self.hosting),
             issue.iid,
             self.state.last_seen_comment_id(issue.iid),
             self.state.agent_id.to_string(),
@@ -1305,7 +1313,7 @@ impl PmoPort for LivePmoPort<'_> {
             &prompt,
             &InvokeOptions {
                 cancel_check: Some(pmo_planning_label_cancel_check(
-                    self.gitlab.clone(),
+                    Arc::clone(&self.hosting),
                     issue.iid,
                     self.state.agent_id.to_string(),
                     was_planning,
@@ -1332,23 +1340,23 @@ impl PmoPort for LivePmoPort<'_> {
     }
 
     fn update_issue_description(&mut self, issue_iid: u64, body: &str) -> Result<()> {
-        self.gitlab.update_issue_description(issue_iid, body)
+        self.hosting.update_issue_description(issue_iid, body)
     }
 
     fn add_issue_comment(&mut self, issue_iid: u64, body: &str) -> Result<()> {
-        self.gitlab.add_issue_comment(issue_iid, body)
+        self.hosting.add_issue_comment(issue_iid, body)
     }
 
     fn add_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()> {
-        self.gitlab.add_issue_label(issue_iid, label)
+        self.hosting.add_issue_label(issue_iid, label)
     }
 
     fn remove_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()> {
-        self.gitlab.remove_issue_label(issue_iid, label)
+        self.hosting.remove_issue_label(issue_iid, label)
     }
 
     fn close_issue(&mut self, issue_iid: u64) -> Result<()> {
-        self.gitlab.close_issue(issue_iid)
+        self.hosting.close_issue(issue_iid)
     }
 
     fn save_split_checkpoint(&mut self, pending: &PendingSplit) -> Result<()> {
@@ -1360,7 +1368,7 @@ impl PmoPort for LivePmoPort<'_> {
     }
 
     fn create_child(&mut self, title: &str, description: &str) -> Result<u64> {
-        self.gitlab.create_issue(title, description)
+        self.hosting.create_issue(title, description)
     }
 }
 
@@ -1368,7 +1376,7 @@ impl PmoPort for LivePmoPort<'_> {
 fn pmo_cycle(
     state: &AgentState,
     git_repo: &GitRepo,
-    gitlab: &GitLabClient,
+    hosting: Arc<dyn CodeHostingClient>,
     model: &AgentModel,
     claimed_issue: &mut Option<ClaimLease>,
     shutdown: Arc<AtomicBool>,
@@ -1379,7 +1387,7 @@ fn pmo_cycle(
     let mut port = LivePmoPort {
         state,
         git_repo,
-        gitlab,
+        hosting,
         model,
         claimed_issue,
         shutdown: Arc::clone(&shutdown),
@@ -1504,9 +1512,9 @@ fn build_existing_issues_summary(current_iid: u64, all_issues: &[Issue]) -> Stri
     }
 }
 
-/// Markdown for the "Comments" section of `pmo-issue-*.md` via [`GitLabClient::get_issue_comments`].
-fn pmo_gitlab_comments_section(gitlab: &GitLabClient, issue_iid: u64) -> (String, usize) {
-    match gitlab.get_issue_comments(issue_iid) {
+/// Markdown for the "Comments" section of `pmo-issue-*.md` via [`CodeHostingClient::get_issue_comments`].
+fn pmo_gitlab_comments_section(hosting: &dyn CodeHostingClient, issue_iid: u64) -> (String, usize) {
+    match hosting.get_issue_comments(issue_iid) {
         Ok(comments) => {
             let n = comments.len();
             let text = if comments.is_empty() {
@@ -1541,13 +1549,13 @@ fn pmo_gitlab_comments_section(gitlab: &GitLabClient, issue_iid: u64) -> (String
 /// work on an issue (new claim, resumed claim, pmo-pending poll, pending split).
 fn refresh_pmo_issue_context_file(
     state: &AgentState,
-    gitlab: &GitLabClient,
+    hosting: &dyn CodeHostingClient,
     issue: &Issue,
     all_issues: &[Issue],
 ) -> Result<String> {
-    let (comments_text, gitlab_note_count) = pmo_gitlab_comments_section(gitlab, issue.iid);
+    let (comments_text, gitlab_note_count) = pmo_gitlab_comments_section(hosting, issue.iid);
     let existing_issues_text = build_existing_issues_summary(issue.iid, all_issues);
-    let closed_mr_text = pmo_closed_mr_section(gitlab, issue.iid);
+    let closed_mr_text = pmo_closed_mr_section(hosting, issue.iid);
 
     let generated_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1589,9 +1597,9 @@ fn refresh_pmo_issue_context_file(
 ///
 /// Returns "No closed MRs found for this issue." when there are none (the
 /// common case for issues that were never assigned to a worker).
-fn pmo_closed_mr_section(gitlab: &GitLabClient, issue_iid: u64) -> String {
+fn pmo_closed_mr_section(hosting: &dyn CodeHostingClient, issue_iid: u64) -> String {
     let branch_name = format!("issue-{issue_iid}");
-    let mr_iids = match gitlab.find_mrs_by_source_branch(&branch_name) {
+    let mr_iids = match hosting.find_mrs_by_source_branch(&branch_name) {
         Ok(iids) => iids,
         Err(e) => {
             warn!("PMO: failed to search MRs for issue #{issue_iid} branch {branch_name}: {e}");
@@ -1605,7 +1613,7 @@ fn pmo_closed_mr_section(gitlab: &GitLabClient, issue_iid: u64) -> String {
     // excluded — they're handled by the worker/reviewer flow, not PMO.
     let mr_iid = mr_iids
         .iter()
-        .find(|&&iid| match gitlab.get_merge_request(iid) {
+        .find(|&&iid| match hosting.get_merge_request(iid) {
             Ok(mr) => mr.state != "opened",
             Err(_) => false,
         })
@@ -1615,7 +1623,7 @@ fn pmo_closed_mr_section(gitlab: &GitLabClient, issue_iid: u64) -> String {
         return "No closed MRs found for this issue.".to_string();
     };
 
-    let mr = match gitlab.get_merge_request(mr_iid) {
+    let mr = match hosting.get_merge_request(mr_iid) {
         Ok(mr) => mr,
         Err(e) => {
             warn!("PMO: failed to fetch MR !{mr_iid}: {e}");
@@ -1625,7 +1633,7 @@ fn pmo_closed_mr_section(gitlab: &GitLabClient, issue_iid: u64) -> String {
         }
     };
 
-    let comments_text = match gitlab.get_mr_comments(mr_iid) {
+    let comments_text = match hosting.get_mr_comments(mr_iid) {
         Ok(comments) if comments.is_empty() => "No MR comments.".to_string(),
         Ok(comments) => comments
             .iter()
@@ -1638,7 +1646,7 @@ fn pmo_closed_mr_section(gitlab: &GitLabClient, issue_iid: u64) -> String {
         }
     };
 
-    let diff_text = match gitlab.get_merge_request_changes(mr_iid) {
+    let diff_text = match hosting.get_merge_request_changes(mr_iid) {
         Ok(snapshot) if snapshot.patch.is_empty() => "No diff available.".to_string(),
         Ok(snapshot) => {
             let files_list = if snapshot.files.is_empty() {
@@ -1842,7 +1850,7 @@ fn guidance_or_empty(instructions: &str) -> String {
 /// cursor. PMO-generated planning comments are ignored even when GitLab
 /// reports the shared service-account username instead of the agent id.
 fn has_new_human_comments(
-    comments: &[gitlab::Comment],
+    comments: &[hosting::Comment],
     last_seen_comment_id: u64,
     pmo_agent_id: &str,
 ) -> bool {
@@ -1859,7 +1867,7 @@ fn has_new_human_comments(
 /// Mirrors the predicate in [`has_new_human_comments`] so live mid-session
 /// injection and the per-cycle re-triage trigger agree on what is "new".
 fn is_new_human_comment(
-    comment: &gitlab::Comment,
+    comment: &hosting::Comment,
     last_seen_comment_id: u64,
     pmo_agent_id: &str,
 ) -> bool {
@@ -1880,7 +1888,7 @@ fn is_new_human_comment(
 /// without a real client. Returns the formatted injection messages and the
 /// new cursor value to persist.
 fn collect_new_human_comment_follow_ups(
-    comments: &[gitlab::Comment],
+    comments: &[hosting::Comment],
     last_seen_comment_id: &mut u64,
     issue_iid: u64,
     pmo_agent_id: &str,
@@ -1917,14 +1925,14 @@ type FollowUpCursor = Arc<std::sync::Mutex<u64>>;
 /// — the session should stop silently, with no handoff comment. For a fresh
 /// issue that never had `pmo-planning`, only the claim label is watched.
 fn pmo_planning_label_cancel_check(
-    gitlab: GitLabClient,
+    hosting: Arc<dyn CodeHostingClient>,
     issue_iid: u64,
     agent_id: String,
     was_planning: bool,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
     let claim_label = super::claim::claim_label(&agent_id);
     Arc::new(move || {
-        gitlab.get_issue(issue_iid).ok().is_some_and(|issue| {
+        hosting.get_issue(issue_iid).ok().is_some_and(|issue| {
             let lost_planning = was_planning
                 && !issue
                     .labels
@@ -1944,7 +1952,7 @@ fn pmo_planning_label_cancel_check(
 /// the next cycle's [`AgentState::last_seen_comment_id`] check from re-tripping
 /// on comments already injected live.
 fn build_pmo_comment_follow_up_poll(
-    gitlab: GitLabClient,
+    hosting: Arc<dyn CodeHostingClient>,
     issue_iid: u64,
     seed_cursor: u64,
     pmo_agent_id: String,
@@ -1952,7 +1960,7 @@ fn build_pmo_comment_follow_up_poll(
     let cursor: FollowUpCursor = Arc::new(std::sync::Mutex::new(seed_cursor));
     let cursor_for_closure = Arc::clone(&cursor);
     let poll = Arc::new(move || {
-        let Ok(comments) = gitlab.get_issue_comments(issue_iid) else {
+        let Ok(comments) = hosting.get_issue_comments(issue_iid) else {
             return Vec::new();
         };
         let mut last = cursor_for_closure
@@ -2025,7 +2033,7 @@ fn delete_pending_split(path: &str) -> Result<()> {
 
 fn try_resume_pmo_state(
     state: &AgentState,
-    gitlab: &GitLabClient,
+    hosting: Arc<dyn CodeHostingClient>,
     scope_label: Option<&str>,
 ) -> Option<ClaimLease> {
     // Tolerant: invalid persisted PMO claim state has historically been
@@ -2045,7 +2053,7 @@ fn try_resume_pmo_state(
     };
     let issue_iid = persisted.claimed_issue_iid;
 
-    match gitlab.get_issue(issue_iid) {
+    match hosting.get_issue(issue_iid) {
         Ok(issue) => {
             if issue.state != "opened" {
                 info!(
@@ -2089,7 +2097,7 @@ fn try_resume_pmo_state(
             Some(lease)
         }
         Err(e) => {
-            if crate::agents::gitlab::is_not_found(&e) {
+            if crate::agents::hosting::is_not_found(&e) {
                 info!(
                     "{}: Previously claimed issue #{} no longer exists (404), \
                      discarding state",
@@ -2102,17 +2110,17 @@ fn try_resume_pmo_state(
                 "{}: Failed to verify issue #{}: {}, retaining state and scanning live claims",
                 &state.agent_id, issue_iid, e
             );
-            find_claimed_pmo_issue(state, gitlab, scope_label)
+            find_claimed_pmo_issue(state, hosting, scope_label)
         }
     }
 }
 
 fn find_claimed_pmo_issue(
     state: &AgentState,
-    gitlab: &GitLabClient,
+    hosting: Arc<dyn CodeHostingClient>,
     _scope_label: Option<&str>,
 ) -> Option<ClaimLease> {
-    let mut issues = match gitlab.list_issues() {
+    let mut issues = match hosting.list_issues() {
         Ok(issues) => issues,
         Err(error) => {
             warn!(
@@ -2140,7 +2148,7 @@ fn find_claimed_pmo_issue(
     let issue_iid = lease.resource().iid();
     for mut extra in recovered {
         let iid = extra.resource().iid();
-        if let Err(error) = extra.try_release(gitlab) {
+        if let Err(error) = extra.try_release(hosting.as_ref()) {
             warn!(
                 "{}: Failed to release extra orphaned claim on issue #{}: {}",
                 state.agent_id, iid, error
@@ -2304,14 +2312,14 @@ fn resolve_reply_to_answer(question: &AskQuestion, choice_raw: &str) -> AskAnswe
     AskAnswer::FreeText(choice_trim.to_string())
 }
 
-fn clear_pmo_pending_label(gitlab: &GitLabClient, issue_iid: u64) {
-    let _ = gitlab.remove_issue_label(issue_iid, labels::PMO_PENDING);
+fn clear_pmo_pending_label(hosting: &dyn CodeHostingClient, issue_iid: u64) {
+    let _ = hosting.remove_issue_label(issue_iid, labels::PMO_PENDING);
 }
 
 /// Posts the question note, then **blocks** until a **thread reply** arrives (same process only).
 pub struct GitLabIssueAskHandler {
     issue_iid: u64,
-    gitlab: GitLabClient,
+    hosting: Arc<dyn CodeHostingClient>,
     shutdown: Arc<AtomicBool>,
     wait_deadline: Option<Instant>,
 }
@@ -2319,14 +2327,14 @@ pub struct GitLabIssueAskHandler {
 impl GitLabIssueAskHandler {
     pub fn new(
         issue_iid: u64,
-        gitlab: GitLabClient,
+        hosting: Arc<dyn CodeHostingClient>,
         shutdown: Arc<AtomicBool>,
         timeout: Option<Duration>,
     ) -> Self {
         let wait_deadline = timeout.map(|d| Instant::now() + d);
         Self {
             issue_iid,
-            gitlab,
+            hosting,
             shutdown,
             wait_deadline,
         }
@@ -2335,7 +2343,7 @@ impl GitLabIssueAskHandler {
     fn finish_with_reply(&self, question: &AskQuestion, reply: &IssueThreadNote) -> AskAnswer {
         let choice = reply_body_as_choice(&reply.body);
         let answer = resolve_reply_to_answer(question, &choice);
-        clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+        clear_pmo_pending_label(self.hosting.as_ref(), self.issue_iid);
         info!(
             target: "potlatch::pmo_ask",
             issue_iid = self.issue_iid,
@@ -2352,7 +2360,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
         let ask_id = new_ask_id();
         let comment = build_issue_comment(&ask_id, question);
 
-        if let Err(e) = self.gitlab.add_issue_comment(self.issue_iid, &comment) {
+        if let Err(e) = self.hosting.add_issue_comment(self.issue_iid, &comment) {
             warn!(
                 target: "potlatch::pmo_ask",
                 err = %e,
@@ -2362,7 +2370,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
         }
 
         if let Err(e) = self
-            .gitlab
+            .hosting
             .add_issue_label(self.issue_iid, labels::PMO_PENDING)
         {
             warn!(
@@ -2372,7 +2380,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
             );
         }
 
-        let notes = match self.gitlab.get_issue_thread_notes(self.issue_iid) {
+        let notes = match self.hosting.get_issue_thread_notes(self.issue_iid) {
             Ok(n) => n,
             Err(e) => {
                 warn!(
@@ -2380,7 +2388,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
                     err = %e,
                     "failed to list thread notes after posting ask question"
                 );
-                clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+                clear_pmo_pending_label(self.hosting.as_ref(), self.issue_iid);
                 return AskAnswer::Auto;
             }
         };
@@ -2391,7 +2399,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
                 ask_id = %ask_id,
                 "could not find posted ask note by marker; using automatic answer"
             );
-            clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+            clear_pmo_pending_label(self.hosting.as_ref(), self.issue_iid);
             return AskAnswer::Auto;
         };
 
@@ -2417,11 +2425,11 @@ impl CapabilityProvider for GitLabIssueAskHandler {
                     "potlatch PMO: GitLab thread wait timed out on issue #{}; using automatic answer.",
                     self.issue_iid
                 );
-                let _ = self.gitlab.add_issue_comment(
+                let _ = self.hosting.add_issue_comment(
                     self.issue_iid,
                     "**PMO:** Timed out waiting for a **reply** to the question comment; proceeding with an automatic choice.",
                 );
-                clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+                clear_pmo_pending_label(self.hosting.as_ref(), self.issue_iid);
                 return AskAnswer::Auto;
             }
 
@@ -2430,13 +2438,13 @@ impl CapabilityProvider for GitLabIssueAskHandler {
                     target: "potlatch::pmo_ask",
                     "shutdown during ask wait; using automatic answer"
                 );
-                clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+                clear_pmo_pending_label(self.hosting.as_ref(), self.issue_iid);
                 return AskAnswer::Auto;
             }
 
             thread::sleep(ASK_POLL_INTERVAL);
 
-            let notes = match self.gitlab.get_issue_thread_notes(self.issue_iid) {
+            let notes = match self.hosting.get_issue_thread_notes(self.issue_iid) {
                 Ok(n) => n,
                 Err(e) => {
                     warn!(target: "potlatch::pmo_ask", err = %e, "poll thread notes failed");
@@ -2450,7 +2458,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
                     root_note_id,
                     "root note disappeared during wait"
                 );
-                clear_pmo_pending_label(&self.gitlab, self.issue_iid);
+                clear_pmo_pending_label(self.hosting.as_ref(), self.issue_iid);
                 return AskAnswer::Auto;
             };
 
@@ -2468,6 +2476,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::hosting::gitlab::GitLabClient;
     use crate::core::agent::schema::conformance;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -3153,7 +3162,7 @@ mod tests {
 
     #[test]
     fn comment_cursor_ignores_old_and_pmo_comments_but_detects_later_human_feedback() {
-        let comment = |id, author: &str, body: &str| gitlab::Comment {
+        let comment = |id, author: &str, body: &str| hosting::Comment {
             id,
             author: author.into(),
             body: body.into(),
@@ -3179,7 +3188,7 @@ mod tests {
 
     #[test]
     fn collect_new_human_comment_follow_ups_formats_only_new_human_replies() {
-        let comment = |id, author: &str, body: &str| gitlab::Comment {
+        let comment = |id, author: &str, body: &str| hosting::Comment {
             id,
             author: author.into(),
             body: body.into(),
@@ -3219,7 +3228,7 @@ mod tests {
     #[test]
     fn collect_new_human_comment_follow_ups_advances_cursor_even_when_nothing_is_injected() {
         let comments = vec![
-            gitlab::Comment {
+            hosting::Comment {
                 id: 7,
                 author: "pmo-0".into(),
                 body: "**PMO needs clarification before proceeding:**\n\nWhich scope?".into(),
@@ -3228,7 +3237,7 @@ mod tests {
                 location: None,
                 location_details: None,
             },
-            gitlab::Comment {
+            hosting::Comment {
                 id: 9,
                 author: "service-account".into(),
                 body: "**PMO plan refinement for merge request !5:**\n\nplan".into(),
@@ -3248,7 +3257,7 @@ mod tests {
 
     #[test]
     fn collect_new_human_comment_follow_ups_is_idempotent_across_polls() {
-        let mk = |id: u64| gitlab::Comment {
+        let mk = |id: u64| hosting::Comment {
             id,
             author: "alice".into(),
             body: format!("reply {id}"),
@@ -3708,9 +3717,10 @@ mod tests {
         let dir = pmo_state_test_dir("missing");
         let sessions_dir = dir.to_string_lossy().into_owned();
         let state = pmo_test_agent_state(&sessions_dir, "pmo-2");
-        let gitlab = GitLabClient::for_test("/tmp/unused-repo");
+        let gitlab =
+            Arc::new(GitLabClient::for_test("/tmp/unused-repo")) as Arc<dyn CodeHostingClient>;
 
-        assert!(try_resume_pmo_state(&state, &gitlab, None).is_none());
+        assert!(try_resume_pmo_state(&state, Arc::clone(&gitlab), None).is_none());
     }
 
     #[test]
@@ -3725,9 +3735,10 @@ mod tests {
         let sessions_dir = dir.to_string_lossy().into_owned();
         let state = pmo_test_agent_state(&sessions_dir, "pmo-3");
         fs::write(state.state_path(), b"not valid json").unwrap();
-        let gitlab = GitLabClient::for_test("/tmp/unused-repo");
+        let gitlab =
+            Arc::new(GitLabClient::for_test("/tmp/unused-repo")) as Arc<dyn CodeHostingClient>;
 
-        assert!(try_resume_pmo_state(&state, &gitlab, None).is_none());
+        assert!(try_resume_pmo_state(&state, Arc::clone(&gitlab), None).is_none());
 
         // Quarantined beside the original rather than deleted outright.
         assert!(!state.state_path().exists());
@@ -3748,9 +3759,10 @@ mod tests {
         let sessions_dir = dir.to_string_lossy().into_owned();
         let state = pmo_test_agent_state(&sessions_dir, "pmo-4");
         fs::write(state.state_path(), br#"{"version":4,"state":{}}"#).unwrap();
-        let gitlab = GitLabClient::for_test("/tmp/unused-repo");
+        let gitlab =
+            Arc::new(GitLabClient::for_test("/tmp/unused-repo")) as Arc<dyn CodeHostingClient>;
 
-        assert!(try_resume_pmo_state(&state, &gitlab, None).is_none());
+        assert!(try_resume_pmo_state(&state, Arc::clone(&gitlab), None).is_none());
         assert!(!state.state_path().exists());
 
         let _ = fs::remove_dir_all(&dir);
@@ -4215,15 +4227,15 @@ mod tests {
     #[test]
     fn test_priority_from_labels() {
         assert_eq!(
-            gitlab::priority_from_labels(&["priority::1".to_string()]),
+            hosting::priority_from_labels(&["priority::1".to_string()]),
             1
         );
         assert_eq!(
-            gitlab::priority_from_labels(&["priority::2".to_string(), "in-progress".to_string()]),
+            hosting::priority_from_labels(&["priority::2".to_string(), "in-progress".to_string()]),
             2
         );
         assert_eq!(
-            gitlab::priority_from_labels(&["in-progress".to_string()]),
+            hosting::priority_from_labels(&["in-progress".to_string()]),
             3
         );
     }
