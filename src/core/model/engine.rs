@@ -270,14 +270,12 @@ mod tests {
             Some(m) => format!(
                 r#"[agent.alpha]
 model = "{m}"
-acp_client = "cursor"
 instances = 1
 
 [acp.cursor]
 acp_command = ["agent", "acp"]"#
             ),
             None => r#"[agent.alpha]
-acp_client = "cursor"
 instances = 1
 
 [acp.cursor]
@@ -300,15 +298,15 @@ acp_command = ["agent", "acp"]"#
     }
 
     #[test]
-    fn from_agent_section_without_model_uri() {
+    fn from_agent_section_without_model_uri_errors() {
         let config = sample_config(None);
-        ModelEngine::from_agent_section(
+        let result = ModelEngine::from_agent_section(
             &config,
             &sample_section(None),
             runtime("alpha-0"),
             ModelSessionOptions::default(),
-        )
-        .unwrap();
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -352,8 +350,7 @@ acp_command = ["agent", "acp"]"#
             ]
 
             [agent.alpha]
-            model = "model1-fp8"
-            acp_client = "cursor-local"
+            model = "acp://cursor-local/model1-fp8"
             instances = 1
             "#,
         )

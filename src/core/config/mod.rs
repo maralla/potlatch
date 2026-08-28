@@ -51,10 +51,11 @@ impl Config {
         let acp_clients = parse_acp_profiles(&root)?;
 
         for (name, section) in &agents {
-            if let Some(client_name) = &section.core.acp_client {
+            if let Some(model) = &section.core.model {
+                let vendor = &model.vendor;
                 ensure!(
-                    acp_clients.contains_key(client_name),
-                    "[agent.{name}] references acp_client `{client_name}` but no [acp.{client_name}] section is defined"
+                    acp_clients.contains_key(vendor),
+                    "[agent.{name}] model vendor `{vendor}` has no matching [acp.{vendor}] section"
                 );
             }
         }
@@ -107,39 +108,26 @@ impl Config {
 
     /// Resolve the ACP executable/args, subprocess env, and model for an agent role.
     pub fn resolve_acp_spawn(&self, section: &AgentSection) -> Result<AcpSpawnConfig> {
-        let model_uri = section
+        let model = section
             .core
             .model
             .as_ref()
-            .map(|uri| uri.as_configured().to_string());
-        let endpoint_model = section
-            .core
-            .model
-            .as_ref()
-            .map(|uri| uri.endpoint_model_name().to_string());
+            .context("no model configured for this agent")?;
 
-        let client_name = section
-            .core
-            .acp_client
-            .as_deref()
-            .context("no acp_client configured for this agent")?;
+        let model_uri = model.as_configured().to_string();
+        let endpoint_model = model.endpoint_model_name().to_string();
+        let bare_model = model.bare_model_name().to_string();
 
         let profile = self
             .acp_clients
-            .get(client_name)
-            .with_context(|| format!("unknown acp_client `{client_name}`"))?;
-
-        let bare_model = section
-            .core
-            .model
-            .as_ref()
-            .map(|uri| uri.bare_model_name().to_string());
+            .get(&model.vendor)
+            .with_context(|| format!("unknown acp client `{}`", model.vendor))?;
 
         Ok(AcpSpawnConfig {
             command: build_profile_command(profile),
-            model_uri,
-            endpoint_model,
-            env: resolve_profile_env(profile, bare_model.as_deref())?,
+            model_uri: Some(model_uri),
+            endpoint_model: Some(endpoint_model),
+            env: resolve_profile_env(profile, Some(&bare_model))?,
         })
     }
 }
@@ -193,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_without_acp_client_errors_on_resolve() {
+    fn agent_without_model_errors_on_resolve() {
         let cfg = Config::from_toml_str(
             r#"
             [agent.worker]
@@ -207,11 +195,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_with_model_requires_acp_client() {
+    fn agent_model_vendor_must_match_acp_section() {
         let result = Config::from_toml_str(
             r#"
             [agent.worker]
-            model = "acp://cursor/composer-2"
+            model = "acp://nonexistent/composer-2"
             instances = 1
             "#,
         );
@@ -219,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_with_acp_client_uses_profile() {
+    fn agent_vendor_resolves_acp_profile() {
         let cfg = Config::from_toml_str(
             r#"
             [acp.cursor-local]
@@ -232,8 +220,7 @@ mod tests {
             ]
 
             [agent.worker]
-            model = "acp://cursor/model1-fp8"
-            acp_client = "cursor-local"
+            model = "acp://cursor-local/model1-fp8"
             instances = 1
             "#,
         )
@@ -241,9 +228,11 @@ mod tests {
         let section = cfg.agent("worker").unwrap();
         let spawn = cfg.resolve_acp_spawn(section).unwrap();
         assert_eq!(spawn.command[0], "agent-local");
-        assert_eq!(spawn.model_uri.as_deref(), Some("acp://cursor/model1-fp8"));
+        assert_eq!(
+            spawn.model_uri.as_deref(),
+            Some("acp://cursor-local/model1-fp8")
+        );
         assert_eq!(spawn.endpoint_model.as_deref(), Some("model1-fp8"));
-        // Command is used verbatim from config — no injection
         assert_eq!(spawn.command[1], "--print");
         assert_eq!(spawn.command[2], "--trust");
         assert_eq!(spawn.command[3], "--force");
@@ -266,11 +255,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_acp_client_errors() {
+    fn unknown_vendor_errors() {
         let result = Config::from_toml_str(
             r#"
             [agent.worker]
-            acp_client = "missing"
+            model = "acp://nonexistent/model"
             instances = 1
             "#,
         );

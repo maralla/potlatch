@@ -363,7 +363,6 @@ mod tests {
             Some(m) => format!(
                 r#"[agent.alpha]
 model = "{m}"
-acp_client = "cursor"
 instances = 1
 
 [acp.cursor]

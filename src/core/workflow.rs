@@ -118,7 +118,7 @@ fn plan_agent_spawns(config: &Config, registry: &AgentRegistry) -> Result<Vec<Ag
         })?;
         (registration.validate_config)(config, section)
             .with_context(|| format!("invalid config for [agent.{agent_name}]"))?;
-        if section.core.model.is_some() || section.core.acp_client.is_some() {
+        if section.core.model.is_some() {
             config
                 .resolve_acp_spawn(section)
                 .with_context(|| format!("invalid core config for [agent.{agent_name}]"))?;
@@ -520,7 +520,7 @@ mod tests {
             r#"
             [agent.alpha]
             instances = 1
-            acp_client = "missing"
+            model = "acp://missing/some-model"
             "#,
         );
         assert!(result.is_err());
