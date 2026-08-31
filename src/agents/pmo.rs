@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
-use super::{claim, issue_in_scope, labels, strip_internal_markers, with_split_parent};
+use super::{claim, issue_in_scope, labels, with_split_parent};
 use crate::agents::forge::{self, ForgeClient, Issue, IssueThreadNote};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
@@ -694,7 +694,7 @@ fn apply_pmo_decision(
     let iid = issue.iid;
     match decision {
         PmoOutput::NeedsClarification { question } => {
-            let question = strip_internal_markers(&clarification_question_or_default(&question));
+            let question = clarification_question_or_default(&question);
             port.add_issue_comment(
                 iid,
                 &format!(
@@ -710,7 +710,7 @@ fn apply_pmo_decision(
             plan_text,
             update_description,
         } => {
-            let plan = strip_internal_markers(plan_text.trim());
+            let plan = plan_text.trim();
             if plan.trim().is_empty() {
                 return Err(PmoDecisionError::Recoverable(anyhow::anyhow!(
                     "PMO PROPOSE_PLAN output for issue #{iid} had no usable implementation plan; retrying later"
@@ -719,7 +719,7 @@ fn apply_pmo_decision(
             port.add_issue_label(iid, labels::PMO_PLANNING)
                 .map_err(PmoDecisionError::Recoverable)?;
             if update_description {
-                port.update_issue_description(iid, &plan)
+                port.update_issue_description(iid, plan)
                     .map_err(PmoDecisionError::KeepPending)?;
             } else {
                 port.add_issue_comment(iid, &format!("{PMO_PLAN_COMMENT_HEADER}\n\n{plan}"))
@@ -740,7 +740,7 @@ fn apply_pmo_decision(
             Ok(DecisionDisposition::KeepClaim)
         }
         PmoOutput::AlreadyDone { reason } => {
-            let reason = strip_internal_markers(&already_done_reason_or_default(&reason));
+            let reason = already_done_reason_or_default(&reason);
             port.add_issue_comment(
                 iid,
                 &format!("**PMO: Closing — this work is already implemented.**\n\n{reason}"),
@@ -768,7 +768,7 @@ fn apply_pmo_decision(
             Ok(DecisionDisposition::ReleaseClaim)
         }
         PmoOutput::GuideWorker { instructions } => {
-            let guidance = strip_internal_markers(&guidance_or_empty(&instructions));
+            let guidance = guidance_or_empty(&instructions);
             if guidance.trim().is_empty() {
                 return Err(PmoDecisionError::Recoverable(anyhow::anyhow!(
                     "PMO GUIDE_WORKER output for issue #{iid} had no usable guidance; retrying later"

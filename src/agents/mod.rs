@@ -52,24 +52,6 @@ pub(crate) fn strip_public_comment_blocks(text: &str) -> String {
     strip_marker_blocks(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END")
 }
 
-/// Strip internal potlatch markers from `text` before posting it to GitLab.
-/// Removes `PUBLIC_COMMENT_BEGIN/END` blocks and any stray marker lines so
-/// internal harness markers don't leak into human-facing GitLab comments when
-/// the model includes them in fields like `question` or `reason`.
-pub(crate) fn strip_internal_markers(text: &str) -> String {
-    let out = strip_marker_blocks(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END");
-    // Also strip bare marker lines the model might emit without a matching end.
-    out.lines()
-        .filter(|line| {
-            let t = line.trim();
-            t != "PUBLIC_COMMENT_BEGIN" && t != "PUBLIC_COMMENT_END"
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
-}
-
 /// Remove every `<begin>…<end>` block from `text`. If a `begin` marker has no
 /// matching `end`, the remainder is dropped (an unclosed block would
 /// otherwise leak machine text into a human-facing surface).
@@ -146,8 +128,8 @@ pub fn register(workflow: &mut Workflow) {
 #[cfg(test)]
 mod scope_tests {
     use super::{
-        issue_in_scope, mr_in_scope, register, split_parent_iid, strip_internal_markers,
-        strip_public_comment_blocks, with_split_parent,
+        issue_in_scope, mr_in_scope, register, split_parent_iid, strip_public_comment_blocks,
+        with_split_parent,
     };
     use crate::agents::forge::{Issue, MergeRequest};
     use crate::core::config::Config;
@@ -221,37 +203,6 @@ mod scope_tests {
         assert!(description.starts_with("Implement the parser.\n\n---"));
         assert_eq!(split_parent_iid(&description), Some(42));
         assert_eq!(split_parent_iid("Implement an unrelated issue."), None);
-    }
-
-    #[test]
-    fn strip_internal_markers_removes_public_comment_blocks() {
-        let text = "PUBLIC_COMMENT_BEGIN\nhidden\nPUBLIC_COMMENT_END\nVisible.";
-        let clean = strip_internal_markers(text);
-        assert!(!clean.contains("PUBLIC_COMMENT_BEGIN"));
-        assert!(!clean.contains("hidden"));
-        assert!(clean.contains("Visible."));
-    }
-
-    #[test]
-    fn strip_internal_markers_removes_bare_marker_lines() {
-        let text = "PUBLIC_COMMENT_BEGIN\nPUBLIC_COMMENT_END\nClean text.";
-        let clean = strip_internal_markers(text);
-        assert!(!clean.contains("PUBLIC_COMMENT_BEGIN"));
-        assert!(!clean.contains("PUBLIC_COMMENT_END"));
-        assert!(clean.contains("Clean text."));
-    }
-
-    #[test]
-    fn strip_internal_markers_preserves_clean_text() {
-        let text = "This is a normal comment for humans.";
-        assert_eq!(strip_internal_markers(text), text);
-    }
-
-    #[test]
-    fn strip_internal_markers_handles_empty_result() {
-        let text = "PUBLIC_COMMENT_BEGIN\nPUBLIC_COMMENT_END";
-        let clean = strip_internal_markers(text);
-        assert!(clean.is_empty());
     }
 
     #[test]
