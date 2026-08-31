@@ -1,9 +1,9 @@
-//! Unified code hosting abstraction.
+//! Software forge abstraction.
 //!
-//! Agents (worker, reviewer, pmo, qa, ops) interact with the code hosting
-//! platform (GitLab, GitHub) through the [`CodeHostingClient`] trait. Each
-//! provider implements it in its own submodule ([`gitlab`], [`github`]);
-//! the agents are provider-agnostic.
+//! Agents (worker, reviewer, pmo, qa, ops) interact with the forge (GitLab,
+//! GitHub) through the [`ForgeClient`] trait. Each provider implements it in
+//! its own submodule ([`gitlab`], [`github`]); the agents are
+//! provider-agnostic.
 //!
 //! The shared data types ([`Issue`], [`MergeRequest`], [`Comment`], etc.)
 //! originated from the GitLab API shape and are reused across all providers.
@@ -228,14 +228,14 @@ pub fn is_not_found(err: &anyhow::Error) -> bool {
 
 // ─── Trait ─────────────────────────────────────────────────────────────────────
 
-/// Unified code hosting API. Implemented by [`gitlab::GitLabClient`] and
-/// [`github::GitHubClient`]. Agents hold an `Arc<dyn CodeHostingClient>` and
-/// are unaware of which platform they're talking to.
+/// Unified forge API. Implemented by [`gitlab::GitLabClient`] and
+/// [`github::GitHubClient`]. Agents hold an `Arc<dyn ForgeClient>` and
+/// are unaware of which forge they're talking to.
 ///
 /// "Merge request" is the GitLab term; on GitHub the equivalent is a "pull
 /// request". The trait uses "merge request" throughout for consistency; the
 /// GitHub implementation maps PRs to the same [`MergeRequest`] type.
-pub trait CodeHostingClient: Send + Sync {
+pub trait ForgeClient: Send + Sync {
     // ── Issues ──
 
     fn list_issues(&self) -> Result<Vec<Issue>>;
@@ -315,17 +315,17 @@ pub trait CodeHostingClient: Send + Sync {
 
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
-/// Construct the appropriate [`CodeHostingClient`] for `repo_url`.
+/// Construct the appropriate [`ForgeClient`] for `repo_url`.
 ///
 /// GitHub URLs get a [`github::GitHubClient`]; everything else gets a
 /// [`gitlab::GitLabClient`]. The concrete types stay private to this module —
-/// callers receive an `Arc<dyn CodeHostingClient>` and never see which
-/// provider they're talking to.
+/// callers receive an `Arc<dyn ForgeClient>` and never see which forge
+/// they're talking to.
 pub fn create_client(
     working_dir: &str,
     repo_url: &str,
     shutdown: Arc<AtomicBool>,
-) -> Result<Arc<dyn CodeHostingClient>> {
+) -> Result<Arc<dyn ForgeClient>> {
     let url_lower = repo_url.to_lowercase();
     if url_lower.contains("github.com") {
         let client = github::GitHubClient::new(working_dir.to_string(), repo_url)?;
@@ -337,9 +337,9 @@ pub fn create_client(
 
 /// Construct a no-network client for tests. Returns a GitLab-backed client
 /// whose methods are never called — tests use it to satisfy
-/// `Arc<dyn CodeHostingClient>` fields in agent-state structs while
+/// `Arc<dyn ForgeClient>` fields in agent-state structs while
 /// exercising pure/file-only logic paths.
 #[cfg(test)]
-pub fn for_test_client(repo_path: impl Into<String>) -> Arc<dyn CodeHostingClient> {
+pub fn for_test_client(repo_path: impl Into<String>) -> Arc<dyn ForgeClient> {
     Arc::new(gitlab::GitLabClient::for_test(repo_path))
 }

@@ -5,8 +5,8 @@ use crate::core::workflow::Workflow;
 pub(crate) mod artifact;
 pub(crate) mod claim;
 pub(crate) mod clerk;
+pub mod forge;
 pub mod git;
-pub mod hosting;
 pub mod labels;
 pub mod ops;
 pub mod pmo;
@@ -19,7 +19,7 @@ pub(crate) mod web;
 pub mod worker;
 pub mod workspace;
 
-use crate::agents::hosting::{Issue, MergeRequest};
+use crate::agents::forge::{Issue, MergeRequest};
 
 /// Empty or whitespace-only `scope_label` means handle all items.
 pub fn scope_label_filter(scope_label: &str) -> Option<&str> {
@@ -149,7 +149,7 @@ mod scope_tests {
         issue_in_scope, mr_in_scope, register, split_parent_iid, strip_internal_markers,
         strip_public_comment_blocks, with_split_parent,
     };
-    use crate::agents::hosting::{Issue, MergeRequest};
+    use crate::agents::forge::{Issue, MergeRequest};
     use crate::core::config::Config;
     use crate::core::workflow::Workflow;
 

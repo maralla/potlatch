@@ -13,8 +13,8 @@ use super::{
     claim, issue_in_scope, split_parent_iid, strip_internal_markers, strip_public_comment_blocks,
     write_task_context_file,
 };
+use crate::agents::forge::{ForgeClient, Issue};
 use crate::agents::git::GitRepo;
-use crate::agents::hosting::{CodeHostingClient, Issue};
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 #[cfg(test)]
 use crate::core::agent::StructuredOutput;
@@ -383,7 +383,7 @@ struct ActiveIssue {
 
 /// A borrowing view over the [`AgentWorkspace`] fields the worker cycle
 /// needs. Built fresh from `&AgentWorkspace` at each use site rather
-/// than stored, so the worker never owns a second `GitRepo`/hosting client
+/// than stored, so the worker never owns a second `GitRepo`/forge client
 /// — and, since it is never stored alongside the runtime it borrows from,
 /// it can't become self-referential.
 struct AgentState<'a> {
@@ -392,7 +392,7 @@ struct AgentState<'a> {
     sessions_dir: &'a str,
 
     git_repo: &'a GitRepo,
-    hosting: &'a Arc<dyn CodeHostingClient>,
+    forge: &'a Arc<dyn ForgeClient>,
 }
 
 impl AgentState<'_> {
@@ -402,7 +402,7 @@ impl AgentState<'_> {
             agent_id: &runtime.agent_id,
             sessions_dir: &runtime.sessions_dir,
             git_repo: &runtime.git_repo,
-            hosting: &runtime.hosting,
+            forge: &runtime.forge,
         }
     }
 
@@ -484,7 +484,7 @@ impl AgentState<'_> {
         );
 
         if let Err(error) = claim::release(
-            self.hosting.as_ref(),
+            self.forge.as_ref(),
             ClaimResource::Issue(issue_iid),
             self.agent_id,
         ) {
@@ -494,7 +494,7 @@ impl AgentState<'_> {
             );
             return false;
         }
-        let _ = self.hosting.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+        let _ = self.forge.remove_issue_label(issue_iid, WORKING_ON_LABEL);
         self.cleanup_session(issue_iid);
         true
     }
@@ -510,7 +510,7 @@ impl AgentState<'_> {
 
     fn clear_resumed_issue_state(&self, issue_iid: u64) -> bool {
         if let Err(error) = claim::release(
-            self.hosting.as_ref(),
+            self.forge.as_ref(),
             ClaimResource::Issue(issue_iid),
             self.agent_id,
         ) {
@@ -531,7 +531,7 @@ impl AgentState<'_> {
         let _ = self.git_repo.checkout_remote_branch(&default_branch);
         let _ = self.git_repo.delete_local_branch(&branch);
 
-        let _ = self.hosting.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+        let _ = self.forge.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
         self.cleanup_session(issue_iid);
         true
@@ -544,7 +544,7 @@ impl AgentState<'_> {
         );
 
         if let Err(error) = claim::release(
-            self.hosting.as_ref(),
+            self.forge.as_ref(),
             ClaimResource::Issue(issue_iid),
             self.agent_id,
         ) {
@@ -557,9 +557,9 @@ impl AgentState<'_> {
 
         if let Some(mr) = mr_iid {
             let _ = self
-                .hosting
+                .forge
                 .add_mr_comment(mr, "Closing this MR — the linked issue has been closed.");
-            let _ = self.hosting.close_mr(mr);
+            let _ = self.forge.close_mr(mr);
         }
 
         let branch = format!("issue-{}", issue_iid);
@@ -572,7 +572,7 @@ impl AgentState<'_> {
         let _ = self.git_repo.checkout_remote_branch(&default_branch);
         let _ = self.git_repo.delete_local_branch(&branch);
         self.git_repo.delete_remote_branch_best_effort(&branch);
-        let _ = self.hosting.remove_issue_label(issue_iid, WORKING_ON_LABEL);
+        let _ = self.forge.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
         self.cleanup_session(issue_iid);
         true
@@ -699,10 +699,10 @@ fn clear_resumed_issue_if_ignored(
 ) -> Option<ActiveIssue> {
     let active_issue = active?;
 
-    let issue = match state.hosting.get_issue(active_issue.issue_iid) {
+    let issue = match state.forge.get_issue(active_issue.issue_iid) {
         Ok(issue) => issue,
         Err(e) => {
-            if crate::agents::hosting::is_not_found(&e) {
+            if crate::agents::forge::is_not_found(&e) {
                 info!(
                     "{}: Resumed issue #{} no longer exists (404), dropping resume state",
                     &state.agent_id, active_issue.issue_iid
@@ -1403,12 +1403,12 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
 
     fn issue(&self, issue_iid: u64) -> Result<IssueObservation> {
         Ok(IssueObservation::from_issue(
-            &self.state.hosting.get_issue(issue_iid)?,
+            &self.state.forge.get_issue(issue_iid)?,
         ))
     }
 
     fn merge_request_status(&self, mr_iid: u64) -> Result<MrStatusObservation> {
-        let mr = self.state.hosting.get_merge_request(mr_iid)?;
+        let mr = self.state.forge.get_merge_request(mr_iid)?;
         Ok(MrStatusObservation {
             iid: mr.iid,
             state: mr.state,
@@ -1418,7 +1418,7 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
     fn issues(&self) -> Result<Vec<IssueObservation>> {
         Ok(self
             .state
-            .hosting
+            .forge
             .list_issues()?
             .iter()
             .map(IssueObservation::from_issue)
@@ -1446,7 +1446,7 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
     }
     fn release_issue_claim(&mut self, issue_iid: u64) -> bool {
         claim::release(
-            self.state.hosting.as_ref(),
+            self.state.forge.as_ref(),
             ClaimResource::Issue(issue_iid),
             self.state.agent_id,
         )
@@ -1461,11 +1461,11 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
     fn remove_working_on_label(&mut self, issue_iid: u64) {
         let _ = self
             .state
-            .hosting
+            .forge
             .remove_issue_label(issue_iid, WORKING_ON_LABEL);
     }
     fn remove_issue_label(&mut self, issue_iid: u64, label: &str) {
-        let _ = self.state.hosting.remove_issue_label(issue_iid, label);
+        let _ = self.state.forge.remove_issue_label(issue_iid, label);
     }
     fn cleanup_session(&mut self, issue_iid: u64) {
         self.state.cleanup_session(issue_iid);
@@ -1474,13 +1474,13 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
         let _ = self.state.save_session(issue_iid, mr_iid);
     }
     fn close_issue(&mut self, issue_iid: u64) {
-        close_issue_best_effort(self.state.hosting.as_ref(), issue_iid);
+        close_issue_best_effort(self.state.forge.as_ref(), issue_iid);
     }
 
     fn acquire_issue_claim(&mut self, issue_iid: u64) -> Result<IssueClaimAttempt> {
         Ok(
             match claim::acquire(
-                self.state.hosting.as_ref(),
+                self.state.forge.as_ref(),
                 ClaimResource::Issue(issue_iid),
                 self.state.agent_id,
                 self.shutdown,
@@ -1504,7 +1504,7 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
         let Some(lease) = self.candidate_lease.as_mut() else {
             return;
         };
-        if lease.try_release(self.state.hosting.as_ref()).is_ok() {
+        if lease.try_release(self.state.forge.as_ref()).is_ok() {
             self.candidate_lease = None;
         } else if let Some(lease) = self.candidate_lease.take() {
             lease.preserve();
@@ -1590,7 +1590,7 @@ fn worker_cycle(
     run_worker_routing_cycle(&mut port, state.agent_id, scope_label, active)
 }
 
-fn mr_has_label(mr: &crate::agents::hosting::MergeRequest, label: &str) -> bool {
+fn mr_has_label(mr: &crate::agents::forge::MergeRequest, label: &str) -> bool {
     mr.labels
         .as_ref()
         .is_some_and(|ls| ls.iter().any(|l| l.eq_ignore_ascii_case(label)))
@@ -1604,7 +1604,7 @@ fn try_handle_need_ai_worker_mr(
     shutdown: &AtomicBool,
     scope_label: Option<&str>,
 ) -> Result<bool> {
-    let mut mrs = state.hosting.list_merge_requests()?;
+    let mut mrs = state.forge.list_merge_requests()?;
     mrs.sort_by_key(|mr| mr.iid);
     for mr in mrs {
         if shutdown.load(Ordering::SeqCst) {
@@ -1625,14 +1625,14 @@ fn try_handle_need_ai_worker_mr(
         if claim::is_mr_claimed(&mr.labels) && recovered_lease.is_none() {
             continue;
         }
-        let unresolved = state.hosting.get_unresolved_discussion_ids(mr.iid)?;
+        let unresolved = state.forge.get_unresolved_discussion_ids(mr.iid)?;
         if unresolved.is_empty() {
             continue;
         }
         let mut lease = match recovered_lease {
             Some(lease) => lease,
             None => match claim::acquire(
-                state.hosting.as_ref(),
+                state.forge.as_ref(),
                 ClaimResource::MergeRequest(mr.iid),
                 state.agent_id,
                 shutdown,
@@ -1643,7 +1643,7 @@ fn try_handle_need_ai_worker_mr(
             },
         };
         if shutdown.load(Ordering::SeqCst) {
-            if lease.try_release(state.hosting.as_ref()).is_err() {
+            if lease.try_release(state.forge.as_ref()).is_err() {
                 lease.preserve();
             }
             return Ok(false);
@@ -1656,7 +1656,7 @@ fn try_handle_need_ai_worker_mr(
             unresolved.len()
         );
         let result = handle_mr_comments(state, model, mr.iid, None, true);
-        let release_result = lease.try_release(state.hosting.as_ref());
+        let release_result = lease.try_release(state.forge.as_ref());
         if release_result.is_err() {
             lease.preserve();
         }
@@ -1713,11 +1713,11 @@ fn worker_should_cancel_issue_processing(issue: &IssueObservation) -> bool {
 }
 
 fn worker_issue_cancel_check(
-    hosting: Arc<dyn CodeHostingClient>,
+    forge: Arc<dyn ForgeClient>,
     issue_iid: u64,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
     Arc::new(move || {
-        hosting.get_issue(issue_iid).ok().is_some_and(|issue| {
+        forge.get_issue(issue_iid).ok().is_some_and(|issue| {
             worker_should_cancel_issue_processing(&IssueObservation::from_issue(&issue))
         })
     })
@@ -1739,7 +1739,7 @@ fn handle_worker_issue_processing_cancelled(
         return false;
     }
 
-    match state.hosting.get_issue(issue_iid) {
+    match state.forge.get_issue(issue_iid) {
         Ok(issue) if issue_has_worker_pending_label(&issue.labels) => {
             info!(
                 "{}: Issue #{} marked `{}` mid-run — releasing worker hold (issue stays open)",
@@ -1749,13 +1749,11 @@ fn handle_worker_issue_processing_cancelled(
             // our claim and session so another worker can pick it up once a
             // human removes `pending`.
             let _ = claim::release(
-                state.hosting.as_ref(),
+                state.forge.as_ref(),
                 ClaimResource::Issue(issue_iid),
                 state.agent_id,
             );
-            let _ = state
-                .hosting
-                .remove_issue_label(issue_iid, WORKING_ON_LABEL);
+            let _ = state.forge.remove_issue_label(issue_iid, WORKING_ON_LABEL);
             state.cleanup_session(issue_iid);
             true
         }
@@ -1773,13 +1771,11 @@ fn handle_worker_issue_processing_cancelled(
                 &state.agent_id, issue_iid
             );
             let _ = claim::release(
-                state.hosting.as_ref(),
+                state.forge.as_ref(),
                 ClaimResource::Issue(issue_iid),
                 state.agent_id,
             );
-            let _ = state
-                .hosting
-                .remove_issue_label(issue_iid, WORKING_ON_LABEL);
+            let _ = state.forge.remove_issue_label(issue_iid, WORKING_ON_LABEL);
             state.cleanup_session(issue_iid);
             true
         }
@@ -1789,7 +1785,7 @@ fn handle_worker_issue_processing_cancelled(
                 &state.agent_id, issue_iid, e
             );
             let _ = claim::release(
-                state.hosting.as_ref(),
+                state.forge.as_ref(),
                 ClaimResource::Issue(issue_iid),
                 state.agent_id,
             );
@@ -1800,7 +1796,7 @@ fn handle_worker_issue_processing_cancelled(
 }
 
 fn stop_worker_issue_if_review_only(state: &AgentState, issue_iid: u64) -> bool {
-    let Ok(issue) = state.hosting.get_issue(issue_iid) else {
+    let Ok(issue) = state.forge.get_issue(issue_iid) else {
         return false;
     };
     if !issue_has_worker_review_only_label(&issue.labels) {
@@ -1812,7 +1808,7 @@ fn stop_worker_issue_if_review_only(state: &AgentState, issue_iid: u64) -> bool 
 
 fn should_track_worker_issue(state: &AgentState, issue_iid: u64) -> bool {
     if state
-        .hosting
+        .forge
         .get_issue(issue_iid)
         .is_ok_and(|issue| issue_has_worker_review_only_label(&issue.labels))
     {
@@ -1823,8 +1819,8 @@ fn should_track_worker_issue(state: &AgentState, issue_iid: u64) -> bool {
     true
 }
 
-fn close_issue_best_effort(hosting: &dyn CodeHostingClient, issue_iid: u64) {
-    if let Err(e) = hosting.close_issue(issue_iid) {
+fn close_issue_best_effort(forge: &dyn ForgeClient, issue_iid: u64) {
+    if let Err(e) = forge.close_issue(issue_iid) {
         debug!(
             "Issue #{}: could not close after merged MR (may already be closed): {}",
             issue_iid, e
@@ -1839,15 +1835,12 @@ enum ClosesLinkedMr {
 }
 
 /// MRs whose description contains `Closes #issue_iid` (case-insensitive), preferring an open MR.
-fn closes_keyword_mr_status(
-    hosting: &dyn CodeHostingClient,
-    issue_iid: u64,
-) -> Option<ClosesLinkedMr> {
-    let mrs = hosting.list_merge_requests().ok()?;
+fn closes_keyword_mr_status(forge: &dyn ForgeClient, issue_iid: u64) -> Option<ClosesLinkedMr> {
+    let mrs = forge.list_merge_requests().ok()?;
     let mut opens: Vec<u64> = Vec::new();
     let mut any_merged = false;
     for mr in mrs {
-        if !crate::agents::hosting::mr_description_closes_issue(&mr.description, issue_iid) {
+        if !crate::agents::forge::mr_description_closes_issue(&mr.description, issue_iid) {
             continue;
         }
         match mr.state.as_str() {
@@ -1874,22 +1867,22 @@ enum ResolvedTrackedMr {
 
 /// Prefer an open MR linked via `Closes #issue`, then session MR if still open, then branch `issue-N`.
 fn resolve_tracked_mr_for_worker_issue(
-    hosting: &dyn CodeHostingClient,
+    forge: &dyn ForgeClient,
     issue_iid: u64,
     session_mr_iid: u64,
 ) -> ResolvedTrackedMr {
-    match closes_keyword_mr_status(hosting, issue_iid) {
+    match closes_keyword_mr_status(forge, issue_iid) {
         Some(ClosesLinkedMr::Open(id)) => return ResolvedTrackedMr::Track(id),
         Some(ClosesLinkedMr::Merged) => return ResolvedTrackedMr::MergedCloseIssue,
         None => {}
     }
     if session_mr_iid > 0
-        && let Ok(mr) = hosting.get_merge_request(session_mr_iid)
+        && let Ok(mr) = forge.get_merge_request(session_mr_iid)
         && mr.state == "opened"
     {
         return ResolvedTrackedMr::Track(session_mr_iid);
     }
-    if let Some(id) = find_open_mr_for_issue(hosting, issue_iid) {
+    if let Some(id) = find_open_mr_for_issue(forge, issue_iid) {
         return ResolvedTrackedMr::Track(id);
     }
     ResolvedTrackedMr::None
@@ -2208,7 +2201,7 @@ impl LiveImplementationPort<'_> {
         let issue_iid = self.issue.iid;
         let options = InvokeOptions {
             cancel_check: Some(worker_issue_cancel_check(
-                self.state.hosting.clone(),
+                self.state.forge.clone(),
                 issue_iid,
             )),
             follow_up_poll: None,
@@ -2254,11 +2247,11 @@ impl LiveImplementationPort<'_> {
 
 impl ImplementationPort for LiveImplementationPort<'_> {
     fn closes_linked_mr(&self) -> Option<ClosesLinkedMr> {
-        closes_keyword_mr_status(self.state.hosting.as_ref(), self.issue.iid)
+        closes_keyword_mr_status(self.state.forge.as_ref(), self.issue.iid)
     }
 
     fn open_mr_for_issue(&self) -> Option<u64> {
-        find_open_mr_for_issue(self.state.hosting.as_ref(), self.issue.iid)
+        find_open_mr_for_issue(self.state.forge.as_ref(), self.issue.iid)
     }
 
     fn default_branch(&self) -> Result<String> {
@@ -2286,7 +2279,7 @@ impl ImplementationPort for LiveImplementationPort<'_> {
 
     fn merge_request_state(&self, mr_iid: u64) -> Option<String> {
         self.state
-            .hosting
+            .forge
             .get_merge_request(mr_iid)
             .ok()
             .map(|mr| mr.state)
@@ -2294,14 +2287,14 @@ impl ImplementationPort for LiveImplementationPort<'_> {
 
     fn dependency_closed(&self, issue_iid: u64) -> bool {
         self.state
-            .hosting
+            .forge
             .get_issue(issue_iid)
             .map(|dep| dep.state == "closed")
             .unwrap_or(false)
     }
 
     fn issue_comments(&self) -> String {
-        format_issue_comments_for_worker_context(self.state.hosting.as_ref(), self.issue.iid)
+        format_issue_comments_for_worker_context(self.state.forge.as_ref(), self.issue.iid)
     }
 
     fn stop_if_review_only(&mut self) -> bool {
@@ -2311,34 +2304,34 @@ impl ImplementationPort for LiveImplementationPort<'_> {
     fn add_working_on_label(&mut self) {
         let _ = self
             .state
-            .hosting
+            .forge
             .add_issue_label(self.issue.iid, WORKING_ON_LABEL);
     }
 
     fn require_working_on_label(&mut self) -> Result<()> {
         self.state
-            .hosting
+            .forge
             .add_issue_label(self.issue.iid, WORKING_ON_LABEL)
     }
 
     fn remove_working_on_label(&mut self) {
         let _ = self
             .state
-            .hosting
+            .forge
             .remove_issue_label(self.issue.iid, WORKING_ON_LABEL);
     }
 
     fn add_issue_label(&mut self, label: &str) {
-        let _ = self.state.hosting.add_issue_label(self.issue.iid, label);
+        let _ = self.state.forge.add_issue_label(self.issue.iid, label);
     }
 
     fn add_issue_comment(&mut self, body: &str) {
-        let _ = self.state.hosting.add_issue_comment(self.issue.iid, body);
+        let _ = self.state.forge.add_issue_comment(self.issue.iid, body);
     }
 
     fn release_issue_claim(&mut self) -> Result<()> {
         claim::release(
-            self.state.hosting.as_ref(),
+            self.state.forge.as_ref(),
             ClaimResource::Issue(self.issue.iid),
             self.state.agent_id,
         )
@@ -2349,7 +2342,7 @@ impl ImplementationPort for LiveImplementationPort<'_> {
     }
 
     fn close_issue(&mut self) {
-        close_issue_best_effort(self.state.hosting.as_ref(), self.issue.iid);
+        close_issue_best_effort(self.state.forge.as_ref(), self.issue.iid);
     }
 
     fn save_session(&mut self, mr_iid: u64) {
@@ -2433,13 +2426,13 @@ impl ImplementationPort for LiveImplementationPort<'_> {
         description: &str,
     ) -> Result<u64> {
         self.state
-            .hosting
+            .forge
             .create_merge_request(branch, base, title, description)
     }
 
     fn add_mr_scope_label(&mut self, mr_iid: u64) {
         if let Some(label) = self.scope_label
-            && let Err(e) = self.state.hosting.add_mr_label_with_retries(mr_iid, label)
+            && let Err(e) = self.state.forge.add_mr_label_with_retries(mr_iid, label)
         {
             warn!(
                 "{}: Failed to add scope label {:?} to MR !{} (permanent error): {}",
@@ -2491,17 +2484,17 @@ fn hand_issue_back_to_humans(
     branch_name: &str,
     reason: &str,
 ) -> Result<()> {
-    state.hosting.add_issue_comment(issue_iid, reason)?;
+    state.forge.add_issue_comment(issue_iid, reason)?;
 
-    if let Some(mr_iid) = find_open_mr_for_issue(state.hosting.as_ref(), issue_iid) {
-        state.hosting.add_mr_comment(
+    if let Some(mr_iid) = find_open_mr_for_issue(state.forge.as_ref(), issue_iid) {
+        state.forge.add_mr_comment(
             mr_iid,
             &format!(
                 "Closing this MR — the issue cannot be implemented:\n\n{}",
                 reason
             ),
         )?;
-        let _ = state.hosting.close_mr(mr_iid);
+        let _ = state.forge.close_mr(mr_iid);
     }
 
     // Reset git to a clean state — keep remote branch for potential retry.
@@ -2514,10 +2507,10 @@ fn hand_issue_back_to_humans(
     let _ = state.git_repo.delete_local_branch(branch_name);
 
     state
-        .hosting
+        .forge
         .remove_issue_label(issue_iid, WORKING_ON_LABEL)?;
     state
-        .hosting
+        .forge
         .add_issue_label(issue_iid, ACTION_REQUIRED_LABEL)?;
     info!(
         "Issue #{} requires user action, labeled with '{}'",
@@ -2535,7 +2528,7 @@ fn hand_issue_back_to_humans(
 /// New top-level comments and replies to unrelated discussions advance the
 /// observation cursor but are not injected into the active model session.
 fn collect_new_follow_ups(
-    comments: &[crate::agents::hosting::Comment],
+    comments: &[crate::agents::forge::Comment],
     last_seen_id: &mut u64,
     mr_iid: u64,
     handled_discussion_ids: &HashSet<String>,
@@ -2603,9 +2596,9 @@ fn handle_mr_comments(
     linked_issue_iid: Option<u64>,
     comments_only_mode: bool,
 ) -> Result<bool> {
-    let latest_mr = state.hosting.get_merge_request(mr_iid)?;
-    let unresolved_ids = state.hosting.get_unresolved_discussion_ids(latest_mr.iid)?;
-    let all_comments = state.hosting.get_mr_comments(latest_mr.iid)?;
+    let latest_mr = state.forge.get_merge_request(mr_iid)?;
+    let unresolved_ids = state.forge.get_unresolved_discussion_ids(latest_mr.iid)?;
+    let all_comments = state.forge.get_mr_comments(latest_mr.iid)?;
     let plain_comments: Vec<_> = all_comments
         .iter()
         .filter(|c| !c.discussion_resolvable)
@@ -2672,7 +2665,7 @@ fn handle_mr_comments(
         state.project_name,
         &latest_mr,
         state.git_repo,
-        state.hosting.as_ref(),
+        state.forge.as_ref(),
     );
 
     // Merge the latest target branch so the worker has up-to-date upstream code.
@@ -2699,7 +2692,7 @@ fn handle_mr_comments(
         return Ok(false);
     }
     let issue_context = issue_number
-        .map(|n| load_issue_context(state.hosting.as_ref(), n))
+        .map(|n| load_issue_context(state.forge.as_ref(), n))
         .transpose()?
         .unwrap_or_else(|| "No linked issue context available for this MR.".to_string());
     let implementation_summary = issue_number
@@ -2789,7 +2782,7 @@ INSTRUCTIONS:
     let seen_comment_id =
         std::sync::Mutex::new(all_comments.iter().map(|c| c.id).max().unwrap_or(0));
     let handled_discussion_ids: HashSet<String> = unresolved_ids.iter().cloned().collect();
-    let glab_for_poll = state.hosting.clone();
+    let glab_for_poll = state.forge.clone();
     let mr_iid_for_poll = latest_mr.iid;
     let follow_up_poll: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(move || {
         let Ok(comments) = glab_for_poll.get_mr_comments(mr_iid_for_poll) else {
@@ -2812,7 +2805,7 @@ INSTRUCTIONS:
         let output = match model.complete_typed::<WorkerFeedbackOutput>(
             &prompt,
             &InvokeOptions {
-                cancel_check: Some(worker_issue_cancel_check(state.hosting.clone(), issue_iid)),
+                cancel_check: Some(worker_issue_cancel_check(state.forge.clone(), issue_iid)),
                 follow_up_poll: Some(follow_up_poll.clone()),
                 activity_label: Some(format!(
                     "{} addressing MR !{} feedback",
@@ -2866,14 +2859,14 @@ INSTRUCTIONS:
             if let Some(issue_number) = issue_number {
                 abandon_mr(state, &latest_mr, issue_number, &reason)?;
             } else {
-                state.hosting.add_mr_comment(
+                state.forge.add_mr_comment(
                     latest_mr.iid,
                     &format!(
                         "Cannot resolve this MR feedback autonomously:\n\n{}",
                         reason
                     ),
                 )?;
-                let _ = state.hosting.close_mr(latest_mr.iid);
+                let _ = state.forge.close_mr(latest_mr.iid);
             }
 
             return Ok(true);
@@ -2894,7 +2887,7 @@ INSTRUCTIONS:
     };
     let mut port = LiveFeedbackTailPort {
         git_repo: state.git_repo,
-        hosting: state.hosting.as_ref(),
+        forge: state.forge.as_ref(),
         mr_iid: latest_mr.iid,
         source_branch: latest_mr.source_branch.clone(),
         target_branch: latest_mr.target_branch.clone(),
@@ -2915,7 +2908,7 @@ struct MrSurfaceObservation {
 }
 
 impl MrSurfaceObservation {
-    fn from_mr(mr: &crate::agents::hosting::MergeRequest) -> Self {
+    fn from_mr(mr: &crate::agents::forge::MergeRequest) -> Self {
         Self {
             title: mr.title.clone(),
             description: mr.description.clone(),
@@ -3165,7 +3158,7 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
 
 struct LiveFeedbackTailPort<'a> {
     git_repo: &'a GitRepo,
-    hosting: &'a dyn CodeHostingClient,
+    forge: &'a dyn ForgeClient,
     mr_iid: u64,
     source_branch: String,
     target_branch: String,
@@ -3174,7 +3167,7 @@ struct LiveFeedbackTailPort<'a> {
 impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
     fn update_mr_metadata(&mut self, title: &str, description: &str) {
         if let Err(e) =
-            self.hosting
+            self.forge
                 .update_mr_title_description(self.mr_iid, Some(title), Some(description))
         {
             warn!("Failed to update MR !{} metadata: {}", self.mr_iid, e);
@@ -3237,7 +3230,7 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
 
     fn merge_request_surface(&self, mr_iid: u64) -> Result<MrSurfaceObservation> {
         Ok(MrSurfaceObservation::from_mr(
-            &self.hosting.get_merge_request(mr_iid)?,
+            &self.forge.get_merge_request(mr_iid)?,
         ))
     }
 
@@ -3248,14 +3241,14 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
     }
 
     fn unresolved_discussion_ids(&self, mr_iid: u64) -> Vec<String> {
-        self.hosting
+        self.forge
             .get_unresolved_discussion_ids(mr_iid)
             .unwrap_or_default()
     }
 
     fn reply_to_discussion(&mut self, discussion_id: &str, body: &str) {
         if let Err(e) = self
-            .hosting
+            .forge
             .reply_to_discussion(self.mr_iid, discussion_id, body)
         {
             warn!("Failed to reply to discussion {}: {}", discussion_id, e);
@@ -3263,13 +3256,13 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
     }
 
     fn resolve_discussion(&mut self, discussion_id: &str) {
-        if let Err(e) = self.hosting.resolve_discussion(self.mr_iid, discussion_id) {
+        if let Err(e) = self.forge.resolve_discussion(self.mr_iid, discussion_id) {
             warn!("Failed to resolve discussion {}: {}", discussion_id, e);
         }
     }
 
     fn post_plain_comment(&mut self, body: &str) {
-        if let Err(e) = self.hosting.add_mr_comment(self.mr_iid, body) {
+        if let Err(e) = self.forge.add_mr_comment(self.mr_iid, body) {
             warn!(
                 "Failed to post MR !{} reply for plain comments: {}",
                 self.mr_iid, e
@@ -3332,10 +3325,10 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
         // Fast path: session file records which agent owned it
         if let Some(ref stored_id) = session.agent_id {
             if stored_id == state.agent_id {
-                let issue = match state.hosting.get_issue(issue_iid) {
+                let issue = match state.forge.get_issue(issue_iid) {
                     Ok(i) => i,
                     Err(e) => {
-                        if state.hosting.is_not_found(&e) {
+                        if state.forge.is_not_found(&e) {
                             // The issue no longer exists on GitLab (deleted or
                             // moved). Drop the stale session so we stop
                             // retrying a 404 on every cycle.
@@ -3395,21 +3388,19 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                 }
 
                 match resolve_tracked_mr_for_worker_issue(
-                    state.hosting.as_ref(),
+                    state.forge.as_ref(),
                     issue_iid,
                     session.mr_iid,
                 ) {
                     ResolvedTrackedMr::MergedCloseIssue => {
-                        close_issue_best_effort(state.hosting.as_ref(), issue_iid);
+                        close_issue_best_effort(state.forge.as_ref(), issue_iid);
 
                         let _ = claim::release(
-                            state.hosting.as_ref(),
+                            state.forge.as_ref(),
                             ClaimResource::Issue(issue_iid),
                             state.agent_id,
                         );
-                        let _ = state
-                            .hosting
-                            .remove_issue_label(issue_iid, WORKING_ON_LABEL);
+                        let _ = state.forge.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
                         state.cleanup_session(issue_iid);
                         continue;
@@ -3447,7 +3438,7 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
         }
 
         // Fallback for old session files without agent_id: check GitLab labels
-        match state.hosting.get_issue(issue_iid) {
+        match state.forge.get_issue(issue_iid) {
             Ok(issue) if issue.state != "opened" => {
                 let mr_iid = (session.mr_iid > 0).then_some(session.mr_iid);
                 state.abandon_closed_issue(issue_iid, mr_iid);
@@ -3466,21 +3457,19 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                 }
 
                 match resolve_tracked_mr_for_worker_issue(
-                    state.hosting.as_ref(),
+                    state.forge.as_ref(),
                     issue_iid,
                     session.mr_iid,
                 ) {
                     ResolvedTrackedMr::MergedCloseIssue => {
-                        close_issue_best_effort(state.hosting.as_ref(), issue_iid);
+                        close_issue_best_effort(state.forge.as_ref(), issue_iid);
 
                         let _ = claim::release(
-                            state.hosting.as_ref(),
+                            state.forge.as_ref(),
                             ClaimResource::Issue(issue_iid),
                             state.agent_id,
                         );
-                        let _ = &state
-                            .hosting
-                            .remove_issue_label(issue_iid, WORKING_ON_LABEL);
+                        let _ = &state.forge.remove_issue_label(issue_iid, WORKING_ON_LABEL);
 
                         state.cleanup_session(issue_iid);
                         continue;
@@ -3521,7 +3510,7 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                 );
             }
             Err(e) => {
-                if state.hosting.is_not_found(&e) {
+                if state.forge.is_not_found(&e) {
                     info!(
                         "{}: Issue #{} no longer exists on GitLab (404), \
                          discarding stale session",
@@ -3546,7 +3535,7 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
 fn find_claimed_issue(state: &AgentState, scope_label: Option<&str>) -> Option<ActiveIssue> {
     let claim_label = format!("claimed:{}", &state.agent_id);
 
-    let issues = match state.hosting.list_issues() {
+    let issues = match state.forge.list_issues() {
         Ok(i) => i,
         Err(e) => {
             warn!(
@@ -3581,18 +3570,16 @@ fn find_claimed_issue(state: &AgentState, scope_label: Option<&str>) -> Option<A
             continue;
         }
 
-        match resolve_tracked_mr_for_worker_issue(state.hosting.as_ref(), issue.iid, 0) {
+        match resolve_tracked_mr_for_worker_issue(state.forge.as_ref(), issue.iid, 0) {
             ResolvedTrackedMr::MergedCloseIssue => {
-                close_issue_best_effort(state.hosting.as_ref(), issue.iid);
+                close_issue_best_effort(state.forge.as_ref(), issue.iid);
 
                 let _ = claim::release(
-                    state.hosting.as_ref(),
+                    state.forge.as_ref(),
                     ClaimResource::Issue(issue.iid),
                     state.agent_id,
                 );
-                let _ = state
-                    .hosting
-                    .remove_issue_label(issue.iid, WORKING_ON_LABEL);
+                let _ = state.forge.remove_issue_label(issue.iid, WORKING_ON_LABEL);
 
                 state.cleanup_session(issue.iid);
                 continue;
@@ -3669,7 +3656,7 @@ fn try_adopt_orphaned_session(
             continue;
         }
 
-        let Ok(issue) = state.hosting.get_issue(issue_iid) else {
+        let Ok(issue) = state.forge.get_issue(issue_iid) else {
             continue;
         };
 
@@ -3697,7 +3684,7 @@ fn try_adopt_orphaned_session(
 
         let (mr_iid, mr_created) = if session.mr_iid > 0 {
             // Check if the MR is still open
-            if let Ok(mr) = state.hosting.get_merge_request(session.mr_iid) {
+            if let Ok(mr) = state.forge.get_merge_request(session.mr_iid) {
                 if mr.state == "merged" || mr.state == "closed" {
                     info!(
                         "{}: Orphaned session for issue #{} has {} MR !{}, cleaning up",
@@ -3705,9 +3692,7 @@ fn try_adopt_orphaned_session(
                     );
 
                     state.cleanup_session(issue_iid);
-                    let _ = state
-                        .hosting
-                        .remove_issue_label(issue_iid, WORKING_ON_LABEL);
+                    let _ = state.forge.remove_issue_label(issue_iid, WORKING_ON_LABEL);
                     continue;
                 }
             } else {
@@ -3716,7 +3701,7 @@ fn try_adopt_orphaned_session(
             (Some(session.mr_iid), true)
         } else {
             // No MR yet — check if one was created in the meantime
-            match find_open_mr_for_issue(state.hosting.as_ref(), issue_iid) {
+            match find_open_mr_for_issue(state.forge.as_ref(), issue_iid) {
                 Some(mr) => (Some(mr), true),
                 None => (None, false),
             }
@@ -3724,7 +3709,7 @@ fn try_adopt_orphaned_session(
 
         // Try to claim this issue
         match claim::acquire(
-            state.hosting.as_ref(),
+            state.forge.as_ref(),
             ClaimResource::Issue(issue_iid),
             state.agent_id,
             shutdown,
@@ -3759,9 +3744,9 @@ fn try_adopt_orphaned_session(
 // ---------------------------------------------------------------------------
 
 /// Find an *open* MR for an issue. Closed/merged MRs are ignored.
-fn find_open_mr_for_issue(hosting: &dyn CodeHostingClient, issue_iid: u64) -> Option<u64> {
+fn find_open_mr_for_issue(forge: &dyn ForgeClient, issue_iid: u64) -> Option<u64> {
     let branch_name = format!("issue-{}", issue_iid);
-    hosting
+    forge
         .find_open_mr_by_source_branch(&branch_name)
         .ok()
         .flatten()
@@ -3781,8 +3766,8 @@ fn extract_issue_number_from_branch(branch_name: &str) -> Result<u64> {
     }
 }
 
-fn load_issue_context(hosting: &dyn CodeHostingClient, issue_number: u64) -> Result<String> {
-    match hosting.get_issue(issue_number) {
+fn load_issue_context(forge: &dyn ForgeClient, issue_number: u64) -> Result<String> {
+    match forge.get_issue(issue_number) {
         Ok(issue) => Ok(format!(
             "Issue #{}: {}\n\nDescription:\n{}\n\nLabels: {}",
             issue.iid,
@@ -3796,18 +3781,18 @@ fn load_issue_context(hosting: &dyn CodeHostingClient, issue_number: u64) -> Res
 
 fn abandon_mr(
     state: &AgentState,
-    mr: &crate::agents::hosting::MergeRequest,
+    mr: &crate::agents::forge::MergeRequest,
     issue_iid: u64,
     reason: &str,
 ) -> Result<()> {
-    state.hosting.add_mr_comment(
+    state.forge.add_mr_comment(
         mr.iid,
         &format!(
             "Closing this MR — the issue cannot be resolved autonomously:\n\n{}",
             reason
         ),
     )?;
-    let _ = state.hosting.close_mr(mr.iid);
+    let _ = state.forge.close_mr(mr.iid);
 
     let default_branch = state
         .git_repo
@@ -3817,13 +3802,11 @@ fn abandon_mr(
     let _ = state.git_repo.checkout_remote_branch(&default_branch);
     let _ = state.git_repo.delete_local_branch(&mr.source_branch);
 
-    let _ = state
-        .hosting
-        .remove_issue_label(issue_iid, WORKING_ON_LABEL);
+    let _ = state.forge.remove_issue_label(issue_iid, WORKING_ON_LABEL);
     state
-        .hosting
+        .forge
         .add_issue_label(issue_iid, ACTION_REQUIRED_LABEL)?;
-    state.hosting.add_issue_comment(
+    state.forge.add_issue_comment(
         issue_iid,
         &format!(
             "This issue requires additional human input before it can be implemented:\n\n{}",
@@ -3988,9 +3971,9 @@ fn build_diff_highlights_since(git_repo: &GitRepo, base_ref: &str) -> Option<Str
 
 fn build_mr_diff_context(
     project_name: &str,
-    mr: &crate::agents::hosting::MergeRequest,
+    mr: &crate::agents::forge::MergeRequest,
     git_repo: &GitRepo,
-    gitlab: &dyn CodeHostingClient,
+    gitlab: &dyn ForgeClient,
 ) -> String {
     const MAX_DIFF_CHARS: usize = 120_000;
     const MAX_FILES: usize = 200;
@@ -4093,7 +4076,7 @@ fn truncate_utf8_string_in_place(s: &mut String, max_bytes: usize) {
     s.truncate(end);
 }
 
-fn format_comments_for_prompt(comments: &[crate::agents::hosting::Comment]) -> String {
+fn format_comments_for_prompt(comments: &[crate::agents::forge::Comment]) -> String {
     comments
         .iter()
         .map(|c| c.format_for_prompt())
@@ -4103,7 +4086,7 @@ fn format_comments_for_prompt(comments: &[crate::agents::hosting::Comment]) -> S
 
 struct CombinedMrFeedbackContextInput<'a> {
     project_name: &'a str,
-    mr: &'a crate::agents::hosting::MergeRequest,
+    mr: &'a crate::agents::forge::MergeRequest,
     issue_context: &'a str,
     implementation_summary: &'a str,
     merge_conflict_status: &'a str,
@@ -4145,7 +4128,7 @@ fn build_combined_mr_feedback_context(input: CombinedMrFeedbackContextInput<'_>)
 }
 
 fn build_merge_conflict_status_section(
-    mr: &crate::agents::hosting::MergeRequest,
+    mr: &crate::agents::forge::MergeRequest,
     requires_conflict_resolution: bool,
     local_merge_clean: bool,
     git_repo: &GitRepo,
@@ -4254,11 +4237,8 @@ fn extract_no_change_resolution_reason(resolution: &FeedbackResolution) -> Optio
 // Prompt builders
 // ---------------------------------------------------------------------------
 
-fn format_issue_comments_for_worker_context(
-    hosting: &dyn CodeHostingClient,
-    issue_iid: u64,
-) -> String {
-    let comments = match hosting.get_issue_comments(issue_iid) {
+fn format_issue_comments_for_worker_context(forge: &dyn ForgeClient, issue_iid: u64) -> String {
+    let comments = match forge.get_issue_comments(issue_iid) {
         Ok(c) => c,
         Err(e) => {
             warn!(
@@ -4280,16 +4260,16 @@ fn format_issue_comments_for_worker_context(
 }
 
 fn split_parent_context(
-    hosting: &dyn CodeHostingClient,
+    forge: &dyn ForgeClient,
     issue: &IssueObservation,
 ) -> Result<Option<String>> {
     let Some(parent_iid) = split_parent_iid(&issue.description) else {
         return Ok(None);
     };
-    let parent = hosting
+    let parent = forge
         .get_issue(parent_iid)
         .with_context(|| format!("failed to load parent issue #{parent_iid} for split child"))?;
-    let comments = format_issue_comments_for_worker_context(hosting, parent_iid);
+    let comments = format_issue_comments_for_worker_context(forge, parent_iid);
     Ok(Some(format!(
         "## Original parent issue context\n\nIssue: #{} {}\n\n### Description\n{}\n\n### Issue comments\n\n{}",
         parent.iid, parent.title, parent.description, comments
@@ -4315,7 +4295,7 @@ fn build_implementation_prompt(
     issue: &IssueObservation,
     gitlab_comments_text: &str,
 ) -> Result<String> {
-    let parent_context = split_parent_context(state.hosting.as_ref(), issue)?;
+    let parent_context = split_parent_context(state.forge.as_ref(), issue)?;
     let context_content =
         worker_issue_context_markdown(issue, gitlab_comments_text, parent_context.as_deref());
     // Write to disk for archival, but inject content into the prompt.
@@ -4392,7 +4372,7 @@ fn build_continuation_prompt(
     issue: &IssueObservation,
     gitlab_comments_text: &str,
 ) -> Result<String> {
-    let parent_context = split_parent_context(state.hosting.as_ref(), issue)?;
+    let parent_context = split_parent_context(state.forge.as_ref(), issue)?;
     let context_content =
         worker_issue_context_markdown(issue, gitlab_comments_text, parent_context.as_deref());
     // Write to disk for archival, but inject content into the prompt.
@@ -4685,13 +4665,13 @@ fn extract_mr_description(mr_description: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::hosting;
+    use crate::agents::forge;
     use crate::core::agent::schema::conformance;
 
     // -----------------------------------------------------------------
     // Session persistence: tolerant policy. Corrupt/unsupported session
     // files have historically been treated as "no session" rather than
-    // failing the worker cycle; `GitRepo::new`/`hosting::for_test_client`
+    // failing the worker cycle; `GitRepo::new`/`forge::for_test_client`
     // are file/network-free constructors so this exercises the real
     // `AgentState` session methods without touching git or GitLab.
     // -----------------------------------------------------------------
@@ -4703,7 +4683,7 @@ mod tests {
         agent_id: String,
         sessions_dir: String,
         git_repo: GitRepo,
-        hosting: Arc<dyn CodeHostingClient>,
+        forge: Arc<dyn ForgeClient>,
     }
 
     fn test_runtime(sessions_dir: &str, agent_id: &str) -> TestRuntime {
@@ -4715,7 +4695,7 @@ mod tests {
                 std::env::temp_dir().to_string_lossy().into_owned(),
                 Arc::new(AtomicBool::new(false)),
             ),
-            hosting: hosting::for_test_client("/tmp/unused-repo"),
+            forge: forge::for_test_client("/tmp/unused-repo"),
         }
     }
 
@@ -4725,7 +4705,7 @@ mod tests {
             agent_id: &rt.agent_id,
             sessions_dir: &rt.sessions_dir,
             git_repo: &rt.git_repo,
-            hosting: &rt.hosting,
+            forge: &rt.forge,
         }
     }
 
@@ -5653,7 +5633,7 @@ mod tests {
 
     #[test]
     fn merge_request_surface_changed_detects_title_labels() {
-        use crate::agents::hosting::MergeRequest;
+        use crate::agents::forge::MergeRequest;
         let a = MergeRequest {
             iid: 1,
             title: "Old".into(),
@@ -5742,8 +5722,8 @@ mod tests {
         author: &str,
         discussion_id: &str,
         body: &str,
-    ) -> crate::agents::hosting::Comment {
-        crate::agents::hosting::Comment {
+    ) -> crate::agents::forge::Comment {
+        crate::agents::forge::Comment {
             id,
             body: body.to_string(),
             author: author.to_string(),

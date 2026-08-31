@@ -8,8 +8,8 @@ use tracing::{debug, error, info, warn};
 
 use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::{claim, mr_in_scope, write_task_context_file};
+use crate::agents::forge::{self, ForgeClient, Issue, MergeRequest};
 use crate::agents::git::GitRepo;
-use crate::agents::hosting::{self, CodeHostingClient, Issue, MergeRequest};
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::schema::tagged;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
@@ -217,7 +217,7 @@ impl CoreAgent for ReviewerAgent {
                     &self.runtime.sessions_dir,
                     &self.config,
                     &self.runtime.git_repo,
-                    &self.runtime.hosting,
+                    &self.runtime.forge,
                     model,
                     &mut self.merged_mrs,
                     &mut self.claimed_mr,
@@ -237,7 +237,7 @@ impl CoreAgent for ReviewerAgent {
             merge_when_approved: settings.merge_when_approved,
         };
         let scope = crate::agents::scope_label_filter(&runtime.scope_label);
-        let claimed_mr = find_claimed_mr(&runtime.agent_id, &runtime.hosting, scope);
+        let claimed_mr = find_claimed_mr(&runtime.agent_id, &runtime.forge, scope);
         Ok(Self {
             runtime,
             config,
@@ -431,12 +431,12 @@ fn sort_review_candidates(candidates: &mut [MrObservation], priorities: &[(u64, 
         if aa != bb {
             return bb.cmp(&aa);
         }
-        let pa = hosting::issue_iid_from_branch(&a.source_branch)
+        let pa = forge::issue_iid_from_branch(&a.source_branch)
             .and_then(|iid| priority_map.get(&iid).copied())
-            .unwrap_or(hosting::DEFAULT_PRIORITY);
-        let pb = hosting::issue_iid_from_branch(&b.source_branch)
+            .unwrap_or(forge::DEFAULT_PRIORITY);
+        let pb = forge::issue_iid_from_branch(&b.source_branch)
             .and_then(|iid| priority_map.get(&iid).copied())
-            .unwrap_or(hosting::DEFAULT_PRIORITY);
+            .unwrap_or(forge::DEFAULT_PRIORITY);
         pa.cmp(&pb).then_with(|| a.iid.cmp(&b.iid))
     });
 }
@@ -449,7 +449,7 @@ fn linked_issue_iid(mr: &MrObservation) -> Option<u64> {
         r.captures(&mr.description)
             .and_then(|c| c.get(1)?.as_str().parse().ok())
     })
-    .or_else(|| hosting::issue_iid_from_branch(&mr.source_branch))
+    .or_else(|| forge::issue_iid_from_branch(&mr.source_branch))
 }
 
 /// Whether the MR can be reviewed at all, or must be handed straight back
@@ -767,7 +767,7 @@ struct LiveReviewerPort<'a> {
     project_name: &'a str,
     sessions_dir: &'a str,
     git_repo: &'a GitRepo,
-    hosting: &'a Arc<dyn CodeHostingClient>,
+    forge: &'a Arc<dyn ForgeClient>,
     model: &'a AgentModel,
     claimed_mr: &'a mut Option<ClaimLease>,
     shutdown: &'a AtomicBool,
@@ -792,7 +792,7 @@ impl ReviewerPort for LiveReviewerPort<'_> {
     }
     fn recover_claim(&mut self) {
         if self.claimed_mr.is_none() {
-            *self.claimed_mr = find_claimed_mr(self.agent_id, self.hosting, self.scope_label);
+            *self.claimed_mr = find_claimed_mr(self.agent_id, self.forge, self.scope_label);
         }
     }
     fn try_release_held_claim(&mut self) -> Result<()> {
@@ -804,26 +804,26 @@ impl ReviewerPort for LiveReviewerPort<'_> {
             "{}: Releasing held claim on MR !{} from previous cycle",
             self.agent_id, iid
         );
-        lease.try_release(self.hosting.as_ref())?;
+        lease.try_release(self.forge.as_ref())?;
         *self.claimed_mr = None;
         Ok(())
     }
     fn release_held_claim(&mut self) {
-        release_claimed_mr(self.claimed_mr, self.hosting, self.agent_id);
+        release_claimed_mr(self.claimed_mr, self.forge, self.agent_id);
     }
     fn release_stale_claim_label(&mut self, mr_iid: u64) {
-        release_mr_claim_or_warn(self.hosting, mr_iid, self.agent_id);
+        release_mr_claim_or_warn(self.forge, mr_iid, self.agent_id);
     }
     fn merge_requests(&self) -> Result<Vec<MrObservation>> {
         Ok(self
-            .hosting
+            .forge
             .list_merge_requests()?
             .iter()
             .map(MrObservation::from_merge_request)
             .collect())
     }
     fn issue_priorities(&self) -> Vec<(u64, u8)> {
-        self.hosting
+        self.forge
             .list_issues()
             .unwrap_or_default()
             .iter()
@@ -831,12 +831,12 @@ impl ReviewerPort for LiveReviewerPort<'_> {
             .collect()
     }
     fn unresolved_discussions(&self, mr_iid: u64) -> Result<DiscussionCounts> {
-        let (unresolved, total) = self
-            .hosting
-            .get_unresolved_discussion_count(mr_iid)
-            .map_err(|error| {
-                error.context(format!("Failed to fetch discussions for MR !{mr_iid}"))
-            })?;
+        let (unresolved, total) =
+            self.forge
+                .get_unresolved_discussion_count(mr_iid)
+                .map_err(|error| {
+                    error.context(format!("Failed to fetch discussions for MR !{mr_iid}"))
+                })?;
         if unresolved == 0 && total > 0 {
             info!(
                 "MR !{} all {} discussion(s) resolved, ready for re-review",
@@ -847,7 +847,7 @@ impl ReviewerPort for LiveReviewerPort<'_> {
     }
     fn acquire_claim(&mut self, mr_iid: u64) -> Result<ClaimAttempt> {
         match claim::acquire(
-            self.hosting.as_ref(),
+            self.forge.as_ref(),
             ClaimResource::MergeRequest(mr_iid),
             self.agent_id,
             self.shutdown,
@@ -879,7 +879,7 @@ impl ReviewerPort for LiveReviewerPort<'_> {
     fn invoke_review_model(&mut self, subject: &ReviewSubject) -> Result<ReviewerOutput> {
         let prompt = build_review_prompt(ReviewPromptInput {
             project_name: self.project_name,
-            hosting: self.hosting.as_ref(),
+            forge: self.forge.as_ref(),
             mr: &subject.mr,
             diff_stat: &subject.diff_stat,
             changed_files: &subject.changed_files,
@@ -947,20 +947,20 @@ Inspect the actual code changes in the repository (the source branch is checked 
             .description)
     }
     fn post_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
-        self.hosting.add_mr_discussion(mr_iid, body)
+        self.forge.add_mr_discussion(mr_iid, body)
     }
     fn post_resolved_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()> {
-        self.hosting.add_resolved_mr_discussion(mr_iid, body)
+        self.forge.add_resolved_mr_discussion(mr_iid, body)
     }
     fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
-        self.hosting.create_issue(title, description)
+        self.forge.create_issue(title, description)
     }
     fn add_approved_label(&mut self, mr_iid: u64) -> Result<()> {
-        self.hosting
+        self.forge
             .add_mr_label_with_retries(mr_iid, REVIEWER_APPROVED_LABEL)
     }
     fn merge_merge_request(&mut self, mr_iid: u64) -> Result<()> {
-        self.hosting.merge_mr(mr_iid)
+        self.forge.merge_mr(mr_iid)
     }
 }
 
@@ -972,7 +972,7 @@ fn reviewer_cycle(
     sessions_dir: &str,
     config: &ReviewerConfig,
     git_repo: &GitRepo,
-    hosting: &Arc<dyn CodeHostingClient>,
+    forge: &Arc<dyn ForgeClient>,
     model: &AgentModel,
     merged_mrs: &mut HashSet<u64>,
     claimed_mr: &mut Option<ClaimLease>,
@@ -984,7 +984,7 @@ fn reviewer_cycle(
         project_name,
         sessions_dir,
         git_repo,
-        hosting,
+        forge,
         model,
         claimed_mr,
         shutdown,
@@ -998,9 +998,9 @@ fn reviewer_cycle(
     Ok(())
 }
 
-fn release_mr_claim_or_warn(hosting: &Arc<dyn CodeHostingClient>, mr_iid: u64, agent_id: &str) {
+fn release_mr_claim_or_warn(forge: &Arc<dyn ForgeClient>, mr_iid: u64, agent_id: &str) {
     if let Err(e) = claim::release(
-        hosting.as_ref(),
+        forge.as_ref(),
         ClaimResource::MergeRequest(mr_iid),
         agent_id,
     ) {
@@ -1015,14 +1015,14 @@ fn release_mr_claim_or_warn(hosting: &Arc<dyn CodeHostingClient>, mr_iid: u64, a
 /// keeps the lease in memory so the next cycle can retry it.
 fn release_claimed_mr(
     claimed_mr: &mut Option<ClaimLease>,
-    hosting: &Arc<dyn CodeHostingClient>,
+    forge: &Arc<dyn ForgeClient>,
     agent_id: &str,
 ) {
     let Some(lease) = claimed_mr.as_mut() else {
         return;
     };
     let mr_iid = lease.resource().iid();
-    if let Err(e) = lease.try_release(hosting.as_ref()) {
+    if let Err(e) = lease.try_release(forge.as_ref()) {
         warn!(
             "{}: Failed to release claim on MR !{}: {}",
             agent_id, mr_iid, e
@@ -1057,7 +1057,7 @@ fn plan_approval(has_unresolved: bool, merge_when_approved: bool) -> ApprovalPla
 
 struct ReviewPromptInput<'a> {
     project_name: &'a str,
-    hosting: &'a dyn CodeHostingClient,
+    forge: &'a dyn ForgeClient,
     mr: &'a MrObservation,
     diff_stat: &'a str,
     changed_files: &'a [String],
@@ -1068,7 +1068,7 @@ struct ReviewPromptInput<'a> {
 
 fn build_review_prompt(input: ReviewPromptInput<'_>) -> Result<String> {
     let comments = input
-        .hosting
+        .forge
         .get_mr_comments(input.mr.iid)
         .unwrap_or_default();
 
@@ -1095,7 +1095,7 @@ fn build_review_prompt(input: ReviewPromptInput<'_>) -> Result<String> {
     };
 
     let issue_context = if let Some(iid) = input.issue_iid {
-        build_issue_context(input.hosting, iid)
+        build_issue_context(input.forge, iid)
     } else {
         String::new()
     };
@@ -1211,10 +1211,10 @@ FILE HYGIENE (STRICT — reject if violated):
     Ok(prompt)
 }
 
-fn build_issue_context(hosting: &dyn CodeHostingClient, issue_iid: u64) -> String {
+fn build_issue_context(forge: &dyn ForgeClient, issue_iid: u64) -> String {
     let mut ctx = String::new();
 
-    match hosting.get_issue(issue_iid) {
+    match forge.get_issue(issue_iid) {
         Ok(issue) => {
             ctx.push_str(&format_issue_context_header(issue_iid, &issue));
         }
@@ -1224,7 +1224,7 @@ fn build_issue_context(hosting: &dyn CodeHostingClient, issue_iid: u64) -> Strin
         }
     }
 
-    match hosting.get_issue_comments(issue_iid) {
+    match forge.get_issue_comments(issue_iid) {
         Ok(comments) if !comments.is_empty() => {
             ctx.push_str("\nISSUE COMMENTS (read as possible updates to requirements):\n");
             for c in &comments {
@@ -1375,10 +1375,10 @@ fn mr_labels_has(labels: Option<&[String]>, label: &str) -> bool {
 /// this scan finds the label live on GitLab, per [`ClaimLease::recover`].
 fn find_claimed_mr(
     agent_id: &str,
-    hosting: &Arc<dyn CodeHostingClient>,
+    forge: &Arc<dyn ForgeClient>,
     scope_label: Option<&str>,
 ) -> Option<ClaimLease> {
-    match hosting.list_merge_requests() {
+    match forge.list_merge_requests() {
         Ok(mrs) => {
             for mr in &mrs {
                 if mr.state != "opened" || !mr_in_scope(mr, scope_label) {

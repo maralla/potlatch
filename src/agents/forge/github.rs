@@ -1,6 +1,6 @@
-//! GitHub code hosting client.
+//! GitHub forge client.
 //!
-//! Implements [`super::CodeHostingClient`] using the GitHub REST API (via
+//! Implements [`super::ForgeClient`] using the GitHub REST API (via
 //! the `gh` CLI). Maps GitHub's pull requests to the shared [`super::MergeRequest`]
 //! type and GitHub issues to [`super::Issue`].
 //!
@@ -11,7 +11,7 @@
 use anyhow::Result;
 
 use super::{
-    CodeHostingClient, Comment, Issue, IssueThreadNote, MergeRequest, MergeRequestChangesSnapshot,
+    Comment, ForgeClient, Issue, IssueThreadNote, MergeRequest, MergeRequestChangesSnapshot,
 };
 
 pub(crate) struct GitHubClient;
@@ -22,7 +22,7 @@ impl GitHubClient {
     }
 }
 
-impl CodeHostingClient for GitHubClient {
+impl ForgeClient for GitHubClient {
     fn list_issues(&self) -> Result<Vec<Issue>> {
         unimplemented!("GitHub: list_issues")
     }

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use crate::agents::hosting::{self, CodeHostingClient};
+use crate::agents::forge::{self, ForgeClient};
 use crate::agents::ssh_util::{shell_single_quote, validate_remote_path, validate_ssh_identity};
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::agents::write_task_context_file;
@@ -398,7 +398,7 @@ impl CoreAgent for OpsAgent {
                 ops_cycle(
                     &state,
                     &self.config,
-                    self.runtime.hosting.as_ref(),
+                    self.runtime.forge.as_ref(),
                     model,
                     Arc::clone(&shutdown),
                     scope,
@@ -653,7 +653,7 @@ fn run_ops_cycle(
 /// ops decision meets ssh, the filesystem, GitLab, or the model.
 struct LiveOpsPort<'a> {
     state: &'a AgentState<'a>,
-    hosting: &'a dyn CodeHostingClient,
+    forge: &'a dyn ForgeClient,
     model: &'a AgentModel,
     shutdown: &'a AtomicBool,
     scope_label: Option<&'a str>,
@@ -695,7 +695,7 @@ impl OpsPort for LiveOpsPort<'_> {
     }
 
     fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String> {
-        write_gitlab_context_file(self.state, self.hosting, unix_ts)
+        write_gitlab_context_file(self.state, self.forge, unix_ts)
     }
 
     fn write_scrape_file(&mut self, unix_ts: u64, window_log: &str) -> Result<()> {
@@ -743,17 +743,17 @@ impl OpsPort for LiveOpsPort<'_> {
     }
 
     fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
-        self.hosting.create_issue(title, description)
+        self.forge.create_issue(title, description)
     }
 
     fn add_priority_label(&mut self, issue_iid: u64, priority: u8) -> Result<()> {
-        self.hosting
-            .add_issue_label(issue_iid, &hosting::priority_label(priority))
+        self.forge
+            .add_issue_label(issue_iid, &forge::priority_label(priority))
     }
 
     fn add_scope_label(&mut self, issue_iid: u64) -> Result<()> {
         match self.scope_label {
-            Some(label) => self.hosting.add_issue_label(issue_iid, label),
+            Some(label) => self.forge.add_issue_label(issue_iid, label),
             None => Ok(()),
         }
     }
@@ -766,14 +766,14 @@ impl OpsPort for LiveOpsPort<'_> {
 fn ops_cycle(
     state: &AgentState,
     config: &OpsConfig,
-    hosting: &dyn CodeHostingClient,
+    forge: &dyn ForgeClient,
     model: &AgentModel,
     shutdown: Arc<AtomicBool>,
     scope_label: Option<&str>,
 ) -> Result<()> {
     let mut port = LiveOpsPort {
         state,
-        hosting,
+        forge,
         model,
         shutdown: shutdown.as_ref(),
         scope_label,
@@ -847,10 +847,10 @@ fn ensure_history_file(state: &AgentState, history: &OpsIssueHistory) -> Result<
 
 fn write_gitlab_context_file(
     state: &AgentState,
-    hosting: &dyn CodeHostingClient,
+    forge: &dyn ForgeClient,
     unix_ts: u64,
 ) -> Result<String> {
-    let content = build_gitlab_context(hosting)?;
+    let content = build_gitlab_context(forge)?;
     write_task_context_file(
         state.sessions_dir,
         &format!("{}-gitlab-context-{unix_ts}.md", state.agent_id),
@@ -858,26 +858,26 @@ fn write_gitlab_context_file(
     )
 }
 
-fn build_gitlab_context(hosting: &dyn CodeHostingClient) -> Result<String> {
+fn build_gitlab_context(forge: &dyn ForgeClient) -> Result<String> {
     let mut out = String::from("# Current GitLab issues and merge requests\n\n");
 
-    let issues = hosting.list_issues()?;
+    let issues = forge.list_issues()?;
     out.push_str("## Open issues\n\n");
     if issues.is_empty() {
         out.push_str("(none)\n\n");
     } else {
         for issue in &issues {
-            append_issue_context(&mut out, hosting, issue)?;
+            append_issue_context(&mut out, forge, issue)?;
         }
     }
 
-    let mrs = hosting.list_merge_requests()?;
+    let mrs = forge.list_merge_requests()?;
     out.push_str("## Open merge requests\n\n");
     if mrs.is_empty() {
         out.push_str("(none)\n");
     } else {
         for mr in &mrs {
-            append_mr_context(&mut out, hosting, mr)?;
+            append_mr_context(&mut out, forge, mr)?;
         }
     }
 
@@ -886,8 +886,8 @@ fn build_gitlab_context(hosting: &dyn CodeHostingClient) -> Result<String> {
 
 fn append_issue_context(
     out: &mut String,
-    hosting: &dyn CodeHostingClient,
-    issue: &hosting::Issue,
+    forge: &dyn ForgeClient,
+    issue: &forge::Issue,
 ) -> Result<()> {
     let labels = if issue.labels.is_empty() {
         "none".to_string()
@@ -899,7 +899,7 @@ fn append_issue_context(
         issue.iid, issue.title, labels, issue.description
     ));
 
-    match hosting.get_issue_comments(issue.iid) {
+    match forge.get_issue_comments(issue.iid) {
         Ok(comments) if !comments.is_empty() => {
             out.push_str("\nComments:\n");
             for comment in &comments {
@@ -921,8 +921,8 @@ fn append_issue_context(
 
 fn append_mr_context(
     out: &mut String,
-    hosting: &dyn CodeHostingClient,
-    mr: &hosting::MergeRequest,
+    forge: &dyn ForgeClient,
+    mr: &forge::MergeRequest,
 ) -> Result<()> {
     let labels = mr
         .labels
@@ -935,7 +935,7 @@ fn append_mr_context(
         mr.iid, mr.title, labels, mr.source_branch, mr.target_branch, mr.description
     ));
 
-    match hosting.get_mr_comments(mr.iid) {
+    match forge.get_mr_comments(mr.iid) {
         Ok(comments) if !comments.is_empty() => {
             out.push_str("\nComments:\n");
             for comment in &comments {
@@ -1917,7 +1917,7 @@ mod tests {
 
     #[test]
     fn gitlab_context_markdown_sections_are_structured() {
-        use crate::agents::hosting::{Comment, Issue, MergeRequest};
+        use crate::agents::forge::{Comment, Issue, MergeRequest};
 
         let issue = Issue {
             iid: 7,
@@ -2133,7 +2133,7 @@ mod tests {
     // after the create-issue loop, and only when at least one issue was
     // actually created (`created > 0`). `ensure_history_file` runs earlier,
     // before analysis, and is a no-op once a history file already exists.
-    // The create/label hosting calls themselves are real network calls
+    // The create/label forge calls themselves are real network calls
     // and are not characterized here — see note below.
     // -----------------------------------------------------------------
 
