@@ -7,8 +7,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::Value;
-#[cfg(test)]
-use serde_json::json;
 use tracing::info;
 
 use crate::core::agent::CoreAgent;
@@ -323,7 +321,7 @@ fn search_google(browser: &mut ChromeBrowser, query: &str, max_results: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use serde_json::json;
     struct RecordingBackend {
         queries: Vec<(String, usize)>,
         search_markdown: Option<String>,

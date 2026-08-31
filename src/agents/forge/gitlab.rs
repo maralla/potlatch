@@ -8,8 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tracing::{debug, info};
 
-#[cfg(test)]
-pub(crate) use super::order_active_claim_labels;
 use super::{
     Comment, Issue, IssueThreadNote, IssueThreadNoteAuthor, MergeRequest,
     MergeRequestChangesSnapshot, ResourceLabelEvent,
@@ -1294,10 +1292,10 @@ impl super::ForgeClient for GitLabClient {
 #[cfg(test)]
 mod tests {
     use super::super::mr_description_closes_issue;
+    use super::super::order_active_claim_labels;
     use super::{
         GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, ResourceLabelEvent,
-        compact_cli_output, mr_create_error_is_duplicate, order_active_claim_labels,
-        parse_gitlab_repo,
+        compact_cli_output, mr_create_error_is_duplicate, parse_gitlab_repo,
     };
     use serde_json::json;
 
