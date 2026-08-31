@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
-use super::{claim, issue_in_scope, split_parent_iid, write_task_context_file};
-use crate::agents::forge::{ForgeClient, Issue};
+use super::claim::{self, ClaimAcquireOutcome, ClaimLease, ClaimResource};
+use crate::agents::artifact::write_task_context_file;
+use crate::agents::forge::{self, ForgeClient, Issue, issue_in_scope, split_parent_iid};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::schema::tagged;
@@ -636,7 +636,7 @@ impl CoreAgent for WorkerAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "gitlab_poll" => {
-                let scope = crate::agents::scope_label_filter(&self.runtime.scope_label);
+                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
                 let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
                 let state = AgentState::from_runtime(&self.runtime);
@@ -652,7 +652,7 @@ impl CoreAgent for WorkerAgent {
         let config = WorkerConfig {
             poll_interval: settings.poll_interval,
         };
-        let scope = crate::agents::scope_label_filter(&runtime.scope_label);
+        let scope = crate::agents::forge::scope_label_filter(&runtime.scope_label);
         let active = {
             let state = AgentState::from_runtime(&runtime);
             let mut active =
@@ -792,7 +792,7 @@ impl IssueObservation {
     }
 
     fn in_scope(&self, scope_label: Option<&str>) -> bool {
-        super::issue_labels_in_scope(&self.labels, scope_label)
+        forge::issue_labels_in_scope(&self.labels, scope_label)
     }
 }
 
@@ -1611,7 +1611,7 @@ fn try_handle_need_ai_worker_mr(
         if !mr_has_label(&mr, NEED_AI_WORKER_LABEL) {
             continue;
         }
-        if !super::mr_in_scope(&mr, scope_label) {
+        if !forge::mr_in_scope(&mr, scope_label) {
             continue;
         }
         let recovered_lease = mr.labels.as_deref().and_then(|labels| {

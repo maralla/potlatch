@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
-use super::{claim, mr_in_scope, write_task_context_file};
-use crate::agents::forge::{self, ForgeClient, Issue, MergeRequest};
+use super::claim::{self, ClaimAcquireOutcome, ClaimLease, ClaimResource};
+use crate::agents::artifact::write_task_context_file;
+use crate::agents::forge::{self, ForgeClient, Issue, MergeRequest, mr_in_scope};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::schema::tagged;
@@ -207,7 +207,7 @@ impl CoreAgent for ReviewerAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "gitlab_poll" => {
-                let scope = crate::agents::scope_label_filter(&self.runtime.scope_label);
+                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
                 let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
                 reviewer_cycle(
@@ -236,7 +236,7 @@ impl CoreAgent for ReviewerAgent {
             poll_interval: settings.poll_interval,
             merge_when_approved: settings.merge_when_approved,
         };
-        let scope = crate::agents::scope_label_filter(&runtime.scope_label);
+        let scope = crate::agents::forge::scope_label_filter(&runtime.scope_label);
         let claimed_mr = find_claimed_mr(&runtime.agent_id, &runtime.forge, scope);
         Ok(Self {
             runtime,
@@ -311,7 +311,7 @@ impl MrObservation {
     }
 
     fn in_scope(&self, scope_label: Option<&str>) -> bool {
-        super::mr_labels_in_scope(self.labels(), scope_label)
+        forge::mr_labels_in_scope(self.labels(), scope_label)
     }
 }
 

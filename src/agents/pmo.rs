@@ -9,9 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
-use super::{claim, issue_in_scope, labels, with_split_parent};
-use crate::agents::forge::{self, ForgeClient, Issue, IssueThreadNote};
+use super::claim::{self, ClaimAcquireOutcome, ClaimLease, ClaimResource};
+use super::labels;
+use crate::agents::forge::{
+    self, ForgeClient, Issue, IssueThreadNote, issue_in_scope, with_split_parent,
+};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::schema::tagged;
@@ -483,7 +485,7 @@ impl CoreAgent for PmoAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "gitlab_poll" => {
-                let scope = crate::agents::scope_label_filter(&self.runtime.scope_label);
+                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
                 let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
                 let state = AgentState::from_runtime(&self.runtime);
@@ -510,7 +512,7 @@ impl CoreAgent for PmoAgent {
             ask_via_gitlab: settings.ask_via_gitlab,
             ask_gitlab_timeout_secs: settings.ask_gitlab_timeout_secs,
         };
-        let scope = crate::agents::scope_label_filter(&runtime.scope_label);
+        let scope = crate::agents::forge::scope_label_filter(&runtime.scope_label);
         let claimed_issue = {
             let state = AgentState::from_runtime(&runtime);
             state.ensure_sessions_dir()?;

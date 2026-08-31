@@ -370,7 +370,7 @@ impl CoreAgent for QaAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "qa_poll" => {
-                let scope = crate::agents::scope_label_filter(&self.runtime.scope_label);
+                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
                 let state = AgentState::from_runtime(&self.runtime);
                 qa_cycle(&state, &self.config, &self.runtime.model, scope)
             }
