@@ -4,9 +4,12 @@ use anyhow::Result;
 use serde_json::{Map, Value, json};
 
 use crate::core::agent::InvokeOptions;
+use crate::core::agent::ModelResponse;
 use crate::core::agent::schema::{ObjectSchema, OneOfSchema, Schema, StructuredOutputTool};
-use crate::core::config::{AcpSpawnConfig, Config};
+use crate::core::bus::AgentBus;
+use crate::core::config::{AcpSpawnConfig, AgentSection, Config};
 use crate::core::model::acp::AcpRuntime;
+use crate::core::model::acp::capabilities::CapabilityProvider;
 
 /// Model backend boundary: converts the neutral [`StructuredOutputTool`]
 /// contract into generic JSON (`{"name", "description", "parameters"}` with
@@ -148,7 +151,7 @@ fn live_callbacks(options: &InvokeOptions) -> LiveCallbacks<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct ModelSessionOptions {
     pub preferred_session_mode: Option<&'static str>,
-    pub(crate) agent_bus: Option<crate::core::bus::AgentBus>,
+    pub(crate) agent_bus: Option<AgentBus>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,7 +168,7 @@ pub(crate) struct ModelEngine {
 /// Build a [`ModelEngine`] from config, an agent section, and runtime context.
 pub(crate) fn spawn_model_engine(
     config: &Config,
-    section: &crate::core::config::AgentSection,
+    section: &AgentSection,
     working_dir: impl Into<String>,
     agent_id: impl Into<String>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -186,7 +189,7 @@ pub(crate) fn spawn_model_engine(
 impl ModelEngine {
     pub fn from_agent_section(
         config: &Config,
-        section: &crate::core::config::AgentSection,
+        section: &AgentSection,
         runtime: ModelRuntimeContext,
         session: ModelSessionOptions,
     ) -> Result<Self> {
@@ -223,13 +226,13 @@ impl ModelEngine {
         prompt: &str,
         options: &InvokeOptions,
         tools: &[StructuredOutputTool],
-    ) -> Result<crate::core::agent::ModelResponse> {
+    ) -> Result<ModelResponse> {
         let contracts = structured_output_contracts_json(tools);
         let (cancel_check, follow_up_poll) = live_callbacks(options);
         let handoff = self
             .inner
             .run_task(prompt, contracts, cancel_check, follow_up_poll)?;
-        Ok(crate::core::agent::ModelResponse { handoff })
+        Ok(ModelResponse { handoff })
     }
 
     /// Continue the *current* task in the same session (structured-output
@@ -241,19 +244,16 @@ impl ModelEngine {
         &self,
         prompt: &str,
         options: &InvokeOptions,
-    ) -> Result<crate::core::agent::ModelResponse> {
+    ) -> Result<ModelResponse> {
         let (cancel_check, follow_up_poll) = live_callbacks(options);
         let handoff = self
             .inner
             .run_in_current_session(prompt, cancel_check, follow_up_poll)?;
-        Ok(crate::core::agent::ModelResponse { handoff })
+        Ok(ModelResponse { handoff })
     }
 
     /// Set the capability provider (called by the agent at construction).
-    pub fn set_capability_provider(
-        &self,
-        provider: Option<Arc<dyn crate::core::model::acp::capabilities::CapabilityProvider>>,
-    ) {
+    pub fn set_capability_provider(&self, provider: Option<Arc<dyn CapabilityProvider>>) {
         self.inner.set_capability_provider(provider);
     }
 }
@@ -262,7 +262,7 @@ impl ModelEngine {
 mod tests {
     use super::*;
     use crate::core::agent::schema::OneOfSchema;
-    use crate::core::config::Config;
+    use crate::core::config::{AgentSection, Config};
     use std::sync::atomic::AtomicBool;
 
     fn sample_config(model: Option<&str>) -> Config {
@@ -285,7 +285,7 @@ acp_command = ["agent", "acp"]"#
         Config::from_toml_str(&toml).unwrap()
     }
 
-    fn sample_section(model: Option<&str>) -> crate::core::config::AgentSection {
+    fn sample_section(model: Option<&str>) -> AgentSection {
         sample_config(model).agent("alpha").unwrap().clone()
     }
 

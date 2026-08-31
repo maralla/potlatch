@@ -18,21 +18,24 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::agents::forge::{self, ForgeClient};
+use super::labels;
+use super::state::StateStore;
+use crate::agents::forge::{self, ForgeClient, scope_label_filter};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
-use crate::core::config::Config;
+use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
+use crate::core::workflow::AgentBuildContext;
 
 pub(crate) const NAME: &str = "qa";
 const MAX_INSTANCES: usize = 1;
 
-const QA_LABEL: &str = crate::agents::labels::QA;
-const DO_NOT_IMPLEMENT_LABEL: &str = crate::agents::labels::DO_NOT_IMPLEMENT;
+const QA_LABEL: &str = labels::QA;
+const DO_NOT_IMPLEMENT_LABEL: &str = labels::DO_NOT_IMPLEMENT;
 
 /// A finding's severity, as the model reports it via the `qa_report` tool.
 /// The contract only admits the four names below; a severity the model
@@ -340,16 +343,13 @@ impl CoreAgent for QaAgent {
         repo_banner(config, banner);
     }
 
-    fn parse_settings(
-        _config: &Config,
-        section: &crate::core::config::AgentSection,
-    ) -> Result<Self::Settings> {
+    fn parse_settings(_config: &Config, section: &AgentSection) -> Result<Self::Settings> {
         QaAgentSettings::from_raw(&section.raw)
     }
 
     fn validate_settings(
         config: &Config,
-        _section: &crate::core::config::AgentSection,
+        _section: &AgentSection,
         settings: &Self::Settings,
     ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_repo_url()?;
@@ -370,7 +370,7 @@ impl CoreAgent for QaAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "qa_poll" => {
-                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
+                let scope = scope_label_filter(&self.runtime.scope_label);
                 let state = AgentState::from_runtime(&self.runtime);
                 qa_cycle(&state, &self.config, &self.runtime.model, scope)
             }
@@ -378,7 +378,7 @@ impl CoreAgent for QaAgent {
         }
     }
 
-    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+    fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
         let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let agent_settings = ctx.settings;
         let config = QaConfig {
@@ -878,7 +878,7 @@ fn is_potlatch_author(author: &str) -> bool {
 fn load_sha_history(state: &AgentState) -> ShaHistory {
     // Missing, unreadable, and corrupt history have historically reset QA
     // history: tolerant, warn and default rather than failing the cycle.
-    match crate::agents::state::StateStore::new(state.sha_history_path()).load() {
+    match StateStore::new(state.sha_history_path()).load() {
         Ok(history) => history.unwrap_or_default(),
         Err(error) => {
             warn!("Failed to load SHA history: {:#}", error);
@@ -888,7 +888,7 @@ fn load_sha_history(state: &AgentState) -> ShaHistory {
 }
 
 fn save_sha_history(state: &AgentState, history: &ShaHistory) -> Result<()> {
-    let store = crate::agents::state::StateStore::new(state.sha_history_path());
+    let store = StateStore::new(state.sha_history_path());
     store.save(history)
 }
 

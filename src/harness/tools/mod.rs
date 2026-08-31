@@ -20,6 +20,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use crate::core::bus::RemoteAgentToolDefinition;
+
 /// Resolve a path relative to the workspace (cwd), enforcing sandboxing.
 ///
 /// Rejects:
@@ -319,7 +321,7 @@ impl ToolRegistry {
     pub fn register_agent_tools(
         &mut self,
         caller: Arc<dyn agent_bus::AgentToolCaller>,
-        definitions: Vec<crate::core::bus::RemoteAgentToolDefinition>,
+        definitions: Vec<RemoteAgentToolDefinition>,
         allowed_tools: Option<&[String]>,
     ) {
         let allowed = |name: &str| {

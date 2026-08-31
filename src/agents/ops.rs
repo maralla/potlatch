@@ -9,21 +9,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
+use super::state::StateStore;
 use crate::agents::artifact::write_task_context_file;
-use crate::agents::forge::{self, ForgeClient};
+use crate::agents::forge::{self, ForgeClient, scope_label_filter};
 use crate::agents::ssh_util::{shell_single_quote, validate_remote_path, validate_ssh_identity};
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
-use crate::core::config::Config;
+use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
+use crate::core::workflow::AgentBuildContext;
 
 mod grafana;
 
 pub(crate) const NAME: &str = "ops";
 const MAX_INSTANCES: usize = 1;
+const DEFAULT_LOG_WINDOW_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const MAX_TAIL_LINES: u32 = 100_000;
+const MAX_SCRAPE_FILES_KEPT: usize = 10;
+const MIN_LOG_BYTES_FOR_ANALYSIS: usize = 20;
 
 /// One issue proposal as the model described it via the `ops_report` tool's
 /// `issues` array, before the empty-field defensive filtering in
@@ -116,12 +123,6 @@ fn normalize_ops_issues(raw: Vec<RawOpsIssue>) -> Vec<OpsIssueProposal> {
         })
         .collect()
 }
-
-const DEFAULT_LOG_WINDOW_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10 * 60);
-const MAX_TAIL_LINES: u32 = 100_000;
-const MAX_SCRAPE_FILES_KEPT: usize = 10;
-const MIN_LOG_BYTES_FOR_ANALYSIS: usize = 20;
 
 #[derive(Debug, Clone)]
 struct OpsConfig {
@@ -365,16 +366,13 @@ impl CoreAgent for OpsAgent {
         repo_banner(config, banner);
     }
 
-    fn parse_settings(
-        _config: &Config,
-        section: &crate::core::config::AgentSection,
-    ) -> Result<Self::Settings> {
+    fn parse_settings(_config: &Config, section: &AgentSection) -> Result<Self::Settings> {
         OpsAgentSettings::from_raw(&section.raw)
     }
 
     fn validate_settings(
         config: &Config,
-        _section: &crate::core::config::AgentSection,
+        _section: &AgentSection,
         _settings: &Self::Settings,
     ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_repo_url()?;
@@ -391,7 +389,7 @@ impl CoreAgent for OpsAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "log_scrape" => {
-                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
+                let scope = scope_label_filter(&self.runtime.scope_label);
                 let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
                 let state = AgentState::from_runtime(&self.runtime);
@@ -408,7 +406,7 @@ impl CoreAgent for OpsAgent {
         }
     }
 
-    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+    fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
         let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         AgentState::from_runtime(&runtime).ensure_sessions_dir()?;
         let agent_settings = ctx.settings;
@@ -958,7 +956,7 @@ fn load_history(path: &Path) -> Result<OpsIssueHistory> {
     // file is quarantined (never losing bytes) but still surfaced as an
     // error rather than silently reset — the caller decides whether to
     // fail the cycle.
-    let store = crate::agents::state::StateStore::new(path);
+    let store = StateStore::new(path);
     if path.exists() {
         let content = fs::read(path)
             .with_context(|| format!("Failed to read issue history at {}", path.display()))?;
@@ -970,7 +968,7 @@ fn load_history(path: &Path) -> Result<OpsIssueHistory> {
 }
 
 fn save_history(path: &Path, history: &OpsIssueHistory) -> Result<()> {
-    crate::agents::state::StateStore::new(path).save(history)
+    StateStore::new(path).save(history)
 }
 
 fn fetch_remote_log_tail(ssh_user: &str, ssh_host: &str, log_path: &str) -> Result<String> {

@@ -20,6 +20,49 @@ const BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
 // Defuddle 0.19.2 full browser bundle (MIT); see defuddle.LICENSE.txt.
 const DEFUDDLE_SCRIPT: &str = include_str!("defuddle.full.js");
 const SEARCH_PROFILE_ENV: &str = "POTLATCH_WEB_PROFILE";
+/// Resolve once the page's client-side rendering has settled: a
+/// [`MutationObserver`] watches `document.body` and the Promise resolves after
+/// the DOM has been **quiet** (no mutations) for `SETTLE_MS`. This is
+/// selector-free and page-agnostic — it works for any site that renders with
+/// JS after `networkAlmostIdle` (what `wait_until_navigated` waits for), which
+/// a fixed sleep cannot reliably cover.
+///
+/// A `MAX_WAIT_MS` `setTimeout` rejects so the Promise never hangs forever on a
+/// page that keeps churning. The settle window restarts on every mutation, so
+/// only a *sustained* pause counts as "done".
+const RENDER_SETTLED_SCRIPT: &str = r##"new Promise((resolve, reject) => {
+    const SETTLE_MS = 500;
+    const MAX_WAIT_MS = 15000;
+    let settleTimer;
+    const done = () => { observer.disconnect(); clearTimeout(maxTimer); resolve(); };
+    const observer = new MutationObserver(() => {
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(done, SETTLE_MS);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    settleTimer = setTimeout(done, SETTLE_MS);
+    const maxTimer = setTimeout(() => {
+        observer.disconnect();
+        clearTimeout(settleTimer);
+        reject(new Error("timed out waiting for the page to finish rendering"));
+    }, MAX_WAIT_MS);
+})"##;
+/// One-shot, selector-free structural classification of a Google results page
+/// **after** rendering has settled (see [`RENDER_SETTLED_SCRIPT`]). Returns
+/// `"results"`, `"no_results"`, or `"verification"` — never `"loading"`, since
+/// by this point the DOM is stable. Purely structural (no text matching) so it
+/// is robust to Google copy/locale changes. Verification is checked first so a
+/// stale `a h3` from a previous page cannot mask a wall.
+const GOOGLE_RESULTS_STATE_SCRIPT: &str = r##"(() => {
+    if (document.querySelector("#captcha-form, form[action*='sorry'], #recaptcha")) {
+        return "verification";
+    }
+    const search = document.querySelector("#search");
+    if (search) {
+        return search.querySelector("a h3") ? "results" : "no_results";
+    }
+    return "no_results";
+})()"##;
 
 #[derive(Debug)]
 pub(super) struct GoogleVerificationRequired;
@@ -229,51 +272,6 @@ impl ChromeBrowser {
     }
 }
 
-/// Resolve once the page's client-side rendering has settled: a
-/// [`MutationObserver`] watches `document.body` and the Promise resolves after
-/// the DOM has been **quiet** (no mutations) for `SETTLE_MS`. This is
-/// selector-free and page-agnostic — it works for any site that renders with
-/// JS after `networkAlmostIdle` (what `wait_until_navigated` waits for), which
-/// a fixed sleep cannot reliably cover.
-///
-/// A `MAX_WAIT_MS` `setTimeout` rejects so the Promise never hangs forever on a
-/// page that keeps churning. The settle window restarts on every mutation, so
-/// only a *sustained* pause counts as "done".
-const RENDER_SETTLED_SCRIPT: &str = r##"new Promise((resolve, reject) => {
-    const SETTLE_MS = 500;
-    const MAX_WAIT_MS = 15000;
-    let settleTimer;
-    const done = () => { observer.disconnect(); clearTimeout(maxTimer); resolve(); };
-    const observer = new MutationObserver(() => {
-        clearTimeout(settleTimer);
-        settleTimer = setTimeout(done, SETTLE_MS);
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
-    settleTimer = setTimeout(done, SETTLE_MS);
-    const maxTimer = setTimeout(() => {
-        observer.disconnect();
-        clearTimeout(settleTimer);
-        reject(new Error("timed out waiting for the page to finish rendering"));
-    }, MAX_WAIT_MS);
-})"##;
-
-/// One-shot, selector-free structural classification of a Google results page
-/// **after** rendering has settled (see [`RENDER_SETTLED_SCRIPT`]). Returns
-/// `"results"`, `"no_results"`, or `"verification"` — never `"loading"`, since
-/// by this point the DOM is stable. Purely structural (no text matching) so it
-/// is robust to Google copy/locale changes. Verification is checked first so a
-/// stale `a h3` from a previous page cannot mask a wall.
-const GOOGLE_RESULTS_STATE_SCRIPT: &str = r##"(() => {
-    if (document.querySelector("#captcha-form, form[action*='sorry'], #recaptcha")) {
-        return "verification";
-    }
-    const search = document.querySelector("#search");
-    if (search) {
-        return search.querySelector("a h3") ? "results" : "no_results";
-    }
-    return "no_results";
-})()"##;
-
 fn decode_evaluated_json(serialized: Value) -> Result<Value> {
     let serialized = serialized
         .as_str()
@@ -425,6 +423,7 @@ fn standard_browser_paths() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::tools::test_util;
     use std::fs;
 
     #[test]
@@ -437,7 +436,7 @@ mod tests {
 
     #[test]
     fn path_detection_uses_supported_names_only() {
-        let dir = crate::harness::tools::test_util::unique_test_dir();
+        let dir = test_util::unique_test_dir();
         fs::write(dir.path().join("chromium"), "").unwrap();
         fs::write(dir.path().join("firefox"), "").unwrap();
         assert_eq!(

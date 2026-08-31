@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use super::tools::agent_bus::AgentToolCaller;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
@@ -119,7 +120,7 @@ impl ParentRpc {
     }
 }
 
-impl crate::harness::tools::agent_bus::AgentToolCaller for ParentRpc {
+impl AgentToolCaller for ParentRpc {
     fn call(&self, target: &str, operation: &str, arguments: Value) -> Result<Value> {
         let response = self.request(
             "potlatch/agent_tool_call",

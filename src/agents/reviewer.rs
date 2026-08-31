@@ -8,19 +8,32 @@ use tracing::{debug, error, info, warn};
 
 use super::claim::{self, ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use crate::agents::artifact::write_task_context_file;
-use crate::agents::forge::{self, ForgeClient, Issue, MergeRequest, mr_in_scope};
+use crate::agents::forge::{
+    self, ForgeClient, Issue, MergeRequest, mr_in_scope, scope_label_filter,
+};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::schema::tagged;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
-use crate::core::config::Config;
+use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
+use crate::core::workflow::AgentBuildContext;
 
 const REVIEWER_APPROVED_LABEL: &str = "reviewer-approved";
 const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
+const MISSING_ISSUE_LINK_BODY: &str = "This MR does not reference an issue. Please link it to the relevant issue by using a branch name like `issue-N` or adding `Closes #N` in the MR description.";
+const GENERIC_TITLES: &[&str] = &[
+    "implementation changes",
+    "implementation completed",
+    "update",
+    "changes",
+    "fix",
+    "fixes",
+    "updates",
+];
 
 /// The reviewer's typed structured-output contract: a tagged union on
 /// `decision`, so each outcome carries exactly the fields it needs and cannot
@@ -186,7 +199,7 @@ impl CoreAgent for ReviewerAgent {
 
     fn validate_settings(
         config: &Config,
-        _section: &crate::core::config::AgentSection,
+        _section: &AgentSection,
         settings: &Self::Settings,
     ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_gitlab_repo()?;
@@ -207,7 +220,7 @@ impl CoreAgent for ReviewerAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "gitlab_poll" => {
-                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
+                let scope = scope_label_filter(&self.runtime.scope_label);
                 let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
                 reviewer_cycle(
@@ -229,14 +242,14 @@ impl CoreAgent for ReviewerAgent {
         }
     }
 
-    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+    fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
         let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let settings = ctx.settings;
         let config = ReviewerConfig {
             poll_interval: settings.poll_interval,
             merge_when_approved: settings.merge_when_approved,
         };
-        let scope = crate::agents::forge::scope_label_filter(&runtime.scope_label);
+        let scope = scope_label_filter(&runtime.scope_label);
         let claimed_mr = find_claimed_mr(&runtime.agent_id, &runtime.forge, scope);
         Ok(Self {
             runtime,
@@ -484,8 +497,6 @@ fn decide_pre_review_gate(mr: &MrObservation, subject: &ReviewSubject) -> PreRev
     }
     PreReviewGate::Proceed
 }
-
-const MISSING_ISSUE_LINK_BODY: &str = "This MR does not reference an issue. Please link it to the relevant issue by using a branch name like `issue-N` or adding `Closes #N` in the MR description.";
 
 fn merge_conflict_body(target_branch: &str) -> String {
     format!(
@@ -1250,16 +1261,6 @@ fn format_issue_context_header(issue_iid: u64, issue: &Issue) -> String {
         issue_iid, issue.title, labels, issue.description
     )
 }
-
-const GENERIC_TITLES: &[&str] = &[
-    "implementation changes",
-    "implementation completed",
-    "update",
-    "changes",
-    "fix",
-    "fixes",
-    "updates",
-];
 
 fn has_bad_title_or_description(title: &str, description: &str) -> bool {
     is_generic_title(title) || is_generic_description(description)

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 const DEFAULT_ORG_ID: u64 = 1;
 const TIME_FIELD: &str = "@timestamp";
+const PAGE_SIZE: usize = 1_000;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,8 +140,6 @@ impl GrafanaLogSource {
         Ok(endpoint)
     }
 }
-
-const PAGE_SIZE: usize = 1_000;
 
 pub(super) fn fetch_logs(
     source: &GrafanaLogSource,
