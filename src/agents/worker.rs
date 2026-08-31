@@ -10,8 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::{
-    claim, issue_in_scope, split_parent_iid, strip_internal_markers, strip_public_comment_blocks,
-    write_task_context_file,
+    claim, issue_in_scope, split_parent_iid, strip_public_comment_blocks, write_task_context_file,
 };
 use crate::agents::forge::{ForgeClient, Issue};
 use crate::agents::git::GitRepo;
@@ -3830,7 +3829,7 @@ fn blocked_outcome_text(blocked: &BlockedOutcome, default_text: &str) -> String 
     }
     let trimmed = blocked.reason.trim();
     if !trimmed.is_empty() {
-        return strip_internal_markers(trimmed);
+        return trimmed.to_string();
     }
     default_text.to_string()
 }
@@ -4228,7 +4227,7 @@ fn extract_no_change_resolution_reason(resolution: &FeedbackResolution) -> Optio
         .flatten()
         .map(|text| text.trim())
         .find(|text| !text.is_empty())
-        .map(|text| strip_markdown_formatting(&strip_internal_markers(text)))
+        .map(strip_markdown_formatting)
 }
 
 // ---------------------------------------------------------------------------
@@ -4562,14 +4561,13 @@ fn extract_cannot_implement_reason(blocked: &BlockedOutcome) -> String {
 }
 
 /// Clean the worker's public comment text from a `handoff` branch's
-/// `public_comment` field. Stray internal markers are stripped as
-/// defense-in-depth before this text reaches a GitLab surface.
+/// `public_comment` field: blank text means "no comment".
 fn extract_worker_public_comment(public_comment: Option<&str>) -> Option<String> {
     let s = public_comment?.trim();
     if s.is_empty() {
         return None;
     }
-    Some(strip_internal_markers(s))
+    Some(s.to_string())
 }
 
 /// Prefix for labels that park an issue until a dependency issue is closed.
@@ -5230,15 +5228,6 @@ mod tests {
             extract_cannot_implement_reason(&blocked("contradictory requirements")),
             "contradictory requirements"
         );
-    }
-
-    #[test]
-    fn extract_worker_public_comment_strips_stray_internal_markers() {
-        let comment = extract_worker_public_comment(Some(
-            "PUBLIC_COMMENT_BEGIN\nHidden.\nPUBLIC_COMMENT_END\nVisible.",
-        ))
-        .unwrap();
-        assert_eq!(comment, "Visible.");
     }
 
     #[test]
