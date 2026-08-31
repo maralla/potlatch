@@ -1,23 +1,23 @@
 use crate::core::workflow::Workflow;
 
-pub(crate) mod artifact;
-pub(crate) mod claim;
-pub(crate) mod clerk;
-pub mod forge;
-pub mod git;
-pub mod labels;
-pub mod ops;
-pub mod pmo;
-pub(crate) mod qa;
-pub mod reviewer;
-pub mod settings;
-pub(crate) mod ssh_util;
-pub(crate) mod state;
-pub(crate) mod web;
-pub mod worker;
-pub mod workspace;
+mod artifact;
+mod claim;
+mod clerk;
+mod forge;
+mod git;
+mod labels;
+mod ops;
+mod pmo;
+mod qa;
+mod reviewer;
+mod settings;
+mod ssh_util;
+mod state;
+mod web;
+mod worker;
+mod workspace;
 
-pub fn register(workflow: &mut Workflow) {
+pub(crate) fn register(workflow: &mut Workflow) {
     workflow.register_agent::<worker::WorkerAgent>();
     workflow.register_agent::<reviewer::ReviewerAgent>();
     workflow.register_agent::<pmo::PmoAgent>();
