@@ -1176,7 +1176,7 @@ impl GitLabClient {
     }
 }
 
-impl super::CodeHostingClient for GitLabClient {
+impl super::ForgeClient for GitLabClient {
     fn list_issues(&self) -> Result<Vec<Issue>> {
         GitLabClient::list_issues(self)
     }

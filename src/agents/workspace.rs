@@ -6,8 +6,8 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 
+use super::forge::{self, ForgeClient};
 use super::git::GitRepo;
-use super::hosting::{self, CodeHostingClient};
 use super::settings::AgentSettings;
 use crate::core::agent::{AgentModel, ModelPreferences};
 use crate::core::banner::Banner;
@@ -15,14 +15,14 @@ use crate::core::config::Config;
 use crate::core::runtime::AgentRuntime as CoreAgentRuntime;
 use crate::core::workflow::AgentSpawnContext;
 
-/// Shared runtime resources for one code-hosting-backed agent instance.
+/// Shared runtime resources for one forge-backed agent instance.
 pub struct AgentWorkspace {
     pub agent_id: String,
     pub project_name: String,
     pub working_dir: String,
     pub sessions_dir: String,
     pub git_repo: GitRepo,
-    pub hosting: Arc<dyn CodeHostingClient>,
+    pub forge: Arc<dyn ForgeClient>,
     pub scope_label: String,
     pub model: AgentModel,
     pub core: CoreAgentRuntime,
@@ -62,7 +62,7 @@ impl<'a> AgentBootstrap<'a> {
         let working_dir = work_dir(&self.ctx.workflow.base_dir, &project_name, &agent_id);
         let sessions_dir = sessions_dir(&self.ctx.workflow.base_dir, &project_name);
         let git_repo = GitRepo::new(working_dir.clone(), Arc::clone(&self.ctx.workflow.shutdown));
-        let hosting = hosting::create_client(
+        let client = forge::create_client(
             &working_dir,
             &repo_url,
             Arc::clone(&self.ctx.workflow.shutdown),
@@ -75,7 +75,7 @@ impl<'a> AgentBootstrap<'a> {
             working_dir,
             sessions_dir,
             git_repo,
-            hosting,
+            forge: client,
             scope_label: settings.scope_label,
             model,
             core: self.ctx.runtime.clone(),

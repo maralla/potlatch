@@ -18,8 +18,8 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::agents::forge::{self, ForgeClient};
 use crate::agents::git::GitRepo;
-use crate::agents::hosting::{self, CodeHostingClient};
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 #[cfg(test)]
 use crate::core::agent::StructuredOutput;
@@ -246,14 +246,14 @@ impl QaAgentSettings {
 
 /// A borrowing view over the [`AgentWorkspace`] fields the QA cycle
 /// needs. Built fresh from `&AgentWorkspace` at each use site rather
-/// than stored, so QA never owns a second `GitRepo`/hosting client — and,
+/// than stored, so QA never owns a second `GitRepo`/forge client — and,
 /// since it is never stored alongside the runtime it borrows from, it
 /// can't become self-referential.
 struct AgentState<'a> {
     agent_id: &'a str,
     sessions_dir: &'a str,
     git_repo: &'a GitRepo,
-    hosting: &'a Arc<dyn CodeHostingClient>,
+    forge: &'a Arc<dyn ForgeClient>,
 }
 
 impl AgentState<'_> {
@@ -262,7 +262,7 @@ impl AgentState<'_> {
             agent_id: &runtime.agent_id,
             sessions_dir: &runtime.sessions_dir,
             git_repo: &runtime.git_repo,
-            hosting: &runtime.hosting,
+            forge: &runtime.forge,
         }
     }
 
@@ -405,8 +405,8 @@ struct IssueObservation {
     labels: Vec<String>,
 }
 
-impl From<&hosting::Issue> for IssueObservation {
-    fn from(issue: &hosting::Issue) -> Self {
+impl From<&forge::Issue> for IssueObservation {
+    fn from(issue: &forge::Issue) -> Self {
         Self {
             iid: issue.iid,
             title: issue.title.clone(),
@@ -422,8 +422,8 @@ struct CommentObservation {
     body: String,
 }
 
-impl From<&hosting::Comment> for CommentObservation {
-    fn from(comment: &hosting::Comment) -> Self {
+impl From<&forge::Comment> for CommentObservation {
+    fn from(comment: &forge::Comment) -> Self {
         Self {
             author: comment.author.clone(),
             body: comment.body.clone(),
@@ -571,7 +571,7 @@ fn run_qa_cycle(
         let Ok(iid) = port.create_issue(&finding.title, &description) else {
             continue;
         };
-        let _ = port.add_issue_label(iid, &hosting::priority_label(finding.severity.priority()));
+        let _ = port.add_issue_label(iid, &forge::priority_label(finding.severity.priority()));
         let _ = port.add_issue_label(iid, QA_LABEL);
         if let Some(label) = scope_label {
             let _ = port.add_issue_label(iid, label);
@@ -618,7 +618,7 @@ impl QaPort for LiveQaPort<'_> {
     fn open_issues(&self) -> Result<Vec<IssueObservation>> {
         Ok(self
             .state
-            .hosting
+            .forge
             .list_issues()?
             .iter()
             .map(IssueObservation::from)
@@ -626,7 +626,7 @@ impl QaPort for LiveQaPort<'_> {
     }
 
     fn issue_comments(&self, issue_iid: u64) -> Option<Vec<CommentObservation>> {
-        match self.state.hosting.get_issue_comments(issue_iid) {
+        match self.state.forge.get_issue_comments(issue_iid) {
             Ok(comments) => Some(comments.iter().map(CommentObservation::from).collect()),
             Err(error) => {
                 warn!("Failed to fetch comments for issue #{issue_iid}: {error}");
@@ -667,15 +667,15 @@ impl QaPort for LiveQaPort<'_> {
     }
 
     fn close_answered_clarification(&mut self, issue_iid: u64) -> Result<()> {
-        self.state.hosting.close_issue(issue_iid)
+        self.state.forge.close_issue(issue_iid)
     }
 
     fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
-        self.state.hosting.create_issue(title, description)
+        self.state.forge.create_issue(title, description)
     }
 
     fn add_issue_label(&mut self, issue_iid: u64, label: &str) -> Result<()> {
-        self.state.hosting.add_issue_label(issue_iid, label)
+        self.state.forge.add_issue_label(issue_iid, label)
     }
 
     fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
@@ -1008,7 +1008,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::agents::hosting;
+    use crate::agents::forge;
     use crate::core::agent::schema::conformance;
 
     struct FakeQaPort {
@@ -1647,9 +1647,9 @@ mod tests {
     // which is the mechanism `qa_cycle` relies on to only advance a branch's
     // recorded SHA once a cycle has fully completed (findings/clarifications
     // processed and `model.complete_typed` returned `Ok`). `GitRepo::new` and
-    // `hosting::for_test_client` are file/network-free constructors, so this
+    // `forge::for_test_client` are file/network-free constructors, so this
     // exercises the real `AgentState` methods without touching git or the
-    // hosting service.
+    // forge service.
 
     /// Owns the resources a test [`AgentState`] borrows from, standing in
     /// for the [`AgentWorkspace`] fields QA's cycle needs.
@@ -1657,7 +1657,7 @@ mod tests {
         agent_id: String,
         sessions_dir: String,
         git_repo: GitRepo,
-        hosting: Arc<dyn CodeHostingClient>,
+        forge: Arc<dyn ForgeClient>,
     }
 
     fn test_runtime(sessions_dir: &str, agent_id: &str) -> TestRuntime {
@@ -1668,7 +1668,7 @@ mod tests {
                 std::env::temp_dir().to_string_lossy().into_owned(),
                 Arc::new(AtomicBool::new(false)),
             ),
-            hosting: hosting::for_test_client("/tmp/unused-repo"),
+            forge: forge::for_test_client("/tmp/unused-repo"),
         }
     }
 
@@ -1677,7 +1677,7 @@ mod tests {
             agent_id: &rt.agent_id,
             sessions_dir: &rt.sessions_dir,
             git_repo: &rt.git_repo,
-            hosting: &rt.hosting,
+            forge: &rt.forge,
         }
     }
 

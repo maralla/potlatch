@@ -40,9 +40,9 @@
 //!
 //! ## Ports
 //! [`ClaimPort`] is deliberately narrow — add/remove/read one resource's
-//! labels — rather than a stand-in for the entire hosting API, so tests can
+//! labels — rather than a stand-in for the entire forge API, so tests can
 //! exercise the claim protocol against an in-memory fake instead of a real
-//! (or fully mocked) [`CodeHostingClient`].
+//! (or fully mocked) [`ForgeClient`].
 
 use std::fmt;
 use std::sync::atomic::AtomicBool;
@@ -51,7 +51,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::agents::hosting::{CodeHostingClient, order_active_claim_labels};
+use crate::agents::forge::{ForgeClient, order_active_claim_labels};
 use crate::util::sleep;
 
 /// Settle time in seconds. After adding a claim label, we wait this long
@@ -110,7 +110,7 @@ pub(crate) trait ClaimPort {
     }
 }
 
-impl ClaimPort for dyn CodeHostingClient {
+impl ClaimPort for dyn ForgeClient {
     fn add_label(&self, resource: ClaimResource, label: &str) -> Result<()> {
         match resource {
             ClaimResource::Issue(iid) => self.add_issue_label(iid, label),
