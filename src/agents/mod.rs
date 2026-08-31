@@ -48,30 +48,6 @@ pub(crate) fn split_parent_iid(description: &str) -> Option<u64> {
     })
 }
 
-pub(crate) fn strip_public_comment_blocks(text: &str) -> String {
-    strip_marker_blocks(text, "PUBLIC_COMMENT_BEGIN", "PUBLIC_COMMENT_END")
-}
-
-/// Remove every `<begin>…<end>` block from `text`. If a `begin` marker has no
-/// matching `end`, the remainder is dropped (an unclosed block would
-/// otherwise leak machine text into a human-facing surface).
-fn strip_marker_blocks(text: &str, begin: &str, end: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(begin) {
-        out.push_str(&rest[..start]);
-        let after_begin = &rest[start + begin.len()..];
-        if let Some(end_rel) = after_begin.find(end) {
-            rest = &after_begin[end_rel + end.len()..];
-        } else {
-            rest = "";
-            break;
-        }
-    }
-    out.push_str(rest);
-    out.trim().to_string()
-}
-
 pub(crate) fn write_task_context_file(
     work_dir: &str,
     file_name: &str,
@@ -127,10 +103,7 @@ pub fn register(workflow: &mut Workflow) {
 
 #[cfg(test)]
 mod scope_tests {
-    use super::{
-        issue_in_scope, mr_in_scope, register, split_parent_iid, strip_public_comment_blocks,
-        with_split_parent,
-    };
+    use super::{issue_in_scope, mr_in_scope, register, split_parent_iid, with_split_parent};
     use crate::agents::forge::{Issue, MergeRequest};
     use crate::core::config::Config;
     use crate::core::workflow::Workflow;
@@ -203,26 +176,5 @@ mod scope_tests {
         assert!(description.starts_with("Implement the parser.\n\n---"));
         assert_eq!(split_parent_iid(&description), Some(42));
         assert_eq!(split_parent_iid("Implement an unrelated issue."), None);
-    }
-
-    #[test]
-    fn strip_public_comment_blocks_removes_one_block() {
-        let text = "Goal line\nPUBLIC_COMMENT_BEGIN\nThanks.\nPUBLIC_COMMENT_END\n## Testing\nx";
-        assert_eq!(
-            strip_public_comment_blocks(text),
-            "Goal line\n\n## Testing\nx"
-        );
-    }
-
-    #[test]
-    fn strip_public_comment_blocks_removes_multiple() {
-        let t = "A\nPUBLIC_COMMENT_BEGIN\n1\nPUBLIC_COMMENT_END\nB\nPUBLIC_COMMENT_BEGIN\n2\nPUBLIC_COMMENT_END\nC";
-        assert_eq!(strip_public_comment_blocks(t), "A\n\nB\n\nC");
-    }
-
-    #[test]
-    fn strip_public_comment_blocks_truncates_unclosed_begin() {
-        let t = "Keep\nPUBLIC_COMMENT_BEGIN\ndangling";
-        assert_eq!(strip_public_comment_blocks(t), "Keep");
     }
 }
