@@ -10,6 +10,8 @@ Coding Rules
 - Never commit secrets or API keys
 - Never add user info or real user data in tests or comments
 - Never use real IP addresses, ports, or internal hostnames in code, tests, or config examples — use placeholder domains (e.g. `http://example.invalid`, `http://model.example`) instead
+- Arrange items with structure, like put consts at the top of the file
+- Avoid long item access path, the path level should not greater than one, like foo::Bar, or Bar, but not foo::baz::Bar
 
 Testing
 -------
