@@ -10,7 +10,11 @@
 //! Each provider maps its native types into these shared shapes.
 
 use anyhow::Result;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
 
 pub mod github;
 pub mod gitlab;
@@ -199,6 +203,20 @@ pub fn issue_iid_from_branch(branch: &str) -> Option<u64> {
     branch.strip_prefix("issue-")?.parse().ok()
 }
 
+static CLOSES_ISSUE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)closes?\s+#(\d+)").expect("CLOSES_ISSUE_RE"));
+
+/// True if the MR description contains `Closes #iid` / `Close #iid` for this
+/// issue (case-insensitive). The `Closes #NNN` convention is shared across
+/// GitLab and GitHub.
+pub fn mr_description_closes_issue(description: &str, issue_iid: u64) -> bool {
+    CLOSES_ISSUE_RE.captures_iter(description).any(|cap| {
+        cap.get(1)
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .is_some_and(|n| n == issue_iid)
+    })
+}
+
 /// Returns true if `err` wraps a [`NonRetryable`] error (e.g. a permanent
 /// `404 Not Found` for a deleted issue or MR). Callers that fetch a specific
 /// resource by IID should check this and abandon the stale resource (e.g.
@@ -279,4 +297,49 @@ pub trait CodeHostingClient: Send + Sync {
     // ── Utility ──
 
     fn is_not_found(&self, err: &anyhow::Error) -> bool;
+
+    // ── Label events (for claim ordering) ──
+
+    /// Label-event history for an issue, used to order active claims by when
+    /// they were added. Providers without label-event history (GitHub scaffold)
+    /// return an empty vec; the claim layer falls back to lexicographic order.
+    fn get_issue_label_events(&self, _iid: u64) -> Result<Vec<ResourceLabelEvent>> {
+        Ok(Vec::new())
+    }
+
+    /// Label-event history for a merge request. See [`Self::get_issue_label_events`].
+    fn get_mr_label_events(&self, _iid: u64) -> Result<Vec<ResourceLabelEvent>> {
+        Ok(Vec::new())
+    }
+}
+
+// ─── Factory ──────────────────────────────────────────────────────────────────
+
+/// Construct the appropriate [`CodeHostingClient`] for `repo_url`.
+///
+/// GitHub URLs get a [`github::GitHubClient`]; everything else gets a
+/// [`gitlab::GitLabClient`]. The concrete types stay private to this module —
+/// callers receive an `Arc<dyn CodeHostingClient>` and never see which
+/// provider they're talking to.
+pub fn create_client(
+    working_dir: &str,
+    repo_url: &str,
+    shutdown: Arc<AtomicBool>,
+) -> Result<Arc<dyn CodeHostingClient>> {
+    let url_lower = repo_url.to_lowercase();
+    if url_lower.contains("github.com") {
+        let client = github::GitHubClient::new(working_dir.to_string(), repo_url)?;
+        return Ok(Arc::new(client));
+    }
+    let client = gitlab::GitLabClient::new(working_dir.to_string(), repo_url, shutdown)?;
+    Ok(Arc::new(client))
+}
+
+/// Construct a no-network client for tests. Returns a GitLab-backed client
+/// whose methods are never called — tests use it to satisfy
+/// `Arc<dyn CodeHostingClient>` fields in agent-state structs while
+/// exercising pure/file-only logic paths.
+#[cfg(test)]
+pub fn for_test_client(repo_path: impl Into<String>) -> Arc<dyn CodeHostingClient> {
+    Arc::new(gitlab::GitLabClient::for_test(repo_path))
 }

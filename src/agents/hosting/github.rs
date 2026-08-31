@@ -14,10 +14,10 @@ use super::{
     CodeHostingClient, Comment, Issue, IssueThreadNote, MergeRequest, MergeRequestChangesSnapshot,
 };
 
-pub struct GitHubClient;
+pub(crate) struct GitHubClient;
 
 impl GitHubClient {
-    pub fn new(_repo_path: String, _repo_url: &str) -> Result<Self> {
+    pub(crate) fn new(_repo_path: String, _repo_url: &str) -> Result<Self> {
         Ok(Self)
     }
 }

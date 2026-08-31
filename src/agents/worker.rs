@@ -14,8 +14,6 @@ use super::{
     write_task_context_file,
 };
 use crate::agents::git::GitRepo;
-#[cfg(test)]
-use crate::agents::hosting::gitlab::GitLabClient;
 use crate::agents::hosting::{CodeHostingClient, Issue};
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 #[cfg(test)]
@@ -1849,8 +1847,7 @@ fn closes_keyword_mr_status(
     let mut opens: Vec<u64> = Vec::new();
     let mut any_merged = false;
     for mr in mrs {
-        if !crate::agents::hosting::gitlab::mr_description_closes_issue(&mr.description, issue_iid)
-        {
+        if !crate::agents::hosting::mr_description_closes_issue(&mr.description, issue_iid) {
             continue;
         }
         match mr.state.as_str() {
@@ -4688,13 +4685,14 @@ fn extract_mr_description(mr_description: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::hosting;
     use crate::core::agent::schema::conformance;
 
     // -----------------------------------------------------------------
     // Session persistence: tolerant policy. Corrupt/unsupported session
     // files have historically been treated as "no session" rather than
-    // failing the worker cycle; `GitRepo::new`/`GitLabClient::for_test` are
-    // file/network-free constructors so this exercises the real
+    // failing the worker cycle; `GitRepo::new`/`hosting::for_test_client`
+    // are file/network-free constructors so this exercises the real
     // `AgentState` session methods without touching git or GitLab.
     // -----------------------------------------------------------------
 
@@ -4717,7 +4715,7 @@ mod tests {
                 std::env::temp_dir().to_string_lossy().into_owned(),
                 Arc::new(AtomicBool::new(false)),
             ),
-            hosting: Arc::new(GitLabClient::for_test("/tmp/unused-repo")),
+            hosting: hosting::for_test_client("/tmp/unused-repo"),
         }
     }
 

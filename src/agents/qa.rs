@@ -1008,7 +1008,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::agents::hosting::gitlab::GitLabClient;
+    use crate::agents::hosting;
     use crate::core::agent::schema::conformance;
 
     struct FakeQaPort {
@@ -1647,8 +1647,9 @@ mod tests {
     // which is the mechanism `qa_cycle` relies on to only advance a branch's
     // recorded SHA once a cycle has fully completed (findings/clarifications
     // processed and `model.complete_typed` returned `Ok`). `GitRepo::new` and
-    // `GitLabClient::for_test` are file/network-free constructors, so this
-    // exercises the real `AgentState` methods without touching git or GitLab.
+    // `hosting::for_test_client` are file/network-free constructors, so this
+    // exercises the real `AgentState` methods without touching git or the
+    // hosting service.
 
     /// Owns the resources a test [`AgentState`] borrows from, standing in
     /// for the [`AgentWorkspace`] fields QA's cycle needs.
@@ -1667,7 +1668,7 @@ mod tests {
                 std::env::temp_dir().to_string_lossy().into_owned(),
                 Arc::new(AtomicBool::new(false)),
             ),
-            hosting: Arc::new(GitLabClient::for_test("/tmp/unused-repo")),
+            hosting: hosting::for_test_client("/tmp/unused-repo"),
         }
     }
 
