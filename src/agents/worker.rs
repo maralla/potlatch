@@ -16,8 +16,6 @@ use super::{
 use crate::agents::forge::{ForgeClient, Issue};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
-#[cfg(test)]
-use crate::core::agent::StructuredOutput;
 use crate::core::agent::schema::tagged;
 use crate::core::agent::{
     AgentModel, CoreAgent, InvokeOptions, ModelPreferences, ObjectSchema, Schema, compat,
@@ -4666,6 +4664,7 @@ fn extract_mr_description(mr_description: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::agents::forge;
+    use crate::core::agent::StructuredOutput;
     use crate::core::agent::schema::conformance;
 
     // -----------------------------------------------------------------

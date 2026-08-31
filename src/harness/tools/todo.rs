@@ -92,13 +92,6 @@ mod tests {
     use super::*;
     use crate::harness::todo::TodoList;
 
-    fn item(desc: &str, status: TodoStatus) -> TodoItem {
-        TodoItem {
-            description: desc.into(),
-            status,
-        }
-    }
-
     #[test]
     fn set_creates_list_with_statuses() {
         let todo = Arc::new(TodoList::new());

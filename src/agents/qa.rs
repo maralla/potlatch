@@ -21,8 +21,6 @@ use tracing::{debug, warn};
 use crate::agents::forge::{self, ForgeClient};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
-#[cfg(test)]
-use crate::core::agent::StructuredOutput;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
@@ -1009,6 +1007,7 @@ mod tests {
 
     use super::*;
     use crate::agents::forge;
+    use crate::core::agent::StructuredOutput;
     use crate::core::agent::schema::conformance;
 
     struct FakeQaPort {
