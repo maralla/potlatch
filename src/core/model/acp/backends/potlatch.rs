@@ -18,12 +18,14 @@ use super::super::capabilities::CapabilityProvider;
 use super::super::client::AcpClient;
 use super::super::types::{InitializeResult, NewSessionResult, SessionModeStateBrief};
 use super::{AcpVendorExtension, AcpVendorState, StructuredOutputBackend};
+use crate::core::bus::AgentBus;
+use crate::core::config::uri::ModelUri;
 
 /// Per-session vendor state for the potlatch backend. The harness sends no
 /// `cursor/*` requests and no mode updates that need tracking, so this is a
 /// no-op implementation.
 struct PotlatchVendorState {
-    agent_bus: Option<crate::core::bus::AgentBus>,
+    agent_bus: Option<AgentBus>,
 }
 
 impl AcpVendorState for PotlatchVendorState {
@@ -104,7 +106,7 @@ impl PotlatchExtension {
     /// Create a Potlatch extension if the model URI vendor is `potlatch`.
     pub fn new(model_uri: Option<&str>) -> Option<Self> {
         let is_potlatch = model_uri
-            .and_then(|uri| crate::core::config::uri::ModelUri::parse(uri).ok())
+            .and_then(|uri| ModelUri::parse(uri).ok())
             .is_some_and(|u| u.vendor == "potlatch");
 
         if !is_potlatch {
@@ -119,7 +121,7 @@ impl AcpVendorExtension for PotlatchExtension {
     fn create_state(
         &self,
         _provider: Option<Arc<dyn CapabilityProvider>>,
-        agent_bus: Option<crate::core::bus::AgentBus>,
+        agent_bus: Option<AgentBus>,
     ) -> Arc<dyn AcpVendorState> {
         Arc::new(PotlatchVendorState { agent_bus })
     }
@@ -163,6 +165,7 @@ impl AcpVendorExtension for PotlatchExtension {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::bus::AgentBus;
     use serde_json::json;
 
     #[test]
@@ -189,7 +192,7 @@ mod tests {
 
     #[test]
     fn potlatch_vendor_routes_agent_tool_calls_to_the_in_process_bus() {
-        let bus = crate::core::bus::AgentBus::new();
+        let bus = AgentBus::new();
         let inbox = bus.register("web", vec![]).unwrap();
         let worker = std::thread::spawn(move || {
             let request = inbox.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();

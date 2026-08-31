@@ -433,6 +433,7 @@ mod tests {
     use super::super::transport::{LineTransport, line_channel_pair};
     use super::super::types::{
         ClientCapabilities, ClientFsCapabilities, DEFAULT_PROTOCOL_VERSION, ImplementationInfo,
+        model_selector_for_session, select_option_allows_value,
     };
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -908,14 +909,9 @@ mod tests {
         );
 
         let sid = session.session_id;
-        let opt = crate::core::model::acp::types::model_selector_for_session(
-            session.config_options.as_deref().unwrap(),
-        )
-        .expect("model option");
-        assert!(crate::core::model::acp::types::select_option_allows_value(
-            opt,
-            "composer-2"
-        ));
+        let opt = model_selector_for_session(session.config_options.as_deref().unwrap())
+            .expect("model option");
+        assert!(select_option_allows_value(opt, "composer-2"));
         client.session_set_config_option(&sid, &opt.id, "composer-2")?;
 
         let pr = client.session_prompt(&sid, "ping")?;

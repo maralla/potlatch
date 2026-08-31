@@ -4,6 +4,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use toml::Value;
 
+const RESERVED_KEYS: &[&str] = &["acp_command", "env", "endpoints"];
+
 /// A parsed `[acp.<name>]` profile. Structural fields (`acp_command`, `env`,
 /// `endpoints`) are stored separately; every other key in the section is a
 /// user-defined field available as a `{field}` reference in `env` values.
@@ -36,9 +38,6 @@ pub struct AcpSpawnConfig {
     pub endpoint_model: Option<String>,
     pub env: HashMap<String, String>,
 }
-
-/// Structural keys that are not user-defined fields.
-const RESERVED_KEYS: &[&str] = &["acp_command", "env", "endpoints"];
 
 pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfile>> {
     let Some(acp_root) = root.get("acp").and_then(Value::as_table) else {
@@ -517,7 +516,7 @@ mod tests {
             Some("EMPTY")
         );
         // No `key` field when omitted — it's a user-defined field, not a default.
-        assert!(p.endpoints[1].fields.get("key").is_none());
+        assert!(!p.endpoints[1].fields.contains_key("key"));
     }
 
     #[test]

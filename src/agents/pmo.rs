@@ -11,8 +11,10 @@ use tracing::{info, warn};
 
 use super::claim::{self, ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::labels;
+use super::state::StateStore;
 use crate::agents::forge::{
-    self, ForgeClient, Issue, IssueThreadNote, issue_in_scope, with_split_parent,
+    self, ForgeClient, Issue, IssueThreadNote, is_not_found, issue_in_scope, scope_label_filter,
+    with_split_parent,
 };
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
@@ -20,10 +22,11 @@ use crate::core::agent::schema::tagged;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
-use crate::core::config::Config;
+use crate::core::config::{AgentSection, Config};
 use crate::core::model::acp::capabilities::{AskAnswer, AskQuestion, CapabilityProvider};
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
+use crate::core::workflow::AgentBuildContext;
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
@@ -32,6 +35,24 @@ const PMO_PROCESSED_LABEL: &str = "pmo-processed";
 const PMO_PLAN_COMMENT_HEADER: &str = "**PMO plan:**";
 /// ACP runtime message when `cancel_check` returns true.
 const PMO_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
+/// Legacy names the model has been seen using for the dependency IID.
+const DEPENDENCY_IID_ALIASES: &[&str] = &[
+    "dependency_iid",
+    "depends_on_issue",
+    "blocked_by",
+    "dependency",
+];
+const PMO_DECISIONS: &[&str] = &[
+    "guide_worker",
+    "propose_plan",
+    "keep_plan",
+    "split",
+    "already_done",
+    "needs_clarification",
+    "wait_for_dependency",
+];
+const STALE_THRESHOLD_SECS: u64 = 3600; // 1 hour
+const ASK_POLL_INTERVAL: Duration = Duration::from_secs(4);
 
 /// One sub-issue as the model described it via the `plan` tool's `sub_issues`
 /// array, before the empty-title/description defensive filtering in
@@ -173,24 +194,6 @@ struct NeedsClarificationWire {
 struct WaitForDependencyWire {
     dependency_issue_iid: u64,
 }
-
-/// Legacy names the model has been seen using for the dependency IID.
-const DEPENDENCY_IID_ALIASES: &[&str] = &[
-    "dependency_iid",
-    "depends_on_issue",
-    "blocked_by",
-    "dependency",
-];
-
-const PMO_DECISIONS: &[&str] = &[
-    "guide_worker",
-    "propose_plan",
-    "keep_plan",
-    "split",
-    "already_done",
-    "needs_clarification",
-    "wait_for_dependency",
-];
 
 impl<'de> Deserialize<'de> for PmoOutput {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
@@ -401,7 +404,7 @@ impl AgentState<'_> {
     }
 
     fn save_state_with_comment_cursor(&self, issue_iid: u64, last_seen_comment_id: u64) {
-        let store = crate::agents::state::StateStore::new(self.state_path());
+        let store = StateStore::new(self.state_path());
         if let Err(e) = store.save(&PersistedPmoState {
             claimed_issue_iid: issue_iid,
             last_seen_comment_id,
@@ -411,7 +414,7 @@ impl AgentState<'_> {
     }
 
     fn last_seen_comment_id(&self, issue_iid: u64) -> u64 {
-        let store = crate::agents::state::StateStore::new(self.state_path());
+        let store = StateStore::new(self.state_path());
         store
             .load()
             .ok()
@@ -422,8 +425,7 @@ impl AgentState<'_> {
     }
 
     fn clear_state(&self) {
-        let store: crate::agents::state::StateStore<PersistedPmoState> =
-            crate::agents::state::StateStore::new(self.state_path());
+        let store: StateStore<PersistedPmoState> = StateStore::new(self.state_path());
         let _ = store.remove();
     }
 
@@ -464,7 +466,7 @@ impl CoreAgent for PmoAgent {
 
     fn validate_settings(
         config: &Config,
-        _section: &crate::core::config::AgentSection,
+        _section: &AgentSection,
         settings: &Self::Settings,
     ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_repo_url()?;
@@ -485,7 +487,7 @@ impl CoreAgent for PmoAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "gitlab_poll" => {
-                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
+                let scope = scope_label_filter(&self.runtime.scope_label);
                 let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
                 let state = AgentState::from_runtime(&self.runtime);
@@ -504,7 +506,7 @@ impl CoreAgent for PmoAgent {
         }
     }
 
-    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+    fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
         let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let settings = ctx.settings;
         let config = PmoConfig {
@@ -512,7 +514,7 @@ impl CoreAgent for PmoAgent {
             ask_via_gitlab: settings.ask_via_gitlab,
             ask_gitlab_timeout_secs: settings.ask_gitlab_timeout_secs,
         };
-        let scope = crate::agents::forge::scope_label_filter(&runtime.scope_label);
+        let scope = scope_label_filter(&runtime.scope_label);
         let claimed_issue = {
             let state = AgentState::from_runtime(&runtime);
             state.ensure_sessions_dir()?;
@@ -1384,8 +1386,6 @@ fn pmo_cycle(
     run_pmo_cycle(state.agent_id, scope_label, held_issue_iid, &mut port)
 }
 
-const STALE_THRESHOLD_SECS: u64 = 3600; // 1 hour
-
 fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
     // GitLab returns timestamps like "2026-03-18T05:30:00.000Z" or "2026-03-18T05:30:00+00:00"
     // Parse manually to avoid pulling in a datetime crate.
@@ -2000,7 +2000,7 @@ fn format_pmo_guidance_comment(guidance: &str) -> String {
 }
 
 fn save_pending_split(path: &str, pending: &PendingSplit) -> Result<()> {
-    crate::agents::state::StateStore::new(path)
+    StateStore::new(path)
         .save(pending)
         .context("Failed to save pending split file")?;
     info!(
@@ -2017,14 +2017,13 @@ fn load_pending_split(path: &str) -> Result<Option<PendingSplit>> {
     // unsupported pending-split checkpoint is quarantined (never losing
     // bytes) but still surfaced as an error — resuming a split from bad
     // checkpoint data would risk re-creating or losing sub-issues.
-    crate::agents::state::StateStore::new(path)
+    StateStore::new(path)
         .load()
         .context("Failed to load pending split file")
 }
 
 fn delete_pending_split(path: &str) -> Result<()> {
-    let store: crate::agents::state::StateStore<PendingSplit> =
-        crate::agents::state::StateStore::new(path);
+    let store: StateStore<PendingSplit> = StateStore::new(path);
     let existed = store.path().exists();
     store
         .remove()
@@ -2042,8 +2041,7 @@ fn try_resume_pmo_state(
 ) -> Option<ClaimLease> {
     // Tolerant: invalid persisted PMO claim state has historically been
     // ignored, warn and treat as "nothing to resume" rather than failing.
-    let store: crate::agents::state::StateStore<PersistedPmoState> =
-        crate::agents::state::StateStore::new(state.state_path());
+    let store: StateStore<PersistedPmoState> = StateStore::new(state.state_path());
     let persisted = match store.load() {
         Ok(Some(persisted)) => persisted,
         Ok(None) => return None,
@@ -2101,7 +2099,7 @@ fn try_resume_pmo_state(
             Some(lease)
         }
         Err(e) => {
-            if crate::agents::forge::is_not_found(&e) {
+            if is_not_found(&e) {
                 info!(
                     "{}: Previously claimed issue #{} no longer exists (404), \
                      discarding state",
@@ -2189,8 +2187,6 @@ fn sub_issue_already_created(pending: &PendingSplit, index: usize) -> bool {
 // ---------------------------------------------------------------------------
 // GitLab-based ask question handler (CapabilityProvider::ask)
 // ---------------------------------------------------------------------------
-
-const ASK_POLL_INTERVAL: Duration = Duration::from_secs(4);
 
 fn new_ask_id() -> String {
     let mut r = rand::rng();
@@ -3835,8 +3831,7 @@ mod tests {
         // The bare pre-envelope payload written by older builds.
         fs::write(&path, br#"{"claimed_issue_iid":77}"#).unwrap();
 
-        let store: crate::agents::state::StateStore<PersistedPmoState> =
-            crate::agents::state::StateStore::new(&path);
+        let store: StateStore<PersistedPmoState> = StateStore::new(&path);
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded.claimed_issue_iid, 77);
         assert_eq!(loaded.last_seen_comment_id, 0);

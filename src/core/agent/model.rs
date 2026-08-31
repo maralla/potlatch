@@ -7,7 +7,12 @@ use tracing::{debug, warn};
 
 use super::AgentHandoff;
 use super::schema::{OutputError, StructuredOutput};
+#[cfg(test)]
+use crate::core::activity::NoopActivityReporter;
 use crate::core::activity::SharedActivityReporter;
+#[cfg(test)]
+use crate::core::config::{AgentSection, Config};
+use crate::core::model::acp::capabilities::CapabilityProvider;
 use crate::core::model::engine::{ModelEngine, ModelSessionOptions, spawn_model_engine};
 use crate::core::workflow::AgentSpawnContext;
 
@@ -176,24 +181,20 @@ impl AgentModel {
 
     /// Set the capability provider (called by the agent at construction).
     /// The vendor extension reads from it to wire handlers to its protocol.
-    pub fn set_capability_provider(
-        &self,
-        provider: Option<Arc<dyn crate::core::model::acp::capabilities::CapabilityProvider>>,
-    ) {
+    pub fn set_capability_provider(&self, provider: Option<Arc<dyn CapabilityProvider>>) {
         self.engine.set_capability_provider(provider);
     }
 
     #[cfg(test)]
     pub(crate) fn from_section_for_test(
-        config: &crate::core::config::Config,
-        section: &crate::core::config::AgentSection,
+        config: &Config,
+        section: &AgentSection,
         agent_id: &str,
         working_dir: &str,
         prefs: ModelPreferences,
     ) -> Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let activity: SharedActivityReporter =
-            Arc::new(crate::core::activity::NoopActivityReporter);
+        let activity: SharedActivityReporter = Arc::new(NoopActivityReporter);
         let engine = spawn_model_engine(
             config,
             section,
@@ -348,11 +349,11 @@ fn resolve_structured_output<T: StructuredOutput>(
 mod tests {
     use super::*;
     use crate::core::agent::schema::{ObjectSchema, OneOfSchema, Schema, compat};
-    use crate::core::config::Config;
+    use crate::core::config::{AgentSection, Config};
     use serde_json::{Value, json};
     use std::cell::RefCell;
 
-    fn sample_section(model: Option<&str>) -> crate::core::config::AgentSection {
+    fn sample_section(model: Option<&str>) -> AgentSection {
         sample_config(model).agent("alpha").unwrap().clone()
     }
 

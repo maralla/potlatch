@@ -11,6 +11,7 @@ use tracing::info;
 
 use crate::core::agent::CoreAgent;
 use crate::core::bus::{AgentInbox, AgentRequest, AgentToolDefinition};
+use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 use crate::core::runtime::AgentRuntime;
 use crate::core::workflow::AgentBuildContext;
@@ -125,8 +126,8 @@ impl CoreAgent for WebAgent {
     }
 
     fn validate_settings(
-        _config: &crate::core::config::Config,
-        _section: &crate::core::config::AgentSection,
+        _config: &Config,
+        _section: &AgentSection,
         settings: &Self::Settings,
     ) -> Result<()> {
         ensure!(
@@ -448,14 +449,12 @@ mod tests {
 
     #[test]
     fn web_settings_have_a_bounded_result_count() {
-        let valid =
-            crate::core::config::Config::from_toml_str("[agent.web]\nmax_results = 10").unwrap();
+        let valid = Config::from_toml_str("[agent.web]\nmax_results = 10").unwrap();
         let section = valid.agent("web").unwrap();
         let settings = WebAgent::parse_settings(&valid, section).unwrap();
         WebAgent::validate_settings(&valid, section, &settings).unwrap();
 
-        let invalid =
-            crate::core::config::Config::from_toml_str("[agent.web]\nmax_results = 0").unwrap();
+        let invalid = Config::from_toml_str("[agent.web]\nmax_results = 0").unwrap();
         let section = invalid.agent("web").unwrap();
         let settings = WebAgent::parse_settings(&invalid, section).unwrap();
         assert!(WebAgent::validate_settings(&invalid, section, &settings).is_err());

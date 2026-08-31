@@ -6,13 +6,14 @@ use anyhow::{Context, Result};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 
-use crate::core::activity::SharedActivityReporter;
+use crate::core::activity::{NoopActivityReporter, SharedActivityReporter};
 use crate::core::agent::CoreAgent;
 use crate::core::banner::Banner;
 use crate::core::bus::AgentBus;
 use crate::core::config::Config;
 use crate::core::registry::AgentRegistry;
 use crate::core::runtime::AgentRuntime;
+use crate::core::supervisor;
 
 pub struct WorkflowContext {
     pub config: Arc<Config>,
@@ -86,7 +87,7 @@ pub(crate) fn spawn_core_agent<A>(workflow: WorkflowContext, instance_id: usize)
 where
     A: CoreAgent,
 {
-    crate::core::supervisor::supervise::<A>(workflow, instance_id)
+    supervisor::supervise::<A>(workflow, instance_id)
 }
 
 #[derive(Clone)]
@@ -203,7 +204,7 @@ impl Workflow {
             config,
             config_path: config_path.into(),
             registry: AgentRegistry::new(),
-            activity: Arc::new(crate::core::activity::NoopActivityReporter),
+            activity: Arc::new(NoopActivityReporter),
         }
     }
 
@@ -281,6 +282,7 @@ impl Workflow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::AgentSection;
     use anyhow::Result;
 
     struct AlphaAgent;
@@ -353,7 +355,7 @@ mod tests {
 
         fn validate_settings(
             _config: &Config,
-            _section: &crate::core::config::AgentSection,
+            _section: &AgentSection,
             _settings: &Self::Settings,
         ) -> Result<()> {
             anyhow::bail!("deliberately invalid")

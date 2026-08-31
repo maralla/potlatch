@@ -9,6 +9,8 @@
 //! originated from the GitLab API shape and are reused across all providers.
 //! Each provider maps its native types into these shared shapes.
 
+use super::labels::NEED_AI_WORKER;
+use crate::core::retry::NonRetryable;
 use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -52,11 +54,7 @@ pub fn mr_in_scope(mr: &MergeRequest, scope_label: Option<&str>) -> bool {
 /// observes an MR through its own snapshot type still applies exactly the
 /// same rule as [`mr_in_scope`].
 pub fn mr_labels_in_scope(labels: Option<&[String]>, scope_label: Option<&str>) -> bool {
-    if labels.is_some_and(|labels| {
-        labels
-            .iter()
-            .any(|x| x == crate::agents::labels::NEED_AI_WORKER)
-    }) {
+    if labels.is_some_and(|labels| labels.iter().any(|x| x == NEED_AI_WORKER)) {
         return true;
     }
     match scope_label {
@@ -285,8 +283,7 @@ pub fn mr_description_closes_issue(description: &str, issue_iid: u64) -> bool {
 /// resource by IID should check this and abandon the stale resource (e.g.
 /// clear persisted claim state) instead of treating it as a transient failure.
 pub fn is_not_found(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.is::<crate::core::retry::NonRetryable>())
+    err.chain().any(|cause| cause.is::<NonRetryable>())
 }
 
 // ─── Trait ─────────────────────────────────────────────────────────────────────
@@ -455,7 +452,7 @@ mod tests {
         let no_labels = sample_mr(None);
         assert!(!mr_in_scope(&no_labels, Some("potlatch")));
 
-        let ai_worker = sample_mr(Some(vec![crate::agents::labels::NEED_AI_WORKER]));
+        let ai_worker = sample_mr(Some(vec![NEED_AI_WORKER]));
         assert!(mr_in_scope(&ai_worker, Some("other-scope")));
     }
 

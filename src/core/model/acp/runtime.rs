@@ -42,7 +42,9 @@ use super::types::{
     model_selector_for_session, select_option_allows_value,
 };
 use crate::core::agent::AgentHandoff;
+use crate::core::bus::AgentBus;
 use crate::core::config::build_acp_spawn_command;
+use crate::core::config::uri::ModelUri;
 
 const TASK_CONTEXT_RESET_GUIDANCE: &str = r#"IMPORTANT CONTEXT HANDLING:
 Treat this assignment as a fresh task. Do not rely on prior chat history or assumptions from earlier assignments unless this prompt explicitly refers to them. Use only the repository state, issue/MR context, and instructions present in this task.
@@ -93,7 +95,7 @@ pub(crate) struct AcpRuntime {
     structured_output_backend: Arc<dyn StructuredOutputBackend>,
     /// Capability provider (set by the agent at construction).
     capability_provider: Mutex<Option<Arc<dyn CapabilityProvider>>>,
-    agent_bus: Option<crate::core::bus::AgentBus>,
+    agent_bus: Option<AgentBus>,
     /// Structured-output definitions for the task currently in flight. The
     /// selected backend either passes them to the harness via `session/new` or
     /// renders them into the marker prompt. Set per task by
@@ -114,7 +116,7 @@ impl AcpRuntime {
         acp_command: Vec<String>,
         acp_env: std::collections::HashMap<String, String>,
         preferred_session_mode: Option<&'static str>,
-        agent_bus: Option<crate::core::bus::AgentBus>,
+        agent_bus: Option<AgentBus>,
         shutdown: Arc<AtomicBool>,
         agent_id: String,
     ) -> Self {
@@ -234,7 +236,7 @@ impl AcpRuntime {
         let is_potlatch = self
             .model_uri
             .as_deref()
-            .and_then(|uri| crate::core::config::uri::ModelUri::parse(uri).ok())
+            .and_then(|uri| ModelUri::parse(uri).ok())
             .is_some_and(|uri| uri.vendor == "potlatch");
         if !is_potlatch {
             return None;
@@ -260,7 +262,7 @@ impl AcpRuntime {
         let is_potlatch = self
             .model_uri
             .as_deref()
-            .and_then(|uri| crate::core::config::uri::ModelUri::parse(uri).ok())
+            .and_then(|uri| ModelUri::parse(uri).ok())
             .is_some_and(|uri| uri.vendor == "potlatch");
         if !is_potlatch {
             return None;
@@ -838,6 +840,7 @@ impl Drop for AcpRuntime {
 mod tests {
     use super::super::client::AcpHooks;
     use super::*;
+    use crate::core::bus::AgentToolDefinition;
     use serde_json::json;
 
     fn test_runtime_with_model(model_uri: Option<&str>) -> AcpRuntime {
@@ -858,8 +861,8 @@ mod tests {
         test_runtime_with_model(None)
     }
 
-    fn test_tool() -> crate::core::bus::AgentToolDefinition {
-        crate::core::bus::AgentToolDefinition {
+    fn test_tool() -> AgentToolDefinition {
+        AgentToolDefinition {
             name: "web_search".to_string(),
             description: "Search.".to_string(),
             parameters: json!({"type": "object"}),
@@ -909,7 +912,7 @@ mod tests {
 
     #[test]
     fn agent_tools_are_sent_only_to_the_potlatch_vendor() {
-        let bus = crate::core::bus::AgentBus::new();
+        let bus = AgentBus::new();
         let _inbox = bus.register("web", vec![test_tool()]).unwrap();
         let runtime_for = |model: &str| {
             AcpRuntime::new(
@@ -1069,7 +1072,7 @@ mod tests {
                 POTLATCH_STRUCTURED_OUTPUT_END"
         }))
         .unwrap();
-        let backend = crate::core::model::acp::backends::resolve_structured_output_backend(None);
+        let backend = super::super::backends::resolve_structured_output_backend(None);
         let handoff = handoff_from_prompt_hooks(&hooks, pr, None, Some(backend.as_ref()));
 
         assert_eq!(

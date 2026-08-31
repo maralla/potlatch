@@ -15,6 +15,11 @@ use super::context::{Context, ContextEntry, ContextKind, Role};
 use super::prompt;
 use super::tools::ToolRegistry;
 
+/// Maximum character length for a tool result stored in context. Larger results
+/// are truncated with a marker, keeping the first portion (most relevant for
+/// file reads and search results) and a note about the truncation.
+const MAX_TOOL_RESULT_CHARS: usize = 4_000;
+
 /// A signal to break the agent loop.
 enum LoopControl {
     Continue,
@@ -708,11 +713,6 @@ fn classify_tool_result(tool_name: &str, _result: &str) -> ContextKind {
     }
 }
 
-/// Maximum character length for a tool result stored in context. Larger results
-/// are truncated with a marker, keeping the first portion (most relevant for
-/// file reads and search results) and a note about the truncation.
-const MAX_TOOL_RESULT_CHARS: usize = 4_000;
-
 /// Whether a tool is read-only (no side effects). Read-only tools can be
 /// executed concurrently safely; mutating tools must run in order to preserve
 /// dependencies (e.g. `mkdir` before `write`).
@@ -841,7 +841,9 @@ fn format_duration(ms: u128) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::client::{EarlyToolExecCallback, FakeChatClient, ToolExecCallback};
+    use super::super::client::{EarlyToolExecCallback, FakeChatClient, ToolExecCallback, Usage};
+    use super::super::tools::SessionStates;
+    use super::super::tools::test_util;
     use super::*;
 
     #[test]
@@ -855,7 +857,7 @@ mod tests {
                     "function": {"name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
                 })],
                 finish_reason: "tool_calls".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -864,7 +866,7 @@ mod tests {
                 content: "Done, the command ran.".into(),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -872,7 +874,7 @@ mod tests {
         ]));
 
         let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
+            &mut SessionStates::new(),
             "test-session",
             "",
             "",
@@ -904,7 +906,7 @@ mod tests {
                     "function": {"name": "nonexistent_tool", "arguments": "{}"}
                 })],
                 finish_reason: "tool_calls".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -913,7 +915,7 @@ mod tests {
                 content: "Recovered from error.".into(),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -921,7 +923,7 @@ mod tests {
         ]));
 
         let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
+            &mut SessionStates::new(),
             "test-session",
             "",
             "",
@@ -953,7 +955,7 @@ mod tests {
                     "function": {"name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
                 })],
                 finish_reason: "tool_calls".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -962,7 +964,7 @@ mod tests {
                 content: "should not reach".into(),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -970,7 +972,7 @@ mod tests {
         ]));
 
         let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
+            &mut SessionStates::new(),
             "test-session",
             "",
             "",
@@ -1010,7 +1012,7 @@ mod tests {
                         "function": {"name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
                     })],
                     finish_reason: "tool_calls".into(),
-                    usage: super::super::client::Usage::default(),
+                    usage: Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
                     reasoning: String::new(),
@@ -1019,7 +1021,7 @@ mod tests {
                     content: "Done with injected message.".into(),
                     tool_calls: vec![],
                     finish_reason: "stop".into(),
-                    usage: super::super::client::Usage::default(),
+                    usage: Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
                     reasoning: String::new(),
@@ -1031,7 +1033,7 @@ mod tests {
         ));
 
         let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
+            &mut SessionStates::new(),
             "test-session",
             "",
             "",
@@ -1173,7 +1175,7 @@ mod tests {
         // turn, all calls must run sequentially (not concurrently) to preserve
         // dependencies. We verify by issuing write then read on the
         // same path — if they ran concurrently the read might see the old state.
-        let dir = super::super::tools::test_util::unique_test_dir();
+        let dir = test_util::unique_test_dir();
 
         let llm = Arc::new(FakeChatClient::new(vec![
             ChatResponse {
@@ -1191,7 +1193,7 @@ mod tests {
                     }),
                 ],
                 finish_reason: "tool_calls".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -1200,7 +1202,7 @@ mod tests {
                 content: "Done.".into(),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -1208,7 +1210,7 @@ mod tests {
         ]));
 
         let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
+            &mut SessionStates::new(),
             "test-session",
             "",
             "",
@@ -1275,7 +1277,7 @@ mod tests {
                     content: "No more scripted responses".into(),
                     tool_calls: vec![],
                     finish_reason: "stop".into(),
-                    usage: super::super::client::Usage::default(),
+                    usage: Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
                     reasoning: String::new(),
@@ -1293,7 +1295,7 @@ mod tests {
         // We verify this by writing a file, then having the speculative
         // callback "pre-read" it. The final response should contain the
         // cached content.
-        let dir = super::super::tools::test_util::unique_test_dir();
+        let dir = test_util::unique_test_dir();
         std::fs::write(
             std::path::Path::new(dir.as_str()).join("target.txt"),
             "speculative content\n",
@@ -1315,7 +1317,7 @@ mod tests {
                     content: String::new(),
                     tool_calls: vec![tool_call.clone()],
                     finish_reason: "tool_calls".into(),
-                    usage: super::super::client::Usage::default(),
+                    usage: Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
                     reasoning: String::new(),
@@ -1324,7 +1326,7 @@ mod tests {
                     content: "Done.".into(),
                     tool_calls: vec![],
                     finish_reason: "stop".into(),
-                    usage: super::super::client::Usage::default(),
+                    usage: Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
                     reasoning: String::new(),
@@ -1334,7 +1336,7 @@ mod tests {
         ));
 
         let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
+            &mut SessionStates::new(),
             "test-session",
             "",
             "",
@@ -1404,7 +1406,7 @@ mod tests {
                     content: "No more scripted responses".into(),
                     tool_calls: vec![],
                     finish_reason: "stop".into(),
-                    usage: super::super::client::Usage::default(),
+                    usage: Usage::default(),
                     tool_results: vec![],
                     elapsed_ms: 0,
                     reasoning: String::new(),
@@ -1435,7 +1437,7 @@ mod tests {
                     "function": {"name": "read", "arguments": "{\"files\":[]}"}
                 })],
                 finish_reason: "tool_calls".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -1444,7 +1446,7 @@ mod tests {
                 content: "Done.".into(),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -1452,7 +1454,7 @@ mod tests {
         ]));
 
         let tools = ToolRegistry::with_builtin_tools(
-            &mut crate::harness::tools::SessionStates::new(),
+            &mut SessionStates::new(),
             "test-session",
             "",
             "",

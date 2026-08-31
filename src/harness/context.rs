@@ -11,6 +11,17 @@ use serde_json::{Value, json};
 /// Cached BPE encoder for token estimation. Initialized once, reused across all calls.
 static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
 
+/// Number of recent assistant text entries to protect from eviction. Older
+/// assistant text is evictable since the model's intermediate narration
+/// ("Let me check...", "I'll now edit...") is low-value once the action is done.
+const KEEP_LAST_ASSISTANT_TEXT: usize = 3;
+
+/// Number of recent tool-call entries whose `reasoning_content` is preserved.
+/// Older tool-call entries have their reasoning stripped during budget
+/// pressure (the `tool_calls` JSON itself is always kept — only the thinking
+/// trace is dropped, since the tool result already reflects the outcome).
+const KEEP_LAST_REASONING: usize = 2;
+
 /// Categories of context entries. Drives the tiered retention policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextKind {
@@ -89,17 +100,6 @@ pub struct Context {
     total_tokens: usize,
     token_budget: usize,
 }
-
-/// Number of recent assistant text entries to protect from eviction. Older
-/// assistant text is evictable since the model's intermediate narration
-/// ("Let me check...", "I'll now edit...") is low-value once the action is done.
-const KEEP_LAST_ASSISTANT_TEXT: usize = 3;
-
-/// Number of recent tool-call entries whose `reasoning_content` is preserved.
-/// Older tool-call entries have their reasoning stripped during budget
-/// pressure (the `tool_calls` JSON itself is always kept — only the thinking
-/// trace is dropped, since the tool result already reflects the outcome).
-const KEEP_LAST_REASONING: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetAction {

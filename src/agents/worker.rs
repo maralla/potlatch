@@ -9,8 +9,13 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::claim::{self, ClaimAcquireOutcome, ClaimLease, ClaimResource};
+use super::labels::DO_NOT_IMPLEMENT;
+use super::state::StateStore;
 use crate::agents::artifact::write_task_context_file;
-use crate::agents::forge::{self, ForgeClient, Issue, issue_in_scope, split_parent_iid};
+use crate::agents::forge::{
+    self, Comment, ForgeClient, Issue, MergeRequest, is_not_found, issue_in_scope,
+    mr_description_closes_issue, scope_label_filter, split_parent_iid,
+};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::schema::tagged;
@@ -19,9 +24,10 @@ use crate::core::agent::{
     structured_output,
 };
 use crate::core::banner::Banner;
-use crate::core::config::Config;
+use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
+use crate::core::workflow::AgentBuildContext;
 
 const WORKING_ON_LABEL: &str = "in-progress";
 /// Root-level file updated by Potlatch after each successful worker run (impl or MR feedback).
@@ -35,6 +41,9 @@ const WORKER_PENDING_LABEL: &str = "pending";
 const WORKER_REVIEW_ONLY_LABEL: &str = "review-only";
 /// ACP runtime message when `cancel_check` returns true.
 const WORKER_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
+/// Prefix for labels that park an issue until a dependency issue is closed.
+/// The full label is `waiting-on-issue:#N` where N is the dependency issue IID.
+const WAITING_ON_ISSUE_LABEL_PREFIX: &str = "waiting-on-issue:#";
 const WORKER_MISSING_OUTPUT_NUDGE: &str = "Continue this implementation in the current session. \
 Your previous turns did not produce the required structured result. Do not restart or merely \
 explain the task: finish the work, then submit the result using the backend-provided structured \
@@ -405,8 +414,8 @@ impl AgentState<'_> {
         Path::new(&self.sessions_dir).join(format!("{}_issue_{}.json", &self.agent_id, issue_iid))
     }
 
-    fn session_store(&self, issue_iid: u64) -> crate::agents::state::StateStore<SessionFile> {
-        crate::agents::state::StateStore::new(self.session_file_path(issue_iid))
+    fn session_store(&self, issue_iid: u64) -> StateStore<SessionFile> {
+        StateStore::new(self.session_file_path(issue_iid))
     }
 
     fn load_session(&self, issue_iid: u64) -> Option<SessionFile> {
@@ -615,7 +624,7 @@ impl CoreAgent for WorkerAgent {
 
     fn validate_settings(
         config: &Config,
-        _section: &crate::core::config::AgentSection,
+        _section: &AgentSection,
         settings: &Self::Settings,
     ) -> Result<()> {
         super::settings::AgentSettings::from_config(config)?.require_repo_url()?;
@@ -636,7 +645,7 @@ impl CoreAgent for WorkerAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "gitlab_poll" => {
-                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
+                let scope = scope_label_filter(&self.runtime.scope_label);
                 let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
                 let state = AgentState::from_runtime(&self.runtime);
@@ -646,13 +655,13 @@ impl CoreAgent for WorkerAgent {
         }
     }
 
-    fn build(ctx: crate::core::workflow::AgentBuildContext<Self::Settings>) -> Result<Self> {
+    fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
         let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let settings = ctx.settings;
         let config = WorkerConfig {
             poll_interval: settings.poll_interval,
         };
-        let scope = crate::agents::forge::scope_label_filter(&runtime.scope_label);
+        let scope = scope_label_filter(&runtime.scope_label);
         let active = {
             let state = AgentState::from_runtime(&runtime);
             let mut active =
@@ -697,7 +706,7 @@ fn clear_resumed_issue_if_ignored(
     let issue = match state.forge.get_issue(active_issue.issue_iid) {
         Ok(issue) => issue,
         Err(e) => {
-            if crate::agents::forge::is_not_found(&e) {
+            if is_not_found(&e) {
                 info!(
                     "{}: Resumed issue #{} no longer exists (404), dropping resume state",
                     &state.agent_id, active_issue.issue_iid
@@ -1006,9 +1015,7 @@ fn apply_active_issue_hold(
                 ),
                 ClearReason::DoNotImplement => info!(
                     "{}: Active issue #{} has `{}` — releasing without implementation",
-                    agent_id,
-                    tracked.issue_iid,
-                    super::labels::DO_NOT_IMPLEMENT
+                    agent_id, tracked.issue_iid, DO_NOT_IMPLEMENT
                 ),
             }
             if port.clear_issue_state(tracked.issue_iid) {
@@ -1585,7 +1592,7 @@ fn worker_cycle(
     run_worker_routing_cycle(&mut port, state.agent_id, scope_label, active)
 }
 
-fn mr_has_label(mr: &crate::agents::forge::MergeRequest, label: &str) -> bool {
+fn mr_has_label(mr: &MergeRequest, label: &str) -> bool {
     mr.labels
         .as_ref()
         .is_some_and(|ls| ls.iter().any(|l| l.eq_ignore_ascii_case(label)))
@@ -1687,9 +1694,7 @@ fn should_skip_issue(issue: &IssueObservation) -> bool {
 }
 
 fn issue_has_do_not_implement_label(labels: &[String]) -> bool {
-    labels
-        .iter()
-        .any(|label| label == super::labels::DO_NOT_IMPLEMENT)
+    labels.iter().any(|label| label == DO_NOT_IMPLEMENT)
 }
 
 fn issue_has_worker_pending_label(labels: &[String]) -> bool {
@@ -1835,7 +1840,7 @@ fn closes_keyword_mr_status(forge: &dyn ForgeClient, issue_iid: u64) -> Option<C
     let mut opens: Vec<u64> = Vec::new();
     let mut any_merged = false;
     for mr in mrs {
-        if !crate::agents::forge::mr_description_closes_issue(&mr.description, issue_iid) {
+        if !mr_description_closes_issue(&mr.description, issue_iid) {
             continue;
         }
         match mr.state.as_str() {
@@ -2523,7 +2528,7 @@ fn hand_issue_back_to_humans(
 /// New top-level comments and replies to unrelated discussions advance the
 /// observation cursor but are not injected into the active model session.
 fn collect_new_follow_ups(
-    comments: &[crate::agents::forge::Comment],
+    comments: &[Comment],
     last_seen_id: &mut u64,
     mr_iid: u64,
     handled_discussion_ids: &HashSet<String>,
@@ -2903,7 +2908,7 @@ struct MrSurfaceObservation {
 }
 
 impl MrSurfaceObservation {
-    fn from_mr(mr: &crate::agents::forge::MergeRequest) -> Self {
+    fn from_mr(mr: &MergeRequest) -> Self {
         Self {
             title: mr.title.clone(),
             description: mr.description.clone(),
@@ -3774,12 +3779,7 @@ fn load_issue_context(forge: &dyn ForgeClient, issue_number: u64) -> Result<Stri
     }
 }
 
-fn abandon_mr(
-    state: &AgentState,
-    mr: &crate::agents::forge::MergeRequest,
-    issue_iid: u64,
-    reason: &str,
-) -> Result<()> {
+fn abandon_mr(state: &AgentState, mr: &MergeRequest, issue_iid: u64, reason: &str) -> Result<()> {
     state.forge.add_mr_comment(
         mr.iid,
         &format!(
@@ -3966,7 +3966,7 @@ fn build_diff_highlights_since(git_repo: &GitRepo, base_ref: &str) -> Option<Str
 
 fn build_mr_diff_context(
     project_name: &str,
-    mr: &crate::agents::forge::MergeRequest,
+    mr: &MergeRequest,
     git_repo: &GitRepo,
     gitlab: &dyn ForgeClient,
 ) -> String {
@@ -4071,7 +4071,7 @@ fn truncate_utf8_string_in_place(s: &mut String, max_bytes: usize) {
     s.truncate(end);
 }
 
-fn format_comments_for_prompt(comments: &[crate::agents::forge::Comment]) -> String {
+fn format_comments_for_prompt(comments: &[Comment]) -> String {
     comments
         .iter()
         .map(|c| c.format_for_prompt())
@@ -4081,7 +4081,7 @@ fn format_comments_for_prompt(comments: &[crate::agents::forge::Comment]) -> Str
 
 struct CombinedMrFeedbackContextInput<'a> {
     project_name: &'a str,
-    mr: &'a crate::agents::forge::MergeRequest,
+    mr: &'a MergeRequest,
     issue_context: &'a str,
     implementation_summary: &'a str,
     merge_conflict_status: &'a str,
@@ -4123,7 +4123,7 @@ fn build_combined_mr_feedback_context(input: CombinedMrFeedbackContextInput<'_>)
 }
 
 fn build_merge_conflict_status_section(
-    mr: &crate::agents::forge::MergeRequest,
+    mr: &MergeRequest,
     requires_conflict_resolution: bool,
     local_merge_clean: bool,
     git_repo: &GitRepo,
@@ -4568,10 +4568,6 @@ fn extract_worker_public_comment(public_comment: Option<&str>) -> Option<String>
     Some(s.to_string())
 }
 
-/// Prefix for labels that park an issue until a dependency issue is closed.
-/// The full label is `waiting-on-issue:#N` where N is the dependency issue IID.
-const WAITING_ON_ISSUE_LABEL_PREFIX: &str = "waiting-on-issue:#";
-
 /// Build the `waiting-on-issue:#N` label for a dependency issue IID.
 fn waiting_on_issue_label(issue_iid: u64) -> String {
     format!("{WAITING_ON_ISSUE_LABEL_PREFIX}{issue_iid}")
@@ -4643,8 +4639,10 @@ fn extract_mr_description(mr_description: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::agents::forge;
+    use crate::agents::labels::DO_NOT_IMPLEMENT;
     use crate::core::agent::StructuredOutput;
     use crate::core::agent::schema::conformance;
+    use crate::core::agent::validate_agent_config;
 
     // -----------------------------------------------------------------
     // Session persistence: tolerant policy. Corrupt/unsupported session
@@ -5147,8 +5145,7 @@ mod tests {
         .unwrap();
         let section = config.agent("worker").unwrap();
 
-        let error =
-            crate::core::agent::validate_agent_config::<WorkerAgent>(&config, section).unwrap_err();
+        let error = validate_agent_config::<WorkerAgent>(&config, section).unwrap_err();
 
         assert!(format!("{error:#}").contains("Failed to parse agent settings"));
     }
@@ -5232,7 +5229,7 @@ mod tests {
         assert!(should_skip_issue(&issue));
 
         issue.title = "Normal issue".to_string();
-        issue.labels = vec![super::super::labels::DO_NOT_IMPLEMENT.to_string()];
+        issue.labels = vec![DO_NOT_IMPLEMENT.to_string()];
         assert!(should_skip_issue(&issue));
 
         issue.labels = vec![WORKING_ON_LABEL.to_string()];
@@ -5298,7 +5295,7 @@ mod tests {
         issue.labels = vec![WORKER_PENDING_LABEL.to_string()];
         assert!(worker_should_cancel_issue_processing(&issue));
 
-        issue.labels = vec![super::super::labels::DO_NOT_IMPLEMENT.to_string()];
+        issue.labels = vec![DO_NOT_IMPLEMENT.to_string()];
         assert!(worker_should_cancel_issue_processing(&issue));
 
         // Opened with no blocking labels → keep working.
@@ -5602,7 +5599,7 @@ mod tests {
 
     #[test]
     fn merge_request_surface_changed_detects_title_labels() {
-        use crate::agents::forge::MergeRequest;
+        use MergeRequest;
         let a = MergeRequest {
             iid: 1,
             title: "Old".into(),
@@ -5667,13 +5664,8 @@ mod tests {
         assert_eq!(extract_waiting_on_issue_iid(&labels), None);
     }
 
-    fn mr_comment(
-        id: u64,
-        author: &str,
-        discussion_id: &str,
-        body: &str,
-    ) -> crate::agents::forge::Comment {
-        crate::agents::forge::Comment {
+    fn mr_comment(id: u64, author: &str, discussion_id: &str, body: &str) -> Comment {
+        Comment {
             id,
             body: body.to_string(),
             author: author.to_string(),
@@ -6153,7 +6145,7 @@ mod tests {
     #[test]
     fn worker_releases_a_claim_when_do_not_implement_appears_after_screening() {
         let candidate = issue_observation(7, &[]);
-        let blocked = issue_observation(7, &[super::super::labels::DO_NOT_IMPLEMENT]);
+        let blocked = issue_observation(7, &[DO_NOT_IMPLEMENT]);
         let mut port = FakeWorkerPort::new()
             .knowing(&[blocked])
             .listing(&[candidate]);
@@ -6477,7 +6469,7 @@ mod tests {
 
         for (label, action) in [
             (WORKER_PENDING_LABEL, "clear_state:7"),
-            (super::super::labels::DO_NOT_IMPLEMENT, "clear_state:7"),
+            (DO_NOT_IMPLEMENT, "clear_state:7"),
             (WORKER_REVIEW_ONLY_LABEL, "release_review_only:7"),
         ] {
             let mut port = FakeWorkerPort::new()

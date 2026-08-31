@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use super::forge::{self, ForgeClient};
 use super::git::GitRepo;
 use super::settings::AgentSettings;
+use crate::core::activity::SharedActivityReporter;
 use crate::core::agent::{AgentModel, ModelPreferences};
 use crate::core::banner::Banner;
 use crate::core::config::Config;
@@ -121,7 +122,7 @@ pub fn ensure_agent_repo(
     project_name: &str,
     agent_id: &str,
     shutdown: Arc<AtomicBool>,
-    activity: crate::core::activity::SharedActivityReporter,
+    activity: SharedActivityReporter,
 ) -> Result<String> {
     let container = agent_dir(base_dir, project_name, agent_id);
     let repo_path = work_dir(base_dir, project_name, agent_id);
