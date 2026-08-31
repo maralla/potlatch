@@ -9,9 +9,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::claim::{ClaimAcquireOutcome, ClaimLease, ClaimResource};
-use super::{
-    claim, issue_in_scope, split_parent_iid, strip_public_comment_blocks, write_task_context_file,
-};
+use super::{claim, issue_in_scope, split_parent_iid, write_task_context_file};
 use crate::agents::forge::{ForgeClient, Issue};
 use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
@@ -4629,30 +4627,13 @@ fn strip_markdown_formatting(s: &str) -> String {
     result.to_string()
 }
 
-/// Defense-in-depth cleanup for `mr_description` text: strips any stray
-/// public-comment blocks and internal field-name-looking lines the model
-/// might echo into the description despite the typed contract.
-fn sanitize_mr_description_text(s: &str) -> String {
-    let stripped = strip_public_comment_blocks(s);
-    let filtered: Vec<&str> = stripped
-        .lines()
-        .filter(|line| {
-            let t = line.trim_start();
-            !t.starts_with("CHANGES_SUMMARY:")
-                && !t.starts_with("MARK_DISCUSSIONS_RESOLVED:")
-                && !t.starts_with("POST_PLAIN_COMMENT:")
-        })
-        .collect();
-    filtered.join("\n").trim().to_string()
-}
-
 /// Extract the MR description the agent emitted via the `handoff` tool's
 /// `mr_description` field, falling back to a generic placeholder when absent.
 fn extract_mr_description(mr_description: Option<&str>) -> String {
     if let Some(s) = mr_description {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
-            return sanitize_mr_description_text(trimmed);
+            return trimmed.to_string();
         }
     }
     "Implementation completed.".to_string()
@@ -5641,25 +5622,6 @@ mod tests {
         b.title = "Old".into();
         b.labels = Some(vec!["a".into(), "b".into()]);
         assert!(before.differs_from(&MrSurfaceObservation::from_mr(&b)));
-    }
-
-    #[test]
-    fn extract_mr_description_strips_control_marker_lines() {
-        let desc = extract_mr_description(Some(
-            "## Goal\nDescribe change.\nCHANGES_SUMMARY: noisy line\nMARK_DISCUSSIONS_RESOLVED: yes\nPOST_PLAIN_COMMENT: yes\n## Testing\ncargo test",
-        ));
-        assert_eq!(desc, "## Goal\nDescribe change.\n## Testing\ncargo test");
-    }
-
-    #[test]
-    fn extract_mr_description_strips_public_comment_blocks() {
-        let desc = extract_mr_description(Some(
-            "## Goal\npytest coverage.\nPUBLIC_COMMENT_BEGIN\nThanks for the review.\nPUBLIC_COMMENT_END\n## Testing\nuv run pytest",
-        ));
-        assert_eq!(
-            desc,
-            "## Goal\npytest coverage.\n\n## Testing\nuv run pytest"
-        );
     }
 
     #[test]
