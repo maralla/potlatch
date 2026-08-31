@@ -370,12 +370,17 @@ trait ReviewerPort {
     fn reset_worktree(&mut self);
     fn checkout_branch(&mut self, branch: &str) -> Result<()>;
     fn recover_claim(&mut self);
+    /// The MR whose *interrupted* review should be resumed: a claim
+    /// recovered from the live forge (restart recovery). A claim still held
+    /// because its release failed is not resumable — the review already ran.
+    fn resumable_claim_mr_iid(&self) -> Option<u64>;
     /// A failure retains the lease so the next cycle retries the same release.
     fn try_release_held_claim(&mut self) -> Result<()>;
     /// Warns on release failure and always drops the lease.
     fn release_held_claim(&mut self);
     fn release_stale_claim_label(&mut self, mr_iid: u64);
     fn merge_requests(&self) -> Result<Vec<MrObservation>>;
+    fn merge_request(&self, mr_iid: u64) -> Result<MrObservation>;
     /// Best effort: unavailable issue priorities are represented by an empty list.
     fn issue_priorities(&self) -> Vec<(u64, u8)>;
     fn unresolved_discussions(&self, mr_iid: u64) -> Result<DiscussionCounts>;
@@ -431,6 +436,27 @@ fn decide_candidate(
         return CandidateDecision::Skip;
     }
     CandidateDecision::Screen
+}
+
+/// What to do with a claim recovered after a restart (or held over from an
+/// interrupted cycle): resume reviewing that MR in place, or let go of the
+/// claim because the MR can no longer be reviewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumedClaimDecision {
+    Resume,
+    /// The MR is no longer reviewable; release the claim and scan for work.
+    Release,
+}
+
+/// A held claim is resumed only while the MR is still open and in scope.
+/// `reviewer-approved` is not a resume blocker: an approve-then-merge cycle
+/// interrupted between those two steps must finish the merge, not release.
+fn decide_resumed_claim(mr: &MrObservation, scope_label: Option<&str>) -> ResumedClaimDecision {
+    if mr.state == "opened" && mr.in_scope(scope_label) {
+        ResumedClaimDecision::Resume
+    } else {
+        ResumedClaimDecision::Release
+    }
 }
 
 /// Order candidate MRs the way the reviewer picks work up: `need-ai-worker`
@@ -532,6 +558,19 @@ fn run_reviewer_cycle(
     port.reset_worktree();
     port.checkout_branch(&default_branch)?;
     port.recover_claim();
+
+    // A claim recovered after a restart is resumed in place — never released
+    // just to re-enter the candidate race — unless the MR can no longer be
+    // reviewed. (A claim still held because its release failed is NOT
+    // resumed: its review already ran; only the release is retried below.)
+    if let Some(mr_iid) = port.resumable_claim_mr_iid() {
+        match resume_held_claim(agent_id, mr_iid, scope_label, merge_when_approved, port)? {
+            ResumedClaimOutcome::Reviewed(merged) => return Ok(merged.then_some(mr_iid)),
+            ResumedClaimOutcome::Released => {}
+            ResumedClaimOutcome::Halted => return Ok(None),
+        }
+    }
+
     if let Err(error) = port.try_release_held_claim() {
         warn!("{agent_id}: Failed to release held claim: {error}, will retry next cycle");
         return Ok(None);
@@ -603,33 +642,118 @@ fn run_reviewer_cycle(
         }
 
         info!("{agent_id}: Reviewing MR !{}: {}", mr.iid, mr.title);
-        let outcome = match review_claimed_merge_request(agent_id, &mr, merge_when_approved, port) {
-            Ok(outcome) => Some(outcome),
-            Err(error) => {
-                if !port.shutdown_requested() {
-                    error!("{agent_id}: Failed to review MR !{}: {error:#}", mr.iid);
-                }
-                None
-            }
-        };
-
-        match outcome {
-            Some(ReviewOutcome::Merged) => info!("{agent_id}: MR !{} approved and merged", mr.iid),
-            Some(ReviewOutcome::ApprovedWithoutMerge) => info!(
-                "{agent_id}: MR !{} approved without merge, releasing claim",
-                mr.iid
-            ),
-            Some(ReviewOutcome::NeedsChanges) => info!(
-                "{agent_id}: MR !{} reviewed with feedback, releasing claim",
-                mr.iid
-            ),
-            None => {}
-        }
+        let merged = run_review(agent_id, &mr, merge_when_approved, port)?;
         port.release_held_claim();
-        return Ok(matches!(outcome, Some(ReviewOutcome::Merged)).then_some(mr.iid));
+        return Ok(merged.then_some(mr.iid));
     }
 
     Ok(None)
+}
+
+/// Why `resume_held_claim` returned without reviewing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumedClaimOutcome {
+    /// The held MR was reviewed; the flag records whether it merged.
+    Reviewed(bool),
+    /// The MR can no longer be reviewed; the claim was released so the
+    /// cycle can scan for fresh work.
+    Released,
+    /// Shutdown was observed before the review; the claim was released and
+    /// the cycle stops here.
+    Halted,
+}
+
+/// Resume a claim recovered after a restart (or held from an interrupted
+/// cycle): re-observe the MR, and either review it in place (keeping the
+/// claim) or release the claim because the MR is no longer reviewable.
+///
+/// A shutdown observed before the review still releases the claim, so the
+/// restart-recovery protocol never leaves an unowned label behind.
+fn resume_held_claim(
+    agent_id: &str,
+    mr_iid: u64,
+    scope_label: Option<&str>,
+    merge_when_approved: bool,
+    port: &mut dyn ReviewerPort,
+) -> Result<ResumedClaimOutcome> {
+    let mr = match port.merge_request(mr_iid) {
+        Ok(mr) => mr,
+        Err(error) => {
+            if forge::is_not_found(&error) {
+                info!(
+                    "{agent_id}: Held MR !{} no longer exists (404), releasing claim",
+                    mr_iid
+                );
+                port.release_held_claim();
+                return Ok(ResumedClaimOutcome::Released);
+            }
+            warn!(
+                "{agent_id}: Failed to re-observe held MR !{}: {error}, will retry next cycle",
+                mr_iid
+            );
+            return Ok(ResumedClaimOutcome::Released);
+        }
+    };
+
+    match decide_resumed_claim(&mr, scope_label) {
+        ResumedClaimDecision::Release => {
+            info!(
+                "{agent_id}: Held MR !{} is no longer reviewable (state: {}), releasing claim",
+                mr.iid, mr.state
+            );
+            port.release_held_claim();
+            Ok(ResumedClaimOutcome::Released)
+        }
+        ResumedClaimDecision::Resume => {
+            info!(
+                "{agent_id}: Resuming held claim on MR !{}: {}",
+                mr.iid, mr.title
+            );
+            if port.shutdown_requested() {
+                port.release_held_claim();
+                return Ok(ResumedClaimOutcome::Halted);
+            }
+            let merged = run_review(agent_id, &mr, merge_when_approved, port)?;
+            port.release_held_claim();
+            Ok(ResumedClaimOutcome::Reviewed(merged))
+        }
+    }
+}
+
+/// Run the review of a claimed MR and log its outcome. A review failure is
+/// logged (unless we are shutting down) rather than propagated, so the caller
+/// still releases the claim; returns whether the MR merged.
+fn run_review(
+    agent_id: &str,
+    mr: &MrObservation,
+    merge_when_approved: bool,
+    port: &mut dyn ReviewerPort,
+) -> Result<bool> {
+    let outcome = match review_claimed_merge_request(agent_id, mr, merge_when_approved, port) {
+        Ok(outcome) => outcome,
+        Err(review_error) => {
+            if !port.shutdown_requested() {
+                error!(
+                    "{agent_id}: Failed to review MR !{}: {review_error:#}",
+                    mr.iid
+                );
+            }
+            return Ok(false);
+        }
+    };
+    let merged = matches!(outcome, ReviewOutcome::Merged);
+    match outcome {
+        ReviewOutcome::Merged => info!("{agent_id}: MR !{} approved and merged", mr.iid),
+        ReviewOutcome::ApprovedWithoutMerge => info!(
+            "{agent_id}: MR !{} approved without merge, releasing claim",
+            mr.iid
+        ),
+        ReviewOutcome::NeedsChanges => info!(
+            "{agent_id}: MR !{} reviewed with feedback, releasing claim",
+            mr.iid
+        ),
+    }
+    Ok(merged)
 }
 
 fn review_claimed_merge_request(
@@ -778,6 +902,10 @@ struct LiveReviewerPort<'a> {
     project_name: &'a str,
     sessions_dir: &'a str,
     git_repo: &'a GitRepo,
+    /// Whether the held claim (if any) is a recovered one whose interrupted
+    /// review should be resumed, rather than a completed review whose release
+    /// merely failed and must be retried.
+    resumable: bool,
     forge: &'a Arc<dyn ForgeClient>,
     model: &'a AgentModel,
     claimed_mr: &'a mut Option<ClaimLease>,
@@ -804,7 +932,13 @@ impl ReviewerPort for LiveReviewerPort<'_> {
     fn recover_claim(&mut self) {
         if self.claimed_mr.is_none() {
             *self.claimed_mr = find_claimed_mr(self.agent_id, self.forge, self.scope_label);
+            self.resumable = self.claimed_mr.is_some();
         }
+    }
+    fn resumable_claim_mr_iid(&self) -> Option<u64> {
+        self.resumable
+            .then(|| self.claimed_mr.as_ref().map(|lease| lease.resource().iid()))
+            .flatten()
     }
     fn try_release_held_claim(&mut self) -> Result<()> {
         let Some(lease) = self.claimed_mr.as_mut() else {
@@ -812,7 +946,7 @@ impl ReviewerPort for LiveReviewerPort<'_> {
         };
         let iid = lease.resource().iid();
         info!(
-            "{}: Releasing held claim on MR !{} from previous cycle",
+            "{}: Releasing unresumable claim on MR !{}",
             self.agent_id, iid
         );
         lease.try_release(self.forge.as_ref())?;
@@ -832,6 +966,11 @@ impl ReviewerPort for LiveReviewerPort<'_> {
             .iter()
             .map(MrObservation::from_merge_request)
             .collect())
+    }
+    fn merge_request(&self, mr_iid: u64) -> Result<MrObservation> {
+        Ok(MrObservation::from_merge_request(
+            &self.forge.get_merge_request(mr_iid)?,
+        ))
     }
     fn issue_priorities(&self) -> Vec<(u64, u8)> {
         self.forge
@@ -995,6 +1134,7 @@ fn reviewer_cycle(
         project_name,
         sessions_dir,
         git_repo,
+        resumable: false,
         forge,
         model,
         claimed_mr,
@@ -1374,6 +1514,9 @@ fn mr_labels_has(labels: Option<&[String]>, label: &str) -> bool {
 /// The GitLab label is the single source of truth — no local state file
 /// needed — so a recovered claim only ever becomes a [`ClaimLease`] once
 /// this scan finds the label live on GitLab, per [`ClaimLease::recover`].
+/// A recovered claim is resumed in place (see [`resume_held_claim`]), so
+/// a restart continues the interrupted review rather than re-entering the
+/// candidate race.
 fn find_claimed_mr(
     agent_id: &str,
     forge: &Arc<dyn ForgeClient>,
@@ -1390,7 +1533,7 @@ fn find_claimed_mr(
                     ClaimLease::recover(ClaimResource::MergeRequest(mr.iid), agent_id, live_labels)
                 {
                     info!(
-                        "{}: Found existing claim on MR !{}, will release next cycle",
+                        "{}: Found existing claim on MR !{}, will resume next cycle",
                         agent_id, mr.iid
                     );
                     return Some(lease);
@@ -1547,6 +1690,9 @@ mod tests {
                 self.held_claim = self.recoverable_claim;
             }
         }
+        fn resumable_claim_mr_iid(&self) -> Option<u64> {
+            self.recoverable_claim
+        }
         fn try_release_held_claim(&mut self) -> Result<()> {
             if self.held_claim.is_none() {
                 return Ok(());
@@ -1566,6 +1712,15 @@ mod tests {
         fn merge_requests(&self) -> Result<Vec<MrObservation>> {
             self.trace("merge_requests");
             Ok(self.merge_requests.clone())
+        }
+        fn merge_request(&self, mr_iid: u64) -> Result<MrObservation> {
+            self.trace(format!("merge_request:{mr_iid}"));
+            self.fails(&format!("merge_request:{mr_iid}"))?;
+            self.merge_requests
+                .iter()
+                .find(|mr| mr.iid == mr_iid)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("MR !{mr_iid} not found"))
         }
         fn issue_priorities(&self) -> Vec<(u64, u8)> {
             self.trace("issue_priorities");
@@ -1653,6 +1808,10 @@ mod tests {
 
     fn run(port: &mut FakeReviewerPort, merge_when_approved: bool) -> Result<Option<u64>> {
         run_reviewer_cycle(TEST_AGENT, None, merge_when_approved, port)
+    }
+
+    fn run_scoped(scope_label: Option<&str>, port: &mut FakeReviewerPort) -> Result<Option<u64>> {
+        run_reviewer_cycle(TEST_AGENT, scope_label, true, port)
     }
 
     fn startup() -> Vec<String> {
@@ -1789,6 +1948,8 @@ mod tests {
 
     #[test]
     fn reviewer_cycle_preserves_failed_previous_claim_release() {
+        // A claim still held because its release failed is NOT resumed (the
+        // review already ran); only the release is retried.
         let mut port =
             FakeReviewerPort::new(vec![observation(7, None)]).failing("release_previous");
         port.held_claim = Some(4);
@@ -1808,10 +1969,13 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_cycle_releases_recovered_claim_before_listing_work() {
-        let mut port = FakeReviewerPort::new(vec![observation(7, None)]);
+    fn reviewer_cycle_resumes_recovered_claim_in_place() {
+        // A claim recovered after a restart resumes its interrupted review
+        // without re-entering the candidate race: no listing, no claim
+        // acquisition, the model runs directly on the held MR.
+        let mut port = FakeReviewerPort::new(vec![observation(4, None)]);
         port.recoverable_claim = Some(4);
-        run(&mut port, true).unwrap();
+        assert_eq!(run(&mut port, true).unwrap(), Some(4));
         let trace = port.trace.borrow();
         let recovered = trace
             .iter()
@@ -1819,8 +1983,103 @@ mod tests {
             .unwrap();
         assert_eq!(
             &trace[recovered..recovered + 3],
-            ["recover_claim", "release_previous", "merge_requests"]
+            ["recover_claim", "merge_request:4", "shutdown"]
         );
+        assert!(!trace.contains(&"merge_requests".to_string()));
+        assert!(!trace.contains(&"claim:4".to_string()));
+        assert!(trace.contains(&"model:4".to_string()));
+        assert_eq!(trace.last().unwrap(), "release_final");
+        assert_eq!(port.held_claim, None);
+    }
+
+    #[test]
+    fn reviewer_cycle_resumes_an_mr_marked_approved_to_finish_the_merge() {
+        // An approve-then-merge cycle interrupted between those two steps
+        // must finish the merge, not release and re-review.
+        let approved = observation(4, Some(vec![REVIEWER_APPROVED_LABEL]));
+        let mut port = FakeReviewerPort::new(vec![approved]);
+        port.recoverable_claim = Some(4);
+        assert_eq!(run(&mut port, true).unwrap(), Some(4));
+        assert!(port.trace.borrow().contains(&"merge_mr:4".to_string()));
+        assert_eq!(port.held_claim, None);
+    }
+
+    #[test]
+    fn reviewer_cycle_releases_resumable_claim_when_mr_is_no_longer_reviewable() {
+        let closed = {
+            let mut mr = observation(4, None);
+            mr.state = "merged".to_string();
+            mr
+        };
+        let mut port = FakeReviewerPort::new(vec![closed]);
+        port.recoverable_claim = Some(4);
+        assert_eq!(run(&mut port, true).unwrap(), None);
+        let trace = port.trace.borrow();
+        let recovered = trace
+            .iter()
+            .position(|entry| entry == "recover_claim")
+            .unwrap();
+        assert_eq!(
+            &trace[recovered..recovered + 3],
+            ["recover_claim", "merge_request:4", "release_final"]
+        );
+        // The MR is not re-claimed, and the cycle still scans for other work.
+        assert!(!trace.contains(&"model:4".to_string()));
+        assert!(!trace.contains(&"claim:4".to_string()));
+        assert!(trace.contains(&"merge_requests".to_string()));
+        assert_eq!(port.held_claim, None);
+    }
+
+    #[test]
+    fn reviewer_cycle_releases_resumable_claim_when_mr_is_not_found() {
+        let mut port = FakeReviewerPort::new(vec![observation(7, None)]);
+        port.recoverable_claim = Some(4); // MR !4 is not in the listing
+        assert_eq!(run(&mut port, true).unwrap(), Some(7));
+        let trace = port.trace.borrow();
+        let recovered = trace
+            .iter()
+            .position(|entry| entry == "recover_claim")
+            .unwrap();
+        assert_eq!(
+            &trace[recovered..recovered + 2],
+            ["recover_claim", "merge_request:4"]
+        );
+        // The vanished MR's claim is released, then normal work proceeds.
+        assert!(trace.contains(&"release_final".to_string()));
+        assert!(trace.contains(&"claim:7".to_string()));
+        assert_eq!(port.held_claim, None);
+    }
+
+    #[test]
+    fn reviewer_cycle_releases_resumable_claim_on_shutdown_before_resume() {
+        let mut port =
+            FakeReviewerPort::new(vec![observation(4, None)]).with_shutdowns(&[false, true]);
+        port.recoverable_claim = Some(4);
+        assert_eq!(run(&mut port, true).unwrap(), None);
+        let trace = port.trace.borrow();
+        let resumed = trace
+            .iter()
+            .position(|entry| entry == "merge_request:4")
+            .unwrap();
+        assert_eq!(
+            &trace[resumed..resumed + 3],
+            ["merge_request:4", "shutdown", "release_final"]
+        );
+        assert!(!trace.contains(&"model:4".to_string()));
+        assert_eq!(port.held_claim, None);
+    }
+
+    #[test]
+    fn reviewer_cycle_releases_resumable_claim_out_of_scope() {
+        let mut out_of_scope = observation(4, None);
+        out_of_scope.labels = Some(vec!["other-scope".to_string()]);
+        let mut port = FakeReviewerPort::new(vec![out_of_scope]);
+        port.recoverable_claim = Some(4);
+        assert_eq!(run_scoped(Some("potlatch"), &mut port).unwrap(), None);
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"release_final".to_string()));
+        assert!(!trace.contains(&"model:4".to_string()));
+        assert_eq!(port.held_claim, None);
     }
 
     #[test]
@@ -1961,6 +2220,33 @@ mod tests {
         assert_eq!(
             decide_candidate(&observation(7, None), TEST_AGENT, Some("potlatch")),
             CandidateDecision::Skip
+        );
+    }
+
+    #[test]
+    fn decide_resumed_claim_resumes_only_open_in_scope_mrs() {
+        assert_eq!(
+            decide_resumed_claim(&observation(7, None), None),
+            ResumedClaimDecision::Resume
+        );
+        assert_eq!(
+            decide_resumed_claim(&observation(7, Some(vec![REVIEWER_APPROVED_LABEL])), None),
+            ResumedClaimDecision::Resume
+        );
+        assert_eq!(
+            decide_resumed_claim(&observation(7, Some(vec!["potlatch"])), Some("potlatch")),
+            ResumedClaimDecision::Resume
+        );
+
+        let mut closed = observation(7, None);
+        closed.state = "merged".to_string();
+        assert_eq!(
+            decide_resumed_claim(&closed, None),
+            ResumedClaimDecision::Release
+        );
+        assert_eq!(
+            decide_resumed_claim(&observation(7, Some(vec!["other-scope"])), Some("potlatch")),
+            ResumedClaimDecision::Release
         );
     }
 
