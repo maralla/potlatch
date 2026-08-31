@@ -53,6 +53,20 @@ fn is_simple_name(name: &str) -> bool {
     )
 }
 
+/// Write a task-context artifact (agent prompt context, archival/debugging
+/// copies) beneath `work_dir` and return its path.
+pub(crate) fn write_task_context_file(
+    work_dir: &str,
+    file_name: &str,
+    content: &str,
+) -> Result<String> {
+    let store = ArtifactStore::new(work_dir);
+    Ok(store
+        .write(file_name, content)?
+        .to_string_lossy()
+        .into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

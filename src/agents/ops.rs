@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
+use crate::agents::artifact::write_task_context_file;
 use crate::agents::forge::{self, ForgeClient};
 use crate::agents::ssh_util::{shell_single_quote, validate_remote_path, validate_ssh_identity};
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
-use crate::agents::write_task_context_file;
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
@@ -391,7 +391,7 @@ impl CoreAgent for OpsAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
             "log_scrape" => {
-                let scope = crate::agents::scope_label_filter(&self.runtime.scope_label);
+                let scope = crate::agents::forge::scope_label_filter(&self.runtime.scope_label);
                 let model = &self.runtime.model;
                 let shutdown = Arc::clone(model.shutdown());
                 let state = AgentState::from_runtime(&self.runtime);

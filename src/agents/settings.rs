@@ -70,7 +70,7 @@ mod tests {
         let s = AgentSettings::from_config(&config).unwrap();
         assert_eq!(s.repo_url(), Some("https://github.com/group/project"));
         assert_eq!(
-            super::super::scope_label_filter(&s.scope_label),
+            super::super::forge::scope_label_filter(&s.scope_label),
             Some("potlatch")
         );
     }
@@ -113,7 +113,7 @@ mod tests {
         let settings = AgentSettings::from_config(&config).unwrap();
         assert_eq!(settings.repo_url(), None);
         assert_eq!(
-            super::super::scope_label_filter(&settings.scope_label),
+            super::super::forge::scope_label_filter(&settings.scope_label),
             None
         );
     }
@@ -121,10 +121,13 @@ mod tests {
     #[test]
     fn scope_label_filter_empty_means_all() {
         let s = AgentSettings::default();
-        assert_eq!(super::super::scope_label_filter(&s.scope_label), None);
-        assert_eq!(super::super::scope_label_filter("  "), None);
         assert_eq!(
-            super::super::scope_label_filter("potlatch"),
+            super::super::forge::scope_label_filter(&s.scope_label),
+            None
+        );
+        assert_eq!(super::super::forge::scope_label_filter("  "), None);
+        assert_eq!(
+            super::super::forge::scope_label_filter("potlatch"),
             Some("potlatch")
         );
     }
