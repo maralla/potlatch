@@ -25,6 +25,9 @@ use crate::core::runtime::AgentRuntime;
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
+/// Header of the comment the PMO posts when it proposes a plan without
+/// rewriting the description. Used to detect that a plan was already proposed.
+const PMO_PLAN_COMMENT_HEADER: &str = "**PMO plan:**";
 /// ACP runtime message when `cancel_check` returns true.
 const PMO_AGENT_CANCELLED_MSG: &str = "Agent cancelled by external condition";
 
@@ -631,6 +634,10 @@ trait PmoPort {
     fn issue(&self, issue_iid: u64) -> Option<PmoIssueObservation>;
     fn issues(&self) -> Result<Vec<PmoIssueObservation>>;
     fn new_human_comments(&self, issue_iid: u64) -> bool;
+    /// Whether a PMO plan was already proposed for this issue (plan comment
+    /// posted or description rewritten with a plan). Read with the issue's
+    /// comments; used to recognize a human-approved plan.
+    fn plan_previously_proposed(&self, issue: &PmoIssueObservation) -> bool;
     fn current_epoch(&self) -> u64;
     fn acquire_claim(&mut self, issue_iid: u64) -> Result<PmoClaimOutcome>;
     /// Releases and drops the live lease. Some call sites intentionally ignore failure.
@@ -649,6 +656,7 @@ trait PmoPort {
         context_path: &str,
         bound_mr_iid: Option<u64>,
         was_planning: bool,
+        plan_previously_proposed: bool,
     ) -> Result<PmoOutput>;
     fn update_issue_description(&mut self, issue_iid: u64, body: &str) -> Result<()>;
     fn add_issue_comment(&mut self, issue_iid: u64, body: &str) -> Result<()>;
@@ -714,7 +722,7 @@ fn apply_pmo_decision(
                 port.update_issue_description(iid, &plan)
                     .map_err(PmoDecisionError::KeepPending)?;
             } else {
-                port.add_issue_comment(iid, &format!("**PMO plan:**\n\n{plan}"))
+                port.add_issue_comment(iid, &format!("{PMO_PLAN_COMMENT_HEADER}\n\n{plan}"))
                     .map_err(PmoDecisionError::KeepPending)?;
             }
             Ok(DecisionDisposition::KeepClaim)
@@ -819,8 +827,15 @@ fn process_pmo_issue(
         .labels
         .iter()
         .any(|label| label == labels::PMO_PLANNING);
+    let plan_previously_proposed = port.plan_previously_proposed(issue);
     let decision = port
-        .invoke_plan(issue, &path, bound_mr_iid, was_planning)
+        .invoke_plan(
+            issue,
+            &path,
+            bound_mr_iid,
+            was_planning,
+            plan_previously_proposed,
+        )
         .map_err(PmoDecisionError::Recoverable)?;
     apply_pmo_decision(issue, decision, scope_label, port)
 }
@@ -983,16 +998,21 @@ fn run_pmo_cycle(
 
     if let Some(iid) = held_issue_iid {
         match port.issue(iid) {
-            Some(issue)
-                if issue_in_pmo_scope(&issue, scope_label)
-                    && issue
-                        .labels
-                        .iter()
-                        .any(|label| label == labels::PMO_PLANNING) =>
-            {
+            Some(issue) if issue_in_pmo_scope(&issue, scope_label) => {
+                let in_planning = issue
+                    .labels
+                    .iter()
+                    .any(|label| label == labels::PMO_PLANNING);
                 let issues = port.issues()?;
                 let _ = port.prepare_issue_context(&issue, &issues);
-                if !port.new_human_comments(iid) {
+                // While the issue stays in pmo-planning, only new human
+                // comments justify another model session; otherwise the PMO
+                // holds the claim and waits. When pmo-planning is gone the
+                // label removal itself is the trigger: the model decides with
+                // the full context (a previously proposed plan plus the
+                // removed label reads as an approved plan — hand off rather
+                // than re-propose).
+                if in_planning && !port.new_human_comments(iid) {
                     return Ok(());
                 }
                 port.save_claim_state(iid);
@@ -1005,30 +1025,13 @@ fn run_pmo_cycle(
                     }
                     Err(PmoDecisionError::Recoverable(error)) if is_pmo_agent_cancelled(&error) => {
                         // A label the cancel check watches was removed
-                        // mid-session. Re-fetch the issue to decide what to do.
-                        let mr_iid = port.bound_merge_request(iid).unwrap_or(None);
+                        // mid-session. Release the claim and let the next
+                        // cycle re-claim and re-run with full context — the
+                        // model then decides how to follow up (approve-and-
+                        // hand-off, takeover, or a fresh triage).
                         if port.release_claim().is_ok() {
                             port.clear_claim_state();
                         }
-                        let still_planning = port.issue(iid).is_some_and(|issue| {
-                            issue
-                                .labels
-                                .iter()
-                                .any(|label| label == labels::PMO_PLANNING)
-                        });
-                        if !still_planning {
-                            // The pmo-planning label was removed — the human
-                            // approved the plan. For an MR-attached issue, clear
-                            // action-required and post a comment for the worker.
-                            if mr_iid.is_some() {
-                                let _ = port.remove_issue_label(iid, ACTION_REQUIRED_LABEL);
-                                let _ =
-                                    port.add_issue_comment(iid, "Plan refined. Continue working.");
-                            }
-                        }
-                        // If the claim label was removed but pmo-planning is
-                        // still present, the issue was taken over — release the
-                        // claim silently with no comment.
                         return Ok(());
                     }
                     Err(PmoDecisionError::Recoverable(error)) => {
@@ -1043,29 +1046,6 @@ fn run_pmo_cycle(
                     }
                     Err(PmoDecisionError::Immediate(error)) => return Err(error),
                 }
-            }
-            Some(issue)
-                if issue_in_pmo_scope(&issue, scope_label)
-                    && !issue
-                        .labels
-                        .iter()
-                        .any(|label| label == labels::PMO_PLANNING) =>
-            {
-                // The pmo-planning label was removed — the human approved the
-                // plan. Hand off to the worker. For an issue with an attached
-                // MR, clear the claim and the action-required label and post a
-                // comment so the worker picks up the refined plan. For an issue
-                // without an MR, just release the claim and leave the
-                // action-required label so the worker re-claims it normally.
-                let mr_iid = port.bound_merge_request(iid).unwrap_or(None);
-                if port.release_claim().is_ok() {
-                    port.clear_claim_state();
-                }
-                if mr_iid.is_some() {
-                    let _ = port.remove_issue_label(iid, ACTION_REQUIRED_LABEL);
-                    let _ = port.add_issue_comment(iid, "Plan refined. Continue working.");
-                }
-                return Ok(());
             }
             _ => {
                 if port.release_claim().is_ok() {
@@ -1196,6 +1176,15 @@ impl PmoPort for LivePmoPort<'_> {
         )
     }
 
+    fn plan_previously_proposed(&self, issue: &PmoIssueObservation) -> bool {
+        match self.forge.get_issue_comments(issue.iid) {
+            Ok(comments) => issue_comments_contain_proposed_plan(&comments),
+            // Comments unreadable: fall through to the prompt's fallback
+            // wording, which lets the model decide from the context file.
+            Err(_) => false,
+        }
+    }
+
     fn current_epoch(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1271,6 +1260,7 @@ impl PmoPort for LivePmoPort<'_> {
         context_path: &str,
         bound_mr_iid: Option<u64>,
         was_planning: bool,
+        plan_previously_proposed: bool,
     ) -> Result<PmoOutput> {
         let prompt = build_split_prompt(
             self.state,
@@ -1278,6 +1268,7 @@ impl PmoPort for LivePmoPort<'_> {
             context_path,
             issue.priority(),
             bound_mr_iid,
+            plan_previously_proposed,
         )?;
         let provider: Option<Arc<dyn CapabilityProvider>> = if self.config.ask_via_gitlab {
             let timeout = (self.config.ask_gitlab_timeout_secs > 0)
@@ -1707,12 +1698,25 @@ fn truncate_diff_for_pmo(patch: &str) -> String {
     )
 }
 
+/// Whether an issue's comments already contain a PMO-proposed plan. Combined
+/// with the absence of `pmo-planning`, this is how the PMO recognizes a plan
+/// the human approved by removing the label.
+fn issue_comments_contain_proposed_plan(comments: &[forge::Comment]) -> bool {
+    comments.iter().any(|comment| {
+        comment
+            .body
+            .trim_start()
+            .starts_with(PMO_PLAN_COMMENT_HEADER)
+    })
+}
+
 fn build_split_prompt(
     state: &AgentState,
     issue: &Issue,
     context_path: &str,
     parent_priority: u8,
     bound_mr_iid: Option<u64>,
+    plan_previously_proposed: bool,
 ) -> Result<String> {
     let planning_state = if issue
         .labels
@@ -1720,8 +1724,10 @@ fn build_split_prompt(
         .any(|label| label == labels::PMO_PLANNING)
     {
         "This issue is already in pmo-planning. The PMO holds the claim and refines the plan whenever new human comments arrive. Treat new comments as refinement feedback: prefer producing the requested plan update. You may still ask for clarification when a human reply surfaces a genuinely blocking question you cannot answer from the repository — restate your current plan briefly and ask that specific question, rather than restating the whole plan or taking an unapproved final action."
+    } else if plan_previously_proposed {
+        "A PMO plan was already proposed for this issue (see the task context file) and the issue is no longer in pmo-planning — the human approved that plan by removing the label. Hand it off for implementation: use GUIDE_WORKER to direct the worker to the existing plan — point at the plan comment or the updated description instead of restating it. Only propose a new plan when comments newer than the plan genuinely invalidate it; in that case say what changed and why the old plan no longer holds."
     } else {
-        "This issue is not currently in PMO plan refinement."
+        "This issue is not currently in pmo-planning. If the task context file shows a complete implementation plan was already proposed for this issue (a PMO plan comment or a plan written into the issue description) and no newer comment invalidates it, treat that plan as approved by the human and hand it off via GUIDE_WORKER, pointing the worker at the existing plan instead of restating it. Only propose a new plan when newer feedback genuinely invalidates the plan."
     };
     let plan_destination = match bound_mr_iid {
         Some(mr_iid) => format!(
@@ -1753,6 +1759,7 @@ Your job is to analyze the failure reason (from the file + repo when needed) and
 
 TRIAGE POLICY:
 - Give focused worker guidance only for a single focused task blocked by one specific misunderstanding, wrong command, or simple technical obstacle. The guidance should be one clear action.
+- Handing off a previously proposed plan is also worker guidance: when the plan already exists in the issue and the human has approved it, GUIDE_WORKER directs the worker to that plan instead of restating it.
 - Decompose broad task containers, work spanning multiple independent modules/files/components, lists of distinct tasks, or work estimated above roughly 500 non-test lines or 1500 total lines. Auto-generated code does not count. Prefer focused sub-issues over a laundry-list instruction.
 - Do not invent a speculative decomposition. If the context remains too vague to define concrete sub-issues after reading the file and inspecting the repository as needed, provide your best current plan and the specific questions a human must answer.
 - If the repository already fully implements the requested behavior, report that fact instead of guiding or decomposing.
@@ -2487,6 +2494,8 @@ mod tests {
         claim_outcomes: RefCell<VecDeque<PmoClaimOutcome>>,
         checkout_failures: Cell<usize>,
         new_comments: bool,
+        plan_previously_proposed: bool,
+        model_cancelled: bool,
         bound_mr_iid: Option<u64>,
         descriptions: Vec<(u64, String)>,
         comments: Vec<(u64, String)>,
@@ -2541,6 +2550,8 @@ mod tests {
                 claim_outcomes: RefCell::new(VecDeque::new()),
                 checkout_failures: Cell::new(0),
                 new_comments: true,
+                plan_previously_proposed: false,
+                model_cancelled: false,
                 bound_mr_iid: None,
                 descriptions: Vec::new(),
                 comments: Vec::new(),
@@ -2618,6 +2629,11 @@ mod tests {
             self.new_comments
         }
 
+        fn plan_previously_proposed(&self, issue: &PmoIssueObservation) -> bool {
+            self.record(format!("observe:plan_proposed:{}", issue.iid));
+            self.plan_previously_proposed
+        }
+
         fn current_epoch(&self) -> u64 {
             self.record("observe:epoch");
             1_800_000_000
@@ -2668,9 +2684,13 @@ mod tests {
             _context_path: &str,
             _bound_mr_iid: Option<u64>,
             _was_planning: bool,
+            _plan_previously_proposed: bool,
         ) -> Result<PmoOutput> {
             self.record(format!("act:model:{}", issue.iid));
             self.fail("model")?;
+            if self.model_cancelled {
+                anyhow::bail!("{PMO_AGENT_CANCELLED_MSG}");
+            }
             Ok(self.plan.clone())
         }
 
@@ -2758,6 +2778,7 @@ mod tests {
                 "act:save_claim:10",
                 "act:context:10",
                 "observe:bound_mr:10",
+                "observe:plan_proposed:10",
                 "act:model:10",
                 "act:checkpoint:[]",
                 "act:create:Foundation",
@@ -3156,6 +3177,109 @@ mod tests {
     }
 
     #[test]
+    fn approved_plan_held_issue_hands_off_via_guide_worker_without_an_mr() {
+        // The #85 scenario: a plan was proposed, the human removed
+        // pmo-planning (approving it), and the issue has no bound MR. The
+        // PMO must run the model, which sees the approved-plan state and
+        // hands off via GUIDE_WORKER — removing action-required so the
+        // worker can claim the issue — instead of re-proposing the plan.
+        let mut port = FakePmoPort::successful();
+        port.plan_previously_proposed = true;
+        port.plan = PmoOutput::GuideWorker {
+            instructions: "Implement the approved plan from the plan comment.".into(),
+        };
+
+        run_fake(&mut port, Some(10)).unwrap();
+
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"observe:plan_proposed:10".to_string()));
+        assert!(trace.contains(&"act:model:10".to_string()));
+        assert!(trace.contains(&"act:remove:10:action-required".to_string()));
+        assert!(trace.contains(&"act:release".to_string()));
+        assert!(trace.contains(&"act:clear_claim".to_string()));
+        drop(trace);
+        assert!(
+            port.comments
+                .iter()
+                .any(|(_, body)| body.contains("Implement the approved plan"))
+        );
+    }
+
+    #[test]
+    fn approved_plan_held_issue_follows_a_reproposal_decision() {
+        // Same setup, but the model decides the newer feedback invalidates
+        // the plan and re-proposes: the PMO follows the model result and
+        // keeps the claim in pmo-planning.
+        let mut port = FakePmoPort::successful();
+        port.plan_previously_proposed = true;
+        port.plan = PmoOutput::ProposePlan {
+            plan_text: "## Implementation plan\n\nRevised after feedback.".into(),
+            update_description: false,
+        };
+
+        run_fake(&mut port, Some(10)).unwrap();
+
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"act:model:10".to_string()));
+        assert!(trace.contains(&"act:add:10:pmo-planning".to_string()));
+        assert!(trace.contains(&"act:comment:10".to_string()));
+        assert!(!trace.contains(&"act:remove:10:action-required".to_string()));
+        assert!(!trace.contains(&"act:release".to_string()));
+        assert!(!trace.contains(&"act:clear_claim".to_string()));
+    }
+
+    #[test]
+    fn cancelled_planning_session_releases_claim_without_mutations() {
+        // A label the cancel check watches was removed mid-session: release
+        // the claim and make no GitLab mutations — the next cycle re-claims
+        // and the model decides with full context.
+        let mut port = FakePmoPort::successful();
+        port.issues[0].labels.push(labels::PMO_PLANNING.into());
+        port.new_comments = true;
+        port.model_cancelled = true;
+
+        run_fake(&mut port, Some(10)).unwrap();
+
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"act:model:10".to_string()));
+        assert!(trace.contains(&"act:release".to_string()));
+        assert!(trace.contains(&"act:clear_claim".to_string()));
+        assert!(!trace.iter().any(|event| {
+            event.starts_with("act:remove:") || event.starts_with("act:comment:")
+        }));
+        drop(trace);
+        assert!(port.comments.is_empty());
+    }
+
+    #[test]
+    fn unclaimed_approved_plan_issue_is_processed_normally_by_the_scan_loop() {
+        // The claim label was removed too, so no PMO holds the issue. The
+        // scan loop claims it and the model decides with the approved-plan
+        // prompt state; a GUIDE_WORKER decision hands off by removing
+        // action-required.
+        let mut port = FakePmoPort::successful();
+        port.plan_previously_proposed = true;
+        port.plan = PmoOutput::GuideWorker {
+            instructions: "Pick up the approved plan and implement it.".into(),
+        };
+
+        run_fake(&mut port, None).unwrap();
+
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"act:claim:10".to_string()));
+        assert!(trace.contains(&"observe:plan_proposed:10".to_string()));
+        assert!(trace.contains(&"act:model:10".to_string()));
+        assert!(trace.contains(&"act:remove:10:action-required".to_string()));
+        assert!(trace.contains(&"act:release".to_string()));
+        drop(trace);
+        assert!(
+            port.comments
+                .iter()
+                .any(|(_, body)| body.contains("Pick up the approved plan"))
+        );
+    }
+
+    #[test]
     fn comment_cursor_ignores_old_and_pmo_comments_but_detects_later_human_feedback() {
         let comment = |id, author: &str, body: &str| forge::Comment {
             id,
@@ -3179,6 +3303,32 @@ mod tests {
         assert!(has_new_human_comments(&comments, 10, "pmo-0"));
         assert!(!has_new_human_comments(&comments[..2], 10, "pmo-0"));
         assert!(!has_new_human_comments(&comments, 12, "pmo-0"));
+    }
+
+    #[test]
+    fn proposed_plan_detection_matches_only_plan_comment_headers() {
+        let comment = |id: u64, body: &str| forge::Comment {
+            id,
+            author: "someone".into(),
+            body: body.into(),
+            discussion_id: format!("discussion-{id}"),
+            discussion_resolvable: false,
+            location: None,
+            location_details: None,
+        };
+        assert!(issue_comments_contain_proposed_plan(&[comment(
+            10,
+            "**PMO plan:**\n\n## Implementation plan\n\nDo the thing."
+        )]));
+        assert!(issue_comments_contain_proposed_plan(&[
+            comment(10, "Original discussion"),
+            comment(11, "**PMO plan:**\n\nDo the thing."),
+        ]));
+        assert!(!issue_comments_contain_proposed_plan(&[comment(
+            10,
+            "We discussed a plan here but no PMO proposed one."
+        )]));
+        assert!(!issue_comments_contain_proposed_plan(&[]));
     }
 
     #[test]
@@ -3376,6 +3526,9 @@ mod tests {
         let mut invalid_held = FakePmoPort::successful();
         invalid_held.failures = vec!["release"];
         invalid_held.shutdown.borrow_mut().push_back(true);
+        invalid_held.issues[0]
+            .labels
+            .retain(|label| label != "scope::test");
         run_fake(&mut invalid_held, Some(10)).unwrap();
         assert!(invalid_held.trace.borrow().contains(&"act:release".into()));
         assert!(
