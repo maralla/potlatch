@@ -40,9 +40,9 @@
 //!
 //! ## Ports
 //! [`ClaimPort`] is deliberately narrow — add/remove/read one resource's
-//! labels — rather than a stand-in for the entire GitLab API, so tests can
+//! labels — rather than a stand-in for the entire hosting API, so tests can
 //! exercise the claim protocol against an in-memory fake instead of a real
-//! (or fully mocked) [`GitLabClient`].
+//! (or fully mocked) [`CodeHostingClient`].
 
 use std::fmt;
 use std::sync::atomic::AtomicBool;
@@ -51,7 +51,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::agents::hosting::gitlab::GitLabClient;
 use crate::agents::hosting::{CodeHostingClient, order_active_claim_labels};
 use crate::util::sleep;
 
@@ -111,7 +110,7 @@ pub(crate) trait ClaimPort {
     }
 }
 
-impl ClaimPort for GitLabClient {
+impl ClaimPort for dyn CodeHostingClient {
     fn add_label(&self, resource: ClaimResource, label: &str) -> Result<()> {
         match resource {
             ClaimResource::Issue(iid) => self.add_issue_label(iid, label),
@@ -144,33 +143,11 @@ impl ClaimPort for GitLabClient {
             ClaimResource::Issue(iid) => self.get_issue_label_events(iid)?,
             ClaimResource::MergeRequest(iid) => self.get_mr_label_events(iid)?,
         };
+        if events.is_empty() {
+            return Ok(fallback_claim_order(active_claim_labels));
+        }
         order_active_claim_labels(&events, active_claim_labels)
             .with_context(|| format!("could not order active claims on {resource}"))
-    }
-}
-
-impl ClaimPort for dyn CodeHostingClient {
-    fn add_label(&self, resource: ClaimResource, label: &str) -> Result<()> {
-        match resource {
-            ClaimResource::Issue(iid) => self.add_issue_label(iid, label),
-            ClaimResource::MergeRequest(iid) => self.add_mr_label_with_retries(iid, label),
-        }
-    }
-
-    fn remove_label(&self, resource: ClaimResource, label: &str) -> Result<()> {
-        match resource {
-            ClaimResource::Issue(iid) => self.remove_issue_label(iid, label),
-            ClaimResource::MergeRequest(iid) => self.remove_mr_label(iid, label),
-        }
-    }
-
-    fn labels(&self, resource: ClaimResource) -> Result<Vec<String>> {
-        match resource {
-            ClaimResource::Issue(iid) => Ok(self.get_issue(iid)?.labels),
-            ClaimResource::MergeRequest(iid) => {
-                Ok(self.get_merge_request(iid)?.labels.unwrap_or_default())
-            }
-        }
     }
 }
 

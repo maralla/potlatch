@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
 
 use crate::core::retry::{NonRetryable, with_backoff_retries};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, LazyLock};
 use tracing::{debug, info};
 
 #[cfg(test)]
@@ -15,7 +14,7 @@ use super::{
     Comment, Issue, IssueThreadNote, IssueThreadNoteAuthor, MergeRequest,
     MergeRequestChangesSnapshot, ResourceLabelEvent,
 };
-pub use super::{is_not_found, sort_issues_by_priority};
+use super::{is_not_found, sort_issues_by_priority};
 
 fn issue_thread_notes_as_comments(notes: Vec<IssueThreadNote>) -> Vec<Comment> {
     notes
@@ -36,7 +35,7 @@ fn issue_thread_notes_as_comments(notes: Vec<IssueThreadNote>) -> Vec<Comment> {
 }
 
 #[derive(Clone)]
-pub struct GitLabClient {
+pub(crate) struct GitLabClient {
     repo_path: String,
     host: String,
     project_id: u64,
@@ -137,7 +136,11 @@ fn compact_cli_output(text: &str) -> String {
 }
 
 impl GitLabClient {
-    pub fn new(repo_path: String, gitlab_repo: &str, shutdown: Arc<AtomicBool>) -> Result<Self> {
+    pub(crate) fn new(
+        repo_path: String,
+        gitlab_repo: &str,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let (host, project_path) = parse_gitlab_repo(gitlab_repo)?;
         let project_id = resolve_project_id(&host, &project_path, &shutdown)?;
         configure_repo_glab(&repo_path, &host)?;
@@ -1173,18 +1176,6 @@ impl GitLabClient {
     }
 }
 
-static CLOSES_ISSUE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)closes?\s+#(\d+)").expect("CLOSES_ISSUE_RE"));
-
-/// True if the MR description contains `Closes #iid` / `Close #iid` for this issue (case-insensitive).
-pub fn mr_description_closes_issue(description: &str, issue_iid: u64) -> bool {
-    CLOSES_ISSUE_RE.captures_iter(description).any(|cap| {
-        cap.get(1)
-            .and_then(|m| m.as_str().parse::<u64>().ok())
-            .is_some_and(|n| n == issue_iid)
-    })
-}
-
 impl super::CodeHostingClient for GitLabClient {
     fn list_issues(&self) -> Result<Vec<Issue>> {
         GitLabClient::list_issues(self)
@@ -1292,14 +1283,21 @@ impl super::CodeHostingClient for GitLabClient {
     fn is_not_found(&self, err: &anyhow::Error) -> bool {
         is_not_found(err)
     }
+    fn get_issue_label_events(&self, iid: u64) -> Result<Vec<ResourceLabelEvent>> {
+        GitLabClient::get_issue_label_events(self, iid)
+    }
+    fn get_mr_label_events(&self, iid: u64) -> Result<Vec<ResourceLabelEvent>> {
+        GitLabClient::get_mr_label_events(self, iid)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::mr_description_closes_issue;
     use super::{
         GitLabClient, IssueThreadNote, MergeRequestChangesSnapshot, ResourceLabelEvent,
-        compact_cli_output, mr_create_error_is_duplicate, mr_description_closes_issue,
-        order_active_claim_labels, parse_gitlab_repo,
+        compact_cli_output, mr_create_error_is_duplicate, order_active_claim_labels,
+        parse_gitlab_repo,
     };
     use serde_json::json;
 

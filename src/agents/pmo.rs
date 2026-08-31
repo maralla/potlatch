@@ -2476,7 +2476,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::hosting::gitlab::GitLabClient;
+    use crate::agents::hosting;
     use crate::core::agent::schema::conformance;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -3633,7 +3633,7 @@ mod tests {
     // PMO claim state persistence (`save_state`/`clear_state`/
     // `try_resume_pmo_state`): tolerant policy. Invalid persisted state
     // has historically been ignored (warn + treat as "nothing to
-    // resume") rather than failing PMO startup. `GitLabClient::for_test`
+    // resume") rather than failing PMO startup. `hosting::for_test_client`
     // is a network-free constructor, and every case below returns before
     // `try_resume_pmo_state` would ever reach a real GitLab call.
     // -----------------------------------------------------------------
@@ -3717,8 +3717,7 @@ mod tests {
         let dir = pmo_state_test_dir("missing");
         let sessions_dir = dir.to_string_lossy().into_owned();
         let state = pmo_test_agent_state(&sessions_dir, "pmo-2");
-        let gitlab =
-            Arc::new(GitLabClient::for_test("/tmp/unused-repo")) as Arc<dyn CodeHostingClient>;
+        let gitlab = hosting::for_test_client("/tmp/unused-repo");
 
         assert!(try_resume_pmo_state(&state, Arc::clone(&gitlab), None).is_none());
     }
@@ -3735,8 +3734,7 @@ mod tests {
         let sessions_dir = dir.to_string_lossy().into_owned();
         let state = pmo_test_agent_state(&sessions_dir, "pmo-3");
         fs::write(state.state_path(), b"not valid json").unwrap();
-        let gitlab =
-            Arc::new(GitLabClient::for_test("/tmp/unused-repo")) as Arc<dyn CodeHostingClient>;
+        let gitlab = hosting::for_test_client("/tmp/unused-repo");
 
         assert!(try_resume_pmo_state(&state, Arc::clone(&gitlab), None).is_none());
 
@@ -3759,8 +3757,7 @@ mod tests {
         let sessions_dir = dir.to_string_lossy().into_owned();
         let state = pmo_test_agent_state(&sessions_dir, "pmo-4");
         fs::write(state.state_path(), br#"{"version":4,"state":{}}"#).unwrap();
-        let gitlab =
-            Arc::new(GitLabClient::for_test("/tmp/unused-repo")) as Arc<dyn CodeHostingClient>;
+        let gitlab = hosting::for_test_client("/tmp/unused-repo");
 
         assert!(try_resume_pmo_state(&state, Arc::clone(&gitlab), None).is_none());
         assert!(!state.state_path().exists());

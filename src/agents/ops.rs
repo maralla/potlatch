@@ -2133,8 +2133,8 @@ mod tests {
     // after the create-issue loop, and only when at least one issue was
     // actually created (`created > 0`). `ensure_history_file` runs earlier,
     // before analysis, and is a no-op once a history file already exists.
-    // The create/label GitLab calls themselves are real network calls
-    // (`GitLabClient`) and are not characterized here — see note below.
+    // The create/label hosting calls themselves are real network calls
+    // and are not characterized here — see note below.
     // -----------------------------------------------------------------
 
     #[test]

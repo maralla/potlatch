@@ -7,9 +7,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context, Result};
 
 use super::git::GitRepo;
-use super::hosting::CodeHostingClient;
-use super::hosting::github::GitHubClient;
-use super::hosting::gitlab::GitLabClient;
+use super::hosting::{self, CodeHostingClient};
 use super::settings::AgentSettings;
 use crate::core::agent::{AgentModel, ModelPreferences};
 use crate::core::banner::Banner;
@@ -64,7 +62,7 @@ impl<'a> AgentBootstrap<'a> {
         let working_dir = work_dir(&self.ctx.workflow.base_dir, &project_name, &agent_id);
         let sessions_dir = sessions_dir(&self.ctx.workflow.base_dir, &project_name);
         let git_repo = GitRepo::new(working_dir.clone(), Arc::clone(&self.ctx.workflow.shutdown));
-        let hosting = create_hosting_client(
+        let hosting = hosting::create_client(
             &working_dir,
             &repo_url,
             Arc::clone(&self.ctx.workflow.shutdown),
@@ -83,20 +81,6 @@ impl<'a> AgentBootstrap<'a> {
             core: self.ctx.runtime.clone(),
         })
     }
-}
-
-fn create_hosting_client(
-    working_dir: &str,
-    repo_url: &str,
-    shutdown: Arc<AtomicBool>,
-) -> Result<Arc<dyn CodeHostingClient>> {
-    let url_lower = repo_url.to_lowercase();
-    if url_lower.contains("github.com") {
-        let client = GitHubClient::new(working_dir.to_string(), repo_url)?;
-        return Ok(Arc::new(client));
-    }
-    let client = GitLabClient::new(working_dir.to_string(), repo_url, shutdown)?;
-    Ok(Arc::new(client))
 }
 
 pub fn repo_banner(config: &Config, banner: &mut Banner) {
