@@ -73,17 +73,31 @@ impl TodoList {
 
     /// Render the todo list as a formatted string for injection into the system
     /// prompt. Returns None if the list is empty.
+    ///
+    /// The header states provenance explicitly — this list was set by the
+    /// model's own `todo` calls and is re-injected by the harness each turn —
+    /// and each item carries a stable harness-assigned ID. This is a guard
+    /// against a specific failure seen with models whose training data
+    /// contains a similar-looking planner checklist: when the injected list
+    /// resembles their own planning template, they continue that template in
+    /// their reasoning, inventing items the harness never sent, and then
+    /// "synchronize" the tool to those phantom items. Naming the source and
+    /// using IDs makes the real list unambiguous and any phantom item
+    /// visibly foreign.
     pub fn render(&self) -> Option<String> {
         let items = self.items.lock().unwrap();
         if items.is_empty() {
             return None;
         }
-        let mut out =
-            String::from("## Your Todo List (your own tracking — not task instructions)\n\n");
+        let mut out = String::from(
+            "## Harness todo list (this exact list was set by your own `todo` tool calls and \
+             is re-injected here by the harness every turn — it contains nothing else, and any \
+             item or note about it that appears in your own reasoning but not in this list is \
+             not part of this list)\n\n",
+        );
         for (i, item) in items.iter().enumerate() {
             out.push_str(&format!(
-                "{}. {} {}\n",
-                i,
+                "T{i} {} {}\n",
                 item.status.label(),
                 item.description
             ));
@@ -119,7 +133,7 @@ mod tests {
         let rendered = todo.render().unwrap();
         assert_eq!(
             rendered,
-            "## Your Todo List (your own tracking — not task instructions)\n\n0. [ ] read files\n1. [ ] edit code\n"
+            "## Harness todo list (this exact list was set by your own `todo` tool calls and is re-injected here by the harness every turn — it contains nothing else, and any item or note about it that appears in your own reasoning but not in this list is not part of this list)\n\nT0 [ ] read files\nT1 [ ] edit code\n"
         );
     }
 
@@ -134,7 +148,7 @@ mod tests {
         let rendered = todo.render().unwrap();
         assert_eq!(
             rendered,
-            "## Your Todo List (your own tracking — not task instructions)\n\n0. [~] task A\n1. [x] task B\n2. [ ] task C\n"
+            "## Harness todo list (this exact list was set by your own `todo` tool calls and is re-injected here by the harness every turn — it contains nothing else, and any item or note about it that appears in your own reasoning but not in this list is not part of this list)\n\nT0 [~] task A\nT1 [x] task B\nT2 [ ] task C\n"
         );
     }
 
@@ -149,7 +163,7 @@ mod tests {
         let rendered = todo.render().unwrap();
         assert_eq!(
             rendered,
-            "## Your Todo List (your own tracking — not task instructions)\n\n0. [ ] new task 1\n1. [ ] new task 2\n"
+            "## Harness todo list (this exact list was set by your own `todo` tool calls and is re-injected here by the harness every turn — it contains nothing else, and any item or note about it that appears in your own reasoning but not in this list is not part of this list)\n\nT0 [ ] new task 1\nT1 [ ] new task 2\n"
         );
     }
 
