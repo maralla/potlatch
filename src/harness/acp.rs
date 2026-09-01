@@ -245,6 +245,22 @@ impl AcpServer {
             session.transcript_path = Some(std::path::PathBuf::from(path));
         }
 
+        // Optional `write_roots` extension: directories the write/edit tools
+        // may touch outside the cwd (via `outside_cwd: true`). Empty/absent
+        // keeps the historical permissive behavior.
+        let write_roots = params
+            .get("write_roots")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let write_roots = super::tools::WriteRoots::from_paths(write_roots);
+
         // Build the tool registry with built-in tools + caller-defined
         // structured-output tools. The tool set is fixed for the session
         // lifetime.
@@ -253,6 +269,7 @@ impl AcpServer {
             &session.id,
             &cwd,
             &session.model,
+            &write_roots,
             session.allowed_tools.as_deref(),
         );
         if let Some(caller) = &self.agent_tool_caller {

@@ -152,6 +152,10 @@ fn live_callbacks(options: &InvokeOptions) -> LiveCallbacks<'_> {
 pub struct ModelSessionOptions {
     pub preferred_session_mode: Option<&'static str>,
     pub(crate) agent_bus: Option<AgentBus>,
+    /// Directories the harness's write/edit tools may touch outside the
+    /// session cwd (via `outside_cwd: true`). Forwarded to the harness in
+    /// `session/new` as the `write_roots` extension.
+    pub write_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +214,7 @@ impl ModelEngine {
             acp_spawn.env,
             session.preferred_session_mode,
             session.agent_bus,
+            session.write_roots,
             runtime.shutdown,
             runtime.agent_id,
         ))

@@ -96,6 +96,9 @@ pub(crate) struct AcpRuntime {
     /// Capability provider (set by the agent at construction).
     capability_provider: Mutex<Option<Arc<dyn CapabilityProvider>>>,
     agent_bus: Option<AgentBus>,
+    /// Directories the harness's write/edit tools may touch outside the
+    /// session cwd, forwarded to the harness in `session/new`.
+    write_roots: Vec<String>,
     /// Structured-output definitions for the task currently in flight. The
     /// selected backend either passes them to the harness via `session/new` or
     /// renders them into the marker prompt. Set per task by
@@ -117,6 +120,7 @@ impl AcpRuntime {
         acp_env: std::collections::HashMap<String, String>,
         preferred_session_mode: Option<&'static str>,
         agent_bus: Option<AgentBus>,
+        write_roots: Vec<String>,
         shutdown: Arc<AtomicBool>,
         agent_id: String,
     ) -> Self {
@@ -139,6 +143,7 @@ impl AcpRuntime {
             structured_output_backend,
             capability_provider: Mutex::new(None),
             agent_bus,
+            write_roots,
         }
     }
 
@@ -544,6 +549,7 @@ impl AcpRuntime {
                 structured_output_tools: self.session_structured_output_tools(),
                 agent_tools: self.session_agent_tools(),
                 context_channels: self.session_context_channels(),
+                write_roots: (!self.write_roots.is_empty()).then(|| self.write_roots.clone()),
             })
             .context("ACP session/new")?;
 
@@ -852,6 +858,7 @@ mod tests {
             std::collections::HashMap::new(),
             None,
             None,
+            Vec::new(),
             Arc::new(AtomicBool::new(false)),
             "worker-0".into(),
         )
@@ -923,6 +930,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 None,
                 Some(bus.clone()),
+                Vec::new(),
                 Arc::new(AtomicBool::new(false)),
                 "worker-0".into(),
             )

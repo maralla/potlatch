@@ -596,6 +596,7 @@ mod tests {
                 structured_output_tools: None,
                 agent_tools: None,
                 context_channels: None,
+                write_roots: None,
             })?
             .session_id;
         assert_eq!(sid, "test-session");
@@ -691,6 +692,7 @@ mod tests {
                 structured_output_tools: None,
                 agent_tools: None,
                 context_channels: None,
+                write_roots: None,
             })?
             .session_id;
         client.session_set_model(&sid, "composer-2")?;
@@ -786,6 +788,7 @@ mod tests {
                 structured_output_tools: None,
                 agent_tools: None,
                 context_channels: None,
+                write_roots: None,
             })?
             .session_id;
         client.session_set_mode(&sid, "code")?;
@@ -900,6 +903,7 @@ mod tests {
             structured_output_tools: None,
             agent_tools: None,
             context_channels: None,
+            write_roots: None,
         })?;
         assert!(
             session

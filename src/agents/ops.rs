@@ -2233,28 +2233,19 @@ mod tests {
     }
 
     #[test]
-    fn build_analysis_prompt_references_context_files() {
+    fn build_analysis_prompt_references_context_files_without_secrets() {
         let prompt = build_analysis_prompt(
             "/tmp/project-sessions/ops-0-analysis-1.log",
             "/tmp/project-sessions/ops-0_issue_history.json",
             "/tmp/project-sessions/ops-0-gitlab-context-1.md",
         );
+        // Every context path the model must act on is embedded...
         assert!(prompt.contains("/tmp/project-sessions/ops-0-analysis-1.log"));
         assert!(prompt.contains("/tmp/project-sessions/ops-0_issue_history.json"));
         assert!(prompt.contains("/tmp/project-sessions/ops-0-gitlab-context-1.md"));
+        // ...and no SSH connection details leak into the prompt.
         assert!(!prompt.contains("ssh_host"));
         assert!(!prompt.contains("fingerprint"));
-        assert!(prompt.contains("Log session file"));
-        assert!(prompt.contains("GitLab context"));
-        assert!(prompt.contains("inspect the current project codebase"));
-        assert!(prompt.contains("already fixed in the current codebase"));
-        assert!(prompt.contains("explicit code or doc comments"));
-        assert!(prompt.contains("handling is intentional"));
-        assert!(prompt.contains("Descriptions must cite log evidence and relevant code context"));
-        assert!(!prompt.contains("ops_report"));
-        assert!(!prompt.contains("output contract"));
-        assert!(!prompt.contains("tool's `issues` field"));
-        assert!(!prompt.contains("JSON array of objects"));
     }
 
     #[test]

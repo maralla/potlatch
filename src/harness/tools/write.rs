@@ -7,7 +7,15 @@ use serde_json::{Value, json};
 
 use super::Tool;
 
-pub struct WriteTool;
+pub struct WriteTool {
+    roots: super::WriteRoots,
+}
+
+impl WriteTool {
+    pub fn new(roots: super::WriteRoots) -> Self {
+        Self { roots }
+    }
+}
 
 impl Tool for WriteTool {
     fn name(&self) -> &str {
@@ -48,7 +56,7 @@ impl Tool for WriteTool {
             .ok_or_else(|| anyhow::anyhow!("missing 'content' argument"))?;
         let outside_cwd = args["outside_cwd"].as_bool().unwrap_or(false);
 
-        let full_path = match super::resolve_write_path(path, cwd, outside_cwd) {
+        let full_path = match super::resolve_write_path(path, cwd, outside_cwd, &self.roots) {
             Ok(p) => p,
             Err(msg) => return Ok(format!("Error: {msg}")),
         };
@@ -79,11 +87,15 @@ mod tests {
     use super::super::test_util;
     use super::*;
 
+    fn unrestricted_tool() -> WriteTool {
+        WriteTool::new(super::super::WriteRoots::default())
+    }
+
     #[test]
     fn creates_new_file() {
         let dir = test_util::unique_test_dir();
 
-        let tool = WriteTool;
+        let tool = unrestricted_tool();
         let args = json!({
             "path": "new.txt",
             "content": "line one\nline two\n"
@@ -101,7 +113,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         std::fs::write(dir.path().join("over.txt"), "old content").unwrap();
 
-        let tool = WriteTool;
+        let tool = unrestricted_tool();
         let args = json!({
             "path": "over.txt",
             "content": "new content"
@@ -117,7 +129,7 @@ mod tests {
     fn creates_parent_directories() {
         let dir = test_util::unique_test_dir();
 
-        let tool = WriteTool;
+        let tool = unrestricted_tool();
         let args = json!({
             "path": "nested/deep/file.txt",
             "content": "nested"
@@ -131,7 +143,7 @@ mod tests {
     #[test]
     fn rejects_absolute_path() {
         let dir = test_util::unique_test_dir();
-        let tool = WriteTool;
+        let tool = unrestricted_tool();
         let args = json!({
             "path": "/tmp/evil.txt",
             "content": "bad"
@@ -143,7 +155,7 @@ mod tests {
     #[test]
     fn rejects_parent_traversal() {
         let dir = test_util::unique_test_dir();
-        let tool = WriteTool;
+        let tool = unrestricted_tool();
         let args = json!({
             "path": "../escape.txt",
             "content": "bad"
@@ -158,7 +170,7 @@ mod tests {
         let outside = test_util::unique_test_dir();
         let target = outside.path().join("outside.txt");
 
-        let tool = WriteTool;
+        let tool = unrestricted_tool();
         let args = json!({
             "path": target.to_string_lossy(),
             "content": "from outside",
@@ -177,7 +189,7 @@ mod tests {
         let outside = test_util::unique_test_dir();
         let target = outside.path().join("nested/deep/script.py");
 
-        let tool = WriteTool;
+        let tool = unrestricted_tool();
         let args = json!({
             "path": target.to_string_lossy(),
             "content": "print('hi')",
@@ -195,7 +207,7 @@ mod tests {
         let target = outside.path().join("existing.txt");
         std::fs::write(&target, "old").unwrap();
 
-        let tool = WriteTool;
+        let tool = unrestricted_tool();
         let args = json!({
             "path": target.to_string_lossy(),
             "content": "new",
@@ -209,7 +221,7 @@ mod tests {
     #[test]
     fn outside_cwd_defaults_to_false_when_absent() {
         let dir = test_util::unique_test_dir();
-        let tool = WriteTool;
+        let tool = unrestricted_tool();
         // No outside_cwd field — must still reject absolute paths.
         let args = json!({
             "path": "/tmp/evil.txt",
@@ -217,5 +229,83 @@ mod tests {
         });
         let result = tool.execute(&args, dir.as_str()).unwrap();
         assert!(result.contains("absolute paths are not allowed"));
+    }
+
+    fn rooted_tool(roots: Vec<std::path::PathBuf>) -> WriteTool {
+        WriteTool::new(super::super::WriteRoots::from_paths(roots))
+    }
+
+    #[test]
+    fn outside_cwd_write_inside_a_configured_root_is_allowed() {
+        let dir = test_util::unique_test_dir();
+        let outside = test_util::unique_test_dir();
+        let target = outside.path().join("knowledge/notes.md");
+
+        let tool = rooted_tool(vec![outside.path().to_path_buf()]);
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "notes",
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Created"), "{result}");
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn outside_cwd_write_inside_the_cwd_is_allowed_with_roots() {
+        let dir = test_util::unique_test_dir();
+        let other = test_util::unique_test_dir();
+        let target = dir.path().join("in-workspace.txt");
+
+        // Roots are configured, but the write targets the cwd itself.
+        let tool = rooted_tool(vec![other.path().to_path_buf()]);
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "ws",
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(result.contains("Created"), "{result}");
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn outside_cwd_write_outside_every_root_is_rejected() {
+        let dir = test_util::unique_test_dir();
+        let allowed = test_util::unique_test_dir();
+        let forbidden = test_util::unique_test_dir();
+        let target = forbidden.path().join("evil.txt");
+
+        let tool = rooted_tool(vec![allowed.path().to_path_buf()]);
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "bad",
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(
+            result.contains("outside the session's writable directories"),
+            "{result}"
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn outside_cwd_write_to_an_arbitrary_system_path_is_rejected_with_roots() {
+        let dir = test_util::unique_test_dir();
+        let allowed = test_util::unique_test_dir();
+
+        let tool = rooted_tool(vec![allowed.path().to_path_buf()]);
+        let args = json!({
+            "path": "/etc/passwd",
+            "content": "bad",
+            "outside_cwd": true
+        });
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(
+            result.contains("outside the session's writable directories"),
+            "{result}"
+        );
     }
 }
