@@ -545,6 +545,7 @@ fn run_qa_cycle(
         return Ok(());
     }
 
+    let work = crate::ui::WorkTimer::start();
     let all_issues = port.open_issues()?;
     let qa_issues: Vec<_> = all_issues
         .iter()
@@ -644,6 +645,11 @@ fn run_qa_cycle(
         );
         return Ok(());
     }
+
+    info!(
+        "{agent_id}: QA cycle on {branch} done (tested for {})",
+        crate::ui::format_work_duration(work.elapsed_seconds())
+    );
 
     // Advancing the SHA is deliberately the final operation and is best effort.
     history.0.insert(branch, cur_sha);

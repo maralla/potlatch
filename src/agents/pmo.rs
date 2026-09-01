@@ -1266,6 +1266,7 @@ impl PmoPort for LivePmoPort<'_> {
         was_planning: bool,
         plan_previously_proposed: bool,
     ) -> Result<PmoOutput> {
+        let work = crate::ui::WorkTimer::start();
         let prompt = build_split_prompt(
             self.state,
             &issue.as_issue(),
@@ -1317,6 +1318,13 @@ impl PmoPort for LivePmoPort<'_> {
         );
         self.model.set_capability_provider(None);
         let output = result?.output;
+
+        info!(
+            "{}: PMO agent finished triaging issue #{} (triaged for {})",
+            self.state.agent_id,
+            issue.iid,
+            crate::ui::format_work_duration(work.elapsed_seconds())
+        );
 
         // Persist the cursor advanced by the live poll so the next cycle does
         // not re-detect comments already injected into this session. If the poll

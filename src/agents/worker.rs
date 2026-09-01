@@ -1975,6 +1975,7 @@ fn run_implementation_cycle(
     issue: &IssueObservation,
     result: &mut ImplementationCycleResult,
 ) -> Result<()> {
+    let work = crate::ui::WorkTimer::start();
     if port.stop_if_review_only() {
         return Ok(());
     }
@@ -2068,7 +2069,12 @@ fn run_implementation_cycle(
         let output = match model_result {
             ImplModelResult::Cancelled => return Ok(()),
             ImplModelResult::Output(output) => {
-                info!("{}: Worker agent finished issue #{}", agent_id, issue.iid);
+                info!(
+                    "{}: Worker agent finished issue #{} (implemented for {})",
+                    agent_id,
+                    issue.iid,
+                    crate::ui::format_work_duration(work.elapsed_seconds())
+                );
                 output
             }
         };
@@ -2596,6 +2602,7 @@ fn handle_mr_comments(
     linked_issue_iid: Option<u64>,
     comments_only_mode: bool,
 ) -> Result<bool> {
+    let work = crate::ui::WorkTimer::start();
     let latest_mr = state.forge.get_merge_request(mr_iid)?;
     let unresolved_ids = state.forge.get_unresolved_discussion_ids(latest_mr.iid)?;
     let all_comments = state.forge.get_mr_comments(latest_mr.iid)?;
@@ -2820,8 +2827,10 @@ INSTRUCTIONS:
             Err(e) => return Err(e),
         };
         info!(
-            "{}: Worker agent finished MR !{} feedback",
-            &state.agent_id, latest_mr.iid
+            "{}: Worker agent finished MR !{} feedback (addressed for {})",
+            &state.agent_id,
+            latest_mr.iid,
+            crate::ui::format_work_duration(work.elapsed_seconds())
         );
         output
     } else {
@@ -2841,8 +2850,10 @@ INSTRUCTIONS:
             },
         )?;
         info!(
-            "{}: Worker agent finished MR !{} feedback",
-            &state.agent_id, latest_mr.iid
+            "{}: Worker agent finished MR !{} feedback (addressed for {})",
+            &state.agent_id,
+            latest_mr.iid,
+            crate::ui::format_work_duration(work.elapsed_seconds())
         );
         output
     };

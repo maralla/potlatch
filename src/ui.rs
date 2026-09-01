@@ -493,6 +493,65 @@ fn compact_terminal_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Format a work duration in human phrasing for task-finish log lines,
+/// e.g. `3 seconds`, `47 seconds`, `2.5 minutes`, `1.2 hours`.
+///
+/// Chooses the unit that keeps the number readable: sub-minute durations
+/// stay in whole seconds, minutes show one decimal only past the first
+/// minute, and hours take over past an hour. Pure, so agents can log
+/// `"<verb> for {}"` completions without duplicating this logic.
+pub fn format_work_duration(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds} second{}", plural(seconds)),
+        60..=3599 => {
+            let minutes = seconds as f64 / 60.0;
+            if minutes < 1.05 {
+                "1 minute".to_string()
+            } else {
+                format!("{minutes:.1} minutes")
+            }
+        }
+        _ => {
+            let hours = seconds as f64 / 3600.0;
+            if hours < 1.05 {
+                "1 hour".to_string()
+            } else {
+                format!("{hours:.1} hours")
+            }
+        }
+    }
+}
+
+fn plural(n: u64) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// A task timer for the duration-suffixed finish lines: capture the start
+/// with [`WorkTimer::start`], read the elapsed wall time with
+/// [`WorkTimer::elapsed_seconds`].
+#[derive(Debug, Clone)]
+pub struct WorkTimer {
+    started: std::time::Instant,
+}
+
+impl WorkTimer {
+    pub fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub fn elapsed_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+}
+
+impl Default for WorkTimer {
+    fn default() -> Self {
+        Self::start()
+    }
+}
+
 fn should_suppress(target: &str, level: Level) -> bool {
     if level <= Level::INFO
         && (target.contains("::acp_fs")
@@ -669,6 +728,25 @@ mod tests {
             activity_text(2, "worker-0 implementing issue #1"),
             "2 agents working"
         );
+    }
+
+    #[test]
+    fn format_work_duration_uses_human_units() {
+        assert_eq!(format_work_duration(0), "0 seconds");
+        assert_eq!(format_work_duration(1), "1 second");
+        assert_eq!(format_work_duration(47), "47 seconds");
+        assert_eq!(format_work_duration(60), "1 minute");
+        assert_eq!(format_work_duration(90), "1.5 minutes");
+        assert_eq!(format_work_duration(600), "10.0 minutes");
+        assert_eq!(format_work_duration(3600), "1 hour");
+        assert_eq!(format_work_duration(7200), "2.0 hours");
+        assert_eq!(format_work_duration(5400), "1.5 hours");
+    }
+
+    #[test]
+    fn work_timer_measures_elapsed_seconds() {
+        let timer = WorkTimer::start();
+        assert!(timer.elapsed_seconds() < 60);
     }
 
     #[test]
