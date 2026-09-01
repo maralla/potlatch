@@ -878,6 +878,7 @@ mod tests {
             "test-session",
             "",
             "",
+            &Default::default(),
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
@@ -927,6 +928,7 @@ mod tests {
             "test-session",
             "",
             "",
+            &Default::default(),
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
@@ -976,6 +978,7 @@ mod tests {
             "test-session",
             "",
             "",
+            &Default::default(),
             None,
         );
         let cancel = Arc::new(AtomicBool::new(true)); // Pre-cancelled
@@ -1037,6 +1040,7 @@ mod tests {
             "test-session",
             "",
             "",
+            &Default::default(),
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1214,6 +1218,7 @@ mod tests {
             "test-session",
             "",
             "",
+            &Default::default(),
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1340,6 +1345,7 @@ mod tests {
             "test-session",
             "",
             "",
+            &Default::default(),
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1458,6 +1464,7 @@ mod tests {
             "test-session",
             "",
             "",
+            &Default::default(),
             None,
         );
         let cancel = Arc::new(AtomicBool::new(false));

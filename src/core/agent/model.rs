@@ -31,6 +31,11 @@ const MAX_STRUCTURED_OUTPUT_REPAIRS: u32 = 10;
 #[derive(Debug, Clone, Default)]
 pub struct ModelPreferences {
     pub preferred_session_mode: Option<&'static str>,
+    /// Directories the harness's write/edit tools may touch outside the
+    /// session cwd (via `outside_cwd: true`). Forwarded to the harness in
+    /// `session/new` as the `write_roots` extension; empty keeps the
+    /// harness's historical permissive behavior.
+    pub write_roots: Vec<String>,
 }
 
 /// Result of a typed structured-output completion: the backend-neutral
@@ -86,6 +91,7 @@ impl AgentModel {
             ModelSessionOptions {
                 preferred_session_mode: prefs.preferred_session_mode,
                 agent_bus: ctx.workflow.bus.clone(),
+                write_roots: prefs.write_roots.clone(),
             },
         )?;
         Ok(Self {
@@ -204,6 +210,7 @@ impl AgentModel {
             ModelSessionOptions {
                 preferred_session_mode: prefs.preferred_session_mode,
                 agent_bus: None,
+                write_roots: prefs.write_roots.clone(),
             },
         )?;
         Ok(Self {

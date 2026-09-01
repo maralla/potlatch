@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::labels;
 use super::state::StateStore;
@@ -115,6 +115,11 @@ struct QaOutput {
     findings: Vec<RawQaFinding>,
     #[serde(default)]
     clarifications: Vec<RawClarification>,
+    /// True when the cycle could not test — most importantly a rule-1
+    /// version mismatch. A blocked cycle does NOT advance the SHA history,
+    /// so the commit is re-tested once the environment catches up.
+    #[serde(default)]
+    blocked: bool,
 }
 
 structured_output! {
@@ -146,6 +151,9 @@ structured_output! {
                         "Context explaining why the question is needed."
                     ),
                 })
+            ),
+            optional blocked: boolean(
+                "Set true ONLY when this cycle could not test at all — most importantly a rule-1 version mismatch (deployed binary is not the commit under test). When true the harness will NOT advance the SHA history, so the commit is re-tested after a redeploy. Leave false/absent for a normal completed run, even one with failures."
             ),
         });
     /// Tolerated: a severity the model invented or spelled differently, which
@@ -241,6 +249,30 @@ impl QaAgentSettings {
     }
 }
 
+/// Model preferences that confine the harness's `write`/`edit` tools to the
+/// QA agent's own sessions directory. Everything the model legitimately
+/// writes — its knowledge files, the function index, its test scripts —
+/// lives under `<base_dir>/<project>-sessions/`; the checked-out repo is
+/// covered separately by the tools' default (relative-path) mode.
+fn qa_model_preferences(ctx: &AgentBuildContext<QaAgentSettings>) -> ModelPreferences {
+    let Ok(settings) = super::settings::AgentSettings::from_config(&ctx.workflow.config) else {
+        return ModelPreferences::default();
+    };
+    let Some(repo_url) = settings.repo_url() else {
+        return ModelPreferences::default();
+    };
+    let Ok(project_name) = super::workspace::extract_project_name(repo_url) else {
+        return ModelPreferences::default();
+    };
+    ModelPreferences {
+        write_roots: vec![super::workspace::sessions_dir(
+            &ctx.workflow.base_dir,
+            &project_name,
+        )],
+        ..ModelPreferences::default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Agent state
 // ---------------------------------------------------------------------------
@@ -286,6 +318,13 @@ impl AgentState<'_> {
 
     fn knowledge_dir(&self) -> PathBuf {
         Path::new(&self.sessions_dir).join(format!("{}_qa_knowledge", self.agent_id))
+    }
+
+    /// Path to the harness-generated index of the knowledge files' headings
+    /// and the test-script inventory, refreshed each cycle. See
+    /// [`write_function_index`].
+    fn function_index_path(&self) -> PathBuf {
+        Path::new(&self.sessions_dir).join(format!("{}_function_index.md", self.agent_id))
     }
 
     fn test_scripts_dir(&self) -> PathBuf {
@@ -379,7 +418,7 @@ impl CoreAgent for QaAgent {
     }
 
     fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
-        let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
+        let runtime = AgentBootstrap::new(&ctx, qa_model_preferences(&ctx)).build()?;
         let agent_settings = ctx.settings;
         let config = QaConfig {
             poll_interval: agent_settings.poll_interval,
@@ -447,6 +486,18 @@ trait QaPort {
     fn issue_comments(&self, issue_iid: u64) -> Option<Vec<CommentObservation>>;
     fn write_qa_issues_context(&mut self, issues: &[IssueContextObservation]) -> Result<()>;
     fn write_open_issues_context(&mut self, issues: &[IssueObservation]) -> Result<()>;
+    /// Enumerates the knowledge directory: every markdown file the model
+    /// keeps there, each with its heading lines. Includes files the harness
+    /// never named (per-cycle archives, notes the model invented) — they are
+    /// the model's to manage, and the index must cover them all. Advisory:
+    /// a missing or unreadable file yields an empty vec, never a failed cycle.
+    fn knowledge_files(&self) -> Vec<(String, Vec<String>)>;
+    /// Lists the test scripts present this cycle, sorted by name.
+    /// Advisory: an unreadable directory yields an empty vec.
+    fn test_scripts(&self) -> Vec<String>;
+    /// Writes the function index. Required — without it the model has no
+    /// navigable map of knowledge files it can no longer read whole.
+    fn write_function_index(&mut self, index: &str) -> Result<()>;
     /// Changed-file discovery is advisory and therefore cannot fail the cycle.
     fn changed_files_since(&mut self, base: &str) -> Vec<String>;
     fn invoke_qa_model(&mut self, prompt: &str, branch: &str) -> Result<QaOutput>;
@@ -472,13 +523,16 @@ fn run_qa_cycle(
     port.fetch_branches(branches)?;
     let mut history = port.sha_history();
 
-    // Observe every configured branch, but preserve the historical behavior
-    // of testing only the first changed branch in configuration order.
+    // Observe every configured branch. A changed branch is the preferred
+    // work item (test the change), but an unchanged SHA is no longer a
+    // reason to idle: coverage gaps may remain, so the cycle still runs
+    // and the model decides — close gaps, or explicitly report nothing
+    // to do.
     let mut selected = None;
     for branch in branches {
         let current = port.remote_branch_sha(branch)?;
         let previous = history.0.get(branch).cloned().unwrap_or_default();
-        if previous != current && selected.is_none() {
+        if selected.is_none() {
             selected = Some((branch.clone(), previous, current));
         }
     }
@@ -506,6 +560,13 @@ fn run_qa_cycle(
         .collect();
     port.write_qa_issues_context(&context_issues)?;
     port.write_open_issues_context(&all_issues)?;
+
+    // The function index must be refreshed before the model runs — it is
+    // the model's map into knowledge files it can no longer read whole.
+    let knowledge_files = port.knowledge_files();
+    let test_scripts = port.test_scripts();
+    let index = build_function_index(port.current_time(), &knowledge_files, &test_scripts);
+    port.write_function_index(&index)?;
     if port.shutdown_requested() {
         return Ok(());
     }
@@ -531,9 +592,7 @@ fn run_qa_cycle(
     let clarifications = normalize_clarifications(output.clarifications);
     if port.shutdown_requested() {
         return Ok(());
-    }
-
-    // Close answered clarification threads before creating any new issues.
+    } // Close answered clarification threads before creating any new issues.
     for issue in qa_issues.iter().filter(|issue| {
         issue
             .labels
@@ -574,6 +633,16 @@ fn run_qa_cycle(
         if let Some(label) = scope_label {
             let _ = port.add_issue_label(iid, label);
         }
+    }
+
+    // A blocked cycle did not test, so the commit under test has not been
+    // covered: do NOT advance the SHA history. The same commit is re-run
+    // next cycle (hopefully against a corrected environment).
+    if output.blocked {
+        info!(
+            "{agent_id}: QA run on {branch} reported blocked; not advancing SHA history past {cur_sha}"
+        );
+        return Ok(());
     }
 
     // Advancing the SHA is deliberately the final operation and is best effort.
@@ -641,6 +710,59 @@ impl QaPort for LiveQaPort<'_> {
         write_open_issues_context(self.state, issues)
     }
 
+    fn knowledge_files(&self) -> Vec<(String, Vec<String>)> {
+        let dir = self.state.knowledge_dir();
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".md"))
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let headings = fs::read_to_string(dir.join(&name))
+                    .map(|content| {
+                        content
+                            .lines()
+                            .filter(|line| line.starts_with('#'))
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (name, headings)
+            })
+            .collect()
+    }
+
+    fn test_scripts(&self) -> Vec<String> {
+        let dir = self.state.test_scripts_dir();
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".py") && !name.starts_with('_'))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn write_function_index(&mut self, index: &str) -> Result<()> {
+        let path = self.state.function_index_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create sessions dir {}", parent.display()))?;
+        }
+        fs::write(&path, index).with_context(|| format!("Failed to write {}", path.display()))
+    }
+
     fn changed_files_since(&mut self, base: &str) -> Vec<String> {
         self.state
             .git_repo
@@ -693,6 +815,7 @@ fn qa_cycle(
 ) -> Result<()> {
     let qa_issues_path = state.qa_issues_path();
     let open_issues_path = state.open_issues_path();
+    let function_index_path = state.function_index_path();
     let knowledge_dir = state.knowledge_dir();
     let test_scripts_dir = state.test_scripts_dir();
     let mut port = LiveQaPort { state, model };
@@ -704,6 +827,7 @@ fn qa_cycle(
         AnalysisInput {
             qa_issues_path: &qa_issues_path.to_string_lossy(),
             open_issues_path: &open_issues_path.to_string_lossy(),
+            function_index_path: &function_index_path.to_string_lossy(),
             knowledge_dir: &knowledge_dir.to_string_lossy(),
             test_scripts_dir: &test_scripts_dir.to_string_lossy(),
         },
@@ -872,6 +996,65 @@ fn is_potlatch_author(author: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Function index
+// ---------------------------------------------------------------------------
+
+/// Build the function index the model navigates its knowledge files by.
+///
+/// The knowledge files grow monotonically — a long-running project's
+/// `functionality.md` can exceed 250KB, far beyond what the model can read
+/// in one pass. The index lists every heading in every knowledge file (as
+/// enumerated from the knowledge directory, so files the model invented —
+/// per-cycle archives, notes — are covered too) plus the full test-script
+/// inventory, so the model can locate the exact `read` line ranges it needs
+/// instead of skimming a file head it cannot see past. Pure: constructed
+/// from strings the port gathered.
+fn build_function_index(
+    now: chrono::DateTime<chrono::Utc>,
+    knowledge_headings: &[(String, Vec<String>)],
+    test_scripts: &[String],
+) -> String {
+    let mut out = String::new();
+    out.push_str("# Function index\n\n");
+    out.push_str(&format!(
+        "_Generated by the QA harness on {}. This is a navigable index of your knowledge files and test scripts — the files themselves are large, so use these headings to `read` the exact line ranges you need instead of reading whole files._\n\n",
+        now.format("%Y-%m-%d %H:%M UTC")
+    ));
+
+    for (file_name, headings) in knowledge_headings {
+        out.push_str(&format!("## `{file_name}`\n\n"));
+        if headings.is_empty() {
+            if file_name == "functionality.md" {
+                out.push_str(
+                    "_(no function map yet — your coverage gap is \"everything\": follow the \
+                     \"Close coverage gaps\" instructions in the task and discover every \
+                     user-facing surface this cycle)_\n\n",
+                );
+            } else {
+                out.push_str("_(no headings — file may not exist yet)_\n\n");
+            }
+            continue;
+        }
+        for heading in headings {
+            out.push_str(&format!("- {heading}\n"));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Test scripts\n\n");
+    if test_scripts.is_empty() {
+        out.push_str("_(no test scripts yet)_\n");
+    } else {
+        out.push_str(&format!("_{} script(s)._\n\n", test_scripts.len()));
+        for script in test_scripts {
+            out.push_str(&format!("- `{script}`\n"));
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // SHA history persistence
 // ---------------------------------------------------------------------------
 
@@ -908,6 +1091,7 @@ struct GitContext<'a> {
 struct AnalysisInput<'a> {
     qa_issues_path: &'a str,
     open_issues_path: &'a str,
+    function_index_path: &'a str,
     knowledge_dir: &'a str,
     test_scripts_dir: &'a str,
 }
@@ -924,30 +1108,54 @@ fn build_qa_prompt(agent_id: &str, git: &GitContext, input: &AnalysisInput) -> S
     let cur_sha = git.cur_sha;
     let qa_issues_path = input.qa_issues_path;
     let open_issues_path = input.open_issues_path;
+    let function_index_path = input.function_index_path;
     let knowledge_dir = input.knowledge_dir;
     let test_scripts_dir = input.test_scripts_dir;
 
+    // Same SHA as the last completed cycle: no new code to test, so the
+    // cycle's work is coverage gaps — or an explicit report that there is
+    // nothing to do. Different framing from a fresh commit.
+    let unchanged = git.prev_sha == git.cur_sha;
+    let (opening, changes_guidance) = if unchanged {
+        (
+            format!("You are a QA agent ({agent_id}) for this project. Branch {branch} is unchanged since your last completed cycle."),
+            "No new commit landed. Your work this cycle is **coverage, not change-testing**: close coverage gaps — author missing scripts, deepen thin ones, run the scripts of functions still `unverified` in `Coverage status` — until every user-facing function is `tested`. If — and only if — every function is already `tested` and you genuinely have no gap to close, do not invent work: report no findings, no clarifications, and do not set `blocked`; the harness will wait for the next commit.".to_string(),
+        )
+    } else {
+        (
+            format!("You are a QA agent ({agent_id}) for this project. A new commit landed on branch {branch}."),
+            "Use `git log --oneline -5` and the changed files **only to pick your starting functions** — which user-facing functions this commit touched. The commit does not define the whole of your work; it defines where testing starts. Look those functions up in your `functionality.md` map, and check `{qa_issues_path}` for acceptance criteria that apply to them.".to_string(),
+        )
+    };
+
     format!(
-        r##"You are a QA agent ({agent_id}) for this project. A new commit landed on branch {branch}.
+        r##"{opening}
 
 ## Your Role
 
-You are an **end-user tester**, not a code reviewer. Your job is to verify that the system's features work end-to-end from a real user's perspective. Test the *running system* through its external surfaces:
+You are an **end-user tester**, not a code reviewer and not a fix-verifier. Your job is to exercise the system's user-facing functionality end-to-end, from a real user's perspective, against the *running system*. Test through its external surfaces:
 - HTTP APIs (via `curl` or `python3` + `urllib`/`requests`)
 - CLI invocations the way a real user would call them
 - Configuration loading and behavior from a user's perspective
 - Data flow through the system as observed externally
 
-**Your testing is organized around user-facing functionality, not around issues.** You maintain a map of the system's user-facing functions, and a test plan with cases for each function. Issues are a source of context — they describe known bugs, acceptance criteria, and testing instructions that you fold into your functionality-based test plan — but they do not dictate your test organization. You test the functionality a commit touches, and you regression-test the functions you have tracked across prior cycles.
+**Your unit of work is the user-facing function, not the issue and not the commit.** Every cycle you: exercise the functions this commit touched *as a user would*, then spend the rest of your budget closing coverage gaps across the function map you maintain. A commit is only a pointer telling you where to start; the issues file is only a source of acceptance criteria. Neither defines the scope of your testing — and neither bounds it. Your long-run goal is complete coverage of every user-facing function, and every cycle moves toward it regardless of what landed.
 
-You may use `read`, `grep`, and `glob` **only** to discover how to exercise the system (which endpoints exist, which CLI flags are available, how to invoke the binary) in service of testing a function. Never assert on internal code paths or read the project's own tests to judge correctness; that is the developer's responsibility, not yours.
+**Spend your effort on functionality, not on issue forensics.** A cycle whose entire output is "verified the fix for #N" is a failed cycle: that is one data point about one function, not testing. In particular, do NOT sink effort into:
+- Re-deriving root causes or reading the diff line-by-line to reconstruct what a commit "should" have changed. You verify *observable behavior*, not intent.
+- Endless re-checks of one known bug. A known issue is one test case in the owning function's section — it gets exactly one confirmation run, then it's covered by the regression suite like any other case.
+- Deep-diving *which* code path a deployed binary contains (`strings` probes, disassembly) beyond the one version check the task requires (see rule 1).
+
+The bulk of every cycle goes to breadth: functions in the map you haven't exercised recently, user journeys that cross several functions (upload → index → search → delete), and edge cases a user can hit (empty input, huge input, invalid input, concurrent operations).
+
+You may use `read`, `grep`, and `glob` on the repo **only** to discover how to exercise the system (which endpoints exist, which CLI flags are available, how to invoke the binary) — and, when closing coverage gaps, to enumerate the user-facing surface — in service of testing a function. Never assert on internal code paths or read the project's own tests to judge correctness; that is the developer's responsibility, not yours.
 
 ## File Locations
 
 The harness has prepared the following absolute paths for you. Use `read` and `write` with `outside_cwd: true` to access them (they live outside the working directory).
 
 - **Read** QA issues (harness-written; do not modify): `{qa_issues_path}`
-  This file lists every open QA-labeled issue with its description and comments. Read it to gather acceptance criteria, known bugs, and testing instructions for the functions in scope this cycle. It also contains answers to clarification questions you have asked previously. Issues carrying the `do-not-implement` label are clarification threads (questions for humans, plus their answers) — absorb their answers, do not treat them as features to test. Fold each issue's acceptance criteria into the relevant function's test cases in your test plan; do not create per-issue test scripts.
+  Every open QA-labeled issue with its description and comments. This is a **source of acceptance criteria for functions**, not a work queue: treat each issue as extra test cases for the function it concerns, run them once like any other case, and move on. It also carries answers to clarification questions you asked previously. Issues with the `do-not-implement` label are clarification threads — absorb their answers, do not treat them as features to test.
 - **Read** all open issues (harness-written; do not modify): `{open_issues_path}`
   A compact listing of every open project issue — not just QA-labeled ones — with its iid, title, labels, and a one-line description preview. Read it before reporting a finding to check whether an issue is already tracked (by the QA agent, another agent, or a human). Do not report a finding that duplicates an issue listed here. This file is refreshed at the start of every QA run, so it reflects the current open-issue set.
 - **Read/write** your knowledge (persists across runs): `{knowledge_dir}/`
@@ -955,7 +1163,9 @@ The harness has prepared the following absolute paths for you. Use `read` and `w
   - `test_cases.md` — your test plan, organized **by function** (not by issue). Each function section lists its test cases with steps, expected results, and the script that runs them. When a QA-labeled issue provides acceptance criteria for a function, add them as test cases under that function's section — do not create a separate per-issue section. This keeps your regression suite function-oriented.
   - `qa_context.md` — running notes, conventions, environment quirks
   - `requirements.md` — requirements you have discovered
-  Read them at the start of each run to recall what you learned. Update them with `write` (`outside_cwd: true`, full overwrite) or `edit` (`outside_cwd: true`, targeted changes) when you discover something new.
+  These files grow large over a long-lived project. They are **durable maps, not append-only logs** — see "Keeping your knowledge navigable" below.
+- **Read** your function index (harness-written; do not modify): `{function_index_path}`
+  An index of every heading in your knowledge files plus a full inventory of your test scripts, regenerated by the harness at the start of every run. This is your navigation map: use the headings to locate the sections you need, then `read` those files at the exact line ranges (`start_line`/`end_line`) covering the relevant function's section — do not read a large knowledge file whole. Start every run by reading this index.
 - **Read/write/run** your test scripts: `{test_scripts_dir}/`
   Write Python scripts here via `write` (`outside_cwd: true`), **named by the function they test** (e.g. `{test_scripts_dir}/test_p4_search.py`, `{test_scripts_dir}/test_ukb_document_lifecycle.py`), not by issue number or commit SHA. A single script covers all cases for one function — happy path, edge cases, error handling, and regression scenarios as test functions within it. Update existing scripts with `edit` (`outside_cwd: true`) for targeted changes. Run them yourself via `shell` with `outside_cwd: true`: `python3 {test_scripts_dir}/test_p4_search.py`. The harness does not load, save, or run test scripts — you do.
 - **Read** `qa.md` at the repo root (relative path, normal `read`) for project-specific QA instructions, if present.
@@ -964,33 +1174,57 @@ The harness has prepared the following absolute paths for you. Use `read` and `w
 
 - Branch: {branch}
 - Previous SHA: {prev_sha}
-- Current SHA: {cur_sha}
+- Current SHA: **{cur_sha}** ← this is the commit your working directory is checked out at, and the exact version the testing environment must be running (see Hard Rule 1)
 - Changed files: {changed_files_str}
 
-Use `git log --oneline -5` and the changed files above to identify which user-facing functions this commit touches, then look up those functions in your `functionality.md` map and in `{qa_issues_path}` for any acceptance criteria or known bugs related to them.
+{changes_guidance}
+
+## Keeping your knowledge navigable
+
+Your knowledge files are durable maps, not append-only logs. A commit that changes an existing function **updates that function's existing section**; it does not mint a new one.
+
+- **One function, one section.** Sections are keyed by the user-facing function (`## F4 — P4 search`, `## F17 — UKB search`), never by commit, MR, or issue number. A commit that changes `P4 search` edits the `F4` section.
+- **Provenance goes in the section body, not the title.** Record which commit/MR/issue changed a function as a line *inside* the section (`Changed by 7698242 / issue #84`), not in the heading.
+- **Update, don't accrete.** When re-testing a function, replace stale descriptions and superseded test results instead of stacking new notes under the old ones. A section should describe the function *as it works now*.
+- **Retired code gets removed.** When a function is deleted or its internal scaffolding never gains a user-facing surface, delete its section (or fold a one-line tombstone into `qa_context.md`) instead of leaving `[DEFERRED]` sections to accumulate.
+- **Per-cycle archives stay small.** If you keep per-cycle notes, put one short summary line in `qa_context.md` (or a `recent_cycles.md`) and the detail in per-cycle files — never the reverse.
 
 ## Hard Rules
 
-1. **Read the QA issues file and your knowledge files first.** Before any other action, read `{qa_issues_path}` with `read` (`outside_cwd: true`) to gather acceptance criteria and testing instructions for the functions in scope. Also read your knowledge files under `{knowledge_dir}/` to recall your functionality map and test plan.
-2. **Never fetch issues yourself.** Do not call `glab` or any tool to read issues/MRs/commits. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` and the full open-issue listing into `{open_issues_path}` — read those files.
-3. **Never report a duplicate finding.** Before reporting a finding, read `{open_issues_path}` and check whether an open issue already describes the same problem (by the QA agent, another agent, or a human). If it does, do not report that finding — the issue is already tracked. Compare by the underlying problem, not just exact-title match: a finding about "login returns 500 on empty password" duplicates an issue titled "Auth API crashes on malformed input" even though the wording differs. Only report a finding if no open issue covers the same root cause.
-4. **Never mutate issues.** Do not post comments or create/edit issues via tools. The harness creates issues from your structured result.
-5. **Never modify the working directory.** Do not use `write` or `edit` to create, modify, or delete anything inside the checked-out repo. Do not run `cd`, `git checkout`, `git commit`, or any command that mutates the repo tree.
-6. **Never run unit tests, build commands, or liveness/ops endpoints.** Do not run `cargo test`, `go test`, `go build`, `go vet`, `pytest`, `npm test`, or similar — these are the developer's responsibility and redundant for end-user testing; build commands also write artifacts into the repo. Do not test ops/liveness/health endpoints (`/ping`, `/monitor`, `/health`, `/metrics`, `/ready`, etc.) unless a QA-labeled issue explicitly asks you to — they are not functionality and testing them is noise. Allowed commands: `curl`/`python3` against real functionality APIs, invoking an already-built CLI binary the way a user would, and `python3` to run your own test scripts.
+1. **Verify the testing environment runs the commit under test before any testing.** Your working directory is checked out at commit `{cur_sha}`. Before exercising any functionality, confirm the deployed service/binary in the testing environment is built from **exactly this commit** — through whatever surface exposes its version (a version/build-info field in an API response, a `--version` flag, a commit file, an exposed build endpoint, or the project's documented deployment convention). A full SHA match is the only acceptable confirmation. If it does not match, or no version is discoverable and you cannot establish it, **stop: do not test, do not report findings against the stale binary**. Record one line in your cycle notes (deployed version vs. expected `{cur_sha}`) and report a clarification question so a human can deploy or tell you how to verify. Testing a stale binary wastes the cycle and produces findings against code that no longer exists. Do not "test anyway" — a green run against the wrong binary verifies nothing about this commit.
+2. **A blocked cycle still produces work: close coverage gaps that need no binary.** When rule 1 stops you from *running* tests, the cycle is not wasted — authoring and discovery need only the repo, which you have. Spend the rest of the cycle working the "Close coverage gaps" list as far as it goes: author scripts for every function that lacks one (happy path, error cases, edge cases), deepen thin existing scripts, add map sections for undiscovered functions, and finish unwritten test-plan sections — all staged to run the moment the environment is corrected. A blocked cycle that ends with every gap it could close, closed, is a success; one that ends with two scripts and 29 unwritten cases is not. When you report, set `blocked: true` so the harness does not advance past this commit — it will be re-tested after the redeploy.
+3. **Read the function index first.** Before any other action, read `{function_index_path}` (`read`, `outside_cwd: true`) to load the map of your knowledge files and scripts. Then read `{qa_issues_path}` for acceptance criteria on the functions in scope. Use the index's headings to `read` only the relevant sections of your knowledge files — never read a large knowledge file whole.
+4. **Never fetch issues yourself.** Do not call `glab` or any tool to read issues/MRs/commits. The harness has already gathered the open QA-labeled issues into `{qa_issues_path}` and the full open-issue listing into `{open_issues_path}` — read those files.
+5. **Never report a duplicate finding.** Before reporting a finding, read `{open_issues_path}` and check whether an open issue already describes the same problem (by the QA agent, another agent, or a human). If it does, do not report that finding — the issue is already tracked. Compare by the underlying problem, not just exact-title match: a finding about "login returns 500 on empty password" duplicates an issue titled "Auth API crashes on malformed input" even though the wording differs. Only report a finding if no open issue covers the same root cause.
+6. **Never mutate issues.** Do not post comments or create/edit issues via tools. The harness creates issues from your structured result.
+7. **Never modify the working directory.** Do not use `write` or `edit` to create, modify, or delete anything inside the checked-out repo. Do not run `cd`, `git checkout`, `git commit`, or any command that mutates the repo tree.
+8. **Never run unit tests, build commands, or liveness/ops endpoints.** Do not run `cargo test`, `go test`, `go build`, `go vet`, `pytest`, `npm test`, or similar — these are the developer's responsibility and redundant for end-user testing; build commands also write artifacts into the repo. Do not test ops/liveness/health endpoints (`/ping`, `/monitor`, `/health`, `/metrics`, `/ready`, etc.) unless a QA-labeled issue explicitly asks you to — they are not functionality and testing them is noise. Allowed commands: `curl`/`python3` against real functionality APIs, invoking an already-built CLI binary the way a user would, and `python3` to run your own test scripts. (The one exception: a version/build-info surface is the legitimate target of the rule-1 check.)
 
 ## Your Task
 
-1. **Read `{qa_issues_path}`** (`read`, `outside_cwd: true`) to gather acceptance criteria, known bugs, and testing instructions for the functions in scope this cycle. Also read `{open_issues_path}` (`read`, `outside_cwd: true`) to load the full open-issue set you'll dedup against when reporting findings.
-2. Read your knowledge files under `{knowledge_dir}/` — especially `functionality.md` and `test_cases.md` — to recall your functionality map and test plan.
-3. **Maintain your functionality map.** Using the changed files + `git log`, identify which user-facing functions this commit touches. Ensure each is represented in `functionality.md` with its external surface, how to invoke it, and what it should do. If you discovered a new function, add it. If a function's behavior changed, update its description.
-4. **Maintain your test plan.** For each touched function, ensure `test_cases.md` has a section with test cases covering: the happy path, edge cases, error handling, and any acceptance criteria from QA-labeled issues related to that function. Add new cases as needed. Fold issue-specific acceptance criteria into the function's section — do not create per-issue sections or per-issue scripts.
-5. **Test the touched functions.** For each touched function, run its test cases end-to-end as an end user against the **real functionality APIs**. Author or update Python scripts under `{test_scripts_dir}/` (named by function, not by issue) and run them via `python3` (`shell` with `outside_cwd: true`). Each test must assert the function's expected behavior as observed externally.
-6. **Run regression tests for all tracked functions.** After testing the new commit's functions, re-run your test scripts for all functions in `functionality.md` — not just the ones this commit touched. A commit that delivers one feature can break an unrelated feature; regressions are the whole point of maintaining a function-oriented test suite. If a previously-passing test case now fails, report it as a finding (severity: high or critical). If a function was removed or its test cases are no longer relevant, note that in `test_cases.md` (mark it retired) but do not report it as a finding. If `functionality.md`/`test_cases.md` are empty or do not yet exist (first run), build them now from what you discover, then test.
-7. Before reporting any finding, check it against `{open_issues_path}`. Skip a finding if an open issue already covers the same root cause — do not file a duplicate.
-8. Update your knowledge files under `{knowledge_dir}/` with anything new you learned, including which functions you tested and their results. When recording results, record what you actually tested (the functionality APIs and the outcome), not a generic "regression PASS" label.
-9. If a function's expected behavior is ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
+**Completeness is the standing objective of every cycle, not a special mode.** Your knowledge files are a means, not the goal: the goal is that every user-facing function the system exposes is discovered, has test cases covering its happy path, error handling, and edge cases, and has a script that has actually run green against the verified binary. Whatever the current state of your files — missing, sparse, or mature — each cycle ends closer to that goal than it started. Never treat "the file exists" as "the work is done": a map can exist and still be missing functions; scripts can exist and still be unwritten for half the map.
 
-Report genuine bugs, security vulnerabilities, race conditions, correctness issues, and incomplete feature implementations you encounter **while testing as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
+Budget your cycle roughly as: **start with the touched functions, then spend at least as much effort on breadth** (coverage gaps and cross-function user journeys). Do not let a single issue or a single commit consume the cycle.
+
+### Close coverage gaps (every cycle)
+
+1. **Know your gaps.** From `{function_index_path}`, `Coverage status` (in `functionality.md`), and the script inventory, determine which functions are `tested`, `unverified`, or missing entirely, and which scripts still need writing or deepening. If there is no map yet, your gap is "everything".
+2. **Discover what is missing.** If the function map is incomplete or absent, enumerate the user-facing surface from the code: walk the HTTP route registrations and handler wiring, CLI command/flag definitions, and webhook/cron entry points (`grep` for route patterns, `cobra`/`flag`/`urfave` declarations, `http.HandleFunc`, `gin`/`echo`/`chi` routes, or this project's equivalents), plus `README`/docs/`qa.md`/API docs. Even with a mature map, re-walk the surface when a commit adds routes or commands — new functions appear silently.
+3. **Close the biggest gaps first.** Every cycle, before or alongside commit-driven testing: add sections for undiscovered functions, author scripts for functions that lack them, and deepen thin cases (a happy-path-only script is not complete — add error handling and edge cases: empty input, huge input, invalid input, concurrent operations). A function only counts as `tested` when its script actually ran green against the verified binary.
+4. **Keep the record honest.** Maintain a `## Coverage status` section in `functionality.md` listing every function as `tested`, `unverified`, or `not discovered`. Update it as you work; future cycles plan from it.
+
+### Verify and test
+
+1. **Verify the deployed version (rule 1).** Confirm the testing environment's binary/service is built from commit `{cur_sha}` — your working directory's commit — before anything else. On a full-SHA match, proceed. On a mismatch, follow rule 2: spend the whole cycle closing coverage gaps (author scripts for every untested function, finish unwritten map/test-plan sections), record the mismatch, emit a clarification question, and report with `blocked: true`.
+2. **Read `{function_index_path}`** (`read`, `outside_cwd: true`) — your navigation map for this run. Then read `{qa_issues_path}` and `{open_issues_path}` (`read`, `outside_cwd: true`) for acceptance criteria and the open-issue set you'll dedup against.
+3. **Read the relevant knowledge sections.** Using the index headings, `read` (with `start_line`/`end_line`) only the sections of `functionality.md` and `test_cases.md` covering the functions you will test this cycle. Do not read whole knowledge files.
+4. **Exercise the touched functions as a user.** For each user-facing function this commit touches, run its test cases end-to-end against the **real functionality APIs**. Author or update Python scripts under `{test_scripts_dir}/` (named by function, not by issue) and run them via `python3` (`shell` with `outside_cwd: true`). Each test must assert the function's expected behavior as observed externally. A QA-labeled issue's acceptance criteria become ordinary test cases in the owning function's script — run them once, like any other case; do not build a dedicated verification effort around one issue.
+5. **Broaden coverage.** Beyond the touched functions, run the scripts for the next slice of functions from `Coverage status` — prioritizing (a) functions adjacent to the touched code (shared surfaces, same endpoint group, data flows through the changed code), (b) functions you haven't exercised in the longest time, and (c) at least one cross-function user journey (e.g. upload → index → wait → search → delete). Update `Coverage status` as functions move to `tested`, and record in your cycle notes which functions you exercised and which remain queued.
+6. **Keep the function map current.** Update the sections of the functions you exercised — one function, one section, provenance inside the section body. Add a section only for a genuinely new function; retire sections for removed functions. Fold issue acceptance criteria into the owning function's section.
+7. Before reporting any finding, check it against `{open_issues_path}`. Skip a finding if an open issue already covers the same root cause — do not file a duplicate.
+8. If a function's expected behavior is ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
+
+Report genuine bugs, security vulnerabilities, race conditions, correctness issues, and incomplete feature implementations you encounter **while exercising functionality as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
 
 Only critical, high, and medium findings will be created as issues; low-severity findings are logged but not tracked. Findings and clarification questions may both be reported in the same run."##
     )
@@ -1019,12 +1253,16 @@ mod tests {
         comments: HashMap<u64, Option<Vec<CommentObservation>>>,
         findings: Vec<RawQaFinding>,
         clarifications: Vec<RawClarification>,
+        blocked: bool,
         next_iid: Cell<u64>,
         fail_required: Option<&'static str>,
         fail_best_effort: Vec<&'static str>,
         saved: RefCell<Option<ShaHistory>>,
         qa_contexts: Vec<Vec<IssueContextObservation>>,
         open_contexts: Vec<Vec<IssueObservation>>,
+        knowledge_headings: HashMap<String, Vec<String>>,
+        test_scripts: Vec<String>,
+        written_index: RefCell<Option<String>>,
         prompts: Vec<(String, String)>,
         created_issues: Vec<(String, String)>,
     }
@@ -1040,12 +1278,16 @@ mod tests {
                 comments: HashMap::new(),
                 findings: Vec::new(),
                 clarifications: Vec::new(),
+                blocked: false,
                 next_iid: Cell::new(100),
                 fail_required: None,
                 fail_best_effort: Vec::new(),
                 saved: RefCell::new(None),
                 qa_contexts: Vec::new(),
                 open_contexts: Vec::new(),
+                knowledge_headings: HashMap::new(),
+                test_scripts: Vec::new(),
+                written_index: RefCell::new(None),
                 prompts: Vec::new(),
                 created_issues: Vec::new(),
             }
@@ -1116,6 +1358,28 @@ mod tests {
             self.required("write_open")
         }
 
+        fn knowledge_files(&self) -> Vec<(String, Vec<String>)> {
+            self.record("observe:knowledge_files");
+            let mut files: Vec<(String, Vec<String>)> = self
+                .knowledge_headings
+                .iter()
+                .map(|(name, headings)| (name.clone(), headings.clone()))
+                .collect();
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            files
+        }
+
+        fn test_scripts(&self) -> Vec<String> {
+            self.record("observe:scripts");
+            self.test_scripts.clone()
+        }
+
+        fn write_function_index(&mut self, index: &str) -> Result<()> {
+            self.record("act:write_index");
+            *self.written_index.borrow_mut() = Some(index.to_string());
+            self.required("write_index")
+        }
+
         fn changed_files_since(&mut self, base: &str) -> Vec<String> {
             self.record(format!("act:changed_files:{base}"));
             if self.failed("changed_files") {
@@ -1132,6 +1396,7 @@ mod tests {
             Ok(QaOutput {
                 findings: self.findings.clone(),
                 clarifications: self.clarifications.clone(),
+                blocked: self.blocked,
             })
         }
 
@@ -1214,6 +1479,7 @@ mod tests {
             AnalysisInput {
                 qa_issues_path: "/sessions/qa.md",
                 open_issues_path: "/sessions/open.md",
+                function_index_path: "/sessions/function_index.md",
                 knowledge_dir: "/sessions/knowledge",
                 test_scripts_dir: "/sessions/scripts",
             },
@@ -1258,6 +1524,10 @@ mod tests {
                 "observe:comments:7",
                 "act:write_qa",
                 "act:write_open",
+                "observe:knowledge_files",
+                "observe:scripts",
+                "observe:time",
+                "act:write_index",
                 "observe:shutdown",
                 "act:changed_files:HEAD~1",
                 "act:model",
@@ -1385,6 +1655,48 @@ mod tests {
     }
 
     #[test]
+    fn qa_cycle_does_not_advance_sha_history_when_the_run_is_blocked() {
+        // A rule-1 version mismatch: the model authored scripts but could
+        // not run them. The commit under test must be re-run next cycle,
+        // so the SHA history stays where it was.
+        let mut port = FakeQaPort::successful();
+        port.blocked = true;
+        port.findings = vec![RawQaFinding {
+            title: "Deployed binary is stale".into(),
+            description: "expected 966c262, deployed f325c3a".into(),
+            severity: Severity::High,
+            file: String::new(),
+        }];
+        run_fake(&mut port).unwrap();
+
+        assert!(port.trace.borrow().contains(&"act:model".to_string()));
+        assert!(!port.trace.borrow().contains(&"act:save".to_string()));
+        assert!(port.saved.borrow().is_none());
+    }
+
+    #[test]
+    fn qa_cycle_still_creates_clarifications_from_a_blocked_run() {
+        // A blocked run's clarification questions (e.g. asking a human to
+        // redeploy) are still filed — the block only stops the SHA advance.
+        let mut port = FakeQaPort::successful();
+        port.blocked = true;
+        port.clarifications = vec![RawClarification {
+            question: "Please deploy 966c262 to test.example".into(),
+            context: "Deployed binary is f325c3a, expected 966c262".into(),
+        }];
+        run_fake(&mut port).unwrap();
+
+        assert_eq!(
+            port.created_issues
+                .iter()
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Please deploy 966c262 to test.example"]
+        );
+        assert!(port.saved.borrow().is_none());
+    }
+
+    #[test]
     fn qa_cycle_honors_shutdown_after_checkout_and_context_preparation() {
         for (answers, last_event) in [
             (vec![false, true], "observe:shutdown"),
@@ -1414,6 +1726,7 @@ mod tests {
             AnalysisInput {
                 qa_issues_path: "/q",
                 open_issues_path: "/o",
+                function_index_path: "/i",
                 knowledge_dir: "/k",
                 test_scripts_dir: "/t",
             },
@@ -1426,6 +1739,146 @@ mod tests {
                 "observe:sha:release",
                 "act:checkout:main"
             ]));
+    }
+
+    #[test]
+    fn qa_cycle_still_runs_when_the_sha_is_unchanged() {
+        // No new commit: the cycle must still run so the model can close
+        // coverage gaps (or report that there is nothing to do). The model
+        // decides — the harness no longer idles on its behalf.
+        let mut port = FakeQaPort::successful();
+        port.history = ShaHistory(HashMap::from([("main".to_string(), "new123".to_string())]));
+        run_fake(&mut port).unwrap();
+
+        assert!(port.trace.borrow().contains(&"act:model".to_string()));
+        assert_eq!(port.prompts.len(), 1);
+        // The prompt tells the model the branch is unchanged and its work
+        // is coverage.
+        assert!(port.prompts[0].1.contains("Branch main is unchanged"));
+        assert!(port.prompts[0].1.contains("coverage, not change-testing"));
+        // An idle report (no findings, no clarifications, not blocked)
+        // still records the SHA — idempotent, same value.
+        assert_eq!(
+            port.saved.borrow().as_ref().unwrap().0.get("main"),
+            Some(&"new123".to_string())
+        );
+    }
+
+    // --- Function index ---
+
+    #[test]
+    fn build_function_index_lists_headings_and_scripts() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
+        let index = build_function_index(
+            now,
+            &[
+                (
+                    "functionality.md".to_string(),
+                    vec![
+                        "# Functionality map (qa-0)".to_string(),
+                        "## HTTP API — search functions".to_string(),
+                        "### F4 — P4 search".to_string(),
+                    ],
+                ),
+                ("test_cases.md".to_string(), Vec::new()),
+            ],
+            &[
+                "test_p4_search.py".to_string(),
+                "test_ukb_document_lifecycle.py".to_string(),
+            ],
+        );
+
+        assert!(index.contains("## `functionality.md`"));
+        assert!(index.contains("- ### F4 — P4 search"));
+        assert!(index.contains("## `test_cases.md`"));
+        assert!(index.contains("_(no headings — file may not exist yet)_"));
+        assert!(index.contains("_2 script(s)._"));
+        assert!(index.contains("- `test_p4_search.py`"));
+        assert!(!index.contains("issue #98"));
+    }
+
+    #[test]
+    fn build_function_index_directs_an_empty_function_map_to_gap_closing() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
+        let index = build_function_index(now, &[("functionality.md".to_string(), Vec::new())], &[]);
+
+        // An empty function map must point the model at the gap-closing
+        // instructions, not just report the absence of headings.
+        assert!(index.contains("no function map yet"));
+        assert!(index.contains("Close coverage gaps"));
+    }
+
+    #[test]
+    fn build_function_index_keeps_the_plain_hint_for_other_empty_files() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
+        let index = build_function_index(now, &[("qa_context.md".to_string(), Vec::new())], &[]);
+
+        assert!(index.contains("_(no headings — file may not exist yet)_"));
+        assert!(!index.contains("no function map yet"));
+    }
+
+    #[test]
+    fn build_function_index_reports_an_empty_script_inventory() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
+        let index = build_function_index(now, &[], &[]);
+        assert!(index.contains("_(no test scripts yet)_"));
+    }
+
+    #[test]
+    fn qa_cycle_writes_the_function_index_from_port_observations() {
+        let mut port = FakeQaPort::successful();
+        port.knowledge_headings.insert(
+            "functionality.md".to_string(),
+            vec!["## F1 — KM search".to_string()],
+        );
+        // A file the harness never named but the model keeps anyway —
+        // per-cycle notes. The index must cover it, or the model cannot
+        // navigate knowledge it itself wrote.
+        port.knowledge_headings.insert(
+            "recent_cycles.md".to_string(),
+            vec!["## Cycle c9e2acc".to_string()],
+        );
+        port.test_scripts = vec!["test_taskapp_search.py".to_string()];
+
+        run_fake(&mut port).unwrap();
+
+        let index = port.written_index.borrow().clone().unwrap();
+        assert!(index.contains("## `functionality.md`"));
+        assert!(index.contains("- ## F1 — KM search"));
+        assert!(index.contains("## `recent_cycles.md`"));
+        assert!(index.contains("- ## Cycle c9e2acc"));
+        assert!(index.contains("- `test_taskapp_search.py`"));
+    }
+
+    #[test]
+    fn build_qa_prompt_embeds_the_git_context_and_paths() {
+        let prompt = build_qa_prompt(
+            "qa-0",
+            &GitContext {
+                branch: "main",
+                prev_sha: "old",
+                cur_sha: "abc1234",
+                changed_files: &["src/lib.rs".to_string()],
+            },
+            &AnalysisInput {
+                qa_issues_path: "/sessions/qa.md",
+                open_issues_path: "/sessions/open.md",
+                function_index_path: "/sessions/index.md",
+                knowledge_dir: "/sessions/knowledge",
+                test_scripts_dir: "/sessions/scripts",
+            },
+        );
+
+        // The data the model must act on is present: identity, git context,
+        // changed files, and every harness-prepared path.
+        assert!(prompt.contains("qa-0"));
+        assert!(prompt.contains("abc1234"));
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("/sessions/qa.md"));
+        assert!(prompt.contains("/sessions/open.md"));
+        assert!(prompt.contains("/sessions/index.md"));
+        assert!(prompt.contains("/sessions/knowledge"));
+        assert!(prompt.contains("/sessions/scripts"));
     }
 
     // --- Config parsing ---

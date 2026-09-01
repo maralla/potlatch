@@ -96,17 +96,44 @@ pub fn resolve_read_path(path: &str, cwd: &str) -> Result<PathBuf, String> {
     Ok(resolved.canonicalize().unwrap_or(resolved))
 }
 
+/// Extra directories the `write` and `edit` tools may touch outside the
+/// working directory (via `outside_cwd: true`). Supplied per ACP session
+/// from its `write_roots` parameter; empty preserves the historical
+/// blanket-bypass behavior for sessions that predate the parameter.
+#[derive(Debug, Clone, Default)]
+pub struct WriteRoots(Vec<PathBuf>);
+
+impl WriteRoots {
+    pub fn from_paths(roots: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
+        Self(roots.into_iter().map(Into::into).collect())
+    }
+
+    /// Whether `path` (already resolved to an absolute path) falls inside the
+    /// working directory `cwd` or one of the configured roots. Empty roots
+    /// are permissive: the historical behavior allowed any absolute path.
+    fn permits(&self, path: &Path, cwd: &Path) -> bool {
+        self.0.is_empty() || path.starts_with(cwd) || self.0.iter().any(|r| path.starts_with(r))
+    }
+}
+
 /// Resolve a write path, optionally allowing locations outside the workspace.
 ///
 /// When `outside_cwd` is false (the default for all callers), this is exactly
 /// [`resolve_workspace_path`]: absolute paths and `..` escapes are rejected, so
-/// writes stay inside the working directory. When `outside_cwd` is true, the
-/// workspace check is bypassed and absolute paths are accepted — used by agents
-/// (e.g. QA) that manage their own scratch files in a dedicated session
-/// directory outside the checked-out repo. This is no weaker than the `shell`
-/// tool, which can already write anywhere via `bash -c`; the in-workspace guard
-/// in `write` is a footgun guardrail, not a security boundary.
-pub fn resolve_write_path(path: &str, cwd: &str, outside_cwd: bool) -> Result<PathBuf, String> {
+/// writes stay inside the working directory. When `outside_cwd` is true and
+/// `roots` is non-empty, the write must land under the cwd or one of the
+/// configured roots — used by agents (e.g. QA) that manage their own scratch
+/// files in a dedicated session directory outside the checked-out repo. When
+/// `roots` is empty, any absolute path is accepted, preserving the historical
+/// behavior. This is no weaker than the `shell` tool, which can already write
+/// anywhere via `bash -c`; the in-workspace guard in `write` is a footgun
+/// guardrail, not a security boundary.
+pub fn resolve_write_path(
+    path: &str,
+    cwd: &str,
+    outside_cwd: bool,
+    roots: &WriteRoots,
+) -> Result<PathBuf, String> {
     if outside_cwd {
         let p = Path::new(path);
         let resolved = if p.is_absolute() {
@@ -114,7 +141,13 @@ pub fn resolve_write_path(path: &str, cwd: &str, outside_cwd: bool) -> Result<Pa
         } else {
             Path::new(cwd).join(path)
         };
-        Ok(resolved.canonicalize().unwrap_or(resolved))
+        let resolved = resolved.canonicalize().unwrap_or(resolved);
+        if !roots.permits(&resolved, Path::new(cwd)) {
+            return Err(format!(
+                "path '{path}' is outside the session's writable directories. Outside-cwd writes must target the working directory or an agent-managed session directory named by the task."
+            ));
+        }
+        Ok(resolved)
     } else {
         resolve_workspace_path(path, cwd)
     }
@@ -270,6 +303,10 @@ impl ToolRegistry {
     /// subagents default to the parent's model.
     /// `session_id` groups subagent transcripts under the parent session.
     ///
+    /// `write_roots` limits where `write`/`edit` may touch outside the cwd
+    /// (via `outside_cwd: true`); empty keeps the historical permissive
+    /// behavior.
+    ///
     /// `allowed_tools` filters which tools are registered: `None` registers
     /// all; `Some(names)` registers only tools whose name is in the list.
     pub fn with_builtin_tools(
@@ -277,6 +314,7 @@ impl ToolRegistry {
         session_id: &str,
         cwd: &str,
         model: &str,
+        write_roots: &WriteRoots,
         allowed_tools: Option<&[String]>,
     ) -> Self {
         let mut reg = Self::new();
@@ -293,10 +331,10 @@ impl ToolRegistry {
             reg.register(Arc::new(read::ReadTool));
         }
         if allowed("edit") {
-            reg.register(Arc::new(edit::EditTool));
+            reg.register(Arc::new(edit::EditTool::new(write_roots.clone())));
         }
         if allowed("write") {
-            reg.register(Arc::new(write::WriteTool));
+            reg.register(Arc::new(write::WriteTool::new(write_roots.clone())));
         }
         if allowed("grep") {
             reg.register(Arc::new(search::GrepTool));
