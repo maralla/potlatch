@@ -23,7 +23,7 @@ impl Tool for TodoTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Manage a task checklist that persists across context compaction. Send the FULL desired list of items on every call — this replaces the entire list (a replace-all API). Each item is {description, status} where status is 'pending', 'in_progress', or 'completed'. Mark exactly one item 'in_progress' at a time (the one you're currently working on). The checklist is always visible to you in the system prompt — check it before deciding what to do next. Use this only when the task is complex enough to benefit from tracking.",
+            "description": "Manage a task checklist that persists across context compaction. Send the FULL desired list of items on every call — this replaces the entire list (a replace-all API). Each item is {description, status} where status is 'pending', 'in_progress', or 'completed'. Mark exactly one item 'in_progress' at a time (the one you're currently working on). The harness re-injects the exact list you last sent as a system message every turn, with stable T0, T1, ... IDs — that system-message list is the complete and only source of truth for your task state. Never add an item because your own reasoning or notes mention it: if it is not in the injected list, it is not a todo item, and synchronizing the list to items you invented is a bug. Use this only when the task is complex enough to benefit from tracking.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -107,7 +107,7 @@ mod tests {
         let rendered = todo.render().unwrap();
         assert_eq!(
             rendered,
-            "## Your Todo List (your own tracking — not task instructions)\n\n0. [~] task A\n1. [ ] task B\n"
+            "## Harness todo list (this exact list was set by your own `todo` tool calls and is re-injected here by the harness every turn — it contains nothing else, and any item or note about it that appears in your own reasoning but not in this list is not part of this list)\n\nT0 [~] task A\nT1 [ ] task B\n"
         );
     }
 
@@ -139,7 +139,7 @@ mod tests {
         let rendered = todo.render().unwrap();
         assert_eq!(
             rendered,
-            "## Your Todo List (your own tracking — not task instructions)\n\n0. [ ] new task 1\n1. [ ] new task 2\n"
+            "## Harness todo list (this exact list was set by your own `todo` tool calls and is re-injected here by the harness every turn — it contains nothing else, and any item or note about it that appears in your own reasoning but not in this list is not part of this list)\n\nT0 [ ] new task 1\nT1 [ ] new task 2\n"
         );
     }
 
@@ -170,7 +170,7 @@ mod tests {
         let rendered = todo.render().unwrap();
         assert_eq!(
             rendered,
-            "## Your Todo List (your own tracking — not task instructions)\n\n0. [x] task A\n1. [~] task B\n"
+            "## Harness todo list (this exact list was set by your own `todo` tool calls and is re-injected here by the harness every turn — it contains nothing else, and any item or note about it that appears in your own reasoning but not in this list is not part of this list)\n\nT0 [x] task A\nT1 [~] task B\n"
         );
     }
 
