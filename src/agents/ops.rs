@@ -591,6 +591,7 @@ fn run_ops_cycle(
         return Ok(());
     }
 
+    let work = crate::ui::WorkTimer::start();
     port.write_scrape_file(clock.unix_ts, &window_log)?;
     port.prune_scrape_files()?;
     let mut history = port.issue_history()?;
@@ -640,6 +641,10 @@ fn run_ops_cycle(
         port.save_history(&history)?;
         info!("{agent_id}: Created {created} new GitLab issue(s) from log analysis");
     }
+    info!(
+        "{agent_id}: Log analysis done (analyzed for {})",
+        crate::ui::format_work_duration(work.elapsed_seconds())
+    );
     Ok(())
 }
 

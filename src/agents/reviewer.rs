@@ -762,6 +762,7 @@ fn review_claimed_merge_request(
     merge_when_approved: bool,
     port: &mut dyn ReviewerPort,
 ) -> Result<ReviewOutcome> {
+    let work = crate::ui::WorkTimer::start();
     let mut subject = ReviewSubject {
         mr: mr.clone(),
         issue_iid: linked_issue_iid(mr),
@@ -841,7 +842,11 @@ fn review_claimed_merge_request(
     }
 
     let decision = port.invoke_review_model(&subject)?;
-    info!("{agent_id}: Reviewer agent finished MR !{}", mr.iid);
+    info!(
+        "{agent_id}: Reviewer agent finished MR !{} (reviewed for {})",
+        mr.iid,
+        crate::ui::format_work_duration(work.elapsed_seconds())
+    );
     // The model inspects the merged source worktree; restore the target before
     // posting feedback, approving, or attempting the server-side merge.
     port.checkout_branch(&mr.target_branch)?;
