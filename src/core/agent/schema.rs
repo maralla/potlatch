@@ -493,7 +493,15 @@ fn validate_one_of(one_of: &OneOfSchema, value: &Value, path: &str) -> Result<()
     let Some(tag) = value.get(&one_of.discriminator).filter(|v| !v.is_null()) else {
         return Err(SchemaError::new(
             &tag_path,
-            format!("required discriminator is missing; expected one of [{tags}]"),
+            format!(
+                "required discriminator is missing; expected one of [{tags}]. \
+                 The arguments received carried only these top-level keys: [{}] — \
+                 the `{}` field itself was not transmitted. Re-emit the call with \
+                 `{}` set alongside the keys you already sent.",
+                received_keys(value),
+                one_of.discriminator,
+                one_of.discriminator
+            ),
         ));
     };
     let Some(tag) = tag.as_str() else {
@@ -514,6 +522,19 @@ fn validate_one_of(one_of: &OneOfSchema, value: &Value, path: &str) -> Result<()
         path,
         Some(one_of.discriminator.as_str()),
     )
+}
+
+/// The top-level keys an arguments object actually carried, quoted and
+/// comma-joined for an error message. Sorted so the message is stable across
+/// calls (and testable); empty for a non-object, which the caller has
+/// already rejected.
+fn received_keys(value: &Value) -> String {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    quoted_list(keys.into_iter())
 }
 
 fn validate_object(
@@ -1247,6 +1268,52 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "$.decision: expected one of [\"approve\", \"request_changes\"], got \"maybe\""
+        );
+    }
+
+    #[test]
+    fn missing_discriminator_names_the_keys_that_were_received() {
+        // A provider that drops all but one parameter in a tool call leaves
+        // the discriminator absent while a branch's real fields arrive. The
+        // message must say which keys made it through, so one repair turn
+        // reveals "only one parameter is being transmitted" — seen in the
+        // wild as 55 review calls where every emission carried exactly one
+        // key and the model never learned that from "discriminator missing".
+        let schema = sample_union();
+        let error = validate(&schema, &json!({"feedback": "fix it"})).unwrap_err();
+        assert_eq!(error.path, "$.decision");
+        let message = error.message;
+        assert!(
+            message.contains("carried only these top-level keys: [\"feedback\"]"),
+            "{message}"
+        );
+        assert!(
+            message.contains("the `decision` field itself was not transmitted"),
+            "{message}"
+        );
+
+        // Multiple received keys are listed sorted and joined.
+        let error = validate(
+            &schema,
+            &json!({"public_comment": "note", "feedback": "fix it"}),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("carried only these top-level keys: [\"feedback\", \"public_comment\"]"),
+            "{}",
+            error.message
+        );
+
+        // An empty object reports an empty key list.
+        let error = validate(&schema, &json!({})).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("carried only these top-level keys: []"),
+            "{}",
+            error.message
         );
     }
 

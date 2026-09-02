@@ -63,13 +63,54 @@ impl Tool for StructuredOutputTool {
                 "decoded JSON-string container arguments using the registered schema"
             );
         }
+        // An argumentless call is a transport failure, not a schema violation:
+        // the call reached the tool but its arguments were never transmitted.
+        // Seen in the wild as a model emitting a named tool call with empty
+        // `function.arguments` nine times in a row — every repair retry also
+        // arrived empty, and the orchestrator's schema validation then
+        // reported a missing discriminator, sending the model chasing JSON
+        // shape problems that were never the issue. Rejecting here surfaces
+        // the real failure in the tool result channel, where the model can
+        // see it on the very next turn.
+        if args.is_null() {
+            anyhow::bail!(
+                "{} tool call arrived with NO arguments (null) — the call reached the tool \
+                 but no arguments were transmitted. This is a tool-call transport problem, \
+                 not a JSON shape problem: re-emit the call with the full arguments object.",
+                self.name
+            );
+        }
         if !args.is_object() {
-            anyhow::bail!("{} arguments must be a JSON object", self.name);
+            anyhow::bail!(
+                "{} arguments must be a JSON object; received: {}",
+                self.name,
+                truncate_for_error(&args)
+            );
+        }
+        if args.as_object().is_some_and(|object| object.is_empty()) {
+            anyhow::bail!(
+                "{} tool call arrived with EMPTY arguments ({{}}) — the call reached the \
+                 tool but no arguments were transmitted. This is a tool-call transport \
+                 problem, not a JSON shape problem: re-emit the call with the full \
+                 arguments object.",
+                self.name
+            );
         }
         // Store in the side-channel cell (last call wins).
         *self.cell.lock().unwrap() = Some(args);
         Ok(format!("{} recorded.", self.name))
     }
+}
+
+/// Render a received value for an error message, bounded so a huge or
+/// deeply-nested argument can't flood the tool result.
+fn truncate_for_error(value: &Value) -> String {
+    let text = value.to_string();
+    const MAX: usize = 400;
+    if text.len() <= MAX {
+        return text;
+    }
+    format!("{}… ({} bytes total)", &text[..MAX], text.len())
 }
 
 /// Some tool-call dialects serialize nested arrays and objects as JSON strings
@@ -175,6 +216,49 @@ mod tests {
         assert_eq!(result, "handoff recorded.");
         let captured = cell.lock().unwrap().clone();
         assert_eq!(captured, Some(json!({"mr_title": "Add tests"})));
+    }
+
+    #[test]
+    fn rejects_null_arguments_as_a_transport_failure() {
+        let (tool, cell) = StructuredOutputTool::new(
+            "review".into(),
+            "Emit the review decision.",
+            json!({"type": "object"}),
+        );
+        let result = tool.execute(&Value::Null, "/tmp");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("arrived with NO arguments"), "{error}");
+        assert!(error.contains("transport"), "{error}");
+        // Nothing was recorded: a null capture must not shadow a prior value.
+        assert!(cell.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_empty_object_arguments_as_a_transport_failure() {
+        let (tool, cell) = StructuredOutputTool::new(
+            "review".into(),
+            "Emit the review decision.",
+            json!({"type": "object"}),
+        );
+        let result = tool.execute(&json!({}), "/tmp");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("EMPTY arguments"), "{error}");
+        assert!(error.contains("transport"), "{error}");
+        // Nothing was recorded: the empty capture is rejected, not stored.
+        assert!(cell.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_non_object_arguments_with_the_received_value() {
+        let (tool, _cell) = StructuredOutputTool::new(
+            "review".into(),
+            "Emit the review decision.",
+            json!({"type": "object"}),
+        );
+        let result = tool.execute(&json!([1, 2, 3]), "/tmp");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("must be a JSON object"), "{error}");
+        assert!(error.contains("received"), "{error}");
     }
 
     #[test]
