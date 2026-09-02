@@ -228,6 +228,12 @@ enum CaptureError {
     /// The expected tool was not called. `called` lists the structured-output
     /// tools that *were* called, if any.
     MissingToolCall { called: Vec<String> },
+    /// The tool was called but no arguments were transmitted: the capture is
+    /// an empty object. A transport-level failure — the model emitted a named
+    /// call whose `function.arguments` never arrived — distinct from a schema
+    /// violation, and the repair advice differs: restructuring JSON cannot
+    /// fix an empty transmission.
+    EmptyArguments,
     /// The tool was called with arguments the contract rejects.
     Invalid(OutputError),
 }
@@ -248,6 +254,13 @@ impl CaptureError {
                     .map(|name| format!("`{name}`"))
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            CaptureError::EmptyArguments => format!(
+                "your `{tool}` tool call arrived with EMPTY arguments ({{}}) — the call was \
+                 received but no arguments were transmitted. This is a tool-call transmission \
+                 problem, not a JSON shape problem: changing the structure of your arguments \
+                 cannot fix it. Re-emit the complete `{tool}` call with the full arguments \
+                 object, as native structured arguments in the tool call itself"
             ),
             CaptureError::Invalid(error) => {
                 format!("your `{tool}` arguments were rejected — {error}")
@@ -272,6 +285,12 @@ fn capture_structured_output<T: StructuredOutput>(
                 .unwrap_or_default(),
         });
     };
+    // A named call that captured as an empty object transmitted no arguments
+    // at all: report it as the transport failure it is, so the repair prompt
+    // does not send the model restructuring JSON that was never the problem.
+    if value.as_object().is_some_and(|object| object.is_empty()) {
+        return Err(CaptureError::EmptyArguments);
+    }
     T::decode(value.clone()).map_err(CaptureError::Invalid)
 }
 
@@ -516,6 +535,32 @@ acp_command = ["agent", "acp"]"#
             }
         );
         assert_eq!(prompts.len(), 1);
+    }
+
+    #[test]
+    fn empty_arguments_are_reported_as_a_transport_failure_not_a_schema_problem() {
+        // A named tool call whose arguments never arrived captures as an
+        // empty object. The repair prompt must say the transmission was
+        // empty — restructuring JSON cannot fix an empty transmission, and
+        // telling the model the discriminator was missing sent it chasing
+        // schema problems for ten repairs in the wild.
+        let (result, prompts) = resolve_with_script(
+            handoff_with_tool("sample_tool", json!({})),
+            vec![handoff_with_tool(
+                "sample_tool",
+                json!({"decision": "approve"}),
+            )],
+        );
+        assert!(result.is_ok());
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0];
+        assert!(prompt.contains("EMPTY arguments"), "{prompt}");
+        assert!(prompt.contains("transmission"), "{prompt}");
+        assert!(prompt.contains("not a JSON shape problem"), "{prompt}");
+        assert!(
+            !prompt.contains("required discriminator is missing"),
+            "the repair prompt must not misreport a transport failure as a schema violation: {prompt}"
+        );
     }
 
     #[test]
