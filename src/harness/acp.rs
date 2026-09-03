@@ -196,6 +196,17 @@ impl AcpServer {
         let cwd = params["cwd"].as_str().unwrap_or(".").to_string();
         info!("harness ACP: creating session with cwd={cwd}");
 
+        // Guarantee: a session/new on this connection replaces any session
+        // that is still registered. The orchestrator closes the previous
+        // task's session best-effort before rotating; when that close fails
+        // (transport blip — the runtime logs and continues), the old session
+        // would otherwise stay in `sessions` forever with its full agent
+        // context and job table: nothing else ever evicts it, and the child
+        // process outlives thousands of tasks. Running the close path here
+        // bounds the leak to one stale session, reclaimed by the very
+        // `session/new` that follows the failed close.
+        self.close_all_registered_sessions("superseded by session/new");
+
         let mut session = Session::new(cwd.clone());
         // Optional `tools` extension: an allow-list of tool names. When
         // present, only those tools are registered for this session.
@@ -528,13 +539,34 @@ impl AcpServer {
 
     fn handle_session_close(&mut self, params: &Value) -> Result<Value> {
         let session_id = params["sessionId"].as_str().unwrap_or("");
+        self.close_registered_session(session_id);
+        Ok(json!(null))
+    }
+
+    /// Close one registered session by id: shut down its states (kills
+    /// background jobs, stops language servers) and drop it from the shared
+    /// channels map. Unknown ids are a no-op — `session/close` for a session
+    /// this child never knew (or already closed) must not fail the caller's
+    /// rotation.
+    fn close_registered_session(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
             session.states.shutdown();
-            // Also remove from the shared channels map.
             self.shared_channels.lock().unwrap().remove(session_id);
             debug!("harness ACP: closed session {session_id}");
         }
-        Ok(json!(null))
+    }
+
+    /// Close every registered session. Called from `session/new` so a failed
+    /// best-effort close on the previous task's session cannot leave it
+    /// registered forever; at most the sessions created since the last
+    /// successful rotation are still present, and they are all stale by
+    /// definition of being replaced.
+    fn close_all_registered_sessions(&mut self, reason: &str) {
+        let stale: Vec<String> = self.sessions.keys().cloned().collect();
+        for session_id in stale {
+            debug!("harness ACP: closing session {session_id} ({reason})");
+            self.close_registered_session(&session_id);
+        }
     }
 }
 
@@ -779,6 +811,70 @@ mod tests {
             }
             _ => panic!("expected response"),
         }
+    }
+
+    #[test]
+    fn session_new_evicts_sessions_the_caller_failed_to_close() {
+        // The orchestrator closes the previous task's session best-effort
+        // before rotating. When that close never arrives (transport blip),
+        // the old session must not stay registered forever: nothing else
+        // ever evicts it, and this child serves thousands of tasks. The
+        // session/new that follows the failed close reclaims it.
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let mut server = AcpServer::new(llm);
+
+        let new_session = |id: Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "session/new",
+                "params": { "cwd": "/tmp", "mcpServers": [] }
+            })
+        };
+
+        // First session — never closed (simulating the failed close).
+        let (response, _) = collect_output(&mut server, &new_session(json!(1)));
+        let first = match response {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected response"),
+        };
+
+        // Second session/new: must reclaim the first.
+        let (response, _) = collect_output(&mut server, &new_session(json!(2)));
+        let second = match response {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected response"),
+        };
+
+        assert_ne!(first, second);
+        assert!(
+            !server.sessions.contains_key(&first),
+            "the superseded session must be evicted, not leaked"
+        );
+        assert!(server.sessions.contains_key(&second));
+        assert!(
+            server.shared_channels.lock().unwrap().get(&first).is_none(),
+            "the superseded session's channels must be removed too"
+        );
+    }
+
+    #[test]
+    fn session_close_for_unknown_session_is_a_noop() {
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let mut server = AcpServer::new(llm);
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "session/close",
+            "params": { "sessionId": "never-existed" }
+        });
+        let (response, _) = collect_output(&mut server, &msg);
+        assert!(matches!(response, Some(Outbound::Response { .. })));
     }
 
     #[test]

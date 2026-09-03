@@ -14,6 +14,10 @@ use super::Tool;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_OUTPUT: usize = 50_000;
+/// Read chunk size for the capped background-job drain: large enough that a
+/// single `read` call moves a meaningful amount of pipe data, small enough
+/// that the cap is enforced without over-reading past it by much.
+const DRAIN_CHUNK: usize = 8_192;
 
 /// A running background shell job. The child process is kept alive across
 /// tool calls; stdout/stderr are drained into shared buffers by reader threads
@@ -29,6 +33,27 @@ struct Job {
     exit_code: Option<i32>,
     /// Set when the job was killed via `kill`/`kill_all` rather than exiting.
     killed: bool,
+}
+
+/// Read `stream` to EOF into `buf`, storing at most `MAX_OUTPUT` bytes (the
+/// head) and discarding the rest. The stream is still drained to EOF — a
+/// stopped reader would block the child once the pipe filled — but nothing
+/// past the cap is ever stored, so a background job's buffer is bounded by
+/// `MAX_OUTPUT` per stream for its entire lifetime, polled or not.
+/// Runs on a reader thread; publishes under the buffer's mutex per chunk so
+/// a concurrent `poll` sees progress without waiting for EOF.
+fn drain_capped(stream: &mut impl std::io::Read, buf: &Arc<Mutex<Vec<u8>>>) {
+    let mut chunk = [0u8; DRAIN_CHUNK];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let mut buf = buf.lock().unwrap();
+                let room = MAX_OUTPUT.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
+    }
 }
 
 /// Shared table of background jobs, keyed by job id. Held as `Arc<JobTable>`
@@ -77,17 +102,24 @@ impl JobTable {
         let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
+        // Drain each stream into its shared buffer, capped at MAX_OUTPUT
+        // bytes (head kept). The cap is on what the buffer STORES, not what
+        // `poll` returns — an uncapped `read_to_end` on a chatty background
+        // job (a full test suite, a watch loop) grew without limit for the
+        // job's lifetime, which for a never-polled or never-killed job is
+        // the harness process's lifetime; observed as one process ballooning
+        // to ~93 GB of anonymous RSS until the OOM killer took it and its
+        // tmux pane with it. Draining continues past the cap and discards
+        // the overflow, so the child never blocks on a full pipe; the tail
+        // past MAX_OUTPUT is output `poll` already reports as truncated, so
+        // nothing observable is lost.
         let stdout_buf_clone = Arc::clone(&stdout_buf);
         thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            *stdout_buf_clone.lock().unwrap() = buf;
+            drain_capped(&mut stdout, &stdout_buf_clone);
         });
         let stderr_buf_clone = Arc::clone(&stderr_buf);
         thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            *stderr_buf_clone.lock().unwrap() = buf;
+            drain_capped(&mut stderr, &stderr_buf_clone);
         });
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -592,6 +624,72 @@ fn looks_like_file_write(command: &str) -> bool {
 mod tests {
     use super::*;
     use crate::harness::tools::test_util;
+
+    #[test]
+    fn drain_capped_stores_at_most_max_output_bytes() {
+        // A chatty background job must not grow its buffer without limit:
+        // this is the ~93 GB OOM failure mode. The stream is drained to EOF
+        // (a stopped reader would block the child on a full pipe), but only
+        // the first MAX_OUTPUT bytes are ever stored.
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let payload = vec![b'x'; MAX_OUTPUT * 4];
+        let mut cursor = std::io::Cursor::new(payload);
+
+        drain_capped(&mut cursor, &buf);
+
+        let stored = buf.lock().unwrap().clone();
+        assert_eq!(stored.len(), MAX_OUTPUT);
+        assert!(stored.iter().all(|&b| b == b'x'));
+    }
+
+    #[test]
+    fn drain_capped_keeps_short_streams_whole() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut cursor = std::io::Cursor::new(b"short output".to_vec());
+
+        drain_capped(&mut cursor, &buf);
+
+        assert_eq!(buf.lock().unwrap().as_slice(), b"short output");
+    }
+
+    #[test]
+    fn background_job_buffer_is_bounded_by_max_output() {
+        // End to end: spawn a background job that emits far more than
+        // MAX_OUTPUT, poll it after it exits, and assert the stored buffer
+        // stayed at the cap rather than growing with the stream.
+        let jobs = Arc::new(JobTable::new());
+        let id = jobs
+            .spawn("yes hello | head -c $(( 50 * 1024 * 1024 ))", "/tmp")
+            .unwrap();
+        // Wait for the job to finish so the readers have drained to EOF.
+        loop {
+            let done = {
+                let mut table = jobs.jobs.lock().unwrap();
+                let job = table.get_mut(&id).unwrap();
+                match job.child.try_wait() {
+                    Ok(Some(status)) => {
+                        job.exit_code = status.code();
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Give the reader threads a moment to finish draining to EOF.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let table = jobs.jobs.lock().unwrap();
+        let job = table.get(&id).unwrap();
+        assert!(
+            job.stdout_buf.lock().unwrap().len() <= MAX_OUTPUT,
+            "stdout buffer must be capped: {}",
+            job.stdout_buf.lock().unwrap().len()
+        );
+        assert!(job.stderr_buf.lock().unwrap().len() <= MAX_OUTPUT);
+    }
 
     #[test]
     fn runs_echo_command() {
