@@ -16,9 +16,12 @@ use crate::core::model::acp::capabilities::CapabilityProvider;
 /// JSON-schema parameters). The selected ACP backend then either exposes that
 /// JSON as Potlatch harness tools or renders it into a portable marker prompt.
 ///
-/// Objects become closed (`additionalProperties: false`) and tagged unions
-/// become `oneOf` branches whose discriminator property carries a `const`,
-/// so the backend enforces the same shape core validates.
+/// Objects become closed (`additionalProperties: false`). Tagged unions
+/// flatten into one object — the discriminator an enum-valued property, the
+/// branches' fields its siblings — never a top-level `oneOf`, a wire shape
+/// providers were observed failing to serialize (see [`one_of_wire_json`]).
+/// Core still validates the captured value against the full typed contract,
+/// so the wire form is a transport convenience, not the enforcement point.
 pub(crate) fn structured_output_contracts_json(tools: &[StructuredOutputTool]) -> Vec<Value> {
     tools.iter().map(structured_output_contract_json).collect()
 }
@@ -51,7 +54,7 @@ fn schema_wire_json(schema: &Schema) -> Value {
         Schema::Array { items, .. } => {
             json!({"type": "array", "items": schema_wire_json(items)})
         }
-        Schema::Object(object) => object_wire_json(object, None),
+        Schema::Object(object) => object_wire_json(object),
         Schema::OneOf(one_of) => one_of_wire_json(one_of),
     };
     let description = schema.description();
@@ -61,66 +64,83 @@ fn schema_wire_json(schema: &Schema) -> Value {
     obj
 }
 
+/// The wire form of a tagged union: one flat `object` whose discriminator is
+/// an ordinary enum-valued property and whose branches' fields are sibling
+/// properties of that same object.
+///
+/// Not a top-level `oneOf`: providers observed dropping the arguments of
+/// structured-output tool calls entirely (or dropping every parameter but the
+/// longest one) do so specifically for tools whose parameters are
+/// `{"type":"object","oneOf":[...]}` — a shape no other tool on the wire
+/// has. Every tool that carries plain `object` parameters transmitted fine
+/// in the same sessions. Flattening makes a structured-output tool's
+/// parameters indistinguishable on the wire from every working tool.
+///
+/// Per-branch wire strictness is given up deliberately: a field from an
+/// unselected branch is no longer rejected by the schema alone. The typed
+/// contract still rejects it when the captured value is decoded
+/// (see [`crate::core::agent::model::capture_structured_output`]), so
+/// nothing invalid can be recorded — only reported later, after a repair
+/// turn, instead of at emission.
 fn one_of_wire_json(one_of: &OneOfSchema) -> Value {
-    let branches: Vec<Value> = one_of
-        .variants
-        .iter()
-        .map(|variant| {
-            object_wire_json(
-                &variant.fields,
-                Some(DiscriminatorConst {
-                    name: &one_of.discriminator,
-                    value: &variant.tag,
-                    description: &variant.description,
-                }),
-            )
-        })
-        .collect();
-    json!({"type": "object", "oneOf": branches})
-}
-
-/// The discriminator property a `oneOf` branch pins with `const`.
-struct DiscriminatorConst<'a> {
-    name: &'a str,
-    value: &'a str,
-    description: &'a str,
-}
-
-fn object_wire_json(schema: &ObjectSchema, discriminator: Option<DiscriminatorConst<'_>>) -> Value {
     let mut properties = Map::new();
     let mut required: Vec<Value> = Vec::new();
-    if let Some(ref tag) = discriminator {
-        properties.insert(
-            tag.name.to_string(),
-            json!({
-                "type": "string",
-                "const": tag.value,
-                "enum": [tag.value],
-                "description": tag.description,
-            }),
-        );
-        required.push(Value::from(tag.name));
-    }
-    for (name, field) in &schema.properties {
-        properties.insert(name.clone(), schema_wire_json(field));
-    }
-    required.extend(schema.required.iter().cloned().map(Value::from));
 
+    // The discriminator: one enum-valued property listing every branch tag,
+    // described by the union's own description.
+    let tags: Vec<Value> = one_of
+        .variants
+        .iter()
+        .map(|variant| Value::from(variant.tag.as_str()))
+        .collect();
+    properties.insert(
+        one_of.discriminator.clone(),
+        json!({
+            "type": "string",
+            "enum": tags,
+            "description": one_of.description,
+        }),
+    );
+    required.push(Value::from(one_of.discriminator.as_str()));
+
+    // Each branch's fields become sibling properties. A field name shared by
+    // branches (same name, same type in each) serializes once; required-ness
+    // is dropped, since only the selected branch's required fields are
+    // actually required and the wire form cannot express that per branch.
+    for variant in &one_of.variants {
+        for (name, field) in &variant.fields.properties {
+            properties
+                .entry(name.clone())
+                .or_insert_with(|| schema_wire_json(field));
+        }
+    }
+
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+        "required": Value::Array(required),
+        "additionalProperties": false,
+    })
+}
+
+/// The wire form of a plain object schema: properties, required names, and
+/// `additionalProperties: false` so providers treat it as closed.
+fn object_wire_json(schema: &ObjectSchema) -> Value {
+    let properties: Map<String, Value> = schema
+        .properties
+        .iter()
+        .map(|(name, field)| (name.clone(), schema_wire_json(field)))
+        .collect();
     let mut obj = json!({
         "type": "object",
         "properties": Value::Object(properties),
         "additionalProperties": false,
     });
-    let description = if schema.description.is_empty() {
-        discriminator.map(|tag| tag.description)
-    } else {
-        Some(schema.description.as_str())
-    };
-    if let Some(description) = description.filter(|text| !text.is_empty()) {
-        obj["description"] = Value::from(description);
+    if !schema.description.is_empty() {
+        obj["description"] = Value::from(schema.description.as_str());
     }
-    if !required.is_empty() {
-        obj["required"] = Value::Array(required);
+    if !schema.required.is_empty() {
+        obj["required"] = Value::Array(schema.required.iter().cloned().map(Value::from).collect());
     }
     obj
 }
@@ -474,7 +494,12 @@ acp_command = ["agent", "acp"]"#
     }
 
     #[test]
-    fn wire_json_emits_one_of_branches_with_a_const_discriminator() {
+    fn wire_json_flattens_one_of_into_a_single_object() {
+        // The wire form must NOT be a top-level oneOf: providers observed
+        // dropping the arguments of structured-output tool calls do so for
+        // exactly this shape. The flattened form — discriminator as an enum
+        // property, branch fields as siblings — is indistinguishable from
+        // every plain-object tool that transmitted fine.
         let tool = StructuredOutputTool {
             name: "review".into(),
             description: "Emit your decision".into(),
@@ -500,39 +525,24 @@ acp_command = ["agent", "acp"]"#
             json!({
                 "type": "object",
                 "description": "Your review decision.",
-                "oneOf": [
-                    {
-                        "type": "object",
-                        "description": "The MR is good to merge.",
-                        "additionalProperties": false,
-                        "properties": {
-                            "decision": {
-                                "type": "string",
-                                "const": "approve",
-                                "enum": ["approve"],
-                                "description": "The MR is good to merge."
-                            },
-                            "summary": {"type": "string", "description": "One line."}
-                        },
-                        "required": ["decision"]
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "enum": ["approve", "request_changes"],
+                        "description": "Your review decision."
                     },
-                    {
-                        "type": "object",
-                        "description": "The MR needs work.",
-                        "additionalProperties": false,
-                        "properties": {
-                            "decision": {
-                                "type": "string",
-                                "const": "request_changes",
-                                "enum": ["request_changes"],
-                                "description": "The MR needs work."
-                            },
-                            "feedback": {"type": "string", "description": "What to fix."}
-                        },
-                        "required": ["decision", "feedback"]
-                    }
-                ]
+                    "summary": {"type": "string", "description": "One line."},
+                    "feedback": {"type": "string", "description": "What to fix."}
+                },
+                "required": ["decision"],
+                "additionalProperties": false
             })
+        );
+        // The one shape providers fail to serialize must not appear.
+        assert!(
+            wire["parameters"].get("oneOf").is_none(),
+            "wire form must not be a top-level oneOf: {}",
+            wire["parameters"]
         );
     }
 
