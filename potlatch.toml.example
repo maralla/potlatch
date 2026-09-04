@@ -13,7 +13,7 @@ repo_url = "https://gitlab.com/group/project"
 # part of the model URI (`acp://<vendor>/<model>`) selects which profile is used.
 #
 # Potlatch harness (built-in, talks directly to OpenAI-compatible endpoints).
-# Two config styles are supported:
+# Three config styles are supported:
 #
 # 1. Single endpoint via top-level fields:
 # [acp.potlatch]
@@ -32,12 +32,33 @@ repo_url = "https://gitlab.com/group/project"
 # [acp.potlatch]
 # acp_command = ["potlatch", "harness"]
 # endpoints = [
-#   { model = "model1",       endpoint = "http://prod-model1.example", key = "EMPTY" },
-#   { model = "model2-flash", endpoint = "http://prod-model2.example", key = "EMPTY" },
+#   { model = "model1",       endpoint = "http://endpoint1.example", key = "EMPTY" },
+#   { model = "model2", endpoint = "http://endpoint2.example", key = "EMPTY" },
 # ]
 # env = [
 #   "POTLATCH_BASE_URL={endpoint}",
 #   "POTLATCH_API_KEY={key}",
+# ]
+#
+# 3. Dynamic endpoint headers via an auth-provider command. An endpoint may
+#    declare `auth_provider` with an arbitrary command that must follow one
+#    output contract: print progress (OAuth callback URLs, "open this link"
+#    notices) to stderr, then print exactly one JSON document as the final
+#    stdout line:
+#      {"expiration": 1735689600, "headers": {"Authorization": "Bearer ..."}}
+#    `expiration` is a Unix timestamp (seconds; ms and RFC 3339 also accepted)
+#    after which the command is re-run. `headers` are applied to every request
+#    to the endpoint and cached until the expiration, so the interactive part
+#    of an OAuth dance only happens when credentials actually need refreshing.
+#    Anything the command prints before the final document is surfaced to the
+#    user in the UI (never treated as the final output).
+#    The command runs with the directory of this config file as its working
+#    directory, and a bare command name is also resolved there first — a
+#    script placed next to this file runs as `auth-tool.py` or `./auth-tool.py`.
+#    Concurrent agent processes are single-flighted: one runs the command,
+#    the others hold and reuse its published result.
+# endpoints = [
+#   { model = "model1", endpoint = "http://endpoint1.example", auth_provider = "auth-helper --login" },
 # ]
 
 [acp.cursor]

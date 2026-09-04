@@ -62,8 +62,8 @@ impl ModelUri {
     }
 
     /// `<model-name>` with any `?query` suffix stripped, for matching against
-    /// the `endpoints` table of an ACP profile (e.g. `model1-fp8` from
-    /// `acp://potlatch/model1-fp8?thinking=true`).
+    /// the `endpoints` table of an ACP profile (e.g. `model1` from
+    /// `acp://potlatch/model1?thinking=true`).
     pub fn bare_model_name(&self) -> &str {
         self.model_name
             .split('?')
@@ -88,9 +88,9 @@ mod tests {
 
     #[test]
     fn endpoint_model_name_from_uri() {
-        let u = ModelUri::parse("acp://cursor/model1-fp8").unwrap();
-        assert_eq!(u.as_configured(), "acp://cursor/model1-fp8");
-        assert_eq!(u.endpoint_model_name(), "model1-fp8");
+        let u = ModelUri::parse("acp://cursor/model1").unwrap();
+        assert_eq!(u.as_configured(), "acp://cursor/model1");
+        assert_eq!(u.endpoint_model_name(), "model1");
     }
 
     #[test]
@@ -105,10 +105,10 @@ mod tests {
 
     #[test]
     fn bare_model_name_strips_query_suffix() {
-        let u = ModelUri::parse("acp://potlatch/model1-fp8?thinking=true").unwrap();
-        assert_eq!(u.model_name, "model1-fp8?thinking=true");
-        assert_eq!(u.endpoint_model_name(), "model1-fp8?thinking=true");
-        assert_eq!(u.bare_model_name(), "model1-fp8");
+        let u = ModelUri::parse("acp://potlatch/model1?thinking=true").unwrap();
+        assert_eq!(u.model_name, "model1?thinking=true");
+        assert_eq!(u.endpoint_model_name(), "model1?thinking=true");
+        assert_eq!(u.bare_model_name(), "model1");
     }
 
     #[test]

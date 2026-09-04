@@ -711,7 +711,7 @@ impl Tool for SubagentTool {
                     },
                     "model": {
                         "type": "string",
-                        "description": "Model for the subagent (e.g. 'model1-fp8?thinking=true'). Defaults to the parent's model."
+                        "description": "Model for the subagent (e.g. 'model1?thinking=true'). Defaults to the parent's model."
                     },
                     "tools": {
                         "type": "array",

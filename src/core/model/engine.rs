@@ -226,12 +226,25 @@ impl ModelEngine {
         session: ModelSessionOptions,
         runtime: ModelRuntimeContext,
     ) -> Self {
+        let mut env = acp_spawn.env;
+        if let Some(argv) = &acp_spawn.auth_command {
+            // JSON-encoded argv so the harness can execute it without a shell.
+            let serialized =
+                serde_json::to_string(argv).expect("serializing a Vec<String> cannot fail");
+            env.insert(crate::core::config::AUTH_COMMAND_ENV.into(), serialized);
+            if let Some(config_dir) = &acp_spawn.config_dir {
+                env.insert(
+                    crate::core::config::AUTH_COMMAND_DIR_ENV.into(),
+                    config_dir.display().to_string(),
+                );
+            }
+        }
         Self::wrap_runtime(AcpRuntime::new(
             runtime.working_dir,
             acp_spawn.model_uri,
             acp_spawn.endpoint_model,
             acp_spawn.command,
-            acp_spawn.env,
+            env,
             session.preferred_session_mode,
             session.agent_bus,
             session.write_roots,
@@ -366,7 +379,7 @@ acp_command = ["agent", "acp"]"#
         let config = Config::from_toml_str(
             r#"
             [acp.cursor-local]
-            base_url = "http://prod-model1.example/v1"
+            base_url = "http://endpoint1.example/v1"
             api_key = "EMPTY"
             acp_command = ["agent-local", "--print", "--trust", "--force", "--approve-mcps", "acp"]
             env = [
@@ -375,7 +388,7 @@ acp_command = ["agent", "acp"]"#
             ]
 
             [agent.alpha]
-            model = "acp://cursor-local/model1-fp8"
+            model = "acp://cursor-local/model1"
             instances = 1
             "#,
         )

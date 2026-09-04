@@ -11,6 +11,7 @@
 
 pub mod acp;
 pub mod agent_loop;
+pub mod auth_provider;
 pub mod client;
 pub mod context;
 mod parent;
@@ -19,6 +20,7 @@ pub mod todo;
 pub mod tools;
 
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -179,7 +181,43 @@ pub fn run_acp_server() -> Result<()> {
     });
     let api_key = std::env::var("POTLATCH_API_KEY").unwrap_or_else(|_| "EMPTY".into());
 
-    let llm_client = Arc::new(client::OpenAiClient::new(base_url, api_key));
+    // Optional endpoint auth provider: an arbitrary command (configured per
+    // endpoint via `auth_provider` and forwarded by the parent in the env)
+    // whose final stdout line is the headers JSON document. Its headers are
+    // applied to every request to the endpoint and cached until expiration.
+    // The parent also forwards the directory holding potlatch.toml; the
+    // provider command runs from there, so `./auth-tool.py` (or any relative
+    // path) resolves against the config, not the agent's repo checkout.
+    let auth_provider = match std::env::var(crate::core::config::AUTH_COMMAND_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let argv: Vec<String> = serde_json::from_str(&raw).with_context(|| {
+                format!(
+                    "{} must be a JSON array of command arguments",
+                    crate::core::config::AUTH_COMMAND_ENV
+                )
+            })?;
+            if argv.is_empty() {
+                anyhow::bail!(
+                    "{} must not be empty",
+                    crate::core::config::AUTH_COMMAND_ENV
+                );
+            }
+            let working_dir = std::env::var(crate::core::config::AUTH_COMMAND_DIR_ENV)
+                .ok()
+                .map(PathBuf::from);
+            Some(auth_provider::AuthProvider::new(argv, working_dir))
+        }
+        _ => None,
+    };
+    if let Some(auth) = &auth_provider {
+        tracing::info!("auth provider configured: {}", auth.program());
+    }
+
+    let llm_client = Arc::new(client::OpenAiClient::with_auth_provider(
+        base_url,
+        api_key,
+        auth_provider.map(Arc::new),
+    ));
     let shared_stdout = parent::SharedOutput::stdout();
     let parent_rpc = Arc::new(parent::ParentRpc::new(shared_stdout.clone()));
     let mut server = acp::AcpServer::new(llm_client).with_agent_tool_caller(parent_rpc.clone());

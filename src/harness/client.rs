@@ -1,7 +1,7 @@
 //! LLM client: trait + OpenAI-compatible implementation with streaming.
 
 use std::io::{BufRead, BufReader};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -45,8 +45,8 @@ pub trait ChatClient: Send + Sync {
     /// soon as that call's arguments parse as valid JSON during streaming — enabling
     /// speculative execution of read-only tools before `finish_reason` arrives.
     ///
-    /// The `model` string may be a plain model name (e.g. `"model1-fp8"`) or an
-    /// `acp://` URL (e.g. `"acp://zhipu/model1-fp8?thinking=false"`). Implementations
+    /// The `model` string may be a plain model name (e.g. `"model1"`) or an
+    /// `acp://` URL (e.g. `"acp://vendor1/model1?thinking=false"`). Implementations
     /// that support the URL form parse it via [`ModelSpec::parse`] to extract the
     /// real model name and options like `thinking`.
     fn chat(
@@ -76,12 +76,12 @@ pub trait ChatClient: Send + Sync {
 /// (currently DeepSeek).
 ///
 /// Examples:
-/// - `"model1-fp8"` → `ModelSpec { model: "model1-fp8", thinking: false, .. }`
-/// - `"acp://zhipu/model1-fp8?thinking=true"` → `ModelSpec { model: "model1-fp8", thinking: true, .. }`
+/// - `"model1"` → `ModelSpec { model: "model1", thinking: false, .. }`
+/// - `"acp://vendor1/model1?thinking=true"` → `ModelSpec { model: "model1", thinking: true, .. }`
 /// - `"acp://deepseek/deepseek-v4-flash?thinking=true&reasoning_effort=high"`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
-    /// The actual model name to send to the API (e.g. `"model1-fp8"`).
+    /// The actual model name to send to the API (e.g. `"model1"`).
     pub model: String,
     /// Whether to enable thinking/reasoning tokens. Defaults to `false`.
     pub thinking: bool,
@@ -95,7 +95,7 @@ impl ModelSpec {
     /// Parse a model string that may be a plain name, an `acp://` URL, or a
     /// plain name carrying a `?thinking=` query. The latter arrives via the ACP
     /// `session/set_model` command: the orchestrator forwards the config URI's
-    /// model segment verbatim (e.g. `model1-fp8?thinking=true`), so the harness
+    /// model segment verbatim (e.g. `model1?thinking=true`), so the harness
     /// must honor the query even without the `acp://` prefix.
     pub fn parse(s: &str) -> Self {
         let trimmed = s.trim();
@@ -213,15 +213,25 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: String,
     client: Mutex<reqwest::blocking::Client>,
+    /// Optional endpoint auth provider. When set, its headers are applied to
+    /// every request; a provider-supplied `Authorization` replaces the
+    /// default `Bearer {api_key}` header. Headers are cached by the provider
+    /// until their expiration.
+    auth_provider: Option<Arc<super::auth_provider::AuthProvider>>,
 }
 
 impl OpenAiClient {
-    pub fn new(base_url: String, api_key: String) -> Self {
+    pub fn with_auth_provider(
+        base_url: String,
+        api_key: String,
+        auth_provider: Option<Arc<super::auth_provider::AuthProvider>>,
+    ) -> Self {
         let client = Self::build_client();
         Self {
             base_url,
             api_key,
             client: Mutex::new(client),
+            auth_provider,
         }
     }
 
@@ -245,32 +255,34 @@ impl OpenAiClient {
         }
     }
 
-    /// Build the full URL for an API path. Handles base_url that may or may not
-    /// already end with `/v1`.
+    /// Build the full URL for an API path. A base that contains a path
+    /// component (`http://host/v1`, `http://host/gateway/api`) is used
+    /// unchanged — it is already the complete API prefix, and gateways that
+    /// route under a longer prefix 404 when another `/v1` is inserted. A
+    /// bare host (`http://host:11434`) gets `/v1` inserted, matching the
+    /// default OpenAI-compatible layout.
     fn url(&self, path: &str) -> String {
         let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/v1") {
+        if Self::base_has_path(base) {
             format!("{base}{path}")
         } else {
             format!("{base}/v1{path}")
         }
+    }
+
+    /// True when `base` (scheme stripped) still contains a `/`, i.e. it
+    /// points at a path rather than a bare host.
+    fn base_has_path(base: &str) -> bool {
+        let after_scheme = base.split_once("://").map(|(_, rest)| rest).unwrap_or(base);
+        after_scheme.contains('/')
     }
 }
 
 impl ChatClient for OpenAiClient {
     fn list_models(&self) -> Result<Vec<String>> {
         let url = self.url("/models");
-        let resp = {
-            let client = self
-                .client
-                .lock()
-                .map_err(|_| anyhow::anyhow!("client lock poisoned"))?;
-            client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .send()
-                .context("GET /v1/models")?
-        };
+        let resp =
+            self.send_request_with_provider(reqwest::Method::GET, &url, None, "GET /v1/models")?;
         let body: Value = resp.json().context("parse /v1/models response")?;
         let models = body["data"]
             .as_array()
@@ -490,22 +502,47 @@ impl ChatClient for OpenAiClient {
 }
 
 impl OpenAiClient {
-    /// Send a single chat-completion request. Locks the pooled client, sends
-    /// the request, and checks the HTTP status. Returns the streaming
-    /// `Response` on success. The lock is released as soon as `send()` returns
-    /// — reading the SSE body later does not hold the lock.
-    fn send_request(&self, url: &str, body: &Value) -> Result<reqwest::blocking::Response> {
+    /// Send a request, applying the endpoint auth provider's headers when one
+    /// is configured. A provider-supplied `Authorization` header replaces the
+    /// default `Bearer {api_key}`. Provider invocation (which may block on an
+    /// interactive OAuth flow) happens before the client lock is taken.
+    fn send_request_with_provider(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&Value>,
+        context: &str,
+    ) -> Result<reqwest::blocking::Response> {
+        let provider_headers = match &self.auth_provider {
+            Some(provider) => Some(
+                provider
+                    .headers()
+                    .context("resolve endpoint headers via auth provider")?,
+            ),
+            None => None,
+        };
+
         let client = self
             .client
             .lock()
             .map_err(|_| anyhow::anyhow!("client lock poisoned"))?;
-        let resp = client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
-            .context("POST /v1/chat/completions")?;
+        let mut req = client.request(method, url);
+        if let Some(headers) = &provider_headers {
+            for (name, value) in headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+        }
+        if provider_headers
+            .as_ref()
+            .is_none_or(|h| !h.contains_key("Authorization"))
+        {
+            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        let req = match body {
+            Some(body) => req.header("Content-Type", "application/json").json(body),
+            None => req,
+        };
+        let resp = req.send().with_context(|| context.to_string())?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -530,7 +567,12 @@ impl OpenAiClient {
         let mut delay = INITIAL_DELAY;
         loop {
             attempt += 1;
-            match self.send_request(url, body) {
+            match self.send_request_with_provider(
+                reqwest::Method::POST,
+                url,
+                Some(body),
+                "/v1/chat/completions",
+            ) {
                 Ok(resp) => {
                     if attempt > 1 {
                         tracing::info!(
@@ -723,6 +765,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn url_uses_base_as_is_when_it_has_a_path() {
+        // A base pointing at a path (any path, versioned or not) is a full
+        // API prefix: append the path verbatim. A gateway serving the API
+        // under that exact prefix 404s when another `/v1` is inserted.
+        let versioned =
+            OpenAiClient::with_auth_provider("http://prod.example/v1".into(), "EMPTY".into(), None);
+        assert_eq!(
+            versioned.url("/chat/completions"),
+            "http://prod.example/v1/chat/completions"
+        );
+
+        let gateway = OpenAiClient::with_auth_provider(
+            "https://gateway.example/gateway/v1/api".into(),
+            "EMPTY".into(),
+            None,
+        );
+        assert_eq!(
+            gateway.url("/chat/completions"),
+            "https://gateway.example/gateway/v1/api/chat/completions"
+        );
+
+        let unversioned = OpenAiClient::with_auth_provider(
+            "https://gateway.example/openai".into(),
+            "EMPTY".into(),
+            None,
+        );
+        assert_eq!(
+            unversioned.url("/chat/completions"),
+            "https://gateway.example/openai/chat/completions"
+        );
+    }
+
+    #[test]
+    fn url_inserts_v1_for_bare_hosts() {
+        let client =
+            OpenAiClient::with_auth_provider("http://localhost:11434".into(), "EMPTY".into(), None);
+        assert_eq!(
+            client.url("/chat/completions"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        // Trailing slash is trimmed before joining.
+        let trailing = OpenAiClient::with_auth_provider(
+            "http://endpoint1.example/v1/".into(),
+            "EMPTY".into(),
+            None,
+        );
+        assert_eq!(
+            trailing.url("/models"),
+            "http://endpoint1.example/v1/models"
+        );
+    }
+
+    #[test]
+    fn base_has_path_ignores_the_scheme_slashes() {
+        assert!(!OpenAiClient::base_has_path("http://prod.example"));
+        assert!(OpenAiClient::base_has_path("http://prod.example/v1"));
+        // The `//` in the scheme itself does not count as a path.
+        assert!(!OpenAiClient::base_has_path("https://prod.example"));
+        assert!(!OpenAiClient::base_has_path("prod.example"));
+    }
+
+    #[test]
     fn fake_client_returns_scripted_responses() {
         let client = FakeChatClient::new(vec![
             ChatResponse {
@@ -790,8 +894,8 @@ mod tests {
 
     #[test]
     fn model_spec_parses_plain_model_name() {
-        let spec = ModelSpec::parse("model1-fp8");
-        assert_eq!(spec.model, "model1-fp8");
+        let spec = ModelSpec::parse("model1");
+        assert_eq!(spec.model, "model1");
         assert!(
             !spec.thinking,
             "plain model name defaults to thinking=false"
@@ -802,28 +906,28 @@ mod tests {
     fn model_spec_parses_bare_name_with_thinking_query() {
         // The orchestrator forwards the config URI's model segment verbatim via
         // ACP session/set_model, so the harness receives a bare name carrying
-        // the ?thinking= query (e.g. `model1-fp8?thinking=true`). The query
+        // the ?thinking= query (e.g. `model1?thinking=true`). The query
         // must be honored and stripped from the model name sent to the API.
-        let spec = ModelSpec::parse("model1-fp8?thinking=true");
-        assert_eq!(spec.model, "model1-fp8");
+        let spec = ModelSpec::parse("model1?thinking=true");
+        assert_eq!(spec.model, "model1");
         assert!(spec.thinking);
 
-        let spec = ModelSpec::parse("model1-fp8?thinking=false");
-        assert_eq!(spec.model, "model1-fp8");
+        let spec = ModelSpec::parse("model1?thinking=false");
+        assert_eq!(spec.model, "model1");
         assert!(!spec.thinking);
     }
 
     #[test]
     fn model_spec_parses_acp_url_with_thinking_false() {
-        let spec = ModelSpec::parse("acp://zhipu/model1-fp8?thinking=false");
-        assert_eq!(spec.model, "model1-fp8");
+        let spec = ModelSpec::parse("acp://vendor1/model1?thinking=false");
+        assert_eq!(spec.model, "model1");
         assert!(!spec.thinking);
     }
 
     #[test]
     fn model_spec_parses_acp_url_with_thinking_true() {
-        let spec = ModelSpec::parse("acp://zhipu/model1-fp8?thinking=true");
-        assert_eq!(spec.model, "model1-fp8");
+        let spec = ModelSpec::parse("acp://vendor1/model1?thinking=true");
+        assert_eq!(spec.model, "model1");
         assert!(spec.thinking);
     }
 
@@ -837,8 +941,8 @@ mod tests {
     #[test]
     fn model_spec_parses_acp_url_with_vendor_prefix() {
         // The vendor segment is stripped; only the model name matters.
-        let spec = ModelSpec::parse("acp://zhipu/model1-fp8?thinking=false");
-        assert_eq!(spec.model, "model1-fp8");
+        let spec = ModelSpec::parse("acp://vendor1/model1?thinking=false");
+        assert_eq!(spec.model, "model1");
     }
 
     #[test]
@@ -898,7 +1002,7 @@ mod tests {
     fn model_spec_detects_deepseek_model() {
         assert!(ModelSpec::parse("deepseek-v4-flash").is_deepseek());
         assert!(ModelSpec::parse("acp://deepseek/deepseek-v4-pro").is_deepseek());
-        assert!(!ModelSpec::parse("model1-fp8").is_deepseek());
+        assert!(!ModelSpec::parse("model1").is_deepseek());
         assert!(!ModelSpec::parse("acp://cursor/gpt-4o").is_deepseek());
     }
 
@@ -948,7 +1052,7 @@ mod tests {
     #[test]
     fn build_chat_body_non_deepseek_disabled_thinking() {
         let body = build_chat_body(
-            "acp://zhipu/model1-fp8?thinking=false",
+            "acp://vendor1/model1?thinking=false",
             &[json!({"role": "user", "content": "hi"})],
             &[],
         );
@@ -962,7 +1066,7 @@ mod tests {
     #[test]
     fn build_chat_body_non_deepseek_enabled_thinking() {
         let body = build_chat_body(
-            "acp://zhipu/model1-fp8?thinking=true",
+            "acp://vendor1/model1?thinking=true",
             &[json!({"role": "user", "content": "hi"})],
             &[],
         );
