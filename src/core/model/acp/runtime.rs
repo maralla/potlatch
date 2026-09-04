@@ -20,7 +20,6 @@
 //! value or non-empty legacy `availableModes`). Otherwise the agent default is kept;
 //! `current_mode_update` keeps hooks in sync.
 
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -479,17 +478,15 @@ impl AcpRuntime {
             .with_context(|| format!("Failed to spawn `{program}` ACP process"))?;
 
         let stderr = child.stderr.take();
-        if let Some(mut err) = stderr {
+        if let Some(err) = stderr {
             let aid = self.agent_id().to_string();
             thread::spawn(move || {
-                let mut buf = Vec::new();
-                let n = err.read_to_end(&mut buf).unwrap_or(0);
-                if n > 0 {
-                    let preview = String::from_utf8_lossy(&buf[..n.min(2048)]);
-                    debug!(target: "potlatch::agent_stderr", agent_id = %aid, "stderr: {}", preview);
-                    if preview.contains("Cannot use this model") || preview.contains("is not set") {
-                        warn!(target: "potlatch::agent_stderr", agent_id = %aid, "ACP server stderr: {}", preview);
-                    }
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(err);
+                for line in reader.lines().map_while(|l| l.ok()) {
+                    // Surfaced at warn level so auth-provider OAuth URLs and
+                    // other user-actionable notices appear live in the TUI.
+                    warn!(target: "potlatch::agent_stderr", agent_id = %aid, "stderr: {}", line);
                 }
             });
         }

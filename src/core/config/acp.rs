@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use toml::Value;
 
 const RESERVED_KEYS: &[&str] = &["acp_command", "env", "endpoints"];
+
+/// The `endpoints`-entry key holding the auth-provider command.
+const AUTH_PROVIDER_KEY: &str = "auth_provider";
 
 /// A parsed `[acp.<name>]` profile. Structural fields (`acp_command`, `env`,
 /// `endpoints`) are stored separately; every other key in the section is a
@@ -27,16 +31,29 @@ pub struct AcpClientProfile {
 pub struct EndpointEntry {
     pub model: String,
     pub fields: HashMap<String, String>,
+    /// `auth_provider` command argv. When set, the harness runs this command
+    /// before talking to the endpoint and applies the returned headers
+    /// (`{"expiration": <unix-seconds>, "headers": {..}}`) to its requests,
+    /// cached until the expiration.
+    pub auth_command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AcpSpawnConfig {
     pub command: Vec<String>,
-    /// Configured model URI (e.g. `acp://cursor/model1-fp8`).
+    /// Configured model URI (e.g. `acp://cursor/model1`).
     pub model_uri: Option<String>,
     /// Parsed `<model-name>` for `session/set_model` after `session/new`.
     pub endpoint_model: Option<String>,
     pub env: HashMap<String, String>,
+    /// `auth_provider` argv for the selected endpoint, forwarded to the
+    /// harness via the parent's env. `None` when the endpoint has no
+    /// auth provider.
+    pub auth_command: Option<Vec<String>>,
+    /// Directory containing the potlatch config file. The harness runs the
+    /// auth-provider command from here, so `./auth-tool.py` or `auth-tool.py` resolve
+    /// relative to the config, not the agent's repo checkout.
+    pub config_dir: Option<PathBuf>,
 }
 
 pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfile>> {
@@ -78,8 +95,16 @@ pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfi
                 let entry_table = entry_val
                     .as_table()
                     .with_context(|| "endpoints entry must be a table")?;
+                let auth_command = match entry_table.get(AUTH_PROVIDER_KEY) {
+                    Some(Value::String(raw)) => Some(split_command(raw).with_context(
+                        || "invalid `auth_provider` in endpoints entry (model `{model}`)",
+                    )?),
+                    Some(_) => bail!("`auth_provider` in an endpoints entry must be a string"),
+                    None => None,
+                };
                 let mut fields: HashMap<String, String> = entry_table
                     .iter()
+                    .filter(|(k, _)| k.as_str() != AUTH_PROVIDER_KEY)
                     .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                     .collect();
                 let model = fields
@@ -89,7 +114,11 @@ pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfi
                     .with_context(|| "endpoints entry missing required `model` field")?;
                 // `model` stays accessible as a {model} reference.
                 fields.insert("model".into(), model.clone());
-                endpoint_list.push(EndpointEntry { model, fields });
+                endpoint_list.push(EndpointEntry {
+                    model,
+                    fields,
+                    auth_command,
+                });
             }
         }
 
@@ -126,6 +155,22 @@ pub fn validate_acp_command(command: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Split a shell-like command string into argv following POSIX shell word
+/// rules ([`shell_words::split`]): whitespace separation with single/double
+/// quoting and backslash escapes, no variable or command expansion. The
+/// result must be an executable plus arguments.
+pub fn split_command(raw: &str) -> Result<Vec<String>> {
+    let argv: Vec<String> =
+        shell_words::split(raw).map_err(|e| anyhow::anyhow!("invalid command `{raw}`: {e}"))?;
+    if argv.is_empty() {
+        bail!("command must not be empty");
+    }
+    if argv[0].trim().is_empty() {
+        bail!("command executable must be non-empty");
+    }
+    Ok(argv)
+}
+
 /// Resolve `env` entries (`KEY=value`) with `{field}` references.
 ///
 /// Each `{name}` in an env value is a field reference. When a model name is
@@ -156,7 +201,7 @@ pub fn resolve_profile_env(
 /// Pick the `EndpointEntry` whose `model` matches `model_name`.
 /// Returns `Ok(None)` when the profile has no `endpoints` table. Returns
 /// an error when the profile has endpoints but none match.
-fn select_endpoint<'a>(
+pub(crate) fn select_endpoint<'a>(
     profile: &'a AcpClientProfile,
     model_name: &str,
 ) -> Result<Option<&'a EndpointEntry>> {
@@ -352,7 +397,7 @@ mod tests {
         let root: Value = toml::from_str(
             r#"
             [acp.cursor-local]
-            base_url = "http://prod-model1.example/v1"
+            base_url = "http://endpoint1.example/v1"
             api_key = "EMPTY"
             acp_command = ["agent-local", "--print", "--trust", "--force", "--approve-mcps", "acp"]
             env = [
@@ -366,14 +411,14 @@ mod tests {
         let p = profiles.get("cursor-local").unwrap();
         assert_eq!(
             p.fields.get("base_url").map(String::as_str),
-            Some("http://prod-model1.example/v1")
+            Some("http://endpoint1.example/v1")
         );
         assert_eq!(p.fields.get("api_key").map(String::as_str), Some("EMPTY"));
         assert_eq!(p.acp_command[0], "agent-local");
         let env = resolve_profile_env(p, None).unwrap();
         assert_eq!(
             env.get("CURSOR_LOCAL_AGENT_BASE_URL").map(String::as_str),
-            Some("http://prod-model1.example/v1")
+            Some("http://endpoint1.example/v1")
         );
         assert_eq!(
             env.get("CURSOR_LOCAL_AGENT_API_KEY").map(String::as_str),
@@ -411,6 +456,7 @@ mod tests {
                 ("key".into(), "EMPTY".into()),
                 ("model".into(), model.into()),
             ]),
+            auth_command: None,
         }
     }
 
@@ -419,8 +465,8 @@ mod tests {
             vec!["POTLATCH_BASE_URL={endpoint}", "POTLATCH_API_KEY={key}"],
             vec![],
             vec![
-                endpoint_entry("model1-fp8", "http://prod-model1.example"),
-                endpoint_entry("model2-flash", "http://model2.example"),
+                endpoint_entry("model1", "http://endpoint1.example"),
+                endpoint_entry("model2", "http://endpoint2.example"),
             ],
         )
     }
@@ -428,10 +474,10 @@ mod tests {
     #[test]
     fn resolve_profile_env_selects_endpoint_by_model_name() {
         let p = endpoint_profile();
-        let env = resolve_profile_env(&p, Some("model2-flash")).unwrap();
+        let env = resolve_profile_env(&p, Some("model2")).unwrap();
         assert_eq!(
             env.get("POTLATCH_BASE_URL").map(String::as_str),
-            Some("http://model2.example")
+            Some("http://endpoint2.example")
         );
         assert_eq!(
             env.get("POTLATCH_API_KEY").map(String::as_str),
@@ -442,10 +488,10 @@ mod tests {
     #[test]
     fn resolve_profile_env_selects_first_endpoint() {
         let p = endpoint_profile();
-        let env = resolve_profile_env(&p, Some("model1-fp8")).unwrap();
+        let env = resolve_profile_env(&p, Some("model1")).unwrap();
         assert_eq!(
             env.get("POTLATCH_BASE_URL").map(String::as_str),
-            Some("http://prod-model1.example")
+            Some("http://endpoint1.example")
         );
     }
 
@@ -454,8 +500,8 @@ mod tests {
         let p = endpoint_profile();
         let err = resolve_profile_env(&p, Some("nonexistent-model")).unwrap_err();
         assert!(err.to_string().contains("nonexistent-model"));
-        assert!(err.to_string().contains("model1-fp8"));
-        assert!(err.to_string().contains("model2-flash"));
+        assert!(err.to_string().contains("model1"));
+        assert!(err.to_string().contains("model2"));
     }
 
     #[test]
@@ -493,7 +539,7 @@ mod tests {
             [acp.potlatch]
             acp_command = ["potlatch", "harness"]
             endpoints = [
-              { model = "model2-flash", endpoint = "http://model2.example", key = "EMPTY" },
+              { model = "model2", endpoint = "http://endpoint2.example", key = "EMPTY" },
               { model = "deepseek-v4-flash", endpoint = "http://deepseek-flash.example" },
             ]
             env = [
@@ -506,10 +552,10 @@ mod tests {
         let profiles = parse_acp_profiles(&root).unwrap();
         let p = profiles.get("potlatch").unwrap();
         assert_eq!(p.endpoints.len(), 2);
-        assert_eq!(p.endpoints[0].model, "model2-flash");
+        assert_eq!(p.endpoints[0].model, "model2");
         assert_eq!(
             p.endpoints[0].fields.get("endpoint").map(String::as_str),
-            Some("http://model2.example")
+            Some("http://endpoint2.example")
         );
         assert_eq!(
             p.endpoints[0].fields.get("key").map(String::as_str),
@@ -527,7 +573,7 @@ mod tests {
             [acp.potlatch]
             acp_command = ["potlatch", "harness"]
             endpoints = [
-              { model = "model2-flash", endpoint = "http://model2.example", key = "EMPTY" },
+              { model = "model2", endpoint = "http://endpoint2.example", key = "EMPTY" },
             ]
             env = [
               "POTLATCH_BASE_URL={endpoint}",
@@ -535,7 +581,7 @@ mod tests {
             ]
 
             [agent.worker]
-            model = "acp://potlatch/model2-flash?thinking=true"
+            model = "acp://potlatch/model2?thinking=true"
             instances = 1
             "#,
         )
@@ -544,7 +590,7 @@ mod tests {
         let spawn = cfg.resolve_acp_spawn(section).unwrap();
         assert_eq!(
             spawn.env.get("POTLATCH_BASE_URL").map(String::as_str),
-            Some("http://model2.example")
+            Some("http://endpoint2.example")
         );
         assert_eq!(
             spawn.env.get("POTLATCH_API_KEY").map(String::as_str),
@@ -552,8 +598,36 @@ mod tests {
         );
         assert_eq!(
             spawn.endpoint_model.as_deref(),
-            Some("model2-flash?thinking=true")
+            Some("model2?thinking=true")
         );
+    }
+
+    #[test]
+    fn resolve_acp_spawn_forwards_auth_provider() {
+        use super::super::Config;
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", endpoint = "http://endpoint1.example", auth_provider = "your-auth-command --login" },
+              { model = "model2", endpoint = "http://endpoint2.example" },
+            ]
+
+            [agent.worker]
+            model = "acp://potlatch/model1"
+            [agent.flash]
+            model = "acp://potlatch/model2"
+            "#,
+        )
+        .unwrap();
+        let worker = cfg.resolve_acp_spawn(cfg.agent("worker").unwrap()).unwrap();
+        assert_eq!(
+            worker.auth_command.as_deref(),
+            Some(&["your-auth-command".to_string(), "--login".to_string()][..])
+        );
+        let flash = cfg.resolve_acp_spawn(cfg.agent("flash").unwrap()).unwrap();
+        assert!(flash.auth_command.is_none());
     }
 
     #[test]
@@ -565,6 +639,7 @@ mod tests {
                 ("secret".into(), "abc123".into()),
                 ("model".into(), "test".into()),
             ]),
+            auth_command: None,
         };
         let p = profile(
             vec!["URL={ep}", "TOKEN={secret}", "MODEL={model}"],
@@ -585,6 +660,7 @@ mod tests {
         let entry = EndpointEntry {
             model: "test".into(),
             fields: HashMap::from([("endpoint".into(), "http://x".into())]),
+            auth_command: None,
         };
         let p = profile(vec!["X={nonexistent}"], vec![], vec![entry]);
         let err = resolve_profile_env(&p, Some("test")).unwrap_err();
@@ -599,6 +675,7 @@ mod tests {
                 ("endpoint".into(), "http://x".into()),
                 ("key".into(), "K".into()),
             ]),
+            auth_command: None,
         };
         let p = profile(vec!["URL={endpoint}?token={key}"], vec![], vec![entry]);
         let env = resolve_profile_env(&p, Some("test")).unwrap();
@@ -641,9 +718,88 @@ mod tests {
         let entry = EndpointEntry {
             model: "test".into(),
             fields: HashMap::from([("endpoint".into(), "http://x".into())]),
+            auth_command: None,
         };
         let p = profile(vec!["KEY={key}"], vec![], vec![entry]);
         let err = resolve_profile_env(&p, Some("test")).unwrap_err();
         assert!(err.to_string().contains("key"));
+    }
+
+    #[test]
+    fn parse_endpoint_with_auth_provider() {
+        let root: Value = toml::from_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", endpoint = "http://endpoint1.example", auth_provider = "auth helper --login --profile work" },
+              { model = "model2", endpoint = "http://endpoint2.example" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let profiles = parse_acp_profiles(&root).unwrap();
+        let p = profiles.get("potlatch").unwrap();
+        assert_eq!(
+            p.endpoints[0].auth_command.as_deref(),
+            Some(
+                &[
+                    "auth".to_string(),
+                    "helper".to_string(),
+                    "--login".to_string(),
+                    "--profile".to_string(),
+                    "work".to_string()
+                ][..]
+            )
+        );
+        assert!(p.endpoints[1].auth_command.is_none());
+    }
+
+    #[test]
+    fn auth_provider_not_exposed_as_field() {
+        // `auth_provider` is structural: it must not leak into the {field}
+        // namespace used for env interpolation.
+        let root: Value = toml::from_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", endpoint = "http://endpoint1.example", auth_provider = "auth helper" },
+            ]
+            env = ["X={auth_provider}"]
+            "#,
+        )
+        .unwrap();
+        let profiles = parse_acp_profiles(&root).unwrap();
+        let p = profiles.get("potlatch").unwrap();
+        assert!(!p.endpoints[0].fields.contains_key("auth_provider"));
+        // Referencing it as a placeholder is an error when the endpoint is
+        // selected (it's not a field).
+        assert!(resolve_profile_env(p, Some("model1")).is_err());
+    }
+
+    #[test]
+    fn split_command_handles_quoting() {
+        let argv = split_command("auth 'run helper' --model \"model 1\"").unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "auth".to_string(),
+                "run helper".to_string(),
+                "--model".to_string(),
+                "model 1".to_string(),
+            ]
+        );
+        // POSIX backslash escapes (a difference from the previous hand-rolled
+        // splitter, which treated backslashes literally). Inside double
+        // quotes only certain escapes are special, so a literal apostrophe
+        // needs no escape at all.
+        let argv = split_command("auth helper --greeting \"a'b\"").unwrap();
+        assert_eq!(argv[2], "--greeting");
+        assert_eq!(argv[3], "a'b");
+        // Empty command is rejected.
+        assert!(split_command("   ").is_err());
+        // Unterminated quote is rejected.
+        assert!(split_command("auth 'helper").is_err());
     }
 }

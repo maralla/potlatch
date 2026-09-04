@@ -18,11 +18,25 @@ use serde::de::DeserializeOwned;
 use toml::Value;
 use tracing::{debug, info};
 
+/// Env var through which an endpoint's `auth_provider` command argv (a JSON
+/// array) is passed from the resolved `[acp.*]` profile to the harness
+/// subprocess.
+pub const AUTH_COMMAND_ENV: &str = "POTLATCH_AUTH_COMMAND";
+
+/// Env var through which the directory containing the potlatch config file
+/// is passed to the harness subprocess. The harness runs the auth-provider
+/// command with this as its working directory, so `./auth-tool.py` resolves
+/// relative to the config, not the agent's repo checkout.
+pub const AUTH_COMMAND_DIR_ENV: &str = "POTLATCH_AUTH_DIR";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     raw: Value,
     agents: HashMap<String, AgentSection>,
     acp_clients: HashMap<String, AcpClientProfile>,
+    /// Directory containing the loaded config file. `None` for synthetic
+    /// configs (`from_toml_str`) — their spawn configs carry no config dir.
+    config_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -42,10 +56,22 @@ impl Config {
         }
 
         let content = fs::read_to_string(&config_path).context("Failed to read config file")?;
-        Self::from_toml_str(&content)
+        // Canonicalize so the dir is absolute (the harness child resolves it
+        // against its own cwd, which differs from ours) and so `potlatch run`
+        // from the config's own directory ("potlatch.toml" → parent "") still
+        // yields the real directory instead of an empty path.
+        let config_dir = config_path
+            .canonicalize()
+            .ok()
+            .and_then(|abs| abs.parent().map(Path::to_path_buf));
+        Self::from_toml_str_with_dir(&content, config_dir)
     }
 
     pub fn from_toml_str(content: &str) -> Result<Self> {
+        Self::from_toml_str_with_dir(content, None)
+    }
+
+    fn from_toml_str_with_dir(content: &str, config_dir: Option<PathBuf>) -> Result<Self> {
         let root: Value = toml::from_str(content).context("Failed to parse config file")?;
         let agents = parse_agent_sections(&root)?;
         let acp_clients = parse_acp_profiles(&root)?;
@@ -70,6 +96,7 @@ impl Config {
             raw: root,
             agents,
             acp_clients,
+            config_dir,
         })
     }
 
@@ -128,6 +155,9 @@ impl Config {
             model_uri: Some(model_uri),
             endpoint_model: Some(endpoint_model),
             env: resolve_profile_env(profile, Some(&bare_model))?,
+            auth_command: acp::select_endpoint(profile, &bare_model)?
+                .and_then(|e| e.auth_command.clone()),
+            config_dir: self.config_dir.clone(),
         })
     }
 }
@@ -135,6 +165,54 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_from_config_dir_resolves_absolute_config_dir() {
+        // Regression: running `potlatch run` inside the config's directory
+        // resolves the config as the bare relative filename
+        // "potlatch.toml", whose `parent()` is "" — the config dir was
+        // dropped, the harness got no POTLATCH_AUTH_DIR, and the auth
+        // provider failed to find its script. The loaded config must carry
+        // the config's *absolute* directory.
+        let dir = std::env::temp_dir().join(format!("potlatch-cfgdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("potlatch.toml"),
+            r#"
+[acp.potlatch]
+acp_command = ["potlatch", "harness"]
+endpoints = [
+  { model = "m", endpoint = "http://prod.example", auth_provider = "auth-tool.py" },
+]
+
+[agent.worker]
+model = "acp://potlatch/m"
+"#,
+        )
+        .unwrap();
+
+        // Load exactly the way `potlatch run` does from inside the dir.
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let loaded = Config::load(Some("potlatch.toml"));
+        std::env::set_current_dir(previous).unwrap();
+        let cfg = loaded.unwrap();
+
+        let section = cfg.agent("worker").unwrap();
+        let spawn = cfg.resolve_acp_spawn(section).unwrap();
+        let expected = dir.canonicalize().unwrap();
+        assert_eq!(spawn.config_dir.as_deref(), Some(expected.as_path()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn from_toml_str_has_no_config_dir() {
+        let cfg = Config::from_toml_str("[agent.alpha]\ninstances = 1\n").unwrap();
+        let section = cfg.agent("alpha").unwrap();
+        let spawn = cfg.resolve_acp_spawn(section).unwrap_err();
+        assert!(spawn.to_string().contains("no model configured"));
+    }
 
     #[test]
     fn loads_agent_sections_only_when_present() {
@@ -211,7 +289,7 @@ mod tests {
         let cfg = Config::from_toml_str(
             r#"
             [acp.cursor-local]
-            base_url = "http://prod-model1.example/v1"
+            base_url = "http://endpoint1.example/v1"
             api_key = "EMPTY"
             acp_command = ["agent-local", "--print", "--trust", "--force", "--approve-mcps", "acp"]
             env = [
@@ -220,7 +298,7 @@ mod tests {
             ]
 
             [agent.worker]
-            model = "acp://cursor-local/model1-fp8"
+            model = "acp://cursor-local/model1"
             instances = 1
             "#,
         )
@@ -230,9 +308,9 @@ mod tests {
         assert_eq!(spawn.command[0], "agent-local");
         assert_eq!(
             spawn.model_uri.as_deref(),
-            Some("acp://cursor-local/model1-fp8")
+            Some("acp://cursor-local/model1")
         );
-        assert_eq!(spawn.endpoint_model.as_deref(), Some("model1-fp8"));
+        assert_eq!(spawn.endpoint_model.as_deref(), Some("model1"));
         assert_eq!(spawn.command[1], "--print");
         assert_eq!(spawn.command[2], "--trust");
         assert_eq!(spawn.command[3], "--force");
@@ -243,7 +321,7 @@ mod tests {
                 .env
                 .get("CURSOR_LOCAL_AGENT_BASE_URL")
                 .map(String::as_str),
-            Some("http://prod-model1.example/v1")
+            Some("http://endpoint1.example/v1")
         );
         assert_eq!(
             spawn
