@@ -3083,7 +3083,7 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
     if surface_after.has_conflicts {
         conflicts_unresolved = true;
         warn!(
-            "MR !{}: GitLab still reports merge conflicts after worker run",
+            "MR !{}: merge conflicts still reported after worker run",
             input.mr_iid
         );
     }
@@ -3111,7 +3111,7 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
 
     if input.requires_conflict_resolution && conflicts_unresolved {
         info!(
-            "MR !{}: merge conflicts with origin/{} remain; skipping GitLab replies until the branch merges cleanly",
+            "MR !{}: merge conflicts with origin/{} remain; skipping replies until the branch merges cleanly",
             input.mr_iid, input.target_branch
         );
         return Ok(());
@@ -3344,11 +3344,11 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                     Ok(i) => i,
                     Err(e) => {
                         if state.forge.is_not_found(&e) {
-                            // The issue no longer exists on GitLab (deleted or
+                            // The issue no longer exists (deleted or
                             // moved). Drop the stale session so we stop
                             // retrying a 404 on every cycle.
                             info!(
-                                "{}: Issue #{} no longer exists on GitLab (404), \
+                                "{}: Issue #{} no longer exists (404), \
                                  discarding stale session",
                                 &state.agent_id, issue_iid
                             );
@@ -3527,14 +3527,14 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
             Err(e) => {
                 if state.forge.is_not_found(&e) {
                     info!(
-                        "{}: Issue #{} no longer exists on GitLab (404), \
+                        "{}: Issue #{} no longer exists (404), \
                          discarding stale session",
                         &state.agent_id, issue_iid
                     );
                     state.cleanup_session(issue_iid);
                 } else {
                     warn!(
-                        "{}: Failed to verify issue #{} on GitLab: {}, skipping",
+                        "{}: Failed to verify issue #{}: {}, skipping",
                         &state.agent_id, issue_iid, e
                     );
                 }
@@ -3983,14 +3983,14 @@ fn build_mr_diff_context(
     project_name: &str,
     mr: &MergeRequest,
     git_repo: &GitRepo,
-    gitlab: &dyn ForgeClient,
+    forge: &dyn ForgeClient,
 ) -> String {
     const MAX_DIFF_CHARS: usize = 120_000;
     const MAX_FILES: usize = 200;
 
-    let mut source_note = "Source: GitLab MR changes API (matches MR diff view).".to_string();
+    let mut source_note = "Source: MR changes API (matches MR diff view).".to_string();
     let (diff_stat, changed_files, mut diff_patch, overflow_note, diff_refs_line) =
-        match gitlab.get_merge_request_changes(mr.iid) {
+        match forge.get_merge_request_changes(mr.iid) {
             Ok(snapshot) => {
                 let mut files = snapshot.files;
                 if files.len() > MAX_FILES {
@@ -4002,7 +4002,7 @@ fn build_mr_diff_context(
                     format!("{} files changed", files.len())
                 };
                 let overflow_note = if snapshot.overflow {
-                    Some("GitLab reported diff overflow; parts of the MR diff may be omitted.")
+                    Some("The MR diff overflowed; parts of the diff may be omitted.")
                 } else {
                     None
                 };
@@ -4016,7 +4016,7 @@ fn build_mr_diff_context(
             }
             Err(e) => {
                 source_note = format!(
-                    "Source: local git fallback (failed to read GitLab MR changes API: {}).",
+                    "Source: local git fallback (failed to read MR changes API: {}).",
                     e
                 );
                 (
@@ -4165,7 +4165,7 @@ fn build_merge_conflict_status_section(
             mr.source_branch, source_sha
         ),
         format!(
-            "- GitLab reports merge conflicts on this MR: {}",
+            "- Merge conflicts reported on this MR: {}",
             if mr.has_conflicts { "yes" } else { "no" }
         ),
         format!(
@@ -4258,7 +4258,7 @@ fn format_issue_comments_for_worker_context(forge: &dyn ForgeClient, issue_iid: 
         Ok(c) => c,
         Err(e) => {
             warn!(
-                "Worker: failed to fetch GitLab issue comments for #{}: {}",
+                "Worker: failed to fetch issue comments for #{}: {}",
                 issue_iid, e
             );
             Vec::new()
@@ -4294,7 +4294,7 @@ fn split_parent_context(
 
 fn worker_issue_context_markdown(
     issue: &IssueObservation,
-    gitlab_comments_text: &str,
+    comments_text: &str,
     parent_context: Option<&str>,
 ) -> String {
     let parent_context = parent_context
@@ -4302,18 +4302,18 @@ fn worker_issue_context_markdown(
         .unwrap_or_default();
     format!(
         "# Issue Context\n\nIssue: #{} {}\n\n## Description\n{}\n\n## Issue comments\n\n{}{}\n",
-        issue.iid, issue.title, issue.description, gitlab_comments_text, parent_context
+        issue.iid, issue.title, issue.description, comments_text, parent_context
     )
 }
 
 fn build_implementation_prompt(
     state: &AgentState,
     issue: &IssueObservation,
-    gitlab_comments_text: &str,
+    comments_text: &str,
 ) -> Result<String> {
     let parent_context = split_parent_context(state.forge.as_ref(), issue)?;
     let context_content =
-        worker_issue_context_markdown(issue, gitlab_comments_text, parent_context.as_deref());
+        worker_issue_context_markdown(issue, comments_text, parent_context.as_deref());
     // Write to disk for archival, but inject content into the prompt.
     let _context_path = write_task_context_file(
         state.sessions_dir,
@@ -4336,8 +4336,8 @@ TASK CONTEXT (already included below — do NOT read it from disk):
 {}
 
 CONTEXT:
-- The task context above is included in your prompt: it contains this issue's **description** and **every GitLab issue comment** at the time the task started. That is your primary written spec.
-- Labels on the issue (e.g. priority) are visible in GitLab; infer scope from description + comments + `AGENTS.md`.
+- The task context above is included in your prompt: it contains this issue's **description** and **every issue comment** at the time the task started. That is your primary written spec.
+- Labels on the issue (e.g. priority) are visible in the task context; infer scope from description + comments + `AGENTS.md`.
 
 {}
 
@@ -4387,11 +4387,11 @@ Proceed with the implementation autonomously. Do not ask for any user input.
 fn build_continuation_prompt(
     state: &AgentState,
     issue: &IssueObservation,
-    gitlab_comments_text: &str,
+    comments_text: &str,
 ) -> Result<String> {
     let parent_context = split_parent_context(state.forge.as_ref(), issue)?;
     let context_content =
-        worker_issue_context_markdown(issue, gitlab_comments_text, parent_context.as_deref());
+        worker_issue_context_markdown(issue, comments_text, parent_context.as_deref());
     // Write to disk for archival, but inject content into the prompt.
     let _context_path = write_task_context_file(
         state.sessions_dir,
@@ -4414,7 +4414,7 @@ TASK CONTEXT (already included below — do NOT read it from disk):
 {}
 
 CONTEXT:
-- The task context above contains this issue's **description** and **every GitLab issue comment** at task start.
+- The task context above contains this issue's **description** and **every issue comment** at task start.
 - A branch for this issue already exists with previous work
 - You are continuing the implementation from where it was left off
 - Review the existing code changes in this branch
@@ -4495,8 +4495,8 @@ RESOURCE AWARENESS — MANDATORY:
 }
 
 fn get_evidence_bound_scope_bullets() -> &'static str {
-    r#"- Only modify code that is strongly supported by the issue title, issue description, GitLab issue comments, or current unresolved MR feedback. If a change is merely adjacent, speculative, weakly coupled, or "nice to have", do not make it.
-- Treat the issue title, issue description, and GitLab issue comments as the strict boundary of allowed code changes.
+    r#"- Only modify code that is strongly supported by the issue title, issue description, issue comments, or current unresolved MR feedback. If a change is merely adjacent, speculative, weakly coupled, or "nice to have", do not make it.
+- Treat the issue title, issue description, and issue comments as the strict boundary of allowed code changes.
 - Every production code change must have a clear, direct link to those issue details or comments; if you cannot explain that link in one sentence, do not make the change.
 - Do NOT add features, refactors, or integrations not described in the issue.
 - Do NOT over-engineer: avoid new abstractions, compatibility layers, broad refactors, generalized frameworks, hypothetical future cases, unrelated edge cases, broad compatibility, "while here" cleanup, or behavior changes that are not directly required by the task evidence.

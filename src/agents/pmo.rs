@@ -1510,7 +1510,7 @@ fn build_existing_issues_summary(current_iid: u64, all_issues: &[Issue]) -> Stri
 }
 
 /// Markdown for the "Comments" section of `pmo-issue-*.md` via [`ForgeClient::get_issue_comments`].
-fn pmo_gitlab_comments_section(forge: &dyn ForgeClient, issue_iid: u64) -> (String, usize) {
+fn pmo_issue_comments_section(forge: &dyn ForgeClient, issue_iid: u64) -> (String, usize) {
     match forge.get_issue_comments(issue_iid) {
         Ok(comments) => {
             let n = comments.len();
@@ -1527,13 +1527,13 @@ fn pmo_gitlab_comments_section(forge: &dyn ForgeClient, issue_iid: u64) -> (Stri
         }
         Err(e) => {
             warn!(
-                "PMO: failed to fetch GitLab issue comments for #{}: {}",
+                "PMO: failed to fetch issue comments for #{}: {}",
                 issue_iid, e
             );
             (
                 format!(
-                    "**ERROR: {system} could not load GitLab issue comments.**\n\n\
-                     PMO triage may be unreliable until this works (check `glab` auth, network, and that `repo_path` is the git clone root).\n\n\
+                    "**ERROR: {system} could not load issue comments.**\n\n\
+                     PMO triage may be unreliable until this works (check CLI auth, network, and that `repo_path` is the git clone root).\n\n\
                      ```text\n{e}\n```",
                     system = display_name()
                 ),
@@ -1551,7 +1551,7 @@ fn refresh_pmo_issue_context_file(
     issue: &Issue,
     all_issues: &[Issue],
 ) -> Result<String> {
-    let (comments_text, gitlab_note_count) = pmo_gitlab_comments_section(forge, issue.iid);
+    let (comments_text, gitlab_note_count) = pmo_issue_comments_section(forge, issue.iid);
     let existing_issues_text = build_existing_issues_summary(issue.iid, all_issues);
     let closed_mr_text = pmo_closed_mr_section(forge, issue.iid);
 
@@ -2173,7 +2173,7 @@ fn find_claimed_pmo_issue(
         }
     }
     info!(
-        "{}: Recovered orphaned claim on issue #{} from GitLab",
+        "{}: Recovered orphaned claim on issue #{}",
         state.agent_id, issue_iid
     );
     state.save_state(issue_iid);
@@ -2428,7 +2428,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
             "Posted ask question; waiting for direct thread reply"
         );
         eprintln!(
-            "potlatch PMO: Posted question on issue #{} — **Reply to that GitLab comment** (thread). Waiting…",
+            "potlatch PMO: Posted question on issue #{} — **Reply to that issue comment** (thread). Waiting…",
             self.issue_iid
         );
 
@@ -2437,7 +2437,7 @@ impl CapabilityProvider for GitLabIssueAskHandler {
                 && Instant::now() >= dl
             {
                 eprintln!(
-                    "potlatch PMO: GitLab thread wait timed out on issue #{}; using automatic answer.",
+                    "potlatch PMO: thread wait timed out on issue #{}; using automatic answer.",
                     self.issue_iid
                 );
                 let _ = self.forge.add_issue_comment(

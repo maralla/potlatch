@@ -498,7 +498,7 @@ trait OpsPort {
         clock: CycleClock,
         log_window_interval: Duration,
     ) -> Result<String>;
-    fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String>;
+    fn write_forge_context_file(&mut self, unix_ts: u64) -> Result<String>;
     fn write_scrape_file(&mut self, unix_ts: u64, window_log: &str) -> Result<()>;
     fn prune_scrape_files(&mut self) -> Result<()>;
     fn issue_history(&self) -> Result<OpsIssueHistory>;
@@ -550,8 +550,8 @@ fn run_ops_cycle(
     }
     let clock = port.cycle_clock();
 
-    info!("{agent_id}: Fetching GitLab issues and merge requests for deduplication context");
-    let gitlab_context_path = port.write_gitlab_context_file(clock.unix_ts)?;
+    info!("{agent_id}: Fetching issues and merge requests for deduplication context");
+    let forge_context_path = port.write_forge_context_file(clock.unix_ts)?;
     if port.shutdown_requested() {
         return Ok(());
     }
@@ -598,7 +598,7 @@ fn run_ops_cycle(
     port.ensure_history_file(&history)?;
     let analysis_path = port.write_analysis_file(clock.unix_ts, &window_log)?;
     let history_path = port.history_file_path()?;
-    let prompt = build_analysis_prompt(&analysis_path, &history_path, &gitlab_context_path);
+    let prompt = build_analysis_prompt(&analysis_path, &history_path, &forge_context_path);
     let proposals = normalize_ops_issues(port.invoke_analysis_model(&prompt)?);
     if proposals.is_empty() {
         info!("{agent_id}: No new actionable errors found in log window");
@@ -619,7 +619,7 @@ fn run_ops_cycle(
         };
 
         info!(
-            "{agent_id}: Created GitLab issue #{}: {}",
+            "{agent_id}: Created issue #{}: {}",
             issue_iid, proposal.title
         );
         history
@@ -639,7 +639,7 @@ fn run_ops_cycle(
 
     if created > 0 {
         port.save_history(&history)?;
-        info!("{agent_id}: Created {created} new GitLab issue(s) from log analysis");
+        info!("{agent_id}: Created {created} new issue(s) from log analysis");
     }
     info!(
         "{agent_id}: Log analysis done (analyzed for {})",
@@ -697,8 +697,8 @@ impl OpsPort for LiveOpsPort<'_> {
         }
     }
 
-    fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String> {
-        write_gitlab_context_file(self.state, self.forge, unix_ts)
+    fn write_forge_context_file(&mut self, unix_ts: u64) -> Result<String> {
+        write_forge_context_file(self.state, self.forge, unix_ts)
     }
 
     fn write_scrape_file(&mut self, unix_ts: u64, window_log: &str) -> Result<()> {
@@ -790,11 +790,11 @@ fn ops_cycle(
     )
 }
 
-fn build_analysis_prompt(log_path: &str, history_path: &str, gitlab_context_path: &str) -> String {
+fn build_analysis_prompt(log_path: &str, history_path: &str, forge_context_path: &str) -> String {
     format!(
         r#"You are an operations agent triaging log data for errors and exceptions.
 
-Read these context files before proposing any new GitLab issues:
+Read these context files before proposing any new issues:
 
 1. Log session file (primary analysis input; may contain multiple source sections):
 {log_path}
@@ -802,12 +802,12 @@ Read these context files before proposing any new GitLab issues:
 2. Ops issue history (issues previously created by this agent, with related log lines):
 {history_path}
 
-3. Current GitLab context (all open issues and merge requests with descriptions and comments):
-{gitlab_context_path}
+3. Current context (all open issues and merge requests with descriptions and comments):
+{forge_context_path}
 
 Analyze ONLY the log session file for new errors, exceptions, panics, fatal failures, or repeated error patterns.
 
-Use the issue history and GitLab context files to avoid creating duplicate issues for problems that are already tracked, discussed, or being addressed.
+Use the issue history and context files to avoid creating duplicate issues for problems that are already tracked, discussed, or being addressed.
 
 For each candidate problem, inspect the current project codebase in your workspace before proposing an issue. Use the code to decide whether the logged failure is still actionable.
 
@@ -817,11 +817,11 @@ Treat explicit code or doc comments describing a behavior, fallback, limitation,
 
 Use the project codebase to map log errors to likely code paths, root causes, and concrete remediation steps. Do not rely on production host, deployment, or infrastructure details beyond what appears in the log file.
 
-For each NEW distinct problem that is not already covered, propose one GitLab issue.
+For each NEW distinct problem that is not already covered, propose one issue.
 
 Rules:
 - Report no issues if there are no NEW actionable errors.
-- Do not propose issues for errors already represented in the history or GitLab context files.
+- Do not propose issues for errors already represented in the history or context files.
 - Do not propose issues for errors that appear already fixed in the current codebase.
 - Do not propose issues to change behavior that a relevant code or doc comment explicitly identifies as intentional.
 - Titles must be specific and actionable.
@@ -829,7 +829,7 @@ Rules:
 "#,
         log_path = log_path,
         history_path = history_path,
-        gitlab_context_path = gitlab_context_path,
+        forge_context_path = forge_context_path,
     )
 }
 
@@ -848,21 +848,21 @@ fn ensure_history_file(state: &AgentState, history: &OpsIssueHistory) -> Result<
     save_history(&path, history)
 }
 
-fn write_gitlab_context_file(
+fn write_forge_context_file(
     state: &AgentState,
     forge: &dyn ForgeClient,
     unix_ts: u64,
 ) -> Result<String> {
-    let content = build_gitlab_context(forge)?;
+    let content = build_forge_context(forge)?;
     write_task_context_file(
         state.sessions_dir,
-        &format!("{}-gitlab-context-{unix_ts}.md", state.agent_id),
+        &format!("{}-forge-context-{unix_ts}.md", state.agent_id),
         &content,
     )
 }
 
-fn build_gitlab_context(forge: &dyn ForgeClient) -> Result<String> {
-    let mut out = String::from("# Current GitLab issues and merge requests\n\n");
+fn build_forge_context(forge: &dyn ForgeClient) -> Result<String> {
+    let mut out = String::from("# Current issues and merge requests\n\n");
 
     let issues = forge.list_issues()?;
     out.push_str("## Open issues\n\n");
@@ -1116,7 +1116,7 @@ mod tests {
     /// A log line inside the two-hour window measured back from
     /// [`test_clock`], so the real timestamp filter is exercised.
     const RECENT_LOG: &str = "2026-06-15 11:30:00 ERROR connection pool exhausted";
-    const CONTEXT_PATH: &str = "/sessions/ops-0-gitlab-context.md";
+    const CONTEXT_PATH: &str = "/sessions/ops-0-forge-context.md";
     const ANALYSIS_PATH: &str = "/sessions/ops-0-analysis.log";
     const HISTORY_PATH: &str = "/sessions/ops-0_issue_history.json";
 
@@ -1297,8 +1297,8 @@ mod tests {
             Ok(self.log_tail.clone())
         }
 
-        fn write_gitlab_context_file(&mut self, unix_ts: u64) -> Result<String> {
-            self.perform("write_gitlab_context_file")?;
+        fn write_forge_context_file(&mut self, unix_ts: u64) -> Result<String> {
+            self.perform("write_forge_context_file")?;
             self.context_timestamps.borrow_mut().push(unix_ts);
             Ok(CONTEXT_PATH.to_string())
         }
@@ -1397,7 +1397,7 @@ mod tests {
         let mut operations = vec![
             "shutdown_requested",
             "cycle_clock",
-            "write_gitlab_context_file",
+            "write_forge_context_file",
             "shutdown_requested",
         ];
         for _ in 0..source_count {
@@ -1490,7 +1490,7 @@ mod tests {
             vec![
                 "shutdown_requested",
                 "cycle_clock",
-                "write_gitlab_context_file",
+                "write_forge_context_file",
                 "shutdown_requested",
             ]
         );
@@ -1507,7 +1507,7 @@ mod tests {
             vec![
                 "shutdown_requested",
                 "cycle_clock",
-                "write_gitlab_context_file",
+                "write_forge_context_file",
                 "shutdown_requested",
                 "fetch_logs",
                 "shutdown_requested",
@@ -1592,7 +1592,7 @@ mod tests {
             vec![
                 "shutdown_requested",
                 "cycle_clock",
-                "write_gitlab_context_file",
+                "write_forge_context_file",
                 "shutdown_requested",
                 "fetch_logs",
                 "shutdown_requested",
@@ -1719,7 +1719,7 @@ mod tests {
     #[test]
     fn ops_cycle_aborts_when_a_required_write_fails() {
         for failing in [
-            "write_gitlab_context_file",
+            "write_forge_context_file",
             "write_scrape_file",
             "prune_scrape_files",
             "ensure_history_file",
@@ -1919,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_context_markdown_sections_are_structured() {
+    fn forge_context_markdown_sections_are_structured() {
         use crate::agents::forge::{Comment, Issue, MergeRequest};
 
         let issue = Issue {
@@ -2242,12 +2242,12 @@ mod tests {
         let prompt = build_analysis_prompt(
             "/tmp/project-sessions/ops-0-analysis-1.log",
             "/tmp/project-sessions/ops-0_issue_history.json",
-            "/tmp/project-sessions/ops-0-gitlab-context-1.md",
+            "/tmp/project-sessions/ops-0-forge-context-1.md",
         );
         // Every context path the model must act on is embedded...
         assert!(prompt.contains("/tmp/project-sessions/ops-0-analysis-1.log"));
         assert!(prompt.contains("/tmp/project-sessions/ops-0_issue_history.json"));
-        assert!(prompt.contains("/tmp/project-sessions/ops-0-gitlab-context-1.md"));
+        assert!(prompt.contains("/tmp/project-sessions/ops-0-forge-context-1.md"));
         // ...and no SSH connection details leak into the prompt.
         assert!(!prompt.contains("ssh_host"));
         assert!(!prompt.contains("fingerprint"));
