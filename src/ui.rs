@@ -16,6 +16,7 @@ use tracing_subscriber::fmt::{FmtContext, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::core::banner::Banner;
+use crate::paths::APP_NAME;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -25,7 +26,7 @@ const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 
 const BADGE_WIDTH: usize = 11;
-const SYSTEM_BADGE: &str = "potlatch";
+const SYSTEM_BADGE: &str = APP_NAME;
 const SPINNER_CLEAR: &str = "\r\x1b[2K\r";
 const LOG_PREFIX_WIDTH: usize = 18;
 const SPINNER_PREFIX_WIDTH: usize = 4;

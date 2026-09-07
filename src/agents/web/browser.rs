@@ -16,6 +16,8 @@ use headless_chrome::{Browser, Tab};
 use serde_json::Value;
 use tracing::info;
 
+use crate::paths::web_profile_dir_with_home;
+
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
 // Defuddle 0.19.2 full browser bundle (MIT); see defuddle.LICENSE.txt.
 const DEFUDDLE_SCRIPT: &str = include_str!("defuddle.full.js");
@@ -299,7 +301,7 @@ fn resolve_search_profile_dir(explicit: Option<PathBuf>, home: Option<PathBuf>) 
         return Ok(explicit);
     }
     let home = home.context("HOME is not set; set POTLATCH_WEB_PROFILE explicitly")?;
-    Ok(home.join(".potlatch").join("web-chrome-profile"))
+    Ok(web_profile_dir_with_home(&home))
 }
 
 fn detect_browser_executable() -> Result<PathBuf> {

@@ -29,6 +29,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::core::model::acp::jsonrpc::Outbound;
+use crate::paths::sessions_dir;
 
 /// A writer that wraps an `Option<File>` behind a `Mutex`, implementing `io::Write`.
 /// When the inner file is `None`, writes are silently dropped.
@@ -152,14 +153,7 @@ fn set_session_log(writer: &SwappableWriter, session_id: &str) {
 }
 
 pub(crate) fn logging_dir() -> PathBuf {
-    home_dir().join(".potlatch").join("sessions")
-}
-
-pub(crate) fn home_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home);
-    }
-    PathBuf::from(".")
+    sessions_dir()
 }
 
 /// Entry point for `potlatch harness`. Reads JSON-RPC from stdin, writes to stdout.

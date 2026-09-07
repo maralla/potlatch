@@ -17,6 +17,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::paths::{agents_dir, sessions_dir};
+
 /// The two roots of the on-disk layout. Injectable so tests run against a
 /// temp directory instead of the real `~/.potlatch`.
 #[derive(Debug, Clone)]
@@ -29,8 +31,8 @@ impl SessionRoots {
     /// The real `~/.potlatch` layout.
     pub fn real() -> Self {
         Self {
-            sessions: super::logging_dir(),
-            agents: super::home_dir().join(".potlatch").join("agents"),
+            sessions: sessions_dir(),
+            agents: agents_dir(),
         }
     }
 }

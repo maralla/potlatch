@@ -27,6 +27,7 @@ use crate::core::bus::{
 use crate::core::config::Config;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 use crate::core::runtime::AgentRuntime;
+use crate::paths::memory_dir;
 
 const REQUEST_TASK: &str = "requests";
 const INBOX_WAIT: Duration = Duration::from_millis(200);
@@ -285,11 +286,7 @@ fn memory_tool_definition() -> AgentToolDefinition {
 /// working directory path.
 fn memory_file_path(working_dir: &str) -> PathBuf {
     let hash = hash_str(working_dir);
-    home_dir()
-        .join(".potlatch")
-        .join("memory")
-        .join(&hash)
-        .join("memory.md")
+    memory_dir().join(&hash).join("memory.md")
 }
 
 fn hash_str(value: &str) -> String {
@@ -299,13 +296,6 @@ fn hash_str(value: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
-}
-
-fn home_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home);
-    }
-    PathBuf::from(".")
 }
 
 #[cfg(test)]
@@ -327,7 +317,7 @@ mod tests {
     #[test]
     fn memory_file_path_is_under_potlatch_memory_with_hash() {
         let path = memory_file_path("/home/user/project");
-        assert!(path.starts_with(home_dir().join(".potlatch/memory")));
+        assert!(path.starts_with(memory_dir()));
         assert!(path.ends_with("memory.md"));
     }
 
