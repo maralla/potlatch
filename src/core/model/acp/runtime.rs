@@ -317,6 +317,12 @@ impl AcpRuntime {
     /// cancellation check and follow-up forwarding running while it is in
     /// flight. Captures from any earlier turn are cleared first, so what comes
     /// back belongs to this prompt only.
+    ///
+    /// A result reporting `stopReason: "error"` — the agent loop itself
+    /// failed, e.g. the LLM endpoint stayed unavailable after the agent's own
+    /// in-process retries — propagates as an error instead of a handoff: no
+    /// repair prompt can fix an endpoint, so it must not be misread as a turn
+    /// that merely skipped the required tool call.
     fn run_prompt_once(
         &self,
         prompt: &str,
@@ -401,6 +407,16 @@ impl AcpRuntime {
 
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Ok(pr)) => {
+                    if let Some(message) = agent_loop_error_message(&pr) {
+                        break Err(anyhow::anyhow!(
+                            "ACP agent loop error: {}",
+                            if message.trim().is_empty() {
+                                "no detail reported"
+                            } else {
+                                &message
+                            }
+                        ));
+                    }
                     self.wait_for_followup_if_vendor(&hooks, cancel_check)?;
                     break Ok(handoff_from_prompt_hooks(
                         &hooks,
@@ -717,6 +733,25 @@ fn is_transport_failure(error: &anyhow::Error) -> bool {
     message.contains("exited during prompt") || message.contains("ACP session/prompt")
 }
 
+/// The error detail when a prompt result reports `stopReason: "error"` — the
+/// agent loop itself failed (e.g. the LLM endpoint stayed unavailable after
+/// the agent's own in-process retries) rather than completing a turn. No
+/// repair prompt can fix that, so the caller must fail the task instead of
+/// treating the result as a handoff whose structured output is merely
+/// missing. Returns `None` for every other stop reason.
+fn agent_loop_error_message(pr: &PromptResult) -> Option<String> {
+    if !pr.stop_reason.eq_ignore_ascii_case("error") {
+        return None;
+    }
+    Some(
+        pr.extra
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default(),
+    )
+}
+
 fn collect_text_fragments_from_value(v: &Value, out: &mut Vec<String>) {
     match v {
         Value::String(s) => {
@@ -985,6 +1020,46 @@ mod tests {
         assert!(!is_transport_failure(&anyhow::anyhow!(
             "Agent interrupted by shutdown"
         )));
+    }
+
+    #[test]
+    fn agent_loop_error_results_are_not_worth_resending_the_prompt_for() {
+        // An agent loop error is the endpoint failing, not the transport:
+        // resending the same prompt would re-hit the same dead endpoint.
+        assert!(!is_transport_failure(&anyhow::anyhow!(
+            "ACP agent loop error: LLM request failed (503 Service Unavailable)"
+        )));
+    }
+
+    #[test]
+    fn prompt_results_reporting_agent_loop_errors_yield_their_message() {
+        let pr: PromptResult = serde_json::from_value(json!({
+            "stopReason": "error",
+            "message": "LLM request failed (503 Service Unavailable)"
+        }))
+        .unwrap();
+        assert_eq!(
+            agent_loop_error_message(&pr).as_deref(),
+            Some("LLM request failed (503 Service Unavailable)")
+        );
+
+        let missing_detail: PromptResult =
+            serde_json::from_value(json!({"stopReason": "error"})).unwrap();
+        assert_eq!(
+            agent_loop_error_message(&missing_detail).as_deref(),
+            Some("")
+        );
+
+        let end_turn: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "message": "done"
+        }))
+        .unwrap();
+        assert_eq!(agent_loop_error_message(&end_turn), None);
+
+        let aborted: PromptResult =
+            serde_json::from_value(json!({"stopReason": "aborted"})).unwrap();
+        assert_eq!(agent_loop_error_message(&aborted), None);
     }
 
     #[test]
