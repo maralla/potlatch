@@ -18,6 +18,8 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use crate::paths::display_name;
+
 use super::Tool;
 
 const MAX_OUTPUT: usize = 50_000;
@@ -701,7 +703,7 @@ impl Tool for SubagentTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Spawn a subagent — a separate potlatch harness instance with its own LLM session. The subagent runs asynchronously in the background. Returns a subagent_id immediately; poll with subagent_id to get accumulated output. Use for parallel exploration, independent research tasks, or dividing complex work. The subagent has no context from the parent session — provide everything it needs in the prompt. Send follow-up messages to a running subagent with subagent_id + message (mid-run injection into the agent's context).",
+            "description": format!("Spawn a subagent — a separate {d} harness instance with its own LLM session. The subagent runs asynchronously in the background. Returns a subagent_id immediately; poll with subagent_id to get accumulated output. Use for parallel exploration, independent research tasks, or dividing complex work. The subagent has no context from the parent session — provide everything it needs in the prompt. Send follow-up messages to a running subagent with subagent_id + message (mid-run injection into the agent's context).", d = display_name()),
             "parameters": {
                 "type": "object",
                 "properties": {

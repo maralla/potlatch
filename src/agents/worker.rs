@@ -28,6 +28,7 @@ use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 use crate::core::workflow::AgentBuildContext;
+use crate::paths::display_name;
 
 const WORKING_ON_LABEL: &str = "in-progress";
 /// Root-level file updated by Potlatch after each successful worker run (impl or MR feedback).
@@ -250,11 +251,11 @@ structured_output! {
             "How the implementation run ended. Pick exactly one and send only that outcome's fields.",
             {
                 "implemented" => (
-                    "You made the code changes; Potlatch commits, pushes, and opens the merge request.",
+                    format!("You made the code changes; {} commits, pushes, and opens the merge request.", display_name()),
                     fields(mr_metadata_properties(ObjectSchema::new()))
                 ),
                 "existing_mr" => (
-                    "You found an already-open merge request that implements this issue; Potlatch tracks it instead of opening a new one.",
+                    format!("You found an already-open merge request that implements this issue; {} tracks it instead of opening a new one.", display_name()),
                     object({
                         required existing_mr_iid: integer(
                             "IID of the existing open merge request."
@@ -262,7 +263,7 @@ structured_output! {
                     })
                 ),
                 "wait_dependency" => (
-                    "The work is hard-blocked until another issue closes; Potlatch parks this issue and resumes it automatically.",
+                    format!("The work is hard-blocked until another issue closes; {} parks this issue and resumes it automatically.", display_name()),
                     object({
                         required depends_on_issue: integer(
                             "IID of the issue that must close before this work can proceed."
@@ -328,7 +329,8 @@ structured_output! {
                     .property(
                         "mark_discussions_resolved",
                         Schema::boolean(
-                            "Whether Potlatch may mark open review discussions resolved after posting your reply. True only when the request is fully fixed in code/MR metadata, or the branch was verified to already satisfy it and the public comment explains how. For merge-conflict feedback, true only after a pushed branch merges cleanly with no conflict markers. False for partial progress, disagreement, or anything still needing review. Omit to let Potlatch infer from branch changes; set explicitly for metadata-only fixes.",
+                            format!("Whether {d} may mark open review discussions resolved after posting your reply. True only when the request is fully fixed in code/MR metadata, or the branch was verified to already satisfy it and the public comment explains how. For merge-conflict feedback, true only after a pushed branch merges cleanly with no conflict markers. False for partial progress, disagreement, or anything still needing review. Omit to let {d} infer from branch changes; set explicitly for metadata-only fixes.",
+                            d = display_name()),
                         ),
                     )
                     .property(
@@ -339,7 +341,8 @@ structured_output! {
                     ))
                 ),
                 "cannot_resolve" => (
-                    "The feedback cannot be resolved autonomously; Potlatch abandons the merge request and reports back.",
+                    format!("The feedback cannot be resolved autonomously; {d} abandons the merge request and reports back.",
+                    d = display_name()),
                     fields(blocked_properties(
                         ObjectSchema::new(),
                         "Why the feedback cannot be resolved and what human input is needed."
@@ -2751,8 +2754,8 @@ CRITICAL REQUIREMENTS:
 - Make all necessary code changes to resolve the comments
 - Keep the original issue requirements in mind while addressing feedback
 - If the workspace has merge conflict markers (<<<<<<< / ======= / >>>>>>>), resolve ALL of them before doing anything else. Edit each conflicted file to keep the correct version.
-- The **Merge conflict status** section in the task context above is verified by Potlatch. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
-- `origin/{}` already fetched and merged it into your workspace when conflicts were reported. Edit the listed conflicted files, remove all conflict markers, and leave committing/pushing to Potlatch. Do not claim the conflict is fixed until the **Merge conflict status** section shows a clean merge with the fetched target tip.
+- The **Merge conflict status** section in the task context above is verified by {system}. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
+- `origin/{}` already fetched and merged it into your workspace when conflicts were reported. Edit the listed conflicted files, remove all conflict markers, and leave committing/pushing to {system}. Do not claim the conflict is fixed until the **Merge conflict status** section shows a clean merge with the fetched target tip.
 
 {}
 
@@ -2780,7 +2783,8 @@ INSTRUCTIONS:
         latest_mr.title,
         combined_context_content,
         latest_mr.target_branch,
-        feedback_scope_rules
+        feedback_scope_rules,
+        system = display_name(),
     );
 
     // Follow-up poll: while the agent works on this MR's feedback, watch for
@@ -4148,7 +4152,10 @@ fn build_merge_conflict_status_section(
         .remote_short_sha(&mr.source_branch)
         .unwrap_or_else(|_| "(unknown)".to_string());
     let mut lines = vec![
-        "## Merge conflict status (verified by Potlatch — trust this section)".to_string(),
+        format!(
+            "## Merge conflict status (verified by {d} — trust this section)",
+            d = display_name()
+        ),
         format!(
             "- Fetched `origin/{}` at commit: {}",
             mr.target_branch, target_sha
@@ -4174,9 +4181,12 @@ fn build_merge_conflict_status_section(
         format!(
             "- Merge currently in progress in workspace: {}",
             if git_repo.is_merge_in_progress().unwrap_or(false) {
-                "yes — resolve every unmerged file, then Potlatch will conclude the merge commit"
+                format!(
+                    "yes — resolve every unmerged file, then {d} will conclude the merge commit",
+                    d = display_name()
+                )
             } else {
-                "no"
+                "no".to_string()
             }
         ),
         format!(
@@ -4209,7 +4219,7 @@ fn build_merge_conflict_status_section(
 
     if requires_conflict_resolution {
         lines.push(
-            "- After editing conflicted files, remove every conflict marker. Potlatch will `git add` resolved files and conclude the merge commit; you do not need to run git commands.".to_string(),
+            format!("- After editing conflicted files, remove every conflict marker. {d} will `git add` resolved files and conclude the merge commit; you do not need to run git commands.", d = display_name()),
         );
     }
 

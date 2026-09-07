@@ -27,6 +27,7 @@ use crate::core::model::acp::capabilities::{AskAnswer, AskQuestion, CapabilityPr
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 use crate::core::workflow::AgentBuildContext;
+use crate::paths::display_name;
 
 const ACTION_REQUIRED_LABEL: &str = "action-required";
 const PMO_PROCESSED_LABEL: &str = "pmo-processed";
@@ -1531,9 +1532,10 @@ fn pmo_gitlab_comments_section(forge: &dyn ForgeClient, issue_iid: u64) -> (Stri
             );
             (
                 format!(
-                    "**ERROR: Potlatch could not load GitLab issue comments.**\n\n\
+                    "**ERROR: {system} could not load GitLab issue comments.**\n\n\
                      PMO triage may be unreliable until this works (check `glab` auth, network, and that `repo_path` is the git clone root).\n\n\
-                     ```text\n{e}\n```"
+                     ```text\n{e}\n```",
+                    system = display_name()
                 ),
                 0,
             )
@@ -1558,7 +1560,7 @@ fn refresh_pmo_issue_context_file(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let body = format!(
-        "# PMO Triage Context\n\nProject: {project_name}\nIssue: #{iid} {title}\n\n## Issue description\n{description}\n\n## Comments and worker feedback\n{comments}\n\n## Closed merge request context\n{closed_mr}\n\n## Existing open issues\n{existing}\n\n---\n_Potlatch: PMO refreshed this file; {gitlab_note_count} note(s) in the comments section; UNIX ts {generated_ts}._\n",
+        "# PMO Triage Context\n\nProject: {project_name}\nIssue: #{iid} {title}\n\n## Issue description\n{description}\n\n## Comments and worker feedback\n{comments}\n\n## Closed merge request context\n{closed_mr}\n\n## Existing open issues\n{existing}\n\n---\n_{system}: PMO refreshed this file; {gitlab_note_count} note(s) in the comments section; UNIX ts {generated_ts}._\n",
         project_name = &state.project_name,
         iid = issue.iid,
         title = issue.title,
@@ -1568,6 +1570,7 @@ fn refresh_pmo_issue_context_file(
         existing = existing_issues_text,
         gitlab_note_count = gitlab_note_count,
         generated_ts = generated_ts,
+        system = display_name(),
     );
 
     let path = state.context_path(issue.iid);
@@ -1600,7 +1603,8 @@ fn pmo_closed_mr_section(forge: &dyn ForgeClient, issue_iid: u64) -> String {
         Err(e) => {
             warn!("PMO: failed to search MRs for issue #{issue_iid} branch {branch_name}: {e}");
             return format!(
-                "**ERROR: Potlatch could not search merge requests for this issue.**\n\n```\n{e}\n```"
+                "**ERROR: {system} could not search merge requests for this issue.**\n\n```\n{e}\n```",
+                system = display_name()
             );
         }
     };
@@ -1624,7 +1628,8 @@ fn pmo_closed_mr_section(forge: &dyn ForgeClient, issue_iid: u64) -> String {
         Err(e) => {
             warn!("PMO: failed to fetch MR !{mr_iid}: {e}");
             return format!(
-                "**ERROR: Potlatch could not load merge request !{mr_iid}.**\n\n```\n{e}\n```"
+                "**ERROR: {system} could not load merge request !{mr_iid}.**\n\n```\n{e}\n```",
+                system = display_name()
             );
         }
     };
@@ -1761,7 +1766,7 @@ TASK CONTEXT FILE (you MUST open and read this path on disk — it has the full 
 
 CONTEXT:
 An automated worker agent attempted to implement this issue but was unable to complete it.
-Potlatch wrote the path above as a markdown file: **full issue description**, **every issue comment** (including worker rejection / PMO notes), **closed merge request context** (MR comments, reviewer feedback, and diff from the worker's closed MR, when one exists), and **the list of other open issues**. That file is the authoritative written context for this triage.
+{system} wrote the path above as a markdown file: **full issue description**, **every issue comment** (including worker rejection / PMO notes), **closed merge request context** (MR comments, reviewer feedback, and diff from the worker's closed MR, when one exists), and **the list of other open issues**. That file is the authoritative written context for this triage.
 - Use your **file-reading** capability on the absolute path and read it **end-to-end** before you decide the situation is unclear.
 - The single line `ISSUE #…: title` in this prompt is **not** a substitute for the file; do not claim "no context" merely because you did not read the task context file.
 - The **Closed merge request context** section is especially important when the worker closed an MR after failing to resolve reviewer feedback — the MR comments and diff show what the reviewer asked for and what the worker tried.
@@ -1783,7 +1788,7 @@ PLAN PROPOSAL POLICY:
 - Write the plan about the KEY SOLUTION, not a framework or scaffold. State the core approach and the decisive design decisions; do not reproduce boilerplate, directory layouts, file-by-file outlines, or generic "create a module that does X" scaffolding.
 - Be specific about the solution, not about incidental details. Name the exact module/function/boundary the change touches and the concrete approach, but omit step-by-step implementation minutiae the worker can derive from the code.
 - Every idea in the plan must have a reference or proof of concept. For code in this repository, cite the file, function, existing pattern, or concrete repo state that substantiates it. For concepts, methods, libraries, protocols, or any external knowledge the plan relies on, search the web and cite the authoritative source (documentation, RFC, spec, changelog) that backs the claim — do not assert an approach from memory. If you cannot ground an idea in either the repository or a cited external source, it is a question for the human, not a plan item.
-- During pmo-planning refinement, if the current plan is already clear and implementation-ready and the latest human comment does not require a real plan change, explicitly keep the current plan unchanged (KEEP_PLAN). In that case Potlatch must not post another comment or rewrite the description.
+- During pmo-planning refinement, if the current plan is already clear and implementation-ready and the latest human comment does not require a real plan change, explicitly keep the current plan unchanged (KEEP_PLAN). In that case {system} must not post another comment or rewrite the description.
 - Proposing or refining a plan keeps the issue in pmo-planning so human comments can trigger another refinement cycle.
 - Do not use worker guidance as a substitute for a missing plan. Use clarification only when missing human information prevents you from writing a useful plan.
 
@@ -1791,7 +1796,7 @@ DECOMPOSITION POLICY:
 - The parent is a task container and will be closed after its sub-issues are created.
 - Keep each sub-issue focused around the same approximate size limits as above.
 - The parent priority is {parent_priority}. Give blockers, security fixes, and shared prerequisites higher priority than independent leaf work.
-- Record dependencies only for real build order. Potlatch parks dependent sub-issues until their prerequisites close.
+- Record dependencies only for real build order. {system} parks dependent sub-issues until their prerequisites close.
 - Review the existing-open-issues section before proposing sub-issues. Never duplicate or substantially overlap existing work.
 - If an existing open but inactive issue covers part of the work, reference it instead of creating a duplicate. If an in-progress issue covers it, skip that part. If existing issues cover everything, guide the worker to those issues instead of creating more.
 
@@ -1814,6 +1819,7 @@ INSTRUCTIONS:
         plan_destination = plan_destination,
         context_path = context_path,
         parent_priority = parent_priority,
+        system = display_name(),
     );
 
     Ok(prompt)
@@ -2235,8 +2241,9 @@ fn build_issue_comment(ask_id: &str, question: &AskQuestion) -> String {
          ---\n\n\
          **Reply to this comment** (use the *Reply* button on this note so your answer stays in this thread). \
          Your reply text is the answer — usually one line: an option id, a number (`0` = first choice), or a short answer.\n\n\
-         The `{}` label is set until Potlatch forwards your reply to the running agent.",
-        labels::PMO_PENDING
+         The `{}` label is set until {} forwards your reply to the running agent.",
+        labels::PMO_PENDING,
+        display_name()
     )
 }
 

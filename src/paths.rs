@@ -18,6 +18,17 @@ use std::path::{Path, PathBuf};
 /// everything — the CLI name, the `~/.<name>` data root, config discovery.
 pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
+/// The name as a proper noun in prose ("Potlatch"): first letter uppercased.
+/// Prompt text and agent-facing context refer to the system by name; this
+/// keeps those references in step with a crate rename.
+pub(crate) fn display_name() -> String {
+    let mut chars = APP_NAME.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
 /// The config file name: `<name>.toml`, searched in the working directory
 /// (and `config/`) when no path is given.
 pub(crate) const CONFIG_FILE_NAME: &str = concat!(env!("CARGO_PKG_NAME"), ".toml");
@@ -98,5 +109,16 @@ mod tests {
     fn names_come_from_the_package_manifest() {
         assert_eq!(APP_NAME, env!("CARGO_PKG_NAME"));
         assert_eq!(CONFIG_FILE_NAME, format!("{APP_NAME}.toml"));
+    }
+
+    #[test]
+    fn display_name_capitalizes_the_first_letter() {
+        let display = display_name();
+        assert_eq!(
+            display,
+            APP_NAME[..1].to_uppercase() + &APP_NAME[1..],
+            "display name must track the manifest name"
+        );
+        assert!(!display.is_empty());
     }
 }

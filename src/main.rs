@@ -68,8 +68,8 @@ fn main() -> Result<()> {
             println!("Example config file created at: {}", path);
             println!("\nEdit this file to configure agents under [agent.*] sections.");
             println!("\nExample usage:");
-            println!("  potlatch run");
-            println!("  potlatch run --config {}", path);
+            println!("  {APP_NAME} run");
+            println!("  {APP_NAME} run --config {}", path);
             Ok(())
         }
         Some(Commands::Run { config }) => run_workflow(config),
