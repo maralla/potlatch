@@ -8,7 +8,9 @@
 //! in real-time (streamed to stdout as they're produced, not buffered).
 
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +21,10 @@ use tracing::{debug, info, warn};
 
 use super::agent_loop::AgentLoop;
 use super::client::ChatClient;
+use super::session_store::{
+    SessionRoots, agent_current_marker, clear_current_session, read_current_session,
+    session_context_file, write_current_session,
+};
 use super::tools::ToolRegistry;
 use crate::core::model::acp::jsonrpc::Outbound;
 
@@ -79,7 +85,18 @@ struct Session {
     /// human-readable transcript of each `session/prompt` turn (user prompt,
     /// assistant response, reasoning, tool calls) to this file in real time.
     /// The parent agent can read it to inspect subagent progress.
-    transcript_path: Option<std::path::PathBuf>,
+    transcript_path: Option<PathBuf>,
+    /// The orchestrator agent this session runs for (e.g. `worker-7`), from
+    /// the `agent_id` extension of `session/new`. Drives the
+    /// `~/.potlatch/agents/<agent-id>/current` marker: written when this
+    /// session starts, emptied when it finishes, so a recovered process
+    /// resumes only interrupted sessions. Empty when the caller passes none —
+    /// the session then has no marker and cannot be resumed.
+    agent_id: String,
+    /// Path to this session's persisted context file. `None` when the
+    /// session has no sessions-directory identity (agent_id empty): a fresh
+    /// context, never persisted, never resumed.
+    context_path: Option<PathBuf>,
 }
 
 impl Session {
@@ -96,6 +113,8 @@ impl Session {
             structured_output_tools: None,
             agent_tools: Vec::new(),
             transcript_path: None,
+            agent_id: String::new(),
+            context_path: None,
         }
     }
 }
@@ -109,6 +128,9 @@ pub struct AcpServer {
     /// blocked running `session/prompt`.
     shared_channels: SharedSessionChannels,
     agent_tool_caller: Option<Arc<dyn super::tools::agent_bus::AgentToolCaller>>,
+    /// Where session data (run.log, context) and agent markers live.
+    /// Overridable so tests never touch the real `~/.potlatch`.
+    roots: SessionRoots,
 }
 
 impl AcpServer {
@@ -118,7 +140,16 @@ impl AcpServer {
             sessions: HashMap::new(),
             shared_channels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             agent_tool_caller: None,
+            roots: SessionRoots::real(),
         }
+    }
+
+    /// Run the server against explicit filesystem roots (tests).
+    #[cfg(test)]
+    fn with_roots(llm: Arc<dyn ChatClient>, roots: SessionRoots) -> Self {
+        let mut server = Self::new(llm);
+        server.roots = roots;
+        server
     }
 
     pub fn with_agent_tool_caller(
@@ -253,7 +284,41 @@ impl AcpServer {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         {
-            session.transcript_path = Some(std::path::PathBuf::from(path));
+            session.transcript_path = Some(PathBuf::from(path));
+        }
+
+        // Optional `agent_id` extension: the orchestrator agent this session
+        // runs for (e.g. `worker-7`). It locates the session in
+        // `~/.potlatch/agents/<agent-id>/current` so a recovered process can
+        // find the interrupted session and reuse its persisted context.
+        session.agent_id = params
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default();
+
+        // A previous run of this agent may have crashed mid-task: its marker
+        // still names the session it never finished. Adopt that session's id —
+        // and with it the run.log/context directory — so this run resumes it;
+        // the marker then names this run. Nothing to resume (no agent_id, no
+        // marker, or a marker pointing at a session whose context is gone)
+        // keeps the fresh id and starts an empty context.
+        let sessions_root = self.roots.sessions.clone();
+        if !session.agent_id.is_empty() {
+            let marker = agent_current_marker(&self.roots.agents, &session.agent_id);
+            if let Some(prev_id) = read_current_session(&marker)
+                && prev_id != session.id
+                && session_context_file(&sessions_root, &prev_id).is_file()
+            {
+                info!(
+                    "harness ACP: agent {} resuming interrupted session {prev_id} \
+                     (context recovered from disk)",
+                    session.agent_id
+                );
+                session.id = prev_id;
+            }
+            session.context_path = Some(session_context_file(&sessions_root, &session.id));
+            write_current_session(&marker, &session.id);
         }
 
         // Optional `write_roots` extension: directories the write/edit tools
@@ -266,7 +331,7 @@ impl AcpServer {
                 arr.iter()
                     .filter_map(Value::as_str)
                     .filter(|s| !s.is_empty())
-                    .map(std::path::PathBuf::from)
+                    .map(PathBuf::from)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -325,7 +390,9 @@ impl AcpServer {
         // loop owns the Context and is reused across all session/prompt calls
         // — true single long session. The inject_tx is stored in the shared
         // channels map so session/inject can push messages into the running
-        // loop.
+        // loop. A resumed session restores its context from the previous
+        // run's snapshot; a fresh one initializes from the system prompt and
+        // context channels.
         let inject_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let mut agent = AgentLoop::new(
             Arc::clone(&self.llm),
@@ -335,7 +402,14 @@ impl AcpServer {
             Arc::clone(&session.cancel),
             Arc::clone(&inject_queue),
         );
-        agent.init_context(&cwd, &context_channels);
+        if let Some(context_path) = session.context_path.clone() {
+            agent.set_context_path(context_path);
+            if !agent.restore_context(&cwd, &context_channels) {
+                agent.init_context(&cwd, &context_channels);
+            }
+        } else {
+            agent.init_context(&cwd, &context_channels);
+        }
         session.agent = Some(agent);
 
         // Register the inject channel and cancel flag in the shared channels
@@ -547,13 +621,19 @@ impl AcpServer {
     /// background jobs, stops language servers) and drop it from the shared
     /// channels map. Unknown ids are a no-op — `session/close` for a session
     /// this child never knew (or already closed) must not fail the caller's
-    /// rotation.
+    /// rotation. The agent's `current` marker is emptied when it still names
+    /// this session: a closed session is a finished task, and a recovered
+    /// process must resume only interrupted work.
     fn close_registered_session(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
+            if !session.agent_id.is_empty() {
+                let marker = agent_current_marker(&self.roots.agents, &session.agent_id);
+                clear_current_session(&marker, session_id);
+            }
             session.states.shutdown();
-            self.shared_channels.lock().unwrap().remove(session_id);
             debug!("harness ACP: closed session {session_id}");
         }
+        self.shared_channels.lock().unwrap().remove(session_id);
     }
 
     /// Close every registered session. Called from `session/new` so a failed
@@ -571,13 +651,9 @@ impl AcpServer {
 }
 
 /// Append a section to the transcript file.
-fn write_transcript_entry(path: &std::path::Path, header: &str, body: &str) {
+fn write_transcript_entry(path: &Path, header: &str, body: &str) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "\n{header}\n\n{body}");
         let _ = f.flush();
     }
@@ -585,17 +661,9 @@ fn write_transcript_entry(path: &std::path::Path, header: &str, body: &str) {
 
 /// Append a full turn (assistant content, reasoning, tool calls) to the
 /// transcript file.
-fn write_transcript_turn(
-    path: &std::path::Path,
-    turn: u32,
-    response: &super::client::ChatResponse,
-) {
+fn write_transcript_turn(path: &Path, turn: u32, response: &super::client::ChatResponse) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "\n=== Turn {turn} ===");
 
         if !response.content.is_empty() {
@@ -654,6 +722,7 @@ fn extract_prompt_text(prompt: &Value) -> String {
 mod tests {
     use super::super::client::ChatResponse;
     use super::*;
+    use crate::harness::tools::test_util;
     use serde_json::json;
     use std::io::Cursor;
 
@@ -1290,5 +1359,238 @@ mod tests {
     fn default_mode_keeps_file_edit_registered() {
         let tools = run_session_prompt_in_mode("");
         assert!(tools.contains(&"edit".to_string()));
+    }
+
+    /// A chat client that captures the messages it was called with, so tests
+    /// can assert what context a session restored or initialized.
+    struct MessagesCapturingClient {
+        captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    }
+
+    impl ChatClient for MessagesCapturingClient {
+        fn chat(
+            &self,
+            _model: &str,
+            messages: &[Value],
+            _tools: &[Value],
+            _on_chunk: Option<&super::super::client::StreamCallback>,
+            _on_tool_calls: Option<&super::super::client::ToolExecCallback<'_>>,
+            _on_early_tool_call: Option<&super::super::client::EarlyToolExecCallback<'_>>,
+        ) -> Result<ChatResponse> {
+            self.captured.lock().unwrap().push(messages.to_vec());
+            Ok(ChatResponse {
+                content: "ok".into(),
+                tool_calls: vec![],
+                finish_reason: "stop".into(),
+                usage: super::super::client::Usage::default(),
+                tool_results: vec![],
+                elapsed_ms: 0,
+                reasoning: String::new(),
+            })
+        }
+    }
+
+    fn test_roots(dir: &std::path::Path) -> SessionRoots {
+        SessionRoots {
+            sessions: dir.join("sessions"),
+            agents: dir.join("agents"),
+        }
+    }
+
+    fn session_new_with_agent(server: &mut AcpServer, id: Value, agent_id: &str) -> String {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/new",
+            "params": { "cwd": "/tmp", "agent_id": agent_id }
+        });
+        let (response, _) = collect_output(server, &msg);
+        match response {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected session/new response"),
+        }
+    }
+
+    #[test]
+    fn session_new_writes_the_current_marker_and_persists_context() {
+        let dir = test_util::unique_test_dir();
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<Value>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm: Arc<dyn ChatClient> = Arc::new(MessagesCapturingClient {
+            captured: captured.clone(),
+        });
+        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
+
+        let sid = session_new_with_agent(&mut server, json!(1), "worker-7");
+        let marker = dir.path().join("agents").join("worker-7").join("current");
+        assert_eq!(read_current_session(&marker).as_deref(), Some(sid.as_str()));
+
+        // Prompt once — the context (system + user prompt) is persisted.
+        let prompt = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "implement the feature" }]
+            }
+        });
+        let (response, _) = collect_output(&mut server, &prompt);
+        assert!(
+            matches!(&response, Some(Outbound::Response { result, .. })
+                if result.get("stopReason").and_then(Value::as_str).is_some_and(|s| s != "error")),
+            "prompt should end without error, got: {:?}",
+            response.map(|r| r.to_json_line().unwrap_or_default())
+        );
+        let context_file = dir.path().join("sessions").join(&sid).join("context");
+        let snapshot: Value =
+            serde_json::from_str(&fs::read_to_string(&context_file).expect("context persisted"))
+                .unwrap();
+        assert!(snapshot["entries"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn closing_a_session_empties_the_current_marker() {
+        let dir = test_util::unique_test_dir();
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
+
+        let sid = session_new_with_agent(&mut server, json!(1), "worker-7");
+        let close = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/close",
+            "params": { "sessionId": sid }
+        });
+        let (response, _) = collect_output(&mut server, &close);
+        assert!(matches!(response, Some(Outbound::Response { .. })));
+
+        let marker = dir.path().join("agents").join("worker-7").join("current");
+        assert_eq!(
+            read_current_session(&marker),
+            None,
+            "a closed session is a finished task; the marker must be empty"
+        );
+    }
+
+    #[test]
+    fn a_recovered_agent_resumes_its_interrupted_session() {
+        let dir = test_util::unique_test_dir();
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<Value>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm: Arc<dyn ChatClient> = Arc::new(MessagesCapturingClient {
+            captured: captured.clone(),
+        });
+
+        // First run: an agent session whose task never finished (no close).
+        let mut first = AcpServer::with_roots(llm.clone(), test_roots(dir.path()));
+        let sid = session_new_with_agent(&mut first, json!(1), "worker-7");
+        let prompt = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "halfway through the task" }]
+            }
+        });
+        let _ = collect_output(&mut first, &prompt);
+        drop(first); // crash: the session was never closed
+
+        // Second run: a fresh server (recovered process) for the same agent.
+        let mut second = AcpServer::with_roots(llm.clone(), test_roots(dir.path()));
+        let resumed_sid = session_new_with_agent(&mut second, json!(1), "worker-7");
+        assert_eq!(
+            resumed_sid, sid,
+            "the interrupted session's id must be adopted, not replaced"
+        );
+
+        // The next prompt reuses the restored context: the previous run's
+        // user prompt is already in the conversation.
+        let prompt = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": resumed_sid,
+                "prompt": [{ "type": "text", "text": "continue" }]
+            }
+        });
+        let _ = collect_output(&mut second, &prompt);
+        let calls = captured.lock().unwrap();
+        let last = calls.last().expect("prompt ran");
+        let all_text: String = last
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .collect();
+        assert!(
+            all_text.contains("halfway through the task"),
+            "resumed context must carry the previous run's prompt: {all_text}"
+        );
+    }
+
+    #[test]
+    fn an_empty_marker_starts_a_fresh_session() {
+        let dir = test_util::unique_test_dir();
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
+
+        let first = session_new_with_agent(&mut server, json!(1), "worker-7");
+        let close = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/close",
+            "params": { "sessionId": first }
+        });
+        let _ = collect_output(&mut server, &close);
+
+        // The marker is empty; the next session must not adopt the old id.
+        let second = session_new_with_agent(&mut server, json!(3), "worker-7");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_marker_without_a_context_file_starts_fresh() {
+        let dir = test_util::unique_test_dir();
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+
+        // A stale marker names a session whose context file is gone (e.g.
+        // sessions directory wiped): resume must not be attempted.
+        let marker = dir.path().join("agents").join("worker-7").join("current");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "missing-session").unwrap();
+
+        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
+        let sid = session_new_with_agent(&mut server, json!(1), "worker-7");
+        assert_ne!(sid, "missing-session");
+        // The marker now names the new session.
+        assert_eq!(read_current_session(&marker).as_deref(), Some(sid.as_str()));
+    }
+
+    #[test]
+    fn sessions_without_agent_id_have_no_marker() {
+        let dir = test_util::unique_test_dir();
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": { "cwd": "/tmp" }
+        });
+        let (response, _) = collect_output(&mut server, &msg);
+        let sid = match response {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected session/new response"),
+        };
+        let marker = dir.path().join("agents").join("worker-7").join("current");
+        assert!(!marker.exists());
+        let context_file = dir.path().join("sessions").join(&sid).join("context");
+        assert!(!context_file.exists());
     }
 }

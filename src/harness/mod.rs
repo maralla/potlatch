@@ -7,7 +7,7 @@
 //! Config arrives via env vars (`POTLATCH_BASE_URL`, `POTLATCH_API_KEY`) and the ACP
 //! protocol (`session/set_model`, `session/new` with cwd).
 //!
-//! Per-session logs are written to `~/.potlatch/sessions/<session-id>.log`.
+//! Per-session logs are written to `~/.potlatch/sessions/<session-id>/run.log`.
 
 pub mod acp;
 pub mod agent_loop;
@@ -16,9 +16,11 @@ pub mod client;
 pub mod context;
 mod parent;
 pub mod prompt;
+pub(crate) mod session_store;
 pub mod todo;
 pub mod tools;
 
+use std::fs;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -31,20 +33,20 @@ use crate::core::model::acp::jsonrpc::Outbound;
 /// A writer that wraps an `Option<File>` behind a `Mutex`, implementing `io::Write`.
 /// When the inner file is `None`, writes are silently dropped.
 struct SwappableWriter {
-    inner: Mutex<Option<std::fs::File>>,
+    inner: Mutex<Option<fs::File>>,
 }
 
 /// Newtype wrapper for `MakeWriter` impl (avoids orphan rule).
 struct SwappableWriterMaker(Arc<SwappableWriter>);
 
 impl SwappableWriter {
-    fn new(file: Option<std::fs::File>) -> Self {
+    fn new(file: Option<fs::File>) -> Self {
         Self {
             inner: Mutex::new(file),
         }
     }
 
-    fn swap(&self, file: Option<std::fs::File>) {
+    fn swap(&self, file: Option<fs::File>) {
         *self.inner.lock().unwrap() = file;
     }
 }
@@ -101,12 +103,12 @@ impl Write for SwappableWriterWriter {
 }
 
 /// Initialize file-based logging for the harness.
-/// Starts logging to a temporary file; switches to `~/.potlatch/sessions/<session-id>.log`
+/// Starts logging to a temporary file; switches to `~/.potlatch/sessions/<session-id>/run.log`
 /// when a session is created (see [`set_session_log`]).
 fn init_logging() -> Arc<SwappableWriter> {
     let temp_path =
         std::env::temp_dir().join(format!("potlatch-harness-{}.log", std::process::id()));
-    let file = std::fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&temp_path)
@@ -129,13 +131,15 @@ fn init_logging() -> Arc<SwappableWriter> {
     writer
 }
 
-/// Switch the log output to `~/.potlatch/sessions/<session-id>.log`.
+/// Switch the log output to `~/.potlatch/sessions/<session-id>/run.log`.
+///
+/// The full log for one session lives in that session's directory, alongside
+/// the persisted context (see [`session_store`]).
 fn set_session_log(writer: &SwappableWriter, session_id: &str) {
-    let sessions_dir = logging_dir();
-    let _ = std::fs::create_dir_all(&sessions_dir);
+    let _ = fs::create_dir_all(logging_dir().join(session_id));
 
-    let log_path = sessions_dir.join(format!("{session_id}.log"));
-    let file = std::fs::OpenOptions::new()
+    let log_path = session_store::session_run_log(&logging_dir(), session_id);
+    let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
@@ -147,15 +151,15 @@ fn set_session_log(writer: &SwappableWriter, session_id: &str) {
     writer.swap(file);
 }
 
-pub(crate) fn logging_dir() -> std::path::PathBuf {
+pub(crate) fn logging_dir() -> PathBuf {
     home_dir().join(".potlatch").join("sessions")
 }
 
-fn home_dir() -> std::path::PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        return std::path::PathBuf::from(home);
+        return PathBuf::from(home);
     }
-    std::path::PathBuf::from(".")
+    PathBuf::from(".")
 }
 
 /// Entry point for `potlatch harness`. Reads JSON-RPC from stdin, writes to stdout.

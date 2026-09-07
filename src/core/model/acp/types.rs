@@ -61,6 +61,12 @@ pub struct NewSessionParams {
     pub cwd: String,
     #[serde(default)]
     pub mcp_servers: Vec<Value>,
+    /// The orchestrator agent this session runs for (e.g. `worker-7`). The
+    /// harness records it in `~/.potlatch/agents/<agent-id>/current` so a
+    /// recovered process can find and resume the interrupted session.
+    /// Potlatch extension — ignored by non-potlatch backends.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "agent_id")]
+    pub agent_id: Option<String>,
     /// Caller-defined structured-output tool definitions. Each entry has
     /// `name`, `description`, and `parameters` (JSON schema). The harness
     /// creates a generic `StructuredOutputTool` per definition and returns
@@ -238,6 +244,35 @@ struct PromptParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_session_params_serialize_the_agent_id_extension() {
+        let params = NewSessionParams {
+            cwd: "/tmp/repo".into(),
+            agent_id: Some("worker-7".into()),
+            mcp_servers: vec![],
+            structured_output_tools: None,
+            agent_tools: None,
+            context_channels: None,
+            write_roots: None,
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(v["agent_id"], "worker-7");
+
+        // Absent agent_id stays off the wire (backends that predate the
+        // extension see the historical shape).
+        let params = NewSessionParams {
+            cwd: "/tmp/repo".into(),
+            agent_id: None,
+            mcp_servers: vec![],
+            structured_output_tools: None,
+            agent_tools: None,
+            context_channels: None,
+            write_roots: None,
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert!(v.get("agent_id").is_none());
+    }
 
     #[test]
     fn new_session_deserializes_config_options() {
