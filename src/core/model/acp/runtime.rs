@@ -44,6 +44,7 @@ use crate::core::agent::AgentHandoff;
 use crate::core::bus::AgentBus;
 use crate::core::config::build_acp_spawn_command;
 use crate::core::config::uri::ModelUri;
+use crate::paths::APP_NAME;
 
 const TASK_CONTEXT_RESET_GUIDANCE: &str = r#"IMPORTANT CONTEXT HANDLING:
 Treat this assignment as a fresh task. Do not rely on prior chat history or assumptions from earlier assignments unless this prompt explicitly refers to them. Use only the repository state, issue/MR context, and instructions present in this task.
@@ -529,7 +530,7 @@ impl AcpRuntime {
                     terminal: false,
                 },
                 client_info: ImplementationInfo {
-                    name: "potlatch".into(),
+                    name: APP_NAME.into(),
                     version: env!("CARGO_PKG_VERSION").into(),
                 },
             })

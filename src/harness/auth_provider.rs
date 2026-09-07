@@ -38,6 +38,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::paths::auth_provider_state_dir;
+
 /// Progress lines longer than this are truncated before surfacing.
 const MAX_PROGRESS_LINE_LEN: usize = 2048;
 /// Guard against a misbehaving provider flooding stdout with non-JSON lines.
@@ -221,9 +223,7 @@ impl AuthProvider {
 /// Per-user directory shared by all harness processes for auth-provider
 /// coordination files.
 fn default_state_dir() -> PathBuf {
-    crate::harness::home_dir()
-        .join(".potlatch")
-        .join("auth-provider")
+    auth_provider_state_dir()
 }
 
 /// A stable, filesystem-safe key for an argv so different provider commands

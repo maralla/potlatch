@@ -18,6 +18,8 @@ use serde::de::DeserializeOwned;
 use toml::Value;
 use tracing::{debug, info};
 
+use crate::paths::CONFIG_FILE_NAME;
+
 /// Env var through which an endpoint's `auth_provider` command argv (a JSON
 /// array) is passed from the resolved `[acp.*]` profile to the harness
 /// subprocess.
@@ -101,13 +103,15 @@ impl Config {
     }
 
     fn find_config_file() -> Result<PathBuf> {
-        for candidate in ["potlatch.toml", ".potlatch.toml", "config/potlatch.toml"] {
+        let dotted = format!(".{CONFIG_FILE_NAME}");
+        let nested = format!("config/{CONFIG_FILE_NAME}");
+        for candidate in [CONFIG_FILE_NAME, &dotted, &nested] {
             let path = Path::new(candidate);
             if path.exists() {
                 return Ok(path.to_path_buf());
             }
         }
-        Ok(PathBuf::from("potlatch.toml"))
+        Ok(PathBuf::from(CONFIG_FILE_NAME))
     }
 
     pub fn save_example(path: &str) -> Result<()> {
