@@ -592,6 +592,7 @@ mod tests {
         let sid = client
             .session_new(&NewSessionParams {
                 cwd: "/tmp".into(),
+                agent_id: None,
                 mcp_servers: vec![],
                 structured_output_tools: None,
                 agent_tools: None,
@@ -688,6 +689,7 @@ mod tests {
         let sid = client
             .session_new(&NewSessionParams {
                 cwd: "/tmp".into(),
+                agent_id: None,
                 mcp_servers: vec![],
                 structured_output_tools: None,
                 agent_tools: None,
@@ -784,6 +786,7 @@ mod tests {
         let sid = client
             .session_new(&NewSessionParams {
                 cwd: "/tmp".into(),
+                agent_id: None,
                 mcp_servers: vec![],
                 structured_output_tools: None,
                 agent_tools: None,
@@ -899,6 +902,7 @@ mod tests {
 
         let session = client.session_new(&NewSessionParams {
             cwd: "/tmp".into(),
+            agent_id: None,
             mcp_servers: vec![],
             structured_output_tools: None,
             agent_tools: None,

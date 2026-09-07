@@ -11,6 +11,10 @@ use serde_json::{Value, json};
 /// Cached BPE encoder for token estimation. Initialized once, reused across all calls.
 static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
 
+/// Version tag written into persisted context snapshots. Bump when the
+/// snapshot shape changes so an old snapshot never silently misrestores.
+const SNAPSHOT_VERSION: u32 = 1;
+
 /// Number of recent assistant text entries to protect from eviction. Older
 /// assistant text is evictable since the model's intermediate narration
 /// ("Let me check...", "I'll now edit...") is low-value once the action is done.
@@ -603,6 +607,72 @@ impl Context {
         }
         messages
     }
+
+    /// Serialize the full context to a JSON snapshot for persistence. The
+    /// snapshot carries every entry verbatim (role, kind, content,
+    /// tool_call_id) plus the token accounting, so a restored context
+    /// resumes the conversation exactly as it was — same entries, same
+    /// budget math, same eviction-protected history.
+    pub fn snapshot(&self) -> Value {
+        let entries: Vec<Value> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let mut obj = json!({
+                    "role": role_name(entry.role),
+                    "kind": kind_name(&entry.kind),
+                    "content": entry.content,
+                    "tokens": entry.tokens,
+                });
+                if let Some(id) = &entry.tool_call_id {
+                    obj["tool_call_id"] = json!(id);
+                }
+                obj
+            })
+            .collect();
+        json!({
+            "version": SNAPSHOT_VERSION,
+            "token_budget": self.token_budget,
+            "total_tokens": self.total_tokens,
+            "entries": entries,
+        })
+    }
+
+    /// Restore a context from a [`Self::snapshot`] value. Returns `None`
+    /// when the snapshot does not parse — wrong version, missing fields,
+    /// unknown kinds — leaving the caller to start a fresh context rather
+    /// than resume from a corrupt one.
+    pub fn restore(snapshot: &Value) -> Option<Self> {
+        if snapshot.get("version")?.as_u64()? != SNAPSHOT_VERSION as u64 {
+            return None;
+        }
+        let token_budget = snapshot.get("token_budget")?.as_u64()? as usize;
+        let total_tokens = snapshot.get("total_tokens")?.as_u64()? as usize;
+        let raw_entries = snapshot.get("entries")?.as_array()?;
+        let mut entries = Vec::with_capacity(raw_entries.len());
+        for raw in raw_entries {
+            let role = role_from_name(raw.get("role")?.as_str()?)?;
+            let kind = kind_from_name(raw.get("kind")?.as_str()?)?;
+            let content = raw.get("content")?.as_str()?.to_string();
+            let tokens = raw.get("tokens")?.as_u64()? as usize;
+            let tool_call_id = raw
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            entries.push(ContextEntry {
+                role,
+                kind,
+                content,
+                tokens,
+                tool_call_id,
+            });
+        }
+        Some(Self {
+            entries,
+            total_tokens,
+            token_budget,
+        })
+    }
 }
 
 /// Summarize a large tool output into a compact form: a header showing the
@@ -626,6 +696,58 @@ fn sanitize_tool_calls(tool_calls: &[Value]) -> Vec<Value> {
             fixed
         })
         .collect()
+}
+
+/// Stable wire names for [`Role`] in context snapshots.
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+fn role_from_name(name: &str) -> Option<Role> {
+    match name {
+        "system" => Some(Role::System),
+        "user" => Some(Role::User),
+        "assistant" => Some(Role::Assistant),
+        "tool" => Some(Role::Tool),
+        _ => None,
+    }
+}
+
+/// Stable wire names for [`ContextKind`] in context snapshots.
+fn kind_name(kind: &ContextKind) -> &'static str {
+    match kind {
+        ContextKind::System => "system",
+        ContextKind::UserPrompt => "user_prompt",
+        ContextKind::AssistantText => "assistant_text",
+        ContextKind::ToolCall => "tool_call",
+        ContextKind::EditResult => "edit_result",
+        ContextKind::FileRead => "file_read",
+        ContextKind::ShellOutput => "shell_output",
+        ContextKind::Exploration => "exploration",
+        ContextKind::WebFetch => "web_fetch",
+        ContextKind::ToolResult => "tool_result",
+    }
+}
+
+fn kind_from_name(name: &str) -> Option<ContextKind> {
+    match name {
+        "system" => Some(ContextKind::System),
+        "user_prompt" => Some(ContextKind::UserPrompt),
+        "assistant_text" => Some(ContextKind::AssistantText),
+        "tool_call" => Some(ContextKind::ToolCall),
+        "edit_result" => Some(ContextKind::EditResult),
+        "file_read" => Some(ContextKind::FileRead),
+        "shell_output" => Some(ContextKind::ShellOutput),
+        "exploration" => Some(ContextKind::Exploration),
+        "web_fetch" => Some(ContextKind::WebFetch),
+        "tool_result" => Some(ContextKind::ToolResult),
+        _ => None,
+    }
 }
 
 /// Naive compaction: preserve the first few and last few lines of a tool
@@ -675,6 +797,70 @@ fn truncate_lines(content: &str, keep: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_roundtrip_preserves_conversation_and_tokens() {
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "you are a coder");
+        ctx.push(Role::User, ContextKind::UserPrompt, "write hello world");
+        ctx.push_assistant_with_tools(
+            Some("I'll create the file"),
+            &[json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "write", "arguments": "{\"path\":\"hi.py\",\"content\":\"print('hi')\"}"}
+            })],
+            "think about the path first",
+        );
+        ctx.push_tool_result(ContextKind::EditResult, "wrote hi.py", "call_1");
+        ctx.push_assistant_text("done");
+        let before_tokens = ctx.total_tokens();
+
+        let snap = ctx.snapshot();
+        let restored = Context::restore(&snap).expect("snapshot must restore");
+        assert_eq!(restored.total_tokens(), before_tokens);
+        assert_eq!(ctx.entries().len(), restored.entries().len());
+
+        // The restored conversation serializes to the same messages.
+        let original_msgs = ctx.to_messages();
+        let restored_msgs = restored.to_messages();
+        assert_eq!(original_msgs.len(), restored_msgs.len());
+        assert_eq!(restored_msgs[0]["content"], "you are a coder");
+        assert_eq!(restored_msgs[1]["content"], "write hello world");
+        assert!(restored_msgs[2]["tool_calls"].is_array());
+        assert_eq!(restored_msgs[3]["tool_call_id"], "call_1");
+        assert_eq!(restored_msgs[4]["content"], "done");
+        // Reasoning was persisted with the assistant tool-call entry.
+        assert_eq!(
+            restored_msgs[2]["reasoning_content"],
+            "think about the path first"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_foreign_versions_and_garbage() {
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        let snap = ctx.snapshot();
+
+        // A future version is rejected rather than misrestored.
+        let mut future = snap.clone();
+        future["version"] = json!(u32::MAX);
+        assert!(Context::restore(&future).is_none());
+
+        // Truncated or non-snapshot values are rejected.
+        assert!(Context::restore(&json!({})).is_none());
+        assert!(Context::restore(&Value::Null).is_none());
+        assert!(
+            Context::restore(&json!({
+                "version": 1,
+                "token_budget": 100,
+                "total_tokens": 1,
+                "entries": [{"role": "wizard", "kind": "system", "content": "x", "tokens": 1}]
+            }))
+            .is_none()
+        );
+    }
 
     #[test]
     fn context_tracks_tokens() {

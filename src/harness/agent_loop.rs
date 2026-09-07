@@ -2,6 +2,8 @@
 //! and cancel handling.
 
 use std::collections::VecDeque;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +52,10 @@ pub struct AgentLoop {
     recent_calls: VecDeque<(String, String)>,
     /// Number of stuck signals encountered.
     stuck_count: u32,
+    /// Where the current context snapshot is persisted after every update.
+    /// `None` disables persistence (sessions created without a resumable
+    /// identity, e.g. unlogged subagent sessions).
+    context_path: Option<PathBuf>,
 }
 
 impl AgentLoop {
@@ -79,6 +85,62 @@ impl AgentLoop {
             todo,
             recent_calls: VecDeque::with_capacity(8),
             stuck_count: 0,
+            context_path: None,
+        }
+    }
+
+    /// Persist the context snapshot after every update. The file always
+    /// holds the latest context, so a crashed process resumes from the last
+    /// completed update. Setting the path does not write anything: a fresh
+    /// loop's empty context must not clobber the snapshot it is about to
+    /// restore.
+    pub fn set_context_path(&mut self, path: PathBuf) {
+        self.context_path = Some(path);
+    }
+
+    /// Write the current context snapshot to `context_path`, when set.
+    /// Best-effort: a persistence failure logs and continues — losing a
+    /// snapshot must never kill the running task.
+    fn persist_context(&self) {
+        let Some(path) = &self.context_path else {
+            return;
+        };
+        let snapshot = self.context.snapshot();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let body = serde_json::to_string(&snapshot).unwrap_or_default();
+        let tmp = path.with_extension("context.tmp");
+        if fs::write(&tmp, body).is_ok() {
+            // Rename into place so a reader never sees a half-written file.
+            let _ = fs::rename(&tmp, path);
+        } else {
+            warn!("harness: failed to persist context to {}", path.display());
+        }
+    }
+
+    /// Restore the context from a previous run's snapshot. Returns whether a
+    /// snapshot was found and restored; a fresh session (or a corrupt
+    /// snapshot) starts empty and re-runs `init_context`.
+    pub fn restore_context(&mut self, cwd: &str, context_channels: &[(String, String)]) -> bool {
+        let Some(path) = self.context_path.clone() else {
+            self.init_context(cwd, context_channels);
+            return false;
+        };
+        let restored = fs::read_to_string(&path)
+            .ok()
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            .and_then(|snapshot| Context::restore(&snapshot));
+        match restored {
+            Some(context) => {
+                self.context = context;
+                info!("harness: restored context from {}", path.display());
+                true
+            }
+            None => {
+                self.init_context(cwd, context_channels);
+                false
+            }
         }
     }
 
@@ -151,6 +213,7 @@ impl AgentLoop {
         // were already initialized by `init_context` at session creation).
         self.context
             .push(Role::User, ContextKind::UserPrompt, prompt);
+        self.persist_context();
 
         loop {
             if self.cancel.load(Ordering::SeqCst) {
@@ -162,8 +225,12 @@ impl AgentLoop {
             // so they survive compaction. This enables mid-run redirection.
             {
                 let mut queue = self.inject_rx.lock().unwrap();
+                let injected = !queue.is_empty();
                 while let Some(msg) = queue.pop_front() {
                     self.context.push(Role::User, ContextKind::UserPrompt, &msg);
+                }
+                if injected {
+                    self.persist_context();
                 }
             }
 
@@ -290,6 +357,7 @@ impl AgentLoop {
                     "harness: context {action:?}, {} tokens after",
                     format_tokens(self.context.total_tokens() as u64)
                 );
+                self.persist_context();
             }
 
             // Inject the todo checklist as a temporary system message.
@@ -481,6 +549,7 @@ impl AgentLoop {
             // Check finish reason
             match self.handle_response(&response, cwd)? {
                 LoopControl::Stop => {
+                    self.persist_context();
                     return Ok(response.content);
                 }
                 LoopControl::Stuck => {
@@ -488,12 +557,16 @@ impl AgentLoop {
                         "harness: stuck detected (count={}), breaking loop",
                         self.stuck_count
                     );
+                    self.persist_context();
                     return Ok(format!(
                         "{}\n\n[agent loop stopped: stuck after {} attempts]",
                         response.content, self.stuck_count
                     ));
                 }
-                LoopControl::Continue => continue,
+                LoopControl::Continue => {
+                    self.persist_context();
+                    continue;
+                }
             }
         }
     }
@@ -1236,7 +1309,7 @@ mod tests {
         assert!(result.contains("Done"));
         // The read result should contain the content written by write,
         // proving sequential execution preserved the order.
-        let written = std::fs::read_to_string(dir.path().join("out.txt")).unwrap_or_default();
+        let written = fs::read_to_string(dir.path().join("out.txt")).unwrap_or_default();
         assert_eq!(written, "written");
     }
 
@@ -1301,11 +1374,7 @@ mod tests {
         // callback "pre-read" it. The final response should contain the
         // cached content.
         let dir = test_util::unique_test_dir();
-        std::fs::write(
-            std::path::Path::new(dir.as_str()).join("target.txt"),
-            "speculative content\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("target.txt"), "speculative content\n").unwrap();
 
         let tool_call = json!({
             "id": "call_1",

@@ -558,6 +558,7 @@ impl AcpRuntime {
         let session = client
             .session_new(&NewSessionParams {
                 cwd: cwd.to_string_lossy().into_owned(),
+                agent_id: Some(self.agent_id.clone()),
                 mcp_servers: vec![],
                 structured_output_tools: self.session_structured_output_tools(),
                 agent_tools: self.session_agent_tools(),
