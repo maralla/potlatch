@@ -19,6 +19,11 @@ use tracing::info;
 use crate::paths::web_profile_dir_with_home;
 
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many re-extraction rounds `fetch_rendered_markdown` attempts to
+/// observe two consecutive identical extractions before settling for the
+/// last one. Each round adds one settle window (500ms quiet minimum),
+/// so phased client-side pages get several chances to finish.
+const STABILITY_PROBES: usize = 3;
 // Defuddle 0.19.2 full browser bundle (MIT); see defuddle.LICENSE.txt.
 const DEFUDDLE_SCRIPT: &str = include_str!("defuddle.full.js");
 const SEARCH_PROFILE_ENV: &str = "POTLATCH_WEB_PROFILE";
@@ -223,10 +228,26 @@ impl ChromeBrowser {
             .context("wait for page render to settle")
     }
 
+    /// Extract the page as markdown, confirming the render is finished.
+    ///
+    /// Settling once is not enough for phased client-side pages (collaborative
+    /// docs, SPAs that reconnect and re-render): a 500ms quiet window can land
+    /// in a gap between load phases, extracting a pre-content skeleton. Two
+    /// consecutive identical extractions mean the page has stopped changing;
+    /// until then the render was not done, whatever the settle timer said.
     pub(super) fn fetch_rendered_markdown(&self, url: &str) -> Result<String> {
         self.navigate_to(url)?;
         self.wait_for_render()?;
-        self.extract_rendered_markdown()
+        let mut last = self.extract_rendered_markdown()?;
+        for _ in 0..STABILITY_PROBES {
+            self.wait_for_render()?;
+            let next = self.extract_rendered_markdown()?;
+            if next == last {
+                return Ok(last);
+            }
+            last = next;
+        }
+        Ok(last)
     }
 
     pub(super) fn extract_rendered_markdown(&self) -> Result<String> {
