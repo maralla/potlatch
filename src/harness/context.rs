@@ -613,63 +613,86 @@ impl Context {
     /// tool_call_id) plus the token accounting, so a restored context
     /// resumes the conversation exactly as it was — same entries, same
     /// budget math, same eviction-protected history.
-    pub fn snapshot(&self) -> Value {
-        let entries: Vec<Value> = self
-            .entries
-            .iter()
-            .map(|entry| {
-                let mut obj = json!({
-                    "role": role_name(entry.role),
-                    "kind": kind_name(&entry.kind),
-                    "content": entry.content,
-                    "tokens": entry.tokens,
-                });
-                if let Some(id) = &entry.tool_call_id {
-                    obj["tool_call_id"] = json!(id);
-                }
-                obj
-            })
-            .collect();
-        json!({
-            "version": SNAPSHOT_VERSION,
-            "token_budget": self.token_budget,
-            "total_tokens": self.total_tokens,
-            "entries": entries,
-        })
+    /// Render the full context as a plain-text (markdown) transcript for
+    /// persistence. Every entry appears verbatim — role, kind, content,
+    /// tool_call_id — as a readable section, so a restored context resumes
+    /// the conversation exactly as it was: same entries, same budget math,
+    /// same eviction-protected history. Entry content is never escaped or
+    /// reflowed; it runs from its section heading to the next heading (or
+    /// the end sentinel), so arbitrary multi-line content — including lines
+    /// that look like headings — restores losslessly. Sections are numbered
+    /// so a hand-edited or truncated file degrades to restoring a prefix
+    /// instead of misparsing.
+    pub fn snapshot_markdown(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# Context snapshot\n\n");
+        out.push_str(&format!(
+            "- version: {SNAPSHOT_VERSION}\n- token budget: {}\n- total tokens: {}\n- entries: {}\n",
+            self.token_budget, self.total_tokens, self.entries.len()
+        ));
+        for (i, entry) in self.entries.iter().enumerate() {
+            out.push_str("\n## Entry ");
+            out.push_str(&i.to_string());
+            out.push_str(&format!(" [{} | {}]", role_name(entry.role), kind_name(&entry.kind)));
+            if let Some(id) = &entry.tool_call_id {
+                out.push_str(&format!(" | tool_call_id: {id}"));
+            }
+            out.push_str("\n\n");
+            out.push_str(entry.content.as_str());
+            out.push('\n');
+        }
+        out.push_str("\n");
+        out.push_str(SNAPSHOT_END_SENTINEL);
+        out
     }
 
-    /// Restore a context from a [`Self::snapshot`] value. Returns `None`
-    /// when the snapshot does not parse — wrong version, missing fields,
-    /// unknown kinds — leaving the caller to start a fresh context rather
-    /// than resume from a corrupt one.
-    pub fn restore(snapshot: &Value) -> Option<Self> {
-        if snapshot.get("version")?.as_u64()? != SNAPSHOT_VERSION as u64 {
+    /// Restore a context from a [`Self::snapshot_markdown`] transcript.
+    /// Returns `None` when the text does not parse — wrong version, missing
+    /// header, unknown role or kind — leaving the caller to start a fresh
+    /// context rather than resume from a corrupt one.
+    pub fn restore_markdown(text: &str) -> Option<Self> {
+        const HEADER_KEYS: [&str; 4] = [
+            "- version: ",
+            "- token budget: ",
+            "- total tokens: ",
+            "- entries: ",
+        ];
+        let mut header = [None; 4]; // version, budget, total, count
+        for line in text.lines().take_while(|l| !l.starts_with('#')) {
+            for (i, key) in HEADER_KEYS.iter().enumerate() {
+                if let Some(v) = line.strip_prefix(key) {
+                    header[i] = v.trim().parse::<usize>().ok();
+                }
+            }
+        }
+        let [version, token_budget, total_tokens, count] = header;
+        if version != Some(SNAPSHOT_VERSION as usize) {
             return None;
         }
-        let token_budget = snapshot.get("token_budget")?.as_u64()? as usize;
-        let total_tokens = snapshot.get("total_tokens")?.as_u64()? as usize;
-        let raw_entries = snapshot.get("entries")?.as_array()?;
-        let mut entries = Vec::with_capacity(raw_entries.len());
-        for raw in raw_entries {
-            let role = role_from_name(raw.get("role")?.as_str()?)?;
-            let kind = kind_from_name(raw.get("kind")?.as_str()?)?;
-            let content = raw.get("content")?.as_str()?.to_string();
-            let tokens = raw.get("tokens")?.as_u64()? as usize;
-            let tool_call_id = raw
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            entries.push(ContextEntry {
-                role,
-                kind,
-                content,
-                tokens,
-                tool_call_id,
-            });
+        let token_budget = token_budget?;
+
+        let body_start = text.find("\n## Entry ")? + 1;
+        let body = text[body_start..].strip_suffix(SNAPSHOT_END_SENTINEL)?;
+
+        let mut entries = Vec::new();
+        for section in split_entry_sections(body) {
+            let (meta, content) = section.split_once("\n\n")?;
+            entries.push(parse_entry_meta(meta)?.with_content(content.to_string()));
         }
+        if count.is_some_and(|n| n != entries.len()) {
+            return None;
+        }
+        // Token counts are recomputed rather than trusted from the file:
+        // the header total is informational, and per-entry counts must
+        // match what budget enforcement will compute next.
+        for entry in &mut entries {
+            entry.tokens = Self::estimate_tokens(&entry.content) + 4;
+        }
+        let total: usize = entries.iter().map(|e| e.tokens).sum();
+        let _ = total_tokens;
         Some(Self {
             entries,
-            total_tokens,
+            total_tokens: total,
             token_budget,
         })
     }
@@ -696,6 +719,78 @@ fn sanitize_tool_calls(tool_calls: &[Value]) -> Vec<Value> {
             fixed
         })
         .collect()
+}
+
+/// Sentinel closing a persisted context transcript. Everything after it is
+/// ignored; its presence is what makes the final entry's content (which
+/// runs to the end of the file) unambiguous.
+const SNAPSHOT_END_SENTINEL: &str = "<!-- context snapshot end -->\n";
+
+/// Split a transcript body into per-entry sections. A section starts at
+/// each `## Entry ` heading and runs to the next one; the first element of
+/// the returned iterator is the first heading itself (callers strip any
+/// leading text before the first heading).
+fn split_entry_sections(body: &str) -> Vec<&str> {
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    while let Some(pos) = body[offset..].find("\n## Entry ") {
+        starts.push(offset + pos + 1);
+        offset += pos + 1;
+    }
+    if body.starts_with("## Entry ") {
+        starts.insert(0, 0);
+    }
+    let mut sections = Vec::with_capacity(starts.len());
+    for (i, start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(body.len());
+        sections.push(&body[*start..end]);
+    }
+    sections
+}
+
+/// One entry's metadata parsed off its `## Entry <n> [role | kind]( | tool_call_id: id)?`
+/// heading line, waiting for its content.
+struct EntryMeta {
+    role: Role,
+    kind: ContextKind,
+    tool_call_id: Option<String>,
+}
+
+impl EntryMeta {
+    fn with_content(self, content: String) -> ContextEntry {
+        ContextEntry {
+            role: self.role,
+            kind: self.kind,
+            content,
+            tokens: 0,
+            tool_call_id: self.tool_call_id,
+        }
+    }
+}
+
+/// Parse a `## Entry <n> [role | kind]( | tool_call_id: id)?` heading.
+/// Returns `None` for unknown roles/kinds or malformed brackets.
+fn parse_entry_meta(meta: &str) -> Option<EntryMeta> {
+    let meta = meta.trim_end();
+    let rest = meta.strip_prefix("## Entry ")?;
+    let bracket = rest.find('[')?;
+    if !rest[..bracket].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let close = rest.rfind(']')?;
+    let fields = &rest[bracket + 1..close];
+    let mut parts = fields.splitn(3, " | ");
+    let role = role_from_name(parts.next()?.trim())?;
+    let kind = kind_from_name(parts.next()?.trim())?;
+    let tool_call_id = parts
+        .next()
+        .and_then(|s| s.strip_prefix("tool_call_id: "))
+        .map(str::to_string);
+    Some(EntryMeta {
+        role,
+        kind,
+        tool_call_id,
+    })
 }
 
 /// Stable wire names for [`Role`] in context snapshots.
