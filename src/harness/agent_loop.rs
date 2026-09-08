@@ -98,20 +98,19 @@ impl AgentLoop {
         self.context_path = Some(path);
     }
 
-    /// Write the current context snapshot to `context_path`, when set.
+    /// Write the current context transcript to `context_path`, when set.
     /// Best-effort: a persistence failure logs and continues — losing a
     /// snapshot must never kill the running task.
     fn persist_context(&self) {
         let Some(path) = &self.context_path else {
             return;
         };
-        let snapshot = self.context.snapshot();
+        let transcript = self.context.snapshot_markdown();
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let body = serde_json::to_string(&snapshot).unwrap_or_default();
         let tmp = path.with_extension("context.tmp");
-        if fs::write(&tmp, body).is_ok() {
+        if fs::write(&tmp, transcript).is_ok() {
             // Rename into place so a reader never sees a half-written file.
             let _ = fs::rename(&tmp, path);
         } else {
@@ -119,9 +118,9 @@ impl AgentLoop {
         }
     }
 
-    /// Restore the context from a previous run's snapshot. Returns whether a
-    /// snapshot was found and restored; a fresh session (or a corrupt
-    /// snapshot) starts empty and re-runs `init_context`.
+    /// Restore the context from a previous run's transcript. Returns whether
+    /// a transcript was found and restored; a fresh session (or a corrupt
+    /// transcript) starts empty and re-runs `init_context`.
     pub fn restore_context(&mut self, cwd: &str, context_channels: &[(String, String)]) -> bool {
         let Some(path) = self.context_path.clone() else {
             self.init_context(cwd, context_channels);
@@ -129,8 +128,7 @@ impl AgentLoop {
         };
         let restored = fs::read_to_string(&path)
             .ok()
-            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
-            .and_then(|snapshot| Context::restore(&snapshot));
+            .and_then(|text| Context::restore_markdown(&text));
         match restored {
             Some(context) => {
                 self.context = context;

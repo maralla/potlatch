@@ -404,9 +404,10 @@ impl AcpServer {
         );
         if let Some(context_path) = session.context_path.clone() {
             agent.set_context_path(context_path);
-            if !agent.restore_context(&cwd, &context_channels) {
-                agent.init_context(&cwd, &context_channels);
-            }
+            // restore_context falls back to init_context itself when no
+            // transcript restores; initing again here would double the
+            // system prompt.
+            agent.restore_context(&cwd, &context_channels);
         } else {
             agent.init_context(&cwd, &context_channels);
         }
@@ -721,6 +722,7 @@ fn extract_prompt_text(prompt: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::client::ChatResponse;
+    use super::super::context::Context;
     use super::*;
     use crate::harness::tools::test_util;
     use serde_json::json;
@@ -1444,11 +1446,18 @@ mod tests {
             "prompt should end without error, got: {:?}",
             response.map(|r| r.to_json_line().unwrap_or_default())
         );
+        // The persisted transcript restores: system prompt, user prompt,
+        // and the assistant turn — all three survive the markdown roundtrip.
         let context_file = dir.path().join("sessions").join(&sid).join("context");
-        let snapshot: Value =
-            serde_json::from_str(&fs::read_to_string(&context_file).expect("context persisted"))
-                .unwrap();
-        assert!(snapshot["entries"].as_array().unwrap().len() >= 2);
+        let transcript = fs::read_to_string(&context_file).expect("context persisted");
+        assert_eq!(
+            Context::restore_markdown(&transcript)
+                .expect("transcript restores")
+                .entries()
+                .len(),
+            3,
+            "transcript:\n{transcript}"
+        );
     }
 
     #[test]

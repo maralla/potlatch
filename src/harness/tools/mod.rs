@@ -592,7 +592,10 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("taskapp/tasks")).unwrap();
         let file = dir.path().join("taskapp/tasks/handler.go");
         std::fs::write(&file, "x").unwrap();
-        assert_eq!(display_path(&file, dir.as_str()), "taskapp/tasks/handler.go");
+        assert_eq!(
+            display_path(&file, dir.as_str()),
+            "taskapp/tasks/handler.go"
+        );
     }
 
     #[test]
