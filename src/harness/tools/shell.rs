@@ -1,8 +1,8 @@
 //! Shell command execution tool with timeout and process group control.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,10 +14,37 @@ use super::Tool;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_OUTPUT: usize = 50_000;
+/// How long the foreground path waits for its output readers to see EOF after
+/// the child is gone. Normally EOF arrives the instant the child (and its
+/// process group) dies; the wait only binds when a grandchild outlived the
+/// child while holding the output pipes (a daemon, a tunnel), in which case
+/// collection is abandoned rather than blocking the agent loop forever.
+const ORPHAN_PIPE_GRACE: Duration = Duration::from_secs(5);
 /// Read chunk size for the capped background-job drain: large enough that a
 /// single `read` call moves a meaningful amount of pipe data, small enough
 /// that the cap is enforced without over-reading past it by much.
 const DRAIN_CHUNK: usize = 8_192;
+
+/// Whether both reader handles finished within [`ORPHAN_PIPE_GRACE`]. After a
+/// successful kill the child's own pipe ends are closed, so EOF normally
+/// arrives immediately; the wait only elapses when some other process still
+/// holds the pipes (a grandchild the process-group kill could not reach —
+/// e.g. a daemon that re-parented to init, or an ssh tunnel that setsid'd
+/// away), in which case the caller must abandon the readers instead of
+/// joining them or the agent loop hangs on the tool call forever.
+fn wait_for_pipes_or_orphan(
+    stdout_handle: &thread::JoinHandle<()>,
+    stderr_handle: &thread::JoinHandle<()>,
+) -> bool {
+    let deadline = Instant::now() + ORPHAN_PIPE_GRACE;
+    while Instant::now() < deadline {
+        if stdout_handle.is_finished() && stderr_handle.is_finished() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    stdout_handle.is_finished() && stderr_handle.is_finished()
+}
 
 /// A running background shell job. The child process is kept alive across
 /// tool calls; stdout/stderr are drained into shared buffers by reader threads
@@ -42,9 +69,14 @@ struct Job {
 /// `MAX_OUTPUT` per stream for its entire lifetime, polled or not.
 /// Runs on a reader thread; publishes under the buffer's mutex per chunk so
 /// a concurrent `poll` sees progress without waiting for EOF.
-fn drain_capped(stream: &mut impl std::io::Read, buf: &Arc<Mutex<Vec<u8>>>) {
+/// Returns when EOF is seen or `stop` is set; on stop, whatever has arrived
+/// so far stays in `buf`.
+fn drain_capped(stream: &mut impl std::io::Read, buf: &Arc<Mutex<Vec<u8>>>, stop: &AtomicBool) {
     let mut chunk = [0u8; DRAIN_CHUNK];
     loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         match stream.read(&mut chunk) {
             Ok(0) | Err(_) => return,
             Ok(n) => {
@@ -114,12 +146,16 @@ impl JobTable {
         // past MAX_OUTPUT is output `poll` already reports as truncated, so
         // nothing observable is lost.
         let stdout_buf_clone = Arc::clone(&stdout_buf);
+        let stdout_stop = Arc::new(AtomicBool::new(false));
+        let stdout_stop_clone = Arc::clone(&stdout_stop);
         thread::spawn(move || {
-            drain_capped(&mut stdout, &stdout_buf_clone);
+            drain_capped(&mut stdout, &stdout_buf_clone, &stdout_stop_clone);
         });
         let stderr_buf_clone = Arc::clone(&stderr_buf);
+        let stderr_stop = Arc::new(AtomicBool::new(false));
+        let stderr_stop_clone = Arc::clone(&stderr_stop);
         thread::spawn(move || {
-            drain_capped(&mut stderr, &stderr_buf_clone);
+            drain_capped(&mut stderr, &stderr_buf_clone, &stderr_stop_clone);
         });
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -422,20 +458,30 @@ impl Tool for ShellTool {
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
-        // Read stdout and stderr in separate threads to avoid deadlock
+        // Read stdout and stderr on separate threads so a chatty child can't
+        // deadlock on a full pipe while we poll for exit. Reads are bounded:
+        // when the command times out (or its pipes are otherwise still open
+        // with no writer making progress), the readers are stopped instead of
+        // joined, so a grandchild that inherited the pipes and outlived the
+        // command (a tunnel, a daemon) can never hang the agent loop.
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
 
+        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stdout_stop = Arc::new(AtomicBool::new(false));
+        let stderr_stop = Arc::new(AtomicBool::new(false));
+
+        let stdout_buf_clone = Arc::clone(&stdout_buf);
+        let stdout_stop_clone = Arc::clone(&stdout_stop);
         let stdout_handle = thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            buf
+            drain_capped(&mut stdout, &stdout_buf_clone, &stdout_stop_clone);
         });
 
+        let stderr_buf_clone = Arc::clone(&stderr_buf);
+        let stderr_stop_clone = Arc::clone(&stderr_stop);
         let stderr_handle = thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            buf
+            drain_capped(&mut stderr, &stderr_buf_clone, &stderr_stop_clone);
         });
 
         // Poll for completion with timeout
@@ -466,12 +512,34 @@ impl Tool for ShellTool {
             let _ = child.wait();
         }
 
-        let stdout_buf = stdout_handle.join().unwrap_or_default();
-        let stderr_buf = stderr_handle.join().unwrap_or_default();
+        // The child is gone. EOF on the output pipes follows the moment every
+        // process holding them is dead. Give the readers that moment; if a
+        // grandchild still holds a pipe, abandon that reader (keeping
+        // whatever output arrived) rather than blocking forever.
+        let collected = wait_for_pipes_or_orphan(&stdout_handle, &stderr_handle);
+        if !collected {
+            let (stdout_handle, stderr_handle) = (stdout_handle, stderr_handle);
+            for (finished, handle, stop) in [
+                (stdout_handle.is_finished(), stdout_handle, &stdout_stop),
+                (stderr_handle.is_finished(), stderr_handle, &stderr_stop),
+            ] {
+                if finished {
+                    let _ = handle.join();
+                } else {
+                    stop.store(true, Ordering::SeqCst);
+                    std::mem::forget(handle);
+                }
+            }
+        } else {
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+        }
         let exit_status = child.wait().ok();
 
-        let stdout_str = String::from_utf8_lossy(&stdout_buf);
-        let stderr_str = String::from_utf8_lossy(&stderr_buf);
+        let stdout_guard = stdout_buf.lock().unwrap();
+        let stderr_guard = stderr_buf.lock().unwrap();
+        let stdout_str = String::from_utf8_lossy(&stdout_guard);
+        let stderr_str = String::from_utf8_lossy(&stderr_guard);
         let code = exit_status
             .and_then(|s| s.code())
             .unwrap_or(if timed_out { -1 } else { 1 });
@@ -624,6 +692,7 @@ fn looks_like_file_write(command: &str) -> bool {
 mod tests {
     use super::*;
     use crate::harness::tools::test_util;
+    use std::io::Cursor;
 
     #[test]
     fn drain_capped_stores_at_most_max_output_bytes() {
@@ -632,10 +701,11 @@ mod tests {
         // (a stopped reader would block the child on a full pipe), but only
         // the first MAX_OUTPUT bytes are ever stored.
         let buf = Arc::new(Mutex::new(Vec::new()));
+        let stop = AtomicBool::new(false);
         let payload = vec![b'x'; MAX_OUTPUT * 4];
-        let mut cursor = std::io::Cursor::new(payload);
+        let mut cursor = Cursor::new(payload);
 
-        drain_capped(&mut cursor, &buf);
+        drain_capped(&mut cursor, &buf, &stop);
 
         let stored = buf.lock().unwrap().clone();
         assert_eq!(stored.len(), MAX_OUTPUT);
@@ -645,11 +715,63 @@ mod tests {
     #[test]
     fn drain_capped_keeps_short_streams_whole() {
         let buf = Arc::new(Mutex::new(Vec::new()));
-        let mut cursor = std::io::Cursor::new(b"short output".to_vec());
+        let stop = AtomicBool::new(false);
+        let mut cursor = Cursor::new(b"short output".to_vec());
 
-        drain_capped(&mut cursor, &buf);
+        drain_capped(&mut cursor, &buf, &stop);
 
         assert_eq!(buf.lock().unwrap().as_slice(), b"short output");
+    }
+
+    #[test]
+    fn drain_capped_stops_when_the_stop_flag_is_set() {
+        // The orphan-pipe abandonment path relies on the stop flag ending a
+        // reader that will never see EOF (a grandchild holding the pipe).
+        // The pipe read is exercised through a child process holding the
+        // write end (a bare `File` pair here is subject to whatever fd
+        // hygiene the test harness applies between tests — the first
+        // `read` came back EBADF when run in the full suite).
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut holder = PipeHolder::new("sleep 30").expect("spawn pipe holder");
+        let mut read = holder.take_stdout();
+
+        let handle = {
+            let buf = Arc::clone(&buf);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || drain_capped(&mut read, &buf, &stop))
+        };
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !handle.is_finished(),
+            "reader must block without stop (finished={:?})",
+            handle.join()
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert!(buf.lock().unwrap().is_empty());
+        let _ = holder.child.kill();
+        let _ = holder.child.wait();
+    }
+
+    /// A live child whose stdout pipe never reaches EOF while it runs.
+    struct PipeHolder {
+        child: Child,
+    }
+
+    impl PipeHolder {
+        fn new(command: &str) -> std::io::Result<Self> {
+            let child = Command::new("bash")
+                .args(["-c", command])
+                .stdout(Stdio::piped())
+                .spawn()?;
+            Ok(Self { child })
+        }
+
+        fn take_stdout(&mut self) -> std::process::ChildStdout {
+            self.child.stdout.take().unwrap()
+        }
     }
 
     #[test]
@@ -728,6 +850,34 @@ mod tests {
             "should kill within ~2s, took {elapsed:?}"
         );
         assert!(result.contains("timed out"));
+    }
+
+    #[test]
+    fn timeout_returns_even_when_a_grandchild_holds_the_pipes() {
+        // A command that spawns a setsid'd descendant (an ssh tunnel, a
+        // daemon) and exits. killpg cannot reach the detached grandchild, so
+        // the output pipes stay open after the kill. The tool must return
+        // anyway — hanging here froze the whole QA agent loop (run.log ended
+        // mid-command at 11:18:26 with the harness threads parked in
+        // `read_to_end` forever).
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
+        // The grandchild inherits the command's stdout and outlives the kill:
+        // `sleep 30` holds the pipe write end open for the grace window.
+        let args = json!({
+            "command": "setsid sh -c 'sleep 30' & echo staged; sleep 60",
+            "timeout_secs": 2,
+        });
+        let start = Instant::now();
+        let result = tool.execute(&args, "/tmp").unwrap();
+        let elapsed = start.elapsed();
+        assert!(result.contains("timed out"));
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "orphaned pipes must not block return, took {elapsed:?}"
+        );
+        // Clean up the leftover sleeps so the test run is self-contained.
+        let _ = Command::new("pkill").args(["-f", "sleep 30"]).status();
+        let _ = Command::new("pkill").args(["-f", "sleep 60"]).status();
     }
 
     #[test]
