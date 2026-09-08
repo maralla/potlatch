@@ -608,93 +608,134 @@ impl Context {
         messages
     }
 
-    /// Serialize the full context to a JSON snapshot for persistence. The
-    /// snapshot carries every entry verbatim (role, kind, content,
-    /// tool_call_id) plus the token accounting, so a restored context
-    /// resumes the conversation exactly as it was — same entries, same
-    /// budget math, same eviction-protected history.
-    /// Render the full context as a plain-text (markdown) transcript for
-    /// persistence. Every entry appears verbatim — role, kind, content,
-    /// tool_call_id — as a readable section, so a restored context resumes
-    /// the conversation exactly as it was: same entries, same budget math,
-    /// same eviction-protected history. Entry content is never escaped or
-    /// reflowed; it runs from its section heading to the next heading (or
-    /// the end sentinel), so arbitrary multi-line content — including lines
-    /// that look like headings — restores losslessly. Sections are numbered
-    /// so a hand-edited or truncated file degrades to restoring a prefix
-    /// instead of misparsing.
+    /// Render the full context as a plain markdown transcript for
+    /// persistence. Every entry appears verbatim — role, content,
+    /// tool_call_id — as a readable section, so the file reads as the
+    /// conversation it records. Entry content is never escaped or
+    /// reflowed; it runs from its section heading to the next heading,
+    /// so multi-line content restores as written. Kinds and token counts
+    /// are not persisted: kinds are re-inferred from role + content on
+    /// restore, and tokens are recomputed with the same estimator every
+    /// context mutation already uses.
     pub fn snapshot_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str("# Context snapshot\n\n");
+        out.push_str("# Context\n\n");
         out.push_str(&format!(
-            "- version: {SNAPSHOT_VERSION}\n- token budget: {}\n- total tokens: {}\n- entries: {}\n",
-            self.token_budget, self.total_tokens, self.entries.len()
+            "- version: {SNAPSHOT_VERSION}\n- token budget: {}\n- entries: {}\n",
+            self.token_budget,
+            self.entries.len()
         ));
-        for (i, entry) in self.entries.iter().enumerate() {
-            out.push_str("\n## Entry ");
-            out.push_str(&i.to_string());
-            out.push_str(&format!(" [{} | {}]", role_name(entry.role), kind_name(&entry.kind)));
+        for entry in &self.entries {
+            out.push_str("\n## ");
+            out.push_str(role_name(entry.role));
             if let Some(id) = &entry.tool_call_id {
-                out.push_str(&format!(" | tool_call_id: {id}"));
+                out.push_str(&format!(" {id}"));
             }
             out.push_str("\n\n");
             out.push_str(entry.content.as_str());
             out.push('\n');
         }
-        out.push_str("\n");
-        out.push_str(SNAPSHOT_END_SENTINEL);
         out
     }
 
     /// Restore a context from a [`Self::snapshot_markdown`] transcript.
     /// Returns `None` when the text does not parse — wrong version, missing
-    /// header, unknown role or kind — leaving the caller to start a fresh
-    /// context rather than resume from a corrupt one.
+    /// header, unknown role — leaving the caller to start a fresh context
+    /// rather than resume from a corrupt one.
+    ///
+    /// Only `## <known role>` lines open a section; every other line —
+    /// including `## ` lines with other names, like the headings inside a
+    /// system prompt — is content. A content line that spells a role
+    /// heading exactly would split its entry; the entry-count check
+    /// catches that (the count mismatches and the file is refused),
+    /// trading a rare false refusal for never misrestoring.
     pub fn restore_markdown(text: &str) -> Option<Self> {
-        const HEADER_KEYS: [&str; 4] = [
-            "- version: ",
-            "- token budget: ",
-            "- total tokens: ",
-            "- entries: ",
-        ];
-        let mut header = [None; 4]; // version, budget, total, count
-        for line in text.lines().take_while(|l| !l.starts_with('#')) {
-            for (i, key) in HEADER_KEYS.iter().enumerate() {
-                if let Some(v) = line.strip_prefix(key) {
-                    header[i] = v.trim().parse::<usize>().ok();
-                }
+        let mut version = None;
+        let mut token_budget = None;
+        let mut count = None;
+        for line in text.lines() {
+            if line.starts_with("## ") {
+                break;
+            }
+            if let Some(v) = line.strip_prefix("- version: ") {
+                version = v.trim().parse::<u32>().ok();
+            } else if let Some(v) = line.strip_prefix("- token budget: ") {
+                token_budget = v.trim().parse::<usize>().ok();
+            } else if let Some(v) = line.strip_prefix("- entries: ") {
+                count = v.trim().parse::<usize>().ok();
             }
         }
-        let [version, token_budget, total_tokens, count] = header;
-        if version != Some(SNAPSHOT_VERSION as usize) {
+        if version != Some(SNAPSHOT_VERSION) {
             return None;
         }
         let token_budget = token_budget?;
 
-        let body_start = text.find("\n## Entry ")? + 1;
-        let body = text[body_start..].strip_suffix(SNAPSHOT_END_SENTINEL)?;
-
-        let mut entries = Vec::new();
-        for section in split_entry_sections(body) {
-            let (meta, content) = section.split_once("\n\n")?;
-            entries.push(parse_entry_meta(meta)?.with_content(content.to_string()));
+        // Section boundaries: indices of lines that open a section. Only a
+        // `## ` line naming a known role opens one; every other line —
+        // including `## ` lines with other names, like the headings inside
+        // a system prompt — is content.
+        let lines: Vec<&str> = text.lines().collect();
+        let mut starts = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line
+                .strip_prefix("## ")
+                .and_then(split_role_heading)
+                .is_some()
+            {
+                starts.push(i);
+            }
+        }
+        let mut entries = Vec::with_capacity(starts.len());
+        for (n, &start) in starts.iter().enumerate() {
+            let heading = lines[start].strip_prefix("## ").expect("checked above");
+            let (role, tool_call_id) = split_role_heading(heading)?;
+            let end = starts.get(n + 1).copied().unwrap_or(lines.len());
+            // Content runs from the line after the heading's separator
+            // blank to the line before the next heading's separator blank.
+            // Interior blank lines are content, verbatim.
+            let mut content_start = start + 1;
+            if lines.get(content_start) == Some(&"") {
+                content_start += 1;
+            }
+            let mut content_end = end;
+            if content_end > content_start && lines.get(content_end - 1) == Some(&"") {
+                content_end -= 1;
+            }
+            let content = lines[content_start..content_end].join("\n");
+            entries.push(ContextEntry {
+                role,
+                kind: ContextKind::ToolResult,
+                content,
+                tokens: 0,
+                tool_call_id,
+            });
         }
         if count.is_some_and(|n| n != entries.len()) {
             return None;
         }
-        // Token counts are recomputed rather than trusted from the file:
-        // the header total is informational, and per-entry counts must
-        // match what budget enforcement will compute next.
         for entry in &mut entries {
-            entry.tokens = Self::estimate_tokens(&entry.content) + 4;
+            finish_entry_in_place(entry);
         }
-        let total: usize = entries.iter().map(|e| e.tokens).sum();
-        let _ = total_tokens;
-        Some(Self {
+        let mut restored = Self {
             entries,
-            total_tokens: total,
+            total_tokens: 0,
             token_budget,
-        })
+        };
+        restored.recount_tokens();
+        Some(restored)
+    }
+
+    /// Recompute per-entry and total token counts with the standard
+    /// estimator. Every in-memory mutation already maintains exactly this
+    /// arithmetic, so a restored context's budget enforcement behaves the
+    /// same as one that never left memory.
+    fn recount_tokens(&mut self) {
+        let mut total = 0;
+        for entry in &mut self.entries {
+            entry.tokens = Self::estimate_tokens(&entry.content) + 4;
+            total += entry.tokens;
+        }
+        self.total_tokens = total;
     }
 }
 
@@ -721,76 +762,39 @@ fn sanitize_tool_calls(tool_calls: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Sentinel closing a persisted context transcript. Everything after it is
-/// ignored; its presence is what makes the final entry's content (which
-/// runs to the end of the file) unambiguous.
-const SNAPSHOT_END_SENTINEL: &str = "<!-- context snapshot end -->\n";
-
-/// Split a transcript body into per-entry sections. A section starts at
-/// each `## Entry ` heading and runs to the next one; the first element of
-/// the returned iterator is the first heading itself (callers strip any
-/// leading text before the first heading).
-fn split_entry_sections(body: &str) -> Vec<&str> {
-    let mut starts = Vec::new();
-    let mut offset = 0;
-    while let Some(pos) = body[offset..].find("\n## Entry ") {
-        starts.push(offset + pos + 1);
-        offset += pos + 1;
-    }
-    if body.starts_with("## Entry ") {
-        starts.insert(0, 0);
-    }
-    let mut sections = Vec::with_capacity(starts.len());
-    for (i, start) in starts.iter().enumerate() {
-        let end = starts.get(i + 1).copied().unwrap_or(body.len());
-        sections.push(&body[*start..end]);
-    }
-    sections
+/// Split a `## <role>` or `## <role> <tool_call_id>` section heading.
+/// Returns `None` when the role is unknown.
+fn split_role_heading(heading: &str) -> Option<(Role, Option<String>)> {
+    let heading = heading.trim();
+    let (name, tool_call_id) = match heading.split_once(' ') {
+        Some((name, id)) => (name, Some(id.to_string())),
+        None => (heading, None),
+    };
+    Some((role_from_name(name)?, tool_call_id))
 }
 
-/// One entry's metadata parsed off its `## Entry <n> [role | kind]( | tool_call_id: id)?`
-/// heading line, waiting for its content.
-struct EntryMeta {
-    role: Role,
-    kind: ContextKind,
-    tool_call_id: Option<String>,
-}
-
-impl EntryMeta {
-    fn with_content(self, content: String) -> ContextEntry {
-        ContextEntry {
-            role: self.role,
-            kind: self.kind,
-            content,
-            tokens: 0,
-            tool_call_id: self.tool_call_id,
+/// Infer the entry kind a restored section carries, from its role and
+/// content, in place. Assistant content that parses as JSON carrying
+/// `tool_calls` is a tool call; everything else maps by role. Kinds are
+/// not persisted — the inferred kind preserves the eviction-relevant
+/// distinction (what may be compacted vs. never dropped).
+fn finish_entry_in_place(entry: &mut ContextEntry) {
+    entry.kind = match entry.role {
+        Role::System => ContextKind::System,
+        Role::User => ContextKind::UserPrompt,
+        Role::Tool => ContextKind::ToolResult,
+        Role::Assistant => {
+            let is_tool_call = serde_json::from_str::<Value>(&entry.content)
+                .ok()
+                .and_then(|v| v.get("tool_calls").cloned())
+                .is_some();
+            if is_tool_call {
+                ContextKind::ToolCall
+            } else {
+                ContextKind::AssistantText
+            }
         }
-    }
-}
-
-/// Parse a `## Entry <n> [role | kind]( | tool_call_id: id)?` heading.
-/// Returns `None` for unknown roles/kinds or malformed brackets.
-fn parse_entry_meta(meta: &str) -> Option<EntryMeta> {
-    let meta = meta.trim_end();
-    let rest = meta.strip_prefix("## Entry ")?;
-    let bracket = rest.find('[')?;
-    if !rest[..bracket].chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let close = rest.rfind(']')?;
-    let fields = &rest[bracket + 1..close];
-    let mut parts = fields.splitn(3, " | ");
-    let role = role_from_name(parts.next()?.trim())?;
-    let kind = kind_from_name(parts.next()?.trim())?;
-    let tool_call_id = parts
-        .next()
-        .and_then(|s| s.strip_prefix("tool_call_id: "))
-        .map(str::to_string);
-    Some(EntryMeta {
-        role,
-        kind,
-        tool_call_id,
-    })
+    };
 }
 
 /// Stable wire names for [`Role`] in context snapshots.
@@ -809,38 +813,6 @@ fn role_from_name(name: &str) -> Option<Role> {
         "user" => Some(Role::User),
         "assistant" => Some(Role::Assistant),
         "tool" => Some(Role::Tool),
-        _ => None,
-    }
-}
-
-/// Stable wire names for [`ContextKind`] in context snapshots.
-fn kind_name(kind: &ContextKind) -> &'static str {
-    match kind {
-        ContextKind::System => "system",
-        ContextKind::UserPrompt => "user_prompt",
-        ContextKind::AssistantText => "assistant_text",
-        ContextKind::ToolCall => "tool_call",
-        ContextKind::EditResult => "edit_result",
-        ContextKind::FileRead => "file_read",
-        ContextKind::ShellOutput => "shell_output",
-        ContextKind::Exploration => "exploration",
-        ContextKind::WebFetch => "web_fetch",
-        ContextKind::ToolResult => "tool_result",
-    }
-}
-
-fn kind_from_name(name: &str) -> Option<ContextKind> {
-    match name {
-        "system" => Some(ContextKind::System),
-        "user_prompt" => Some(ContextKind::UserPrompt),
-        "assistant_text" => Some(ContextKind::AssistantText),
-        "tool_call" => Some(ContextKind::ToolCall),
-        "edit_result" => Some(ContextKind::EditResult),
-        "file_read" => Some(ContextKind::FileRead),
-        "shell_output" => Some(ContextKind::ShellOutput),
-        "exploration" => Some(ContextKind::Exploration),
-        "web_fetch" => Some(ContextKind::WebFetch),
-        "tool_result" => Some(ContextKind::ToolResult),
         _ => None,
     }
 }
@@ -911,8 +883,10 @@ mod tests {
         ctx.push_assistant_text("done");
         let before_tokens = ctx.total_tokens();
 
-        let snap = ctx.snapshot();
-        let restored = Context::restore(&snap).expect("snapshot must restore");
+        let transcript = ctx.snapshot_markdown();
+        let restored = Context::restore_markdown(&transcript).expect("transcript restores");
+        // Tokens are recomputed with the same estimator, so the restored
+        // context resumes with identical budget math.
         assert_eq!(restored.total_tokens(), before_tokens);
         assert_eq!(ctx.entries().len(), restored.entries().len());
 
@@ -925,7 +899,8 @@ mod tests {
         assert!(restored_msgs[2]["tool_calls"].is_array());
         assert_eq!(restored_msgs[3]["tool_call_id"], "call_1");
         assert_eq!(restored_msgs[4]["content"], "done");
-        // Reasoning was persisted with the assistant tool-call entry.
+        // Reasoning was persisted inside the assistant tool-call entry's
+        // JSON content and survives the roundtrip.
         assert_eq!(
             restored_msgs[2]["reasoning_content"],
             "think about the path first"
@@ -935,26 +910,55 @@ mod tests {
     #[test]
     fn restore_rejects_foreign_versions_and_garbage() {
         let mut ctx = Context::new(100_000);
-        ctx.push(Role::System, ContextKind::System, "sys");
-        let snap = ctx.snapshot();
+        ctx.push(Role::System, ContextKind::System, "body text");
+        let transcript = ctx.snapshot_markdown();
 
         // A future version is rejected rather than misrestored.
-        let mut future = snap.clone();
-        future["version"] = json!(u32::MAX);
-        assert!(Context::restore(&future).is_none());
+        let future = transcript.replace("- version: 1\n", "- version: 4294967295\n");
+        assert!(Context::restore_markdown(&future).is_none());
 
-        // Truncated or non-snapshot values are rejected.
-        assert!(Context::restore(&json!({})).is_none());
-        assert!(Context::restore(&Value::Null).is_none());
-        assert!(
-            Context::restore(&json!({
-                "version": 1,
-                "token_budget": 100,
-                "total_tokens": 1,
-                "entries": [{"role": "wizard", "kind": "system", "content": "x", "tokens": 1}]
-            }))
-            .is_none()
+        // Missing header and unknown role are rejected: a corrupt
+        // transcript starts a fresh context instead of misrestoring.
+        assert!(Context::restore_markdown("").is_none());
+        assert!(Context::restore_markdown("## wizard\n\nx\n").is_none());
+
+        // A content line that spells a role heading splits its entry and
+        // changes the section count; the count check refuses the file.
+        let split = transcript.replace(
+            "body text",
+            "body text\n\n## user\n\nsneaky heading inside content",
         );
+        assert!(
+            Context::restore_markdown(&split).is_none(),
+            "a content line that looks like a heading changes the entry count and must be refused"
+        );
+
+        // A `## ` heading that is not a role name — like the headings
+        // inside a system prompt — is content, not a section boundary.
+        let with_inner_heading =
+            transcript.replace("body text", "body text\n\n## Workspace\n\nthe repo root");
+        assert_eq!(
+            Context::restore_markdown(&with_inner_heading)
+                .expect("non-role headings are content")
+                .entries()
+                .len(),
+            ctx.entries().len()
+        );
+    }
+
+    #[test]
+    fn snapshot_markdown_preserves_multi_line_content_verbatim() {
+        // Tool outputs and file reads are multi-line; the transcript must
+        // carry them unescaped and restore them byte-for-byte.
+        let mut ctx = Context::new(100_000);
+        ctx.push(
+            Role::Tool,
+            ContextKind::ShellOutput,
+            "line one\nline two\n\nindented:\n    keep me\ntrailing spaces   ",
+        );
+        let transcript = ctx.snapshot_markdown();
+        let restored = Context::restore_markdown(&transcript).unwrap();
+        assert_eq!(restored.entries()[0].content, ctx.entries()[0].content);
     }
 
     #[test]
