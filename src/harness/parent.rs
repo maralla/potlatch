@@ -127,13 +127,20 @@ impl ParentRpc {
 }
 
 impl AgentToolCaller for ParentRpc {
-    fn call(&self, target: &str, operation: &str, arguments: Value) -> Result<Value> {
+    fn call(
+        &self,
+        target: &str,
+        operation: &str,
+        arguments: Value,
+        session_id: &str,
+    ) -> Result<Value> {
         let response = self.request(
             "potlatch/agent_tool_call",
             json!({
                 "target": target,
                 "operation": operation,
                 "arguments": arguments,
+                "session_id": session_id,
             }),
         )?;
         if let Some(error) = response.get("error").and_then(Value::as_str) {

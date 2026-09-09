@@ -47,10 +47,15 @@ impl AcpVendorState for PotlatchVendorState {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("agent tool operation is required"))?;
             let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             bus.request(
                 target,
                 operation.to_string(),
                 arguments,
+                session_id,
                 Duration::from_secs(45),
             )
         })();

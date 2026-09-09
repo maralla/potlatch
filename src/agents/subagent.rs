@@ -125,7 +125,7 @@ impl CoreAgent for SubagentAgent {
             let payload = request.payload.clone();
             let result = self
                 .hub
-                .dispatch(&payload, request.caller_session_id.as_deref())
+                .dispatch(&payload, request.session_id.as_deref())
                 .map(Value::String);
             request.respond(result);
         }
