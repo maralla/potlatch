@@ -116,9 +116,12 @@ impl CoreAgent for SubagentAgent {
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         ensure!(task_id == REQUEST_TASK, "unknown subagent task {task_id:?}");
         // Retired caller task sessions first: their subagents are dead
-        // weight — nobody will ever poll them again.
+        // weight — nobody will ever poll them again. Callers that never
+        // spawned any produce no report and no log line.
         while let Ok(caller) = self.lifecycle.try_recv() {
-            info!("{}", self.hub.close_caller_sessions(&caller));
+            if let Some(report) = self.hub.close_caller_sessions(&caller) {
+                info!("{report}");
+            }
         }
         if let Some(request) = self.inbox.recv_timeout(INBOX_WAIT)? {
             let payload = request.payload.clone();
@@ -787,7 +790,7 @@ impl SubagentHub {
     /// Close every live subagent spawned by `owner`. Called when the
     /// caller's task session retires: its task is over, so the subagents it
     /// spawned will never be polled again.
-    fn close_caller_sessions(&self, owner: &str) -> String {
+    fn close_caller_sessions(&self, owner: &str) -> Option<String> {
         let ids: Vec<String> = {
             let sessions = self.shared.sessions.lock().unwrap();
             sessions
@@ -807,11 +810,16 @@ impl SubagentHub {
             sessions.retain(|_, s| s.owner.as_deref() != Some(owner));
             before - sessions.len()
         };
-        format!(
+        // Most caller sessions never spawned a subagent: no report, no log
+        // line for them.
+        if ids.is_empty() && dropped == 0 {
+            return None;
+        }
+        Some(format!(
             "closed {} subagent(s) of caller session {owner} ({} entries reclaimed)",
             ids.len(),
             dropped
-        )
+        ))
     }
 
     /// The vendor and live ACP session id of a tracked subagent.
@@ -1642,7 +1650,7 @@ mod tests {
 
         // The caller's task session retired (the agent drains the bus
         // lifecycle channel into this call).
-        let report = hub.close_caller_sessions("caller-7");
+        let report = hub.close_caller_sessions("caller-7").unwrap();
         assert!(
             report.contains("closed 2 subagent(s)") && report.contains("2 entries reclaimed"),
             "{report}"
@@ -1661,6 +1669,44 @@ mod tests {
             .dispatch(&json!({ "subagent_id": "subagent-3" }))
             .unwrap();
         assert!(report.contains("status: running"), "{report}");
+    }
+
+    #[test]
+    fn close_caller_sessions_is_quiet_when_there_is_nothing_to_close() {
+        // Most caller sessions never spawn a subagent: their retirement
+        // notice produces no report (and no UI log line).
+        let (hub, _transport, _dir) = test_hub();
+        assert_eq!(hub.close_caller_sessions("caller-none"), None);
+    }
+
+    #[test]
+    fn close_caller_sessions_reclaims_killed_tombstones_quietly() {
+        // A caller that spawned and killed its subagents leaves tombstones;
+        // retirement reclaims them and still reports the accounting.
+        let (hub, fakes, _dir) = test_hub();
+        let transport = fakes["potlatch"].clone();
+        let id = hub
+            .dispatch(&json!({
+                "prompt": "task",
+                "model": "acp://potlatch/model1?thinking=true",
+                "__caller_session_id": "caller-7"
+            }))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Subagent started: ")
+            .unwrap()
+            .to_string();
+        hub.dispatch(&json!({ "subagent_id": &id, "kill": true }))
+            .unwrap();
+        assert_eq!(transport.recorded_requests("session/close").len(), 1);
+
+        let report = hub.close_caller_sessions("caller-7").unwrap();
+        assert!(
+            report.contains("closed 0 subagent(s)") && report.contains("1 entries reclaimed"),
+            "{report}"
+        );
     }
 
     #[test]
