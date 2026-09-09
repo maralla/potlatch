@@ -99,8 +99,10 @@ logs = [
 ]
 
 [agent.qa]
-# QA agent: runs regression tests and security analysis on branch commits.
-# Only runs when qa.md exists in the repo root. Omit [agent.qa] to disable.
+# QA agent: monitors the configured branches for new commits and runs
+# regression testing and security analysis against the running system.
+# `qa.md` at the repo root is optional project-specific QA instructions.
+# Omit [agent.qa] to disable.
 model = "acp://cursor/claude-sonnet-4-5"
 poll_interval = "5m"
 instances = 1
