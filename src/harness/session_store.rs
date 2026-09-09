@@ -1,4 +1,6 @@
-//! Filesystem layout for potlatch session data under `~/.potlatch`.
+//! Filesystem layout for potlatch session data: session data under
+//! `~/.potlatch`, agent current-session markers under the working
+//! directory's `<working-dir>/.potlatch/agents`.
 //!
 //! Layout:
 //! - `~/.potlatch/sessions/<session-id>/run.log` — the harness run log for
@@ -6,9 +8,9 @@
 //! - `~/.potlatch/sessions/<session-id>/context` — the session's full
 //!   current context, rewritten on every context update so it always holds
 //!   the latest state.
-//! - `~/.potlatch/agents/<agent-id>/current` — the session the agent is
-//!   currently running. Emptied when the task finishes, so a recovered
-//!   process resumes only interrupted work, never finished work.
+//! - `<working-dir>/.potlatch/agents/<agent-id>/current` — the session the
+//!   agent is currently running. Emptied when the task finishes, so a
+//!   recovered process resumes only interrupted work, never finished work.
 //!
 //! The marker is cross-process coordination: the harness child writes it at
 //! `session/new` and empties it at `session/close`; the orchestrator empties
@@ -17,10 +19,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::paths::{agents_dir, sessions_dir};
+use crate::paths::{agents_dir_with_working_dir, sessions_dir};
 
 /// The two roots of the on-disk layout. Injectable so tests run against a
-/// temp directory instead of the real `~/.potlatch`.
+/// temp directory instead of the real one.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRoots {
     pub sessions: PathBuf,
@@ -28,11 +30,16 @@ pub(crate) struct SessionRoots {
 }
 
 impl SessionRoots {
-    /// The real `~/.potlatch` layout.
+    /// The real layout: session data under `~/.potlatch`, agent markers
+    /// under the working directory's `.potlatch/agents`. The harness child
+    /// always runs with the working directory as its cwd (its parent spawns
+    /// it that way), so the process's current directory IS the working
+    /// directory.
     pub fn real() -> Self {
+        let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             sessions: sessions_dir(),
-            agents: agents_dir(),
+            agents: agents_dir_with_working_dir(&working_dir),
         }
     }
 }

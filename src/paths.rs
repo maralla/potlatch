@@ -6,7 +6,8 @@
 //!
 //! Layout:
 //! - `~/.potlatch/sessions/<session-id>/` — per-session `run.log` + `context`
-//! - `~/.potlatch/agents/<agent-id>/current` — the agent's current session
+//! - `<working-dir>/.potlatch/agents/<agent-id>/current` — the agent's
+//!   current session (per working directory, next to the project)
 //! - `~/.potlatch/auth-provider/` — cross-process auth-provider locks
 //! - `~/.potlatch/memory/<hash>/` — durable project memory
 //! - `~/.potlatch/web-chrome-profile/` — headless browser profile
@@ -52,9 +53,11 @@ pub(crate) fn sessions_dir() -> PathBuf {
     app_home().join("sessions")
 }
 
-/// Per-agent current-session markers: `~/.potlatch/agents/<agent-id>/`.
-pub(crate) fn agents_dir() -> PathBuf {
-    app_home().join("agents")
+/// Per-agent current-session markers: `<working-dir>/.potlatch/agents/`.
+/// Scoped to the working directory (the project the agents operate on), not
+/// the user home.
+pub(crate) fn agents_dir_with_working_dir(working_dir: &Path) -> PathBuf {
+    working_dir.join(format!(".{APP_NAME}")).join("agents")
 }
 
 /// Cross-process auth-provider coordination: `~/.potlatch/auth-provider/`.
@@ -86,13 +89,20 @@ mod tests {
         assert!(home.ends_with(format!(".{APP_NAME}")));
 
         assert!(sessions_dir().starts_with(&home));
-        assert!(agents_dir().starts_with(&home));
         assert!(auth_provider_state_dir().starts_with(&home));
         assert!(memory_dir().starts_with(&home));
         assert_eq!(
             web_profile_dir_with_home(&home_dir()),
             home.join("web-chrome-profile")
         );
+    }
+
+    #[test]
+    fn agent_markers_live_under_the_working_directory() {
+        let working_dir = Path::new("/home/user/project");
+        let dir = agents_dir_with_working_dir(working_dir);
+        assert_eq!(dir, working_dir.join(format!(".{APP_NAME}")).join("agents"));
+        assert!(!dir.starts_with(home_dir()));
     }
 
     #[test]

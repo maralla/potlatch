@@ -93,7 +93,8 @@ struct Session {
     transcript_path: Option<PathBuf>,
     /// The orchestrator agent this session runs for (e.g. `worker-7`), from
     /// the `agent_id` extension of `session/new`. Drives the
-    /// `~/.potlatch/agents/<agent-id>/current` marker: written when this
+    /// `<working-dir>/.potlatch/agents/<agent-id>/current` marker: written
+    /// when this
     /// session starts, emptied when it finishes, so a recovered process
     /// resumes only interrupted sessions. Empty when the caller passes none —
     /// the session then has no marker and cannot be resumed.
@@ -312,7 +313,8 @@ impl AcpServer {
 
         // Optional `agent_id` extension: the orchestrator agent this session
         // runs for (e.g. `worker-7`). It locates the session in
-        // `~/.potlatch/agents/<agent-id>/current` so a recovered process can
+        // `<working-dir>/.potlatch/agents/<agent-id>/current` so a
+        // recovered process can
         // find the interrupted session and reuse its persisted context.
         session.agent_id = params
             .get("agent_id")
