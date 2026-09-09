@@ -2725,9 +2725,9 @@ fn handle_mr_comments(
             all_comments_text: &all_comments_text,
             diff_context: &diff_context_content,
         });
-    // Write the context to disk for archival/debugging, but inject the content
-    // directly into the prompt so the model doesn't waste turns reading it back.
-    let _combined_context_path = write_task_context_file(
+    // The task context (issue, summary, comments, full diff) goes to disk;
+    // the prompt references it by path — the model reads what it needs.
+    let combined_context_path = write_task_context_file(
         state.sessions_dir,
         &format!(
             "{}-mr-feedback-and-diff-{}.md",
@@ -2744,24 +2744,24 @@ PROJECT: {}
 
 MERGE REQUEST !{}: {}
 
-TASK CONTEXT (already included below — do NOT read it from disk):
+TASK CONTEXT FILE (open and read it first — it has the full picture):
 {}
 
 CRITICAL REQUIREMENTS:
 - Leave staging, committing, pushing, and merge request creation to the system
-- The task context above includes all comments and the diff — review it, then act directly
+- The task context file includes all comments and the diff — read it, then act directly
 - Address all unresolved thread feedback and actionable plain MR comments autonomously
 - Make all necessary code changes to resolve the comments
 - Keep the original issue requirements in mind while addressing feedback
 - If the workspace has merge conflict markers (<<<<<<< / ======= / >>>>>>>), resolve ALL of them before doing anything else. Edit each conflicted file to keep the correct version.
-- The **Merge conflict status** section in the task context above is verified by {system}. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
+- The **Merge conflict status** section in the task context file is verified by {system}. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
 - `origin/{}` already fetched and merged it into your workspace when conflicts were reported. Edit the listed conflicted files, remove all conflict markers, and leave committing/pushing to {system}. Do not claim the conflict is fixed until the **Merge conflict status** section shows a clean merge with the fetched target tip.
 
 {}
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly.
-2. The task context is already included above. Review the "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context" sections. Do NOT use read on the task context — it's already in your prompt.
+2. Open and read the ENTIRE task context file at the path above before anything else. Review the "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context" sections in it.
 3. Use inline comment locations (`path:line` or `path:start-end`) from the comments to find the corresponding code and make targeted fixes. Grep for the relevant symbol, read only the surrounding lines, then edit.
 4. First, check for merge conflicts using the **Merge conflict status** section and your workspace. If any exist, resolve ALL conflicts in every file, commit the resolution, and verify the target branch merges cleanly before claiming completion.
 5. Focus on the **content** of each comment. Comments are always made by a reviewer (a user) — do not investigate who the author is, cross-reference their git history, or research their past commits or other MRs. The comment text is the instruction; act on it directly.
@@ -2781,7 +2781,7 @@ INSTRUCTIONS:
         &state.project_name,
         latest_mr.iid,
         latest_mr.title,
-        combined_context_content,
+        combined_context_path,
         latest_mr.target_branch,
         feedback_scope_rules,
         system = display_name(),
@@ -4314,8 +4314,9 @@ fn build_implementation_prompt(
     let parent_context = split_parent_context(state.forge.as_ref(), issue)?;
     let context_content =
         worker_issue_context_markdown(issue, comments_text, parent_context.as_deref());
-    // Write to disk for archival, but inject content into the prompt.
-    let _context_path = write_task_context_file(
+    // The task context (issue description + comments) goes to disk; the
+    // prompt references it by path — the model reads what it needs.
+    let context_path = write_task_context_file(
         state.sessions_dir,
         &format!("{}-issue-{}.md", state.agent_id, issue.iid),
         &context_content,
@@ -4332,12 +4333,12 @@ PROJECT: {}
 
 ISSUE #{}: {}
 
-TASK CONTEXT (already included below — do NOT read it from disk):
+TASK CONTEXT FILE (open and read it first — it has the full picture):
 {}
 
 CONTEXT:
-- The task context above is included in your prompt: it contains this issue's **description** and **every issue comment** at the time the task started. That is your primary written spec.
-- Labels on the issue (e.g. priority) are visible in the task context; infer scope from description + comments + `AGENTS.md`.
+- The task context file contains this issue's **description** and **every issue comment** at the time the task started. That is your primary written spec.
+- Labels on the issue (e.g. priority) are visible in the task context file; infer scope from description + comments + `AGENTS.md`.
 
 {}
 
@@ -4345,7 +4346,7 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly for implementation, tests, linting, and documentation rules.
-2. The task context is already included above. Do NOT use read on it — review it from your prompt.
+2. Open and read the ENTIRE task context file at the path above (description and every issue comment) before anything else.
 3. Analyze the issue and comments carefully
 4. Before writing any new code, investigate the codebase for existing mechanisms that already do what you need (see REUSE FIRST above). Grep for the shape of what you need; read what you find; reuse or extend it. Only create something new when the search genuinely comes up empty — and say what you searched.
 5. Estimate the number of changed lines:
@@ -4375,7 +4376,7 @@ Proceed with the implementation autonomously. Do not ask for any user input.
         &state.project_name,
         issue.iid,
         issue.title,
-        context_content,
+        context_path,
         common_requirements,
         scope_rules,
         notes_rules
@@ -4392,8 +4393,9 @@ fn build_continuation_prompt(
     let parent_context = split_parent_context(state.forge.as_ref(), issue)?;
     let context_content =
         worker_issue_context_markdown(issue, comments_text, parent_context.as_deref());
-    // Write to disk for archival, but inject content into the prompt.
-    let _context_path = write_task_context_file(
+    // The task context (issue description + comments) goes to disk; the
+    // prompt references it by path — the model reads what it needs.
+    let context_path = write_task_context_file(
         state.sessions_dir,
         &format!("{}-issue-{}.md", &state.agent_id, issue.iid),
         &context_content,
@@ -4410,11 +4412,11 @@ PROJECT: {}
 
 ISSUE #{}: {}
 
-TASK CONTEXT (already included below — do NOT read it from disk):
+TASK CONTEXT FILE (open and read it first — it has the full picture):
 {}
 
 CONTEXT:
-- The task context above contains this issue's **description** and **every issue comment** at task start.
+- The task context file contains this issue's **description** and **every issue comment** at task start.
 - A branch for this issue already exists with previous work
 - You are continuing the implementation from where it was left off
 - Review the existing code changes in this branch
@@ -4426,7 +4428,7 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly for implementation, tests, linting, and documentation rules.
-2. The task context is already included above. Do NOT use read on it — review it from your prompt.
+2. Open and read the ENTIRE task context file at the path above (description and every issue comment) before anything else.
 3. Review the existing changes in the current branch
 4. Analyze what has been done and what remains
 5. Before writing any new code, investigate the codebase for existing mechanisms that already do what you need (see REUSE FIRST above) — including the work already on this branch. Reuse or extend what exists; only create something new when the search genuinely comes up empty, and say what you searched.
@@ -4458,7 +4460,7 @@ Proceed with continuing the implementation autonomously. Do not ask for any user
         &state.project_name,
         issue.iid,
         issue.title,
-        context_content,
+        context_path,
         common_requirements,
         scope_rules,
         notes_rules
