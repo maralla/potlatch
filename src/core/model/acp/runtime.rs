@@ -457,7 +457,18 @@ impl AcpRuntime {
     fn kill_child(&self) {
         let mut g = self.acp.lock().unwrap();
         if let Some(s) = g.take() {
+            self.notify_caller_session_closed(&s.session_id);
             dispose_acp_session(s);
+        }
+    }
+
+    /// Notice that a caller task session retired: bus lifecycle listeners
+    /// (e.g. the subagent agent) close the resources owned by that session.
+    /// Best-effort by construction — the notice never blocks or fails, and a
+    /// missed notice (no bus, no listener) is bounded by the subagent cap.
+    fn notify_caller_session_closed(&self, session_id: &str) {
+        if let Some(bus) = self.agent_bus.as_ref() {
+            bus.notify_caller_session_closed(session_id);
         }
     }
 
@@ -643,6 +654,7 @@ impl AcpRuntime {
             Some(s) => match s.child.try_wait() {
                 Ok(Some(_)) => {
                     if let Some(s) = g.take() {
+                        self.notify_caller_session_closed(&s.session_id);
                         dispose_acp_session(s);
                     }
                     true
@@ -650,6 +662,7 @@ impl AcpRuntime {
                 Ok(None) => false,
                 Err(_) => {
                     if let Some(s) = g.take() {
+                        self.notify_caller_session_closed(&s.session_id);
                         dispose_acp_session(s);
                     }
                     true
@@ -673,6 +686,7 @@ impl AcpRuntime {
             .as_mut()
             .context("ACP session missing after child check")?;
         close_acp_session_best_effort(&s.client, &s.session_id);
+        self.notify_caller_session_closed(&s.session_id);
         s.session_id = self.start_acp_session_on_connection(&s.client, &s.hooks)?;
         Ok(())
     }
@@ -686,6 +700,7 @@ impl AcpRuntime {
             Some(s) => match s.child.try_wait() {
                 Ok(Some(_)) => {
                     if let Some(s) = g.take() {
+                        self.notify_caller_session_closed(&s.session_id);
                         dispose_acp_session(s);
                     }
                     true
@@ -693,6 +708,7 @@ impl AcpRuntime {
                 Ok(None) => false,
                 Err(_) => {
                     if let Some(s) = g.take() {
+                        self.notify_caller_session_closed(&s.session_id);
                         dispose_acp_session(s);
                     }
                     true
@@ -871,6 +887,7 @@ impl Drop for AcpRuntime {
     fn drop(&mut self) {
         let mut g = self.acp.lock().unwrap();
         if let Some(s) = g.take() {
+            self.notify_caller_session_closed(&s.session_id);
             dispose_acp_session(s);
         }
     }

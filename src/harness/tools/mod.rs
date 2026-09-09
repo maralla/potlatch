@@ -8,7 +8,6 @@ pub mod read;
 pub mod search;
 pub mod shell;
 pub mod structured_output;
-pub mod subagent;
 pub mod todo;
 pub mod write;
 
@@ -296,12 +295,8 @@ impl ToolRegistry {
     }
 
     /// Build a registry with all built-in tools. Session-scoped tools (shell,
-    /// lsp, subagent) receive `&mut SessionStates` so they can create/retrieve
+    /// lsp) receive `&mut SessionStates` so they can create/retrieve
     /// their long-lived state. Stateless tools don't take it.
-    ///
-    /// `model` is the session model, forwarded to the subagent tool so spawned
-    /// subagents default to the parent's model.
-    /// `session_id` groups subagent transcripts under the parent session.
     ///
     /// `write_roots` limits where `write`/`edit` may touch outside the cwd
     /// (via `outside_cwd: true`); empty keeps the historical permissive
@@ -309,11 +304,11 @@ impl ToolRegistry {
     ///
     /// `allowed_tools` filters which tools are registered: `None` registers
     /// all; `Some(names)` registers only tools whose name is in the list.
+    /// Cross-agent tools (like `subagent`) are not built-in — they arrive as
+    /// bus-registered proxy tools via [`Self::register_agent_tools`].
     pub fn with_builtin_tools(
         states: &mut SessionStates,
-        session_id: &str,
         cwd: &str,
-        model: &str,
         write_roots: &WriteRoots,
         allowed_tools: Option<&[String]>,
     ) -> Self {
@@ -348,11 +343,6 @@ impl ToolRegistry {
         if allowed("lsp") {
             reg.register(Arc::new(lsp::LspTool::new(states, cwd)));
         }
-        if allowed("subagent") {
-            reg.register(Arc::new(subagent::SubagentTool::new(
-                states, session_id, cwd, model,
-            )));
-        }
         reg
     }
 
@@ -361,6 +351,7 @@ impl ToolRegistry {
         caller: Arc<dyn agent_bus::AgentToolCaller>,
         definitions: Vec<RemoteAgentToolDefinition>,
         allowed_tools: Option<&[String]>,
+        session_id: &str,
     ) {
         let allowed = |name: &str| {
             allowed_tools
@@ -374,6 +365,7 @@ impl ToolRegistry {
             self.register(Arc::new(agent_bus::RemoteAgentTool::new(
                 Arc::clone(&caller),
                 definition,
+                session_id,
             )));
         }
     }

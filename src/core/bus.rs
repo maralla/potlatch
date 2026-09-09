@@ -50,7 +50,17 @@ struct BusInner {
     route_changed: Condvar,
     next_route_id: AtomicU64,
     context_channels: Mutex<HashMap<String, ContextProvider>>,
+    /// Agents that scope per-caller resources to a task session (e.g. a
+    /// subagent agent owns each subagent to its caller's task session)
+    /// register a listener here and close those resources when a session
+    /// retires.
+    lifecycle_listeners: Mutex<Vec<mpsc::Sender<String>>>,
 }
+
+/// Reserved payload key the harness injects into every bus tool call,
+/// naming the harness session that made the call. Bus-served agents use it
+/// to scope per-caller state (e.g. subagent ownership).
+pub const CALLER_SESSION_ID_KEY: &str = "__caller_session_id";
 
 #[derive(Clone)]
 pub(crate) struct AgentBus {
@@ -103,6 +113,7 @@ impl AgentBus {
                 route_changed: Condvar::new(),
                 next_route_id: AtomicU64::new(1),
                 context_channels: Mutex::new(HashMap::new()),
+                lifecycle_listeners: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -267,6 +278,31 @@ impl AgentBus {
         }
     }
 
+    /// Register a listener for caller task-session retirement. Every
+    /// retired session id is sent to each live listener; agents close the
+    /// resources owned by that session (e.g. its subagents). Dropping the
+    /// receiver unregisters it — dead listeners are pruned on the next
+    /// notice.
+    pub(crate) fn register_session_lifecycle_listener(&self) -> Result<mpsc::Receiver<String>> {
+        let (sender, receiver) = mpsc::channel();
+        self.inner
+            .lifecycle_listeners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent bus lifecycle listener lock poisoned"))?
+            .push(sender);
+        Ok(receiver)
+    }
+
+    /// Fire-and-forget notice that a caller task session retired. Never
+    /// blocks and never fails: with no listeners it is a no-op, and
+    /// listeners that went away are pruned.
+    pub(crate) fn notify_caller_session_closed(&self, session_id: &str) {
+        if let Ok(mut listeners) = self.inner.lifecycle_listeners.lock() {
+            let session_id = session_id.to_string();
+            listeners.retain(|listener| listener.send(session_id.clone()).is_ok());
+        }
+    }
+
     /// Snapshot all registered context channels: calls each provider and
     /// returns its name + current content. Used by the ACP runtime at
     /// `session/new` to ship context into other agents' harness sessions.
@@ -397,6 +433,46 @@ mod tests {
         );
         drop(inbox);
         assert!(bus.registered_tools(Duration::ZERO).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lifecycle_notices_reach_registered_listeners() {
+        let bus = AgentBus::new();
+        let listener = bus.register_session_lifecycle_listener().unwrap();
+        bus.notify_caller_session_closed("session-1");
+        assert_eq!(
+            listener
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "session-1"
+        );
+    }
+
+    #[test]
+    fn lifecycle_notices_fan_out_and_prune_dead_listeners() {
+        let bus = AgentBus::new();
+        let kept = bus.register_session_lifecycle_listener().unwrap();
+        let dropped = bus.register_session_lifecycle_listener().unwrap();
+        drop(dropped);
+        bus.notify_caller_session_closed("session-1");
+        assert_eq!(
+            kept.recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "session-1"
+        );
+        // The bus keeps working after pruning.
+        bus.notify_caller_session_closed("session-2");
+        assert_eq!(
+            kept.recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "session-2"
+        );
+    }
+
+    #[test]
+    fn lifecycle_notice_without_listeners_is_a_noop() {
+        let bus = AgentBus::new();
+        bus.notify_caller_session_closed("session-1");
     }
 
     #[test]

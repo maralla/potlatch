@@ -4,10 +4,12 @@ pub(crate) mod duration;
 pub mod uri;
 
 pub use acp::{
-    AcpClientProfile, AcpSpawnConfig, build_acp_spawn_command, build_profile_command,
-    parse_acp_profiles, resolve_profile_env,
+    AcpClientProfile, AcpSpawnConfig, POTLATCH_ACP_PROFILE, build_acp_spawn_command,
+    build_profile_command, parse_acp_profiles, resolve_profile_env,
 };
 pub use agent::{AgentSection, parse_agent_sections};
+
+use crate::core::config::uri::ModelUri;
 
 use std::collections::HashMap;
 use std::fs;
@@ -161,6 +163,80 @@ impl Config {
             env: resolve_profile_env(profile, Some(&bare_model))?,
             auth_command: acp::select_endpoint(profile, &bare_model)?
                 .and_then(|e| e.auth_command.clone()),
+            config_dir: self.config_dir.clone(),
+        })
+    }
+
+    /// Resolve the spawn config for the platform's own harness — the shared
+    /// child the subagent agent multiplexes subagent sessions onto. There is
+    /// no per-agent model URI: the command is the running executable itself
+    /// (`potlatch harness`), the well-known `potlatch` ACP profile supplies
+    /// the endpoint env/auth, and every provided model must resolve to that
+    /// profile's same endpoint — one harness child serves exactly one
+    /// endpoint.
+    /// Resolve the spawn config for one subagent ACP client: the child
+    /// process serving the subagent sessions of one vendor. `provided_models`
+    /// are the full model URIs of that vendor; the `[acp.<vendor>]` profile
+    /// supplies the child's env/auth, and every model must resolve to the
+    /// profile's same endpoint — one child serves exactly one endpoint. The
+    /// platform's own harness vendor spawns the running executable
+    /// (`potlatch harness`); every other vendor uses its profile's
+    /// `acp_command`.
+    pub fn resolve_client_spawn(
+        &self,
+        vendor: &str,
+        provided_models: &[String],
+    ) -> Result<AcpSpawnConfig> {
+        let profile = self.acp_clients.get(vendor).with_context(|| {
+            format!(
+                "the `[acp.{vendor}]` profile is required for the \
+                subagent clients of vendor '{vendor}'"
+            )
+        })?;
+
+        // One ACP child serves one endpoint (its base_url/auth are baked
+        // into the child's env): every provided model of this vendor must
+        // select the same one. Profiles without an `endpoints` table are
+        // single-endpoint by construction — nothing to select.
+        let mut endpoint: Option<&acp::EndpointEntry> = None;
+        for model in provided_models {
+            let uri = ModelUri::parse(model).with_context(|| format!("invalid model '{model}'"))?;
+            match acp::select_endpoint(profile, uri.bare_model_name())? {
+                None => {}
+                Some(entry) => match endpoint {
+                    Some(selected) if selected.model == entry.model => {}
+                    Some(selected) => anyhow::bail!(
+                        "provided_models of vendor '{vendor}' must all belong to one ACP \
+                         endpoint (the shared child serves exactly one): '{selected}' and \
+                         '{entry}' differ",
+                        selected = selected.model,
+                        entry = entry.model
+                    ),
+                    None => endpoint = Some(entry),
+                },
+            }
+        }
+
+        let command = if vendor == acp::POTLATCH_ACP_PROFILE {
+            // The platform's own harness: run THIS binary — no PATH lookup.
+            vec![
+                std::env::current_exe()
+                    .context("locate the running potlatch executable for the harness")?
+                    .display()
+                    .to_string(),
+                "harness".to_string(),
+            ]
+        } else {
+            build_profile_command(profile)
+        };
+
+        let env = resolve_profile_env(profile, endpoint.map(|e| e.model.as_str()))?;
+        Ok(AcpSpawnConfig {
+            command,
+            model_uri: None,
+            endpoint_model: None,
+            env,
+            auth_command: endpoint.and_then(|e| e.auth_command.clone()),
             config_dir: self.config_dir.clone(),
         })
     }

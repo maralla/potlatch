@@ -946,8 +946,6 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut SessionStates::new(),
-            "test-session",
-            "",
             "",
             &Default::default(),
             None,
@@ -996,8 +994,6 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut SessionStates::new(),
-            "test-session",
-            "",
             "",
             &Default::default(),
             None,
@@ -1046,8 +1042,6 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut SessionStates::new(),
-            "test-session",
-            "",
             "",
             &Default::default(),
             None,
@@ -1108,8 +1102,6 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut SessionStates::new(),
-            "test-session",
-            "",
             "",
             &Default::default(),
             None,
@@ -1286,8 +1278,6 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut SessionStates::new(),
-            "test-session",
-            "",
             "",
             &Default::default(),
             None,
@@ -1409,8 +1399,6 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut SessionStates::new(),
-            "test-session",
-            "",
             "",
             &Default::default(),
             None,
@@ -1528,8 +1516,6 @@ mod tests {
 
         let tools = ToolRegistry::with_builtin_tools(
             &mut SessionStates::new(),
-            "test-session",
-            "",
             "",
             &Default::default(),
             None,

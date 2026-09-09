@@ -11,7 +11,7 @@ Coding Rules
 - Never add user info or real user data in tests or comments
 - Never use real IP addresses, ports, or internal hostnames in code, tests, or config examples — use placeholder domains (e.g. `http://example.invalid`, `http://model.example`) instead
 - Arrange items with structure, like put consts at the top of the file
-- Avoid long item access path, the path level should not greater than one, like foo::Bar, or Bar, but not foo::baz::Bar
+- Keep `::` item paths short in code: outside `use`/`pub use` lines, a path may contain at most one `::` — write `Bar` or `foo::Bar`, not `foo::baz::Bar`. The check is mechanical: count the `::` in the path; two or more (`crate::a::b::C`, `super::super::X`) means the item belongs in a `use` at the top of the file instead (alias with `as` when names clash). Method/field chains written with `.` are not affected. Exempt — they cannot be imported: string-literal paths in attributes (`serde(deserialize_with = "...")`) and `$crate::…` paths inside `macro_rules!` bodies (macro hygiene)
 
 Testing
 -------

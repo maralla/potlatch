@@ -13,6 +13,7 @@ mod reviewer;
 mod settings;
 mod ssh_util;
 mod state;
+mod subagent;
 mod web;
 mod worker;
 mod workspace;
@@ -25,6 +26,7 @@ pub(crate) fn register(workflow: &mut Workflow) {
     workflow.register_agent::<qa::QaAgent>();
     workflow.register_agent::<web::WebAgent>();
     workflow.register_agent::<clerk::ClerkAgent>();
+    workflow.register_agent::<subagent::SubagentAgent>();
 }
 
 #[cfg(test)]
@@ -42,7 +44,9 @@ mod scope_tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            vec!["clerk", "ops", "pmo", "qa", "reviewer", "web", "worker"]
+            vec![
+                "clerk", "ops", "pmo", "qa", "reviewer", "subagent", "web", "worker"
+            ]
         );
     }
 }
