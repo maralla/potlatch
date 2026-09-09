@@ -9,7 +9,8 @@
 //! - `<project-working-dir>/.potlatch/agents/<agent-id>/current` — the
 //!   agent's current session (the project working dir is where
 //!   `potlatch.toml` lives; never inside an agent worktree)
-//! - `~/.potlatch/auth-provider/` — cross-process auth-provider locks
+//! - `~/.potlatch/endpoints/auth-provider/` — auth-provider single-flight
+//!   locks, header caches, and endpoint-specific provider token caches
 //! - `~/.potlatch/memory/<hash>/` — durable project memory
 //! - `~/.potlatch/web-chrome-profile/` — headless browser profile
 
@@ -70,9 +71,12 @@ pub(crate) fn agents_dir_in_project_working_dir(project_working_dir: &Path) -> P
 /// it would put the markers inside the git checkout.
 pub(crate) const AGENTS_DIR_ENV: &str = "POTLATCH_AGENTS_DIR";
 
-/// Cross-process auth-provider coordination: `~/.potlatch/auth-provider/`.
+/// Auth-provider state: single-flight locks, header caches, and the
+/// providers' own endpoint-specific token caches — all under
+/// `~/.potlatch/endpoints/auth-provider/`, unified with the provider
+/// scripts' default cache location.
 pub(crate) fn auth_provider_state_dir() -> PathBuf {
-    app_home().join("auth-provider")
+    app_home().join("endpoints").join("auth-provider")
 }
 
 /// Durable project memory: `~/.potlatch/memory/<repo-hash>/`.

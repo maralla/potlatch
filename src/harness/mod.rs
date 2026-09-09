@@ -203,7 +203,14 @@ pub fn run_acp_server() -> Result<()> {
             let working_dir = std::env::var(crate::core::config::AUTH_COMMAND_DIR_ENV)
                 .ok()
                 .map(PathBuf::from);
-            Some(auth_provider::AuthProvider::new(argv, working_dir))
+            // The provider authenticates for THIS child's one endpoint; its
+            // URL scopes the provider's own token cache.
+            let endpoint = std::env::var("POTLATCH_BASE_URL").ok();
+            Some(auth_provider::AuthProvider::new(
+                argv,
+                endpoint,
+                working_dir,
+            ))
         }
         _ => None,
     };

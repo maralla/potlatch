@@ -99,6 +99,10 @@ pub struct AuthProvider {
     /// runs, and the leader publishes its result (or error) to a sidecar
     /// file so followers skip re-running.
     state_dir: PathBuf,
+    /// The endpoint URL this provider authenticates for. Scoped into the
+    /// provider command's state dir so two endpoints never share token
+    /// caches.
+    endpoint: Option<String>,
     /// Working directory for the provider command — the potlatch config
     /// directory, so `./auth-tool.py` resolves relative to the config.
     /// `None` inherits the harness's cwd.
@@ -106,23 +110,34 @@ pub struct AuthProvider {
 }
 
 impl AuthProvider {
-    pub fn new(argv: Vec<String>, working_dir: Option<PathBuf>) -> Self {
-        Self::with_state_dir(argv, working_dir, default_state_dir())
+    pub fn new(argv: Vec<String>, endpoint: Option<String>, working_dir: Option<PathBuf>) -> Self {
+        Self::with_state_dir(argv, endpoint, working_dir, default_state_dir())
     }
 
     /// `state_dir` is injectable for tests; production uses the shared
     /// per-user directory so all harness processes coordinate through it.
     pub(crate) fn with_state_dir(
         argv: Vec<String>,
+        endpoint: Option<String>,
         working_dir: Option<PathBuf>,
         state_dir: PathBuf,
     ) -> Self {
         Self {
             argv,
+            endpoint,
             cache: Mutex::new(None),
             state_dir,
             working_dir,
         }
+    }
+
+    /// The state directory for THIS provider: one directory per
+    /// (endpoint, provider command) pair, holding the single-flight lock,
+    /// the published header cache, and the provider script's own token
+    /// cache — so two endpoints, or two commands, never share state.
+    fn scoped_state_dir(&self) -> PathBuf {
+        self.state_dir
+            .join(scoped_state_dir_name(self.endpoint.as_deref(), &self.argv))
     }
 
     /// The provider command's program name, for log lines.
@@ -156,16 +171,12 @@ impl AuthProvider {
     /// surface that failure (until [`ERROR_REPUBLISH_TTL`] passes) instead of
     /// stampeding into their own interactive runs.
     fn run_provider_single_flight(&self) -> Result<CachedHeaders> {
-        std::fs::create_dir_all(&self.state_dir).with_context(|| {
-            format!(
-                "create auth-provider state dir {}",
-                self.state_dir.display()
-            )
-        })?;
+        let state_dir = self.scoped_state_dir();
+        std::fs::create_dir_all(&state_dir)
+            .with_context(|| format!("create auth-provider state dir {}", state_dir.display()))?;
 
-        let key = state_key(&self.argv);
-        let lock_path = self.state_dir.join(format!("run-{key}.lock"));
-        let result_path = self.state_dir.join(format!("run-{key}.json"));
+        let lock_path = state_dir.join("run.lock");
+        let result_path = state_dir.join("run.json");
 
         let lock_file = File::create(&lock_path)
             .with_context(|| format!("open lock file {}", lock_path.display()))?;
@@ -207,7 +218,11 @@ impl AuthProvider {
             PublishedState::Fresh(_) | PublishedState::None => {}
         }
 
-        match run_provider(&self.argv, self.working_dir.as_deref()) {
+        match run_provider(
+            &self.argv,
+            &self.scoped_state_dir(),
+            self.working_dir.as_deref(),
+        ) {
             Ok(cached) => {
                 publish(&result_path, &cached);
                 Ok(cached)
@@ -224,6 +239,16 @@ impl AuthProvider {
 /// coordination files.
 fn default_state_dir() -> PathBuf {
     auth_provider_state_dir()
+}
+
+/// The scoped state-directory name for an auth provider: a stable,
+/// filesystem-safe hash of the (endpoint, provider command) pair — the two
+/// things an auth token belongs to. Non-security: FNV-1a suffices.
+fn scoped_state_dir_name(endpoint: Option<&str>, argv: &[String]) -> String {
+    match endpoint {
+        Some(endpoint) => state_key(&[endpoint.to_string(), argv.join("\u{0}")]),
+        None => state_key(argv),
+    }
 }
 
 /// A stable, filesystem-safe key for an argv so different provider commands
@@ -373,7 +398,11 @@ fn load_published(result_path: &Path) -> PublishedState {
 /// so `./auth-tool.py` or `auth-tool.py` sitting alongside `potlatch.toml`
 /// just work. Absolute paths and bare command names found on `PATH` are
 /// unaffected.
-fn run_provider(argv: &[String], working_dir: Option<&Path>) -> Result<CachedHeaders> {
+fn run_provider(
+    argv: &[String],
+    state_dir: &Path,
+    working_dir: Option<&Path>,
+) -> Result<CachedHeaders> {
     let program = argv
         .first()
         .ok_or_else(|| anyhow::anyhow!("auth_provider command is empty"))?;
@@ -387,6 +416,10 @@ fn run_provider(argv: &[String], working_dir: Option<&Path>) -> Result<CachedHea
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
+    // `state_dir` is already endpoint-scoped by the caller: provider scripts
+    // keep their token caches there (via `POTLATCH_AUTH_STATE_DIR`), so two
+    // endpoints never share an auth.json.
+    cmd.env("POTLATCH_AUTH_STATE_DIR", state_dir);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to run auth_provider `{resolved}`"))?;
@@ -639,7 +672,7 @@ mod tests {
     /// commands with `dir` as the working directory (standing in for the
     /// potlatch config directory).
     fn provider_in(dir: &std::path::Path, argv: Vec<String>) -> AuthProvider {
-        AuthProvider::with_state_dir(argv, Some(dir.to_path_buf()), dir.join("state"))
+        AuthProvider::with_state_dir(argv, None, Some(dir.to_path_buf()), dir.join("state"))
     }
 
     fn provider(dir: &std::path::Path, script_path: &std::path::Path) -> AuthProvider {
@@ -1033,15 +1066,67 @@ mod tests {
     }
 
     #[test]
+    fn provider_command_receives_endpoint_scoped_state_dir() {
+        // The provider's own token cache must be endpoint-specific: the
+        // harness hands each provider command a state dir scoped to the
+        // endpoint it authenticates for, and two endpoints never share one.
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-auth-endpoint-scope-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let script = r#"printf '{"expiration":9999999999999,"headers":{"State":"%s"}}' "$POTLATCH_AUTH_STATE_DIR""#;
+        let provider_for = |endpoint: &str| {
+            AuthProvider::with_state_dir(
+                vec!["sh".into(), "-c".into(), script.into()],
+                Some(endpoint.to_string()),
+                None,
+                state_dir.clone(),
+            )
+        };
+
+        let argv = vec!["sh".into(), "-c".into(), script.into()];
+        let first = provider_for("https://auth.example/v1").headers().unwrap();
+        let second = provider_for("https://auth.example/v2").headers().unwrap();
+
+        let expected_first = state_dir.join(scoped_state_dir_name(
+            Some("https://auth.example/v1"),
+            &argv,
+        ));
+        let expected_second = state_dir.join(scoped_state_dir_name(
+            Some("https://auth.example/v2"),
+            &argv,
+        ));
+        assert_ne!(expected_first, expected_second);
+        assert_eq!(
+            first.get("State").map(String::as_str),
+            Some(expected_first.to_str().unwrap())
+        );
+        assert_eq!(
+            second.get("State").map(String::as_str),
+            Some(expected_second.to_str().unwrap())
+        );
+
+        // The single-flight files are scoped too: each pair's run.json sits
+        // in its own directory, so the second endpoint actually ran.
+        assert!(expected_first.join("run.json").is_file());
+        assert!(expected_second.join("run.json").is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn single_flight_client_main() {
         // Acts as the one-shot client process for
         // `concurrent_processes_run_provider_once`. Not a real test body.
         if let Ok(argv_raw) = std::env::var("POTLATCH_AUTH_SINGLEFLIGHT_ARGV") {
-            let mut lines = argv_raw.splitn(2, '\n');
-            let script = lines.next().unwrap();
-            let state_dir = lines.next().unwrap();
+            let (script, state_dir) = argv_raw.split_once('\n').unwrap();
             let provider = AuthProvider::with_state_dir(
                 vec!["sh".into(), script.to_string()],
+                None,
                 None,
                 PathBuf::from(state_dir),
             );

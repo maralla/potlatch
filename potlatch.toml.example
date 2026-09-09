@@ -55,6 +55,10 @@ repo_url = "https://gitlab.com/group/project"
 #    The command runs with the directory of this config file as its working
 #    directory, and a bare command name is also resolved there first — a
 #    script placed next to this file runs as `auth-tool.py` or `./auth-tool.py`.
+#    It also receives `POTLATCH_AUTH_STATE_DIR`: an endpoint-scoped directory
+#    under ~/.potlatch/endpoints/auth-provider/ for the script's own token
+#    cache, so two endpoints never share an auth.json.
+
 #    Concurrent agent processes are single-flighted: one runs the command,
 #    the others hold and reuse its published result.
 # endpoints = [
