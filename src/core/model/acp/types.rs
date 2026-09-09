@@ -62,7 +62,8 @@ pub struct NewSessionParams {
     #[serde(default)]
     pub mcp_servers: Vec<Value>,
     /// The orchestrator agent this session runs for (e.g. `worker-7`). The
-    /// harness records it in `~/.potlatch/agents/<agent-id>/current` so a
+    /// harness records it in `<working-dir>/.potlatch/agents/<agent-id>/current`
+    /// so a
     /// recovered process can find and resume the interrupted session.
     /// Potlatch extension — ignored by non-potlatch backends.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "agent_id")]
