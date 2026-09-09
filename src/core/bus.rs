@@ -83,6 +83,10 @@ pub(crate) struct AgentInbox {
 pub(crate) struct AgentRequest {
     pub operation: String,
     pub payload: Value,
+    /// The calling harness session id, lifted out of the payload by the bus
+    /// (the harness proxy injects it as [`CALLER_SESSION_ID_KEY`]). Handlers
+    /// never see it among the tool arguments.
+    pub caller_session_id: Option<String>,
     response: mpsc::SyncSender<std::result::Result<Value, String>>,
 }
 
@@ -201,16 +205,23 @@ impl AgentBus {
         &self,
         target: &str,
         operation: String,
-        payload: Value,
+        mut payload: Value,
         timeout: Duration,
     ) -> Result<Value> {
         let deadline = Instant::now() + timeout;
         let sender = self.wait_for_route(target, deadline)?;
         let (response, response_rx) = mpsc::sync_channel(1);
+        // Lift the caller identity out of the tool arguments: it is request
+        // metadata, and handlers deserialize their payloads strictly.
+        let caller_session_id = payload
+            .as_object_mut()
+            .and_then(|object| object.remove(CALLER_SESSION_ID_KEY))
+            .and_then(|value| value.as_str().map(str::to_string));
         sender
             .send(AgentRequest {
                 operation,
                 payload,
+                caller_session_id,
                 response,
             })
             .with_context(|| format!("agent bus target {target:?} stopped before receiving"))?;
