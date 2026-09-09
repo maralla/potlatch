@@ -19,6 +19,12 @@ impl SharedOutput {
     pub fn stdout() -> Self {
         Self(Arc::new(Mutex::new(Box::new(std::io::stdout()))))
     }
+
+    /// Wrap an explicit writer (tests inspect what the harness wrote).
+    #[cfg(test)]
+    pub fn from_writer(writer: Box<dyn Write + Send>) -> Self {
+        Self(Arc::new(Mutex::new(writer)))
+    }
 }
 
 impl Write for SharedOutput {

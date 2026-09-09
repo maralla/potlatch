@@ -7,6 +7,11 @@ use toml::Value;
 
 const RESERVED_KEYS: &[&str] = &["acp_command", "env", "endpoints"];
 
+/// The ACP profile name of the platform's own harness: the app name itself
+/// (`[acp.<app-name>]`). Subagent children for this vendor spawn the running
+/// executable and take their endpoint env/auth from this profile.
+pub const POTLATCH_ACP_PROFILE: &str = crate::paths::APP_NAME;
+
 /// The `endpoints`-entry key holding the auth-provider command.
 const AUTH_PROVIDER_KEY: &str = "auth_provider";
 
@@ -319,6 +324,7 @@ pub fn build_acp_spawn_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::Config;
 
     fn test_command() -> Vec<String> {
         vec!["agent".into(), "acp".into()]
@@ -563,6 +569,190 @@ mod tests {
         );
         // No `key` field when omitted — it's a user-defined field, not a default.
         assert!(!p.endpoints[1].fields.contains_key("key"));
+    }
+
+    fn harness_config() -> Config {
+        Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", endpoint = "http://endpoint1.example", key = "EMPTY" },
+              { model = "model2", endpoint = "http://endpoint2.example", key = "EMPTY" },
+            ]
+            env = [
+              "POTLATCH_BASE_URL={endpoint}",
+              "POTLATCH_API_KEY={key}",
+            ]
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_client_spawn_selects_the_endpoint_of_the_provided_models() {
+        // The provided models pick the endpoint whose env/auth the shared
+        // ACP child is spawned with. Query suffixes are stripped before
+        // matching.
+        let spawn = harness_config()
+            .resolve_client_spawn(
+                "potlatch",
+                &["acp://potlatch/model2?thinking=true".to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            Some("http://endpoint2.example")
+        );
+        assert_eq!(
+            spawn.env.get("POTLATCH_API_KEY").map(String::as_str),
+            Some("EMPTY")
+        );
+        // The platform's own harness vendor runs THIS executable.
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(spawn.command[0], exe.display().to_string());
+        assert_eq!(spawn.command[1], "harness");
+        assert_eq!(spawn.model_uri, None);
+    }
+
+    #[test]
+    fn resolve_client_spawn_accepts_models_sharing_one_endpoint() {
+        // Two provided models whose bare names resolve to the same endpoint
+        // are fine.
+        let spawn = harness_config()
+            .resolve_client_spawn(
+                "potlatch",
+                &[
+                    "acp://potlatch/model1".to_string(),
+                    "acp://potlatch/model1?thinking=true".to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            Some("http://endpoint1.example")
+        );
+    }
+
+    #[test]
+    fn resolve_client_spawn_rejects_models_spanning_endpoints() {
+        // One ACP child serves one endpoint: models from different endpoints
+        // of the same vendor cannot share it.
+        let error = harness_config()
+            .resolve_client_spawn(
+                "potlatch",
+                &[
+                    "acp://potlatch/model1".to_string(),
+                    "acp://potlatch/model2".to_string(),
+                ],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("one ACP endpoint"), "{error}");
+    }
+
+    #[test]
+    fn resolve_client_spawn_rejects_unknown_provided_models() {
+        let error = harness_config()
+            .resolve_client_spawn("potlatch", &["acp://potlatch/no-such-model".to_string()])
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no endpoint matching model `no-such-model`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn resolve_client_spawn_requires_the_vendor_profile() {
+        let cfg = Config::from_toml_str("").unwrap();
+        let error = cfg
+            .resolve_client_spawn("potlatch", &["model1".to_string()])
+            .unwrap_err();
+        assert!(error.to_string().contains("[acp.potlatch]"), "{error}");
+    }
+
+    #[test]
+    fn resolve_client_spawn_uses_the_profile_command_for_other_vendors() {
+        // Non-harness vendors run their profile's acp_command (e.g. a CLI).
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.cursor]
+            acp_command = ["agent", "acp"]
+            "#,
+        )
+        .unwrap();
+        let spawn = cfg
+            .resolve_client_spawn("cursor", &["composer-2".to_string()])
+            .unwrap();
+        assert_eq!(spawn.command, vec!["agent", "acp"]);
+    }
+
+    #[test]
+    fn resolve_client_spawn_handles_full_uris_against_a_multi_endpoint_profile() {
+        // Regression: provided_models are full model URIs — the endpoint
+        // lookup must use the bare model name, not the whole URI string.
+        // Several endpoints, one provided model with a query suffix.
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model-a", endpoint = "http://model-a.example", key = "EMPTY" },
+              { model = "model-b", endpoint = "http://model-b.example", key = "EMPTY" },
+              { model = "model-c", endpoint = "http://model-c.example", key = "EMPTY" },
+              { model = "model-d", endpoint = "http://model-d.example", key = "EMPTY" },
+            ]
+            env = [
+              "POTLATCH_BASE_URL={endpoint}",
+              "POTLATCH_API_KEY={key}",
+            ]
+            "#,
+        )
+        .unwrap();
+        let spawn = cfg
+            .resolve_client_spawn(
+                "potlatch",
+                &["acp://potlatch/model-b?thinking=true".to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            Some("http://model-b.example")
+        );
+        assert_eq!(
+            spawn.env.get("POTLATCH_API_KEY").map(String::as_str),
+            Some("EMPTY")
+        );
+    }
+
+    #[test]
+    fn resolve_client_spawn_resolves_profile_fields_without_endpoints() {
+        // Single-endpoint style: top-level fields, no `endpoints` table —
+        // nothing to select, placeholders resolve from profile fields.
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            base_url = "http://endpoint1.example"
+            api_key = "EMPTY"
+            env = [
+              "POTLATCH_BASE_URL={base_url}",
+              "POTLATCH_API_KEY={api_key}",
+            ]
+            "#,
+        )
+        .unwrap();
+        let spawn = cfg
+            .resolve_client_spawn(
+                "potlatch",
+                &["acp://potlatch/model1?thinking=true".to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            Some("http://endpoint1.example")
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::Tool;
-use crate::core::bus::RemoteAgentToolDefinition;
+use crate::core::bus::{CALLER_SESSION_ID_KEY, RemoteAgentToolDefinition};
 
 pub trait AgentToolCaller: Send + Sync {
     fn call(&self, target: &str, operation: &str, arguments: Value) -> Result<Value>;
@@ -15,14 +15,23 @@ pub trait AgentToolCaller: Send + Sync {
 pub struct RemoteAgentTool {
     caller: Arc<dyn AgentToolCaller>,
     definition: RemoteAgentToolDefinition,
+    /// The harness session this proxy is registered for. Injected into every
+    /// call payload so bus-served agents can scope per-caller state (e.g.
+    /// the subagent agent owns each subagent to its caller's task session).
+    caller_session_id: String,
 }
 
 impl RemoteAgentTool {
     pub(crate) fn new(
         caller: Arc<dyn AgentToolCaller>,
         definition: RemoteAgentToolDefinition,
+        caller_session_id: &str,
     ) -> Self {
-        Self { caller, definition }
+        Self {
+            caller,
+            definition,
+            caller_session_id: caller_session_id.to_string(),
+        }
     }
 }
 
@@ -39,10 +48,17 @@ impl Tool for RemoteAgentTool {
     }
 
     fn execute(&self, args: &Value, _cwd: &str) -> Result<String> {
+        let mut arguments = args.clone();
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert(
+                CALLER_SESSION_ID_KEY.to_string(),
+                Value::String(self.caller_session_id.clone()),
+            );
+        }
         let result = self.caller.call(
             &self.definition.target,
             &self.definition.operation,
-            args.clone(),
+            arguments,
         )?;
         match result {
             Value::String(text) => Ok(text),
@@ -84,7 +100,21 @@ mod tests {
                 target: "provider".to_string(),
                 operation: "run".to_string(),
             },
+            "caller-session-1",
         )
+    }
+
+    #[test]
+    fn proxy_tags_the_payload_with_the_calling_session() {
+        // Bus-served agents scope per-caller state (e.g. subagent ownership)
+        // by the calling harness session; the proxy injects it into every
+        // payload.
+        let result = tool()
+            .execute(&serde_json::json!({"value": "hello"}), "/tmp")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(payload["__caller_session_id"], "caller-session-1");
+        assert_eq!(payload["value"], "hello");
     }
 
     fn tool() -> RemoteAgentTool {

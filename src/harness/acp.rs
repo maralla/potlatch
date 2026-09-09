@@ -14,18 +14,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use super::agent_loop::AgentLoop;
-use super::client::ChatClient;
+use super::client::{ChatClient, ChatResponse, StreamCallback, TurnCallback};
+use super::parent::SharedOutput;
 use super::session_store::{
     SessionRoots, agent_current_marker, clear_current_session, read_current_session,
     session_context_file, write_current_session,
 };
 use super::tools::ToolRegistry;
+use super::tools::agent_bus::AgentToolCaller;
+use crate::core::bus::RemoteAgentToolDefinition;
 use crate::core::model::acp::jsonrpc::Outbound;
 
 /// Context token budget for the harness ACP agent loop. Compaction triggers at
@@ -64,8 +68,9 @@ struct Session {
     /// The persistent agent loop for this session. Created at `session/new`,
     /// reused across all `session/prompt` calls. Owns the `Context`, so
     /// conversation history accumulates across prompts — true single long
-    /// session.
-    agent: Option<AgentLoop>,
+    /// session. Shared with the session's turn threads: the mutex serializes
+    /// prompts to the same session while different sessions run concurrently.
+    agent: Option<Arc<Mutex<AgentLoop>>>,
     /// Session-level state (background jobs, language servers, etc.). Tools
     /// retrieve their state by concrete type via `SessionStates::get`.
     /// All state is shut down on session close.
@@ -80,7 +85,7 @@ struct Session {
     /// schema). The harness creates a generic `StructuredOutputTool` per
     /// definition at prompt time.
     structured_output_tools: Option<Vec<Value>>,
-    agent_tools: Vec<crate::core::bus::RemoteAgentToolDefinition>,
+    agent_tools: Vec<RemoteAgentToolDefinition>,
     /// Optional path to a transcript file. When set, the harness writes a
     /// human-readable transcript of each `session/prompt` turn (user prompt,
     /// assistant response, reasoning, tool calls) to this file in real time.
@@ -124,38 +129,34 @@ pub struct AcpServer {
     llm: Arc<dyn ChatClient>,
     sessions: HashMap<String, Session>,
     /// Shared map of session id → channels. The reader thread uses this to
-    /// handle `session/inject` and `session/cancel` while the main thread is
-    /// blocked running `session/prompt`.
+    /// handle `session/inject` and `session/cancel` while turn threads run.
     shared_channels: SharedSessionChannels,
-    agent_tool_caller: Option<Arc<dyn super::tools::agent_bus::AgentToolCaller>>,
+    agent_tool_caller: Option<Arc<dyn AgentToolCaller>>,
     /// Where session data (run.log, context) and agent markers live.
     /// Overridable so tests never touch the real `~/.potlatch`.
     roots: SessionRoots,
+    /// Shared stdout of the harness process. Turn threads write their
+    /// notifications and responses here when they finish; the main thread
+    /// writes synchronous responses. The internal mutex keeps concurrent
+    /// writes line-atomic.
+    output: SharedOutput,
 }
 
 impl AcpServer {
-    pub fn new(llm: Arc<dyn ChatClient>) -> Self {
+    /// Run the server writing to an explicit shared output (tests, and the
+    /// `harness` command, which passes the process stdout).
+    pub fn with_output(llm: Arc<dyn ChatClient>, output: SharedOutput) -> Self {
         Self {
             llm,
             sessions: HashMap::new(),
             shared_channels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             agent_tool_caller: None,
             roots: SessionRoots::real(),
+            output,
         }
     }
 
-    /// Run the server against explicit filesystem roots (tests).
-    #[cfg(test)]
-    fn with_roots(llm: Arc<dyn ChatClient>, roots: SessionRoots) -> Self {
-        let mut server = Self::new(llm);
-        server.roots = roots;
-        server
-    }
-
-    pub fn with_agent_tool_caller(
-        mut self,
-        caller: Arc<dyn super::tools::agent_bus::AgentToolCaller>,
-    ) -> Self {
+    pub fn with_agent_tool_caller(mut self, caller: Arc<dyn AgentToolCaller>) -> Self {
         self.agent_tool_caller = Some(caller);
         self
     }
@@ -166,14 +167,12 @@ impl AcpServer {
         Arc::clone(&self.shared_channels)
     }
 
-    /// Handle an incoming JSON-RPC message. Writes notifications directly to `writer`
-    /// as they're produced (for real-time streaming during `session/prompt`).
-    /// Returns the response (if the message was a request with an id).
-    pub fn handle_message(
-        &mut self,
-        msg: &Value,
-        writer: &mut dyn Write,
-    ) -> Result<Option<Outbound>> {
+    /// Handle an incoming JSON-RPC message. Returns the immediate response
+    /// (if the message was a request with an id that is answered
+    /// synchronously). `session/prompt` turns run on their own thread and
+    /// write their notifications and response to the server's shared output
+    /// when the turn completes, so the caller receives `Ok(None)` for them.
+    pub fn handle_message(&mut self, msg: &Value) -> Result<Option<Outbound>> {
         let method = msg["method"].as_str().unwrap_or("");
         let id = msg.get("id").cloned();
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -187,14 +186,18 @@ impl AcpServer {
             "session/set_model" => self.handle_set_model(&params)?,
             "session/set_config_option" => self.handle_set_config_option(&params)?,
             "session/set_mode" => json!({}),
+            // The turn runs asynchronously: the turn thread writes the
+            // notifications and the response to the shared output when it
+            // finishes, so nothing is returned here. Sessions are independent
+            // — prompts to different sessions run concurrently; prompts to
+            // the same session queue behind the session's agent loop.
             "session/prompt" => {
-                // session/prompt streams notifications directly to the writer
-                self.handle_session_prompt(&params, writer)?
+                self.handle_session_prompt(&params, id)?;
+                return Ok(None);
             }
             // session/inject and session/cancel are handled directly by the
-            // reader thread via shared channels (they work mid-run, while the
-            // main thread is blocked in session/prompt). They never reach
-            // handle_message.
+            // reader thread via shared channels (they work mid-run). They
+            // never reach handle_message.
             "session/close" => self.handle_session_close(&params)?,
             other => {
                 warn!("harness ACP: unhandled method: {other}");
@@ -202,8 +205,17 @@ impl AcpServer {
             }
         };
 
-        // Return a response only if this was a request (has an id)
-        Ok(id.map(|id| Outbound::Response { id, result }))
+        // Return a response only if this was a request (has an id). The
+        // server writes it to the shared output itself — turn threads write
+        // their own responses there too, and the shared output's mutex keeps
+        // concurrent lines from interleaving.
+        let response = id.map(|id| Outbound::Response { id, result });
+        if let Some(outbound) = &response
+            && let Ok(line) = outbound.to_json_line()
+        {
+            write_line(&self.output, &line);
+        }
+        Ok(response)
     }
 
     fn handle_initialize(&self, _params: &Value) -> Result<Value> {
@@ -236,7 +248,18 @@ impl AcpServer {
         // process outlives thousands of tasks. Running the close path here
         // bounds the leak to one stale session, reclaimed by the very
         // `session/new` that follows the failed close.
-        self.close_all_registered_sessions("superseded by session/new");
+        //
+        // Multiplexing clients (the subagent agent keeps many independent
+        // subagent sessions alive on one connection) opt out via the
+        // `multiplex` extension: they manage their sessions' lifetimes
+        // explicitly through `session/close`.
+        let multiplex = params
+            .get("multiplex")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !multiplex {
+            self.close_all_registered_sessions("superseded by session/new");
+        }
 
         let mut session = Session::new(cwd.clone());
         // Optional `tools` extension: an allow-list of tool names. When
@@ -342,9 +365,7 @@ impl AcpServer {
         // lifetime.
         let mut tools = ToolRegistry::with_builtin_tools(
             &mut session.states,
-            &session.id,
             &cwd,
-            &session.model,
             &write_roots,
             session.allowed_tools.as_deref(),
         );
@@ -353,6 +374,7 @@ impl AcpServer {
                 Arc::clone(caller),
                 session.agent_tools.clone(),
                 session.allowed_tools.as_deref(),
+                &session.id,
             );
         }
         if let Some(defs) = &session.structured_output_tools {
@@ -411,7 +433,7 @@ impl AcpServer {
         } else {
             agent.init_context(&cwd, &context_channels);
         }
-        session.agent = Some(agent);
+        session.agent = Some(Arc::new(Mutex::new(agent)));
 
         // Register the inject channel and cancel flag in the shared channels
         // map so the reader thread can handle session/inject and
@@ -468,7 +490,15 @@ impl AcpServer {
         self.sessions
             .get(session_id)
             .and_then(|session| session.agent.as_ref())
-            .map(|agent| agent.tool_names().into_iter().map(str::to_string).collect())
+            .map(|agent| {
+                agent
+                    .lock()
+                    .unwrap()
+                    .tool_names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -478,8 +508,8 @@ impl AcpServer {
 
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.model = model_id.to_string();
-            if let Some(ref mut agent) = session.agent {
-                agent.set_model(model_id);
+            if let Some(ref agent) = session.agent {
+                agent.lock().unwrap().set_model(model_id);
             }
             debug!("harness ACP: set model to {model_id} for session {session_id}");
         }
@@ -495,8 +525,8 @@ impl AcpServer {
         if let Some(session) = self.sessions.get_mut(session_id) {
             if config_id == "model" {
                 session.model = value.to_string();
-                if let Some(ref mut agent) = session.agent {
-                    agent.set_model(value);
+                if let Some(ref agent) = session.agent {
+                    agent.lock().unwrap().set_model(value);
                 }
                 info!("harness ACP: session {session_id} set model={value}");
             } else if config_id == "mode" {
@@ -514,102 +544,60 @@ impl AcpServer {
         Ok(json!({ "configOptions": [] }))
     }
 
-    fn handle_session_prompt(&mut self, params: &Value, writer: &mut dyn Write) -> Result<Value> {
+    fn handle_session_prompt(&mut self, params: &Value, request_id: Option<Value>) -> Result<()> {
         let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-
         let prompt_text = extract_prompt_text(&params["prompt"]);
 
-        let session = match self.sessions.get_mut(&session_id) {
-            Some(s) => s,
-            None => {
-                return Ok(json!({
-                    "stopReason": "error",
-                    "message": format!("unknown session: {session_id}")
-                }));
-            }
-        };
-
-        let cwd = session.cwd.clone();
-        let transcript_path = session.transcript_path.clone();
-        let cancel = session.cancel.clone();
-        cancel.store(false, Ordering::SeqCst);
-
-        let agent = match session.agent.as_mut() {
-            Some(a) => a,
-            None => {
-                return Ok(json!({
-                    "stopReason": "error",
-                    "message": "session agent not initialized"
-                }));
-            }
-        };
-        // Collect progress text; the agent loop calls this callback after each LLM response.
-        // We emit notifications by writing to the writer after collection.
-        let progress_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let progress_buf_clone = Arc::clone(&progress_buf);
-        let progress_cb: &super::client::StreamCallback = &move |text: &str| {
-            if let Ok(mut buf) = progress_buf_clone.lock() {
-                buf.push(text.to_string());
-            }
-        };
-
-        // Write the user prompt to the transcript file at the start.
-        let turn_counter = std::sync::Arc::new(std::sync::Mutex::new(0u32));
-        if let Some(ref tp) = transcript_path {
-            write_transcript_entry(tp, "## User", &prompt_text);
-        }
-
-        // Turn callback: writes each turn's content, reasoning, and tool calls
-        // to the transcript file in real time.
-        let transcript_path_for_cb = transcript_path.clone();
-        let turn_counter_for_cb = Arc::clone(&turn_counter);
-        let turn_cb: &super::client::TurnCallback =
-            &move |_response: &super::client::ChatResponse| {
-                if let Some(ref tp) = transcript_path_for_cb {
-                    let mut count = turn_counter_for_cb.lock().unwrap();
-                    *count += 1;
-                    write_transcript_turn(tp, *count, _response);
+        // Gather everything the turn thread needs. The session stays in the
+        // map and stays usable while the turn runs: the thread holds only
+        // shared handles (agent loop, cancel flag, transcript path), so
+        // control messages for OTHER sessions keep flowing and this session
+        // can still be closed or cancelled mid-turn.
+        let turn = {
+            let Some(session) = self.sessions.get(&session_id) else {
+                warn!("harness ACP: prompt for unknown session {session_id}");
+                if let Some(id) = request_id {
+                    let response = Outbound::Response {
+                        id,
+                        result: json!({
+                            "stopReason": "error",
+                            "message": format!("unknown session: {session_id}")
+                        }),
+                    };
+                    write_line(&self.output, &response.to_json_line()?);
                 }
+                return Ok(());
             };
-
-        let result =
-            agent.run_with_turn_callback(&prompt_text, &cwd, Some(progress_cb), Some(turn_cb));
-        // Read all captured structured-output tool calls (e.g. `handoff`, `plan`).
-        let structured_outputs = agent.take_structured_outputs();
-
-        // Emit all collected progress as session/update notifications
-        let collected = progress_buf.lock().unwrap();
-        for text in collected.iter() {
-            let notif = Outbound::Notification {
-                method: "session/update".to_string(),
-                params: json!({
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": { "text": text }
-                    }
-                }),
+            let Some(ref agent) = session.agent else {
+                warn!("harness ACP: prompt for session without agent {session_id}");
+                if let Some(id) = request_id {
+                    let response = Outbound::Response {
+                        id,
+                        result: json!({
+                            "stopReason": "error",
+                            "message": "session agent not initialized"
+                        }),
+                    };
+                    write_line(&self.output, &response.to_json_line()?);
+                }
+                return Ok(());
             };
-            if let Ok(line) = notif.to_json_line() {
-                let _ = writer.write_all(line.as_bytes());
-                let _ = writer.flush();
+            PromptTurn {
+                session_id: session_id.clone(),
+                request_id,
+                agent: Arc::clone(agent),
+                cancel: Arc::clone(&session.cancel),
+                cwd: session.cwd.clone(),
+                transcript_path: session.transcript_path.clone(),
+                output: self.output.clone(),
             }
-        }
+        };
 
-        match result {
-            Ok(response) => Ok(json!({
-                "stopReason": "end_turn",
-                "message": response,
-                "structured_outputs": structured_outputs,
-            })),
-            Err(e) => {
-                let err_msg = format!("Agent loop error: {e}");
-                warn!("harness ACP: {err_msg}");
-                Ok(json!({
-                    "stopReason": "error",
-                    "message": err_msg,
-                }))
-            }
-        }
+        thread::Builder::new()
+            .name(format!("session-turn-{session_id}"))
+            .spawn(move || turn.run(&prompt_text))
+            .context("spawn session/prompt turn thread")?;
+        Ok(())
     }
 
     fn handle_session_close(&mut self, params: &Value) -> Result<Value> {
@@ -631,6 +619,10 @@ impl AcpServer {
                 let marker = agent_current_marker(&self.roots.agents, &session.agent_id);
                 clear_current_session(&marker, session_id);
             }
+            // Stop a turn that may still be running on this session: the
+            // agent loop exits at its next iteration, so the turn thread
+            // ends promptly instead of finishing a turn nobody waits for.
+            session.cancel.store(true, Ordering::SeqCst);
             session.states.shutdown();
             debug!("harness ACP: closed session {session_id}");
         }
@@ -653,7 +645,6 @@ impl AcpServer {
 
 /// Append a section to the transcript file.
 fn write_transcript_entry(path: &Path, header: &str, body: &str) {
-    use std::io::Write;
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "\n{header}\n\n{body}");
         let _ = f.flush();
@@ -662,7 +653,126 @@ fn write_transcript_entry(path: &Path, header: &str, body: &str) {
 
 /// Append a full turn (assistant content, reasoning, tool calls) to the
 /// transcript file.
-fn write_transcript_turn(path: &Path, turn: u32, response: &super::client::ChatResponse) {
+/// One `session/prompt` turn, running on its own thread. Holds only shared
+/// handles, so the session stays closable/cancellable mid-turn and control
+/// traffic for other sessions is never blocked by this turn.
+struct PromptTurn {
+    session_id: String,
+    request_id: Option<Value>,
+    agent: Arc<Mutex<AgentLoop>>,
+    cancel: Arc<AtomicBool>,
+    cwd: String,
+    transcript_path: Option<PathBuf>,
+    output: SharedOutput,
+}
+
+impl PromptTurn {
+    fn run(self, prompt_text: &str) {
+        // Serialize prompts to this session: a second prompt queues here
+        // until the running turn releases the agent loop. Different
+        // sessions' turns run concurrently — the agent loop is per session.
+        let mut agent = self.agent.lock().unwrap();
+        // A stale cancel flag (session/cancel or close during a previous
+        // turn) must not abort this new turn.
+        self.cancel.store(false, Ordering::SeqCst);
+
+        // Collect progress text; the agent loop calls this callback after
+        // each LLM response. All collected progress is emitted as
+        // notifications when the turn finishes.
+        let progress_buf = Arc::new(Mutex::new(Vec::<String>::new()));
+        let progress_buf_clone = Arc::clone(&progress_buf);
+        let progress_cb: &StreamCallback = &move |text: &str| {
+            if let Ok(mut buf) = progress_buf_clone.lock() {
+                buf.push(text.to_string());
+            }
+        };
+
+        // Write the user prompt to the transcript file at the start.
+        if let Some(ref tp) = self.transcript_path {
+            write_transcript_entry(tp, "## User", prompt_text);
+        }
+
+        // Turn callback: writes each turn's content, reasoning, and tool
+        // calls to the transcript file in real time.
+        let turn_counter = Arc::new(Mutex::new(0u32));
+        let transcript_path_for_cb = self.transcript_path.clone();
+        let turn_counter_for_cb = Arc::clone(&turn_counter);
+        let turn_cb: &TurnCallback = &move |response: &ChatResponse| {
+            if let Some(ref tp) = transcript_path_for_cb {
+                let mut count = turn_counter_for_cb.lock().unwrap();
+                *count += 1;
+                write_transcript_turn(tp, *count, response);
+            }
+        };
+
+        let result =
+            agent.run_with_turn_callback(prompt_text, &self.cwd, Some(progress_cb), Some(turn_cb));
+        // Read all captured structured-output tool calls (e.g. `handoff`, `plan`).
+        let structured_outputs = agent.take_structured_outputs();
+        drop(agent);
+
+        // Emit all collected progress as session/update notifications. The
+        // sessionId routes each notification to the right session on
+        // multiplexing clients (the ACP session/update params include it).
+        let collected = progress_buf.lock().unwrap();
+        for text in collected.iter() {
+            let notif = Outbound::Notification {
+                method: "session/update".to_string(),
+                params: json!({
+                    "sessionId": &self.session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "text": text }
+                    }
+                }),
+            };
+            if let Ok(line) = notif.to_json_line() {
+                write_line(&self.output, &line);
+            }
+        }
+        drop(collected);
+
+        let result_json = match result {
+            Ok(response) => json!({
+                "stopReason": "end_turn",
+                "message": response,
+                "structured_outputs": structured_outputs,
+            }),
+            Err(e) => {
+                let err_msg = format!("Agent loop error: {e}");
+                warn!("harness ACP: {err_msg}");
+                json!({
+                    "stopReason": "error",
+                    "message": err_msg,
+                })
+            }
+        };
+
+        // Answer the prompt request (when it had an id) now that the turn is
+        // complete — the only response the caller ever sees.
+        if let Some(id) = self.request_id
+            && let Ok(line) = (Outbound::Response {
+                id,
+                result: result_json,
+            })
+            .to_json_line()
+        {
+            write_line(&self.output, &line);
+        }
+    }
+}
+
+/// Write one JSON-RPC line as a single atomic write. Turn threads, the main
+/// thread, and the stdin reader thread share the process stdout; the
+/// underlying mutex keeps concurrent lines from interleaving mid-write.
+/// Callers pass newline-terminated lines (`Outbound::to_json_line`).
+pub(crate) fn write_line(output: &SharedOutput, line: &str) {
+    let mut output = output.clone();
+    let _ = output.write_all(line.as_bytes());
+    let _ = output.flush();
+}
+
+fn write_transcript_turn(path: &Path, turn: u32, response: &ChatResponse) {
     use std::io::Write;
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "\n=== Turn {turn} ===");
@@ -721,17 +831,18 @@ fn extract_prompt_text(prompt: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::client::ChatResponse;
+
     use super::super::context::Context;
     use super::*;
+    use crate::harness::client::{EarlyToolExecCallback, ToolExecCallback, Usage};
     use crate::harness::tools::test_util;
     use serde_json::json;
-    use std::io::Cursor;
+    use std::time::Instant;
 
     struct StubClient;
     struct EchoAgentToolCaller;
 
-    impl super::super::tools::agent_bus::AgentToolCaller for EchoAgentToolCaller {
+    impl AgentToolCaller for EchoAgentToolCaller {
         fn call(&self, _target: &str, _operation: &str, arguments: Value) -> Result<Value> {
             Ok(arguments)
         }
@@ -743,15 +854,15 @@ mod tests {
             _model: &str,
             _messages: &[Value],
             _tools: &[Value],
-            _on_chunk: Option<&super::super::client::StreamCallback>,
-            _on_tool_calls: Option<&super::super::client::ToolExecCallback<'_>>,
-            _on_early_tool_call: Option<&super::super::client::EarlyToolExecCallback<'_>>,
+            _on_chunk: Option<&StreamCallback>,
+            _on_tool_calls: Option<&ToolExecCallback<'_>>,
+            _on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
                 content: "Task completed successfully.".into(),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -759,17 +870,88 @@ mod tests {
         }
     }
 
-    fn collect_output(server: &mut AcpServer, msg: &Value) -> (Option<Outbound>, String) {
-        let mut buf = Cursor::new(Vec::new());
-        let response = server.handle_message(msg, &mut buf).unwrap();
-        let written = String::from_utf8(buf.into_inner()).unwrap();
-        (response, written)
+    /// A test-only writer that captures the harness output for inspection.
+    struct BufferSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufferSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a server whose entire output (responses, notifications) lands
+    /// in an inspectable buffer.
+    fn buffered_server(llm: Arc<dyn ChatClient>) -> (AcpServer, Arc<Mutex<Vec<u8>>>) {
+        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let server = AcpServer::with_output(
+            llm,
+            SharedOutput::from_writer(Box::new(BufferSink(Arc::clone(&buffer)))),
+        );
+        (server, buffer)
+    }
+
+    /// Build a buffer-backed server against explicit filesystem roots (so
+    /// session-store tests never touch the real `~/.potlatch`). Sets the
+    /// private `roots` field directly — the test module is a child of this
+    /// module.
+    fn buffered_server_with_roots(
+        llm: Arc<dyn ChatClient>,
+        roots: SessionRoots,
+    ) -> (AcpServer, Arc<Mutex<Vec<u8>>>) {
+        let (mut server, buffer) = buffered_server(llm);
+        server.roots = roots;
+        (server, buffer)
+    }
+
+    fn written(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Send a message and wait for its response line in the shared buffer.
+    /// Prompt turns answer asynchronously from their turn thread, so the
+    /// response is polled for. Fails the test when no matching response
+    /// arrives within a few seconds.
+    fn collect_output(
+        server: &mut AcpServer,
+        buffer: &Arc<Mutex<Vec<u8>>>,
+        msg: &Value,
+    ) -> Option<Outbound> {
+        let start_len = buffer.lock().unwrap().len();
+        server.handle_message(msg).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let written = written(buffer);
+            for line in written[start_len..].lines() {
+                let Ok(parsed) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let is_response = parsed.get("method").is_none() && parsed.get("id").is_some();
+                if is_response && parsed["id"] == msg["id"] {
+                    return Some(Outbound::Response {
+                        id: parsed["id"].clone(),
+                        result: parsed.get("result").cloned().unwrap_or(Value::Null),
+                    });
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "no response to {} id={:?} within timeout",
+                    msg["method"], msg["id"]
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
     fn initialize_returns_capabilities() {
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -778,8 +960,11 @@ mod tests {
             "params": {}
         });
 
-        let (response, written) = collect_output(&mut server, &msg);
-        assert!(written.is_empty()); // no notifications
+        let response = collect_output(&mut server, &buffer, &msg);
+        let written = written(&buffer);
+        eprintln!("BUFFER: {:?}", written);
+        assert_eq!(written.lines().count(), 1);
+        assert!(written.contains("protocolVersion"));
         match response {
             Some(Outbound::Response { result, .. }) => {
                 assert_eq!(result["protocolVersion"], 1);
@@ -792,7 +977,7 @@ mod tests {
     #[test]
     fn session_new_creates_session() {
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -801,7 +986,7 @@ mod tests {
             "params": { "cwd": "/tmp", "mcpServers": [] }
         });
 
-        let (response, _) = collect_output(&mut server, &msg);
+        let response = collect_output(&mut server, &buffer, &msg);
         match response {
             Some(Outbound::Response { result, .. }) => {
                 assert!(!result["sessionId"].as_str().unwrap().is_empty());
@@ -814,7 +999,8 @@ mod tests {
     #[test]
     fn session_new_registers_tools_supplied_by_the_potlatch_parent() {
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm).with_agent_tool_caller(Arc::new(EchoAgentToolCaller));
+        let (server, buffer) = buffered_server(llm);
+        let mut server = server.with_agent_tool_caller(Arc::new(EchoAgentToolCaller));
         let msg = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -831,19 +1017,23 @@ mod tests {
             }
         });
 
-        let (response, _) = collect_output(&mut server, &msg);
+        let response = collect_output(&mut server, &buffer, &msg);
         let session_id = match response {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
             }
             _ => panic!("expected response"),
         };
-        let tools = server.sessions[&session_id]
-            .agent
-            .as_ref()
-            .unwrap()
-            .tool_names();
-        assert!(tools.contains(&"web_search"));
+        let tools = {
+            let agent = server.sessions[&session_id].agent.as_ref().unwrap();
+            let agent = agent.lock().unwrap();
+            agent
+                .tool_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert!(tools.iter().any(|t| t == "web_search"));
     }
 
     #[test]
@@ -853,7 +1043,7 @@ mod tests {
         // session mode, the plan tool is never registered, and the PMO can't
         // call it.
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -862,7 +1052,7 @@ mod tests {
             "params": { "cwd": "/tmp", "mcpServers": [] }
         });
 
-        let (response, _) = collect_output(&mut server, &msg);
+        let response = collect_output(&mut server, &buffer, &msg);
         match response {
             Some(Outbound::Response { result, .. }) => {
                 let options = result["configOptions"].as_array().unwrap();
@@ -885,6 +1075,221 @@ mod tests {
     }
 
     #[test]
+    fn multiplexed_session_new_keeps_existing_sessions() {
+        // The subagent agent keeps many independent sessions alive on one
+        // harness connection: `multiplex: true` opts out of the supersede
+        // eviction so a second session/new leaves the first session usable.
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let (mut server, buffer) = buffered_server(llm);
+
+        let new_session = |id: Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "session/new",
+                "params": { "cwd": "/tmp", "multiplex": true }
+            })
+        };
+
+        let response = collect_output(&mut server, &buffer, &new_session(json!(1)));
+        let first = match response {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected response"),
+        };
+        let response = collect_output(&mut server, &buffer, &new_session(json!(2)));
+        let second = match response {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected response"),
+        };
+        assert_ne!(first, second);
+
+        // Both sessions are alive: both accept prompts.
+        for (id, sid) in [(3, &first), (4, &second)] {
+            let prompt = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{ "type": "text", "text": "hi" }]
+                }
+            });
+            let response = collect_output(&mut server, &buffer, &prompt);
+            match response {
+                Some(Outbound::Response { result, .. }) => {
+                    assert_eq!(result["stopReason"], "end_turn");
+                }
+                _ => panic!("expected response for {sid}"),
+            }
+        }
+    }
+
+    #[test]
+    fn prompts_to_different_sessions_run_concurrently() {
+        // The second prompt must not wait for the first turn to finish: the
+        // first turn parks inside its LLM call until the second turn's
+        // response has already arrived. If turns were serialized globally,
+        // the second response could never be observed before the release.
+        struct GatedClient {
+            release: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl ChatClient for GatedClient {
+            fn chat(
+                &self,
+                _model: &str,
+                messages: &[Value],
+                _tools: &[Value],
+                _on_chunk: Option<&StreamCallback>,
+                _on_tool_calls: Option<&ToolExecCallback<'_>>,
+                _on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
+            ) -> Result<ChatResponse> {
+                let is_slow = messages
+                    .iter()
+                    .any(|m| serde_json::to_string(m).unwrap().contains("slow turn"));
+                if is_slow {
+                    while !self.release.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                Ok(ChatResponse {
+                    content: if is_slow {
+                        "slow done".into()
+                    } else {
+                        "quick done".into()
+                    },
+                    tool_calls: vec![],
+                    finish_reason: "stop".into(),
+                    usage: Usage::default(),
+                    tool_results: vec![],
+                    elapsed_ms: 0,
+                    reasoning: String::new(),
+                })
+            }
+        }
+
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let llm: Arc<dyn ChatClient> = Arc::new(GatedClient {
+            release: Arc::clone(&release),
+        });
+        let (mut server, buffer) = buffered_server(llm);
+
+        let mut sids = Vec::new();
+        for id in 1..=2 {
+            let msg = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "session/new",
+                "params": { "cwd": "/tmp", "multiplex": true }
+            });
+            match collect_output(&mut server, &buffer, &msg) {
+                Some(Outbound::Response { result, .. }) => {
+                    sids.push(result["sessionId"].as_str().unwrap().to_string());
+                }
+                _ => panic!("expected response"),
+            }
+        }
+
+        // First prompt parks inside its LLM call.
+        let slow_prompt = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": sids[0],
+                "prompt": [{ "type": "text", "text": "slow turn" }]
+            }
+        });
+        server.handle_message(&slow_prompt).unwrap();
+
+        // Second prompt on the OTHER session must complete while the first
+        // is still parked.
+        let quick_prompt = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": sids[1],
+                "prompt": [{ "type": "text", "text": "quick turn" }]
+            }
+        });
+        server.handle_message(&quick_prompt).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let quick_done = loop {
+            if written(&buffer).contains("quick done") {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(
+            quick_done,
+            "second session's prompt was blocked by the first"
+        );
+
+        // Release the slow turn; its response must still arrive.
+        release.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let slow_done = loop {
+            if written(&buffer).contains("slow done") {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(slow_done, "slow turn never completed");
+    }
+
+    #[test]
+    fn progress_notifications_carry_the_session_id() {
+        // Multiplexing clients route notifications by sessionId: every
+        // session/update the harness emits must name its session.
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+        let (mut server, buffer) = buffered_server(llm);
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": { "cwd": "/tmp" }
+        });
+        let session_id = match collect_output(&mut server, &buffer, &msg) {
+            Some(Outbound::Response { result, .. }) => {
+                result["sessionId"].as_str().unwrap().to_string()
+            }
+            _ => panic!("expected response"),
+        };
+
+        let prompt = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "hi" }]
+            }
+        });
+        collect_output(&mut server, &buffer, &prompt);
+
+        let updates: Vec<Value> = written(&buffer)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|msg| msg["method"] == "session/update")
+            .collect();
+        assert!(!updates.is_empty(), "expected at least one session/update");
+        for update in updates {
+            assert_eq!(update["params"]["sessionId"], session_id.as_str());
+        }
+    }
+
+    #[test]
     fn session_new_evicts_sessions_the_caller_failed_to_close() {
         // The orchestrator closes the previous task's session best-effort
         // before rotating. When that close never arrives (transport blip),
@@ -892,7 +1297,7 @@ mod tests {
         // ever evicts it, and this child serves thousands of tasks. The
         // session/new that follows the failed close reclaims it.
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let new_session = |id: Value| {
             json!({
@@ -904,7 +1309,7 @@ mod tests {
         };
 
         // First session — never closed (simulating the failed close).
-        let (response, _) = collect_output(&mut server, &new_session(json!(1)));
+        let response = collect_output(&mut server, &buffer, &new_session(json!(1)));
         let first = match response {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
@@ -913,7 +1318,7 @@ mod tests {
         };
 
         // Second session/new: must reclaim the first.
-        let (response, _) = collect_output(&mut server, &new_session(json!(2)));
+        let response = collect_output(&mut server, &buffer, &new_session(json!(2)));
         let second = match response {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
@@ -936,7 +1341,7 @@ mod tests {
     #[test]
     fn session_close_for_unknown_session_is_a_noop() {
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -944,14 +1349,14 @@ mod tests {
             "method": "session/close",
             "params": { "sessionId": "never-existed" }
         });
-        let (response, _) = collect_output(&mut server, &msg);
+        let response = collect_output(&mut server, &buffer, &msg);
         assert!(matches!(response, Some(Outbound::Response { .. })));
     }
 
     #[test]
     fn authenticate_is_noop() {
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -960,7 +1365,7 @@ mod tests {
             "params": { "methodId": "cursor_login" }
         });
 
-        let (response, _) = collect_output(&mut server, &msg);
+        let response = collect_output(&mut server, &buffer, &msg);
         match response {
             Some(Outbound::Response { result, .. }) => {
                 assert_eq!(result, json!({}));
@@ -972,7 +1377,7 @@ mod tests {
     #[test]
     fn session_prompt_returns_response_and_streams_notifications() {
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let new_msg = json!({
             "jsonrpc": "2.0",
@@ -980,7 +1385,7 @@ mod tests {
             "method": "session/new",
             "params": { "cwd": "/tmp" }
         });
-        let (resp, _) = collect_output(&mut server, &new_msg);
+        let resp = collect_output(&mut server, &buffer, &new_msg);
         let session_id = match resp {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
@@ -998,7 +1403,8 @@ mod tests {
             }
         });
 
-        let (response, written) = collect_output(&mut server, &prompt_msg);
+        let response = collect_output(&mut server, &buffer, &prompt_msg);
+        let written = written(&buffer);
         // Should have streamed at least one notification (the progress text)
         assert!(
             written.contains("session/update") || written.is_empty(),
@@ -1033,7 +1439,7 @@ mod tests {
         // the AgentLoop persists on the Session and is reused. Context
         // accumulates across prompts (single long session).
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let new_msg = json!({
             "jsonrpc": "2.0",
@@ -1041,7 +1447,7 @@ mod tests {
             "method": "session/new",
             "params": { "cwd": "/tmp" }
         });
-        let (resp, _) = collect_output(&mut server, &new_msg);
+        let resp = collect_output(&mut server, &buffer, &new_msg);
         let session_id = match resp {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
@@ -1059,7 +1465,7 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "first prompt" }]
             }
         });
-        let (resp1, _) = collect_output(&mut server, &prompt1);
+        let resp1 = collect_output(&mut server, &buffer, &prompt1);
         match resp1 {
             Some(Outbound::Response { result, .. }) => {
                 assert_eq!(result["stopReason"], "end_turn");
@@ -1077,7 +1483,7 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "second prompt" }]
             }
         });
-        let (resp2, _) = collect_output(&mut server, &prompt2);
+        let resp2 = collect_output(&mut server, &buffer, &prompt2);
         match resp2 {
             Some(Outbound::Response { result, .. }) => {
                 assert_eq!(result["stopReason"], "end_turn");
@@ -1091,7 +1497,7 @@ mod tests {
         // A session without structured-output tools should return
         // structured_outputs: {} (empty object) in the session/prompt result.
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let new_msg = json!({
             "jsonrpc": "2.0",
@@ -1099,7 +1505,7 @@ mod tests {
             "method": "session/new",
             "params": { "cwd": "/tmp" }
         });
-        let (resp, _) = collect_output(&mut server, &new_msg);
+        let resp = collect_output(&mut server, &buffer, &new_msg);
         let session_id = match resp {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
@@ -1116,7 +1522,7 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "hi" }]
             }
         });
-        let (response, _) = collect_output(&mut server, &prompt_msg);
+        let response = collect_output(&mut server, &buffer, &prompt_msg);
         match response {
             Some(Outbound::Response { result, .. }) => {
                 // structured_outputs is present (empty object — no tools called).
@@ -1132,7 +1538,7 @@ mod tests {
         // record the mode on the session. We verify by checking that a
         // subsequent session/prompt succeeds (the mode was stored).
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let new_msg = json!({
             "jsonrpc": "2.0",
@@ -1140,7 +1546,7 @@ mod tests {
             "method": "session/new",
             "params": { "cwd": "/tmp" }
         });
-        let (resp, _) = collect_output(&mut server, &new_msg);
+        let resp = collect_output(&mut server, &buffer, &new_msg);
         let session_id = match resp {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
@@ -1159,7 +1565,7 @@ mod tests {
                 "value": "plan"
             }
         });
-        let _ = collect_output(&mut server, &mode_msg);
+        let _ = collect_output(&mut server, &buffer, &mode_msg);
 
         // Now prompt — the session/prompt should succeed.
         let prompt_msg = json!({
@@ -1171,7 +1577,7 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "triage" }]
             }
         });
-        let (response, _) = collect_output(&mut server, &prompt_msg);
+        let response = collect_output(&mut server, &buffer, &prompt_msg);
         match response {
             Some(Outbound::Response { result, .. }) => {
                 // structured_outputs is present.
@@ -1199,16 +1605,16 @@ mod tests {
             _model: &str,
             _messages: &[Value],
             tools: &[Value],
-            _on_chunk: Option<&super::super::client::StreamCallback>,
-            _on_tool_calls: Option<&super::super::client::ToolExecCallback<'_>>,
-            _on_early_tool_call: Option<&super::super::client::EarlyToolExecCallback<'_>>,
+            _on_chunk: Option<&StreamCallback>,
+            _on_tool_calls: Option<&ToolExecCallback<'_>>,
+            _on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
         ) -> Result<ChatResponse> {
             *self.captured.lock().unwrap() = tools.to_vec();
             Ok(ChatResponse {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -1222,14 +1628,14 @@ mod tests {
         let llm: Arc<dyn ChatClient> =
             Arc::new(ToolsCapturingClient::new(std::sync::Arc::clone(&captured)));
 
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
         let new_msg = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "session/new",
             "params": { "cwd": "/tmp" }
         });
-        let (resp, _) = collect_output(&mut server, &new_msg);
+        let resp = collect_output(&mut server, &buffer, &new_msg);
         let session_id = match resp {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
@@ -1248,7 +1654,7 @@ mod tests {
                     "value": mode
                 }
             });
-            let _ = collect_output(&mut server, &mode_msg);
+            let _ = collect_output(&mut server, &buffer, &mode_msg);
         }
 
         let prompt_msg = json!({
@@ -1260,7 +1666,7 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "hi" }]
             }
         });
-        let _ = collect_output(&mut server, &prompt_msg);
+        let _ = collect_output(&mut server, &buffer, &prompt_msg);
         captured
             .lock()
             .unwrap()
@@ -1279,7 +1685,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let llm: Arc<dyn ChatClient> =
             Arc::new(ToolsCapturingClient::new(std::sync::Arc::clone(&captured)));
-        let mut server = AcpServer::new(llm);
+        let (mut server, buffer) = buffered_server(llm);
 
         let parameters = json!({
             "type": "object",
@@ -1329,7 +1735,7 @@ mod tests {
                 }]
             }
         });
-        let (resp, _) = collect_output(&mut server, &new_msg);
+        let resp = collect_output(&mut server, &buffer, &new_msg);
         let session_id = match resp {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
@@ -1346,7 +1752,7 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "go" }]
             }
         });
-        let _ = collect_output(&mut server, &prompt_msg);
+        let _ = collect_output(&mut server, &buffer, &prompt_msg);
 
         let tools = captured.lock().unwrap().clone();
         let handoff = tools
@@ -1375,16 +1781,16 @@ mod tests {
             _model: &str,
             messages: &[Value],
             _tools: &[Value],
-            _on_chunk: Option<&super::super::client::StreamCallback>,
-            _on_tool_calls: Option<&super::super::client::ToolExecCallback<'_>>,
-            _on_early_tool_call: Option<&super::super::client::EarlyToolExecCallback<'_>>,
+            _on_chunk: Option<&StreamCallback>,
+            _on_tool_calls: Option<&ToolExecCallback<'_>>,
+            _on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
         ) -> Result<ChatResponse> {
             self.captured.lock().unwrap().push(messages.to_vec());
             Ok(ChatResponse {
                 content: "ok".into(),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                usage: super::super::client::Usage::default(),
+                usage: Usage::default(),
                 tool_results: vec![],
                 elapsed_ms: 0,
                 reasoning: String::new(),
@@ -1399,14 +1805,19 @@ mod tests {
         }
     }
 
-    fn session_new_with_agent(server: &mut AcpServer, id: Value, agent_id: &str) -> String {
+    fn session_new_with_agent(
+        server: &mut AcpServer,
+        buffer: &Arc<Mutex<Vec<u8>>>,
+        id: Value,
+        agent_id: &str,
+    ) -> String {
         let msg = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "session/new",
             "params": { "cwd": "/tmp", "agent_id": agent_id }
         });
-        let (response, _) = collect_output(server, &msg);
+        let response = collect_output(server, buffer, &msg);
         match response {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()
@@ -1423,9 +1834,9 @@ mod tests {
         let llm: Arc<dyn ChatClient> = Arc::new(MessagesCapturingClient {
             captured: captured.clone(),
         });
-        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
+        let (mut server, buffer) = buffered_server_with_roots(llm, test_roots(dir.path()));
 
-        let sid = session_new_with_agent(&mut server, json!(1), "worker-7");
+        let sid = session_new_with_agent(&mut server, &buffer, json!(1), "worker-7");
         let marker = dir.path().join("agents").join("worker-7").join("current");
         assert_eq!(read_current_session(&marker).as_deref(), Some(sid.as_str()));
 
@@ -1439,7 +1850,7 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "implement the feature" }]
             }
         });
-        let (response, _) = collect_output(&mut server, &prompt);
+        let response = collect_output(&mut server, &buffer, &prompt);
         assert!(
             matches!(&response, Some(Outbound::Response { result, .. })
                 if result.get("stopReason").and_then(Value::as_str).is_some_and(|s| s != "error")),
@@ -1464,16 +1875,16 @@ mod tests {
     fn closing_a_session_empties_the_current_marker() {
         let dir = test_util::unique_test_dir();
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
+        let (mut server, buffer) = buffered_server_with_roots(llm, test_roots(dir.path()));
 
-        let sid = session_new_with_agent(&mut server, json!(1), "worker-7");
+        let sid = session_new_with_agent(&mut server, &buffer, json!(1), "worker-7");
         let close = json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "session/close",
             "params": { "sessionId": sid }
         });
-        let (response, _) = collect_output(&mut server, &close);
+        let response = collect_output(&mut server, &buffer, &close);
         assert!(matches!(response, Some(Outbound::Response { .. })));
 
         let marker = dir.path().join("agents").join("worker-7").join("current");
@@ -1494,8 +1905,8 @@ mod tests {
         });
 
         // First run: an agent session whose task never finished (no close).
-        let mut first = AcpServer::with_roots(llm.clone(), test_roots(dir.path()));
-        let sid = session_new_with_agent(&mut first, json!(1), "worker-7");
+        let (mut first, buffer) = buffered_server_with_roots(llm.clone(), test_roots(dir.path()));
+        let sid = session_new_with_agent(&mut first, &buffer, json!(1), "worker-7");
         let prompt = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -1505,12 +1916,12 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "halfway through the task" }]
             }
         });
-        let _ = collect_output(&mut first, &prompt);
+        let _ = collect_output(&mut first, &buffer, &prompt);
         drop(first); // crash: the session was never closed
 
         // Second run: a fresh server (recovered process) for the same agent.
-        let mut second = AcpServer::with_roots(llm.clone(), test_roots(dir.path()));
-        let resumed_sid = session_new_with_agent(&mut second, json!(1), "worker-7");
+        let (mut second, buffer) = buffered_server_with_roots(llm.clone(), test_roots(dir.path()));
+        let resumed_sid = session_new_with_agent(&mut second, &buffer, json!(1), "worker-7");
         assert_eq!(
             resumed_sid, sid,
             "the interrupted session's id must be adopted, not replaced"
@@ -1527,7 +1938,7 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "continue" }]
             }
         });
-        let _ = collect_output(&mut second, &prompt);
+        let _ = collect_output(&mut second, &buffer, &prompt);
         let calls = captured.lock().unwrap();
         let last = calls.last().expect("prompt ran");
         let all_text: String = last
@@ -1544,19 +1955,19 @@ mod tests {
     fn an_empty_marker_starts_a_fresh_session() {
         let dir = test_util::unique_test_dir();
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
+        let (mut server, buffer) = buffered_server_with_roots(llm, test_roots(dir.path()));
 
-        let first = session_new_with_agent(&mut server, json!(1), "worker-7");
+        let first = session_new_with_agent(&mut server, &buffer, json!(1), "worker-7");
         let close = json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "session/close",
             "params": { "sessionId": first }
         });
-        let _ = collect_output(&mut server, &close);
+        let _ = collect_output(&mut server, &buffer, &close);
 
         // The marker is empty; the next session must not adopt the old id.
-        let second = session_new_with_agent(&mut server, json!(3), "worker-7");
+        let second = session_new_with_agent(&mut server, &buffer, json!(3), "worker-7");
         assert_ne!(first, second);
     }
 
@@ -1571,8 +1982,8 @@ mod tests {
         fs::create_dir_all(marker.parent().unwrap()).unwrap();
         fs::write(&marker, "missing-session").unwrap();
 
-        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
-        let sid = session_new_with_agent(&mut server, json!(1), "worker-7");
+        let (mut server, buffer) = buffered_server_with_roots(llm, test_roots(dir.path()));
+        let sid = session_new_with_agent(&mut server, &buffer, json!(1), "worker-7");
         assert_ne!(sid, "missing-session");
         // The marker now names the new session.
         assert_eq!(read_current_session(&marker).as_deref(), Some(sid.as_str()));
@@ -1582,7 +1993,7 @@ mod tests {
     fn sessions_without_agent_id_have_no_marker() {
         let dir = test_util::unique_test_dir();
         let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
-        let mut server = AcpServer::with_roots(llm, test_roots(dir.path()));
+        let (mut server, buffer) = buffered_server_with_roots(llm, test_roots(dir.path()));
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -1590,7 +2001,7 @@ mod tests {
             "method": "session/new",
             "params": { "cwd": "/tmp" }
         });
-        let (response, _) = collect_output(&mut server, &msg);
+        let response = collect_output(&mut server, &buffer, &msg);
         let sid = match response {
             Some(Outbound::Response { result, .. }) => {
                 result["sessionId"].as_str().unwrap().to_string()

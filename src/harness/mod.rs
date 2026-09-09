@@ -218,7 +218,8 @@ pub fn run_acp_server() -> Result<()> {
     ));
     let shared_stdout = parent::SharedOutput::stdout();
     let parent_rpc = Arc::new(parent::ParentRpc::new(shared_stdout.clone()));
-    let mut server = acp::AcpServer::new(llm_client).with_agent_tool_caller(parent_rpc.clone());
+    let mut server = acp::AcpServer::with_output(llm_client, shared_stdout.clone())
+        .with_agent_tool_caller(parent_rpc.clone());
 
     // Shared channels map: session_id → inject_tx + cancel flag.
     // The reader thread uses this to handle session/inject and session/cancel
@@ -249,40 +250,31 @@ pub fn run_acp_server() -> Result<()> {
 
     // Main thread: process messages from the reader thread.
     drop(msg_tx); // Close our copy so msg_rx closes when the reader thread exits.
-    let shared_stdout_main = shared_stdout.clone();
     while let Ok(msg) = msg_rx.recv() {
-        let method = msg["method"].as_str().unwrap_or("(unknown)");
+        let method = msg["method"].as_str().unwrap_or("(unknown)").to_string();
         tracing::info!("ACP request: {method}");
 
-        // When a session is created, switch to per-session log file
-        if method == "session/new" {
-            let mut out = shared_stdout_main.clone();
-            let response = server.handle_message(&msg, &mut out)?;
-            if let Some(ref resp) = response {
-                let line = resp.to_json_line().context("serialize response")?;
-                out.write_all(line.as_bytes())?;
-                out.flush()?;
+        // Responses (and turn notifications) are written by the server to the
+        // shared stdout it owns; the main thread only reacts to session/new
+        // by switching to the per-session log file.
+        let response = server.handle_message(&msg)?;
 
-                if let Outbound::Response { result, .. } = resp
-                    && let Some(sid) = result.get("sessionId").and_then(|v| v.as_str())
-                {
-                    set_session_log(&log_writer, sid);
-                    tracing::info!(
-                        "harness ACP: session {} created, registered tools: {:?}",
-                        sid,
-                        server.session_tool_names(sid)
-                    );
-                }
-            }
-            continue;
-        }
-
-        let mut out = shared_stdout_main.clone();
-        let response = server.handle_message(&msg, &mut out)?;
-        if let Some(resp) = response {
-            let line = resp.to_json_line().context("serialize response")?;
-            out.write_all(line.as_bytes())?;
-            out.flush()?;
+        // When a task session is created, switch to the per-session log
+        // file. Multiplexed sessions (subagent agents keep many alive on one
+        // connection) stay on the process log: switching per session/new
+        // would send concurrent sessions' logs into whichever file was set
+        // last.
+        if method == "session/new"
+            && msg["params"]["multiplex"] != true
+            && let Some(Outbound::Response { result, .. }) = &response
+            && let Some(sid) = result.get("sessionId").and_then(|v| v.as_str())
+        {
+            set_session_log(&log_writer, sid);
+            tracing::info!(
+                "harness ACP: session {} created, registered tools: {:?}",
+                sid,
+                server.session_tool_names(sid)
+            );
         }
     }
 
@@ -295,7 +287,7 @@ pub fn run_acp_server() -> Result<()> {
 /// thread via the mpsc channel.
 fn run_reader_thread(
     shared_channels: acp::SharedSessionChannels,
-    mut shared_stdout: parent::SharedOutput,
+    shared_stdout: parent::SharedOutput,
     parent_rpc: Arc<parent::ParentRpc>,
     msg_tx: std::sync::mpsc::Sender<Value>,
 ) {
@@ -356,8 +348,7 @@ fn run_reader_thread(
                     result,
                 };
                 if let Ok(line) = resp.to_json_line() {
-                    let _ = shared_stdout.write_all(line.as_bytes());
-                    let _ = shared_stdout.flush();
+                    acp::write_line(&shared_stdout, &line);
                 }
             }
             continue;
@@ -390,8 +381,7 @@ fn run_reader_thread(
                     result,
                 };
                 if let Ok(line) = resp.to_json_line() {
-                    let _ = shared_stdout.write_all(line.as_bytes());
-                    let _ = shared_stdout.flush();
+                    acp::write_line(&shared_stdout, &line);
                 }
             }
             continue;
