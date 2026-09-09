@@ -68,7 +68,17 @@ impl<'a> AgentBootstrap<'a> {
             &repo_url,
             Arc::clone(&self.ctx.workflow.shutdown),
         )?;
-        let model = AgentModel::connect(self.ctx, working_dir.clone(), self.model_preferences)?;
+        // Pin the agent-marker root to the PROJECT working dir (where
+        // potlatch.toml lives): this agent's harness child runs with the
+        // agent working dir (its worktree) as cwd, and the markers must not
+        // land inside the git checkout.
+        let mut model_preferences = self.model_preferences;
+        model_preferences.agents_dir = Some(
+            crate::paths::agents_dir_in_project_working_dir(Path::new(&self.ctx.workflow.base_dir))
+                .display()
+                .to_string(),
+        );
+        let model = AgentModel::connect(self.ctx, working_dir.clone(), model_preferences)?;
 
         Ok(AgentWorkspace {
             agent_id,

@@ -6,8 +6,9 @@
 //!
 //! Layout:
 //! - `~/.potlatch/sessions/<session-id>/` — per-session `run.log` + `context`
-//! - `<working-dir>/.potlatch/agents/<agent-id>/current` — the agent's
-//!   current session (per working directory, next to the project)
+//! - `<project-working-dir>/.potlatch/agents/<agent-id>/current` — the
+//!   agent's current session (the project working dir is where
+//!   `potlatch.toml` lives; never inside an agent worktree)
 //! - `~/.potlatch/auth-provider/` — cross-process auth-provider locks
 //! - `~/.potlatch/memory/<hash>/` — durable project memory
 //! - `~/.potlatch/web-chrome-profile/` — headless browser profile
@@ -53,12 +54,21 @@ pub(crate) fn sessions_dir() -> PathBuf {
     app_home().join("sessions")
 }
 
-/// Per-agent current-session markers: `<working-dir>/.potlatch/agents/`.
-/// Scoped to the working directory (the project the agents operate on), not
-/// the user home.
-pub(crate) fn agents_dir_with_working_dir(working_dir: &Path) -> PathBuf {
-    working_dir.join(format!(".{APP_NAME}")).join("agents")
+/// Per-agent current-session markers:
+/// `<project-working-dir>/.potlatch/agents/<agent-id>/`. The project
+/// working dir is where `potlatch.toml` lives. Markers are project-scoped —
+/// never per agent worktree, never in the user home.
+pub(crate) fn agents_dir_in_project_working_dir(project_working_dir: &Path) -> PathBuf {
+    project_working_dir
+        .join(format!(".{APP_NAME}"))
+        .join("agents")
 }
+
+/// Env var the parents set for their harness child, pinning the agent-marker
+/// root to the project working directory (where `potlatch.toml` lives). The
+/// child's own cwd is the agent working dir (its per-agent worktree) — using
+/// it would put the markers inside the git checkout.
+pub(crate) const AGENTS_DIR_ENV: &str = "POTLATCH_AGENTS_DIR";
 
 /// Cross-process auth-provider coordination: `~/.potlatch/auth-provider/`.
 pub(crate) fn auth_provider_state_dir() -> PathBuf {
@@ -98,10 +108,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_markers_live_under_the_working_directory() {
-        let working_dir = Path::new("/home/user/project");
-        let dir = agents_dir_with_working_dir(working_dir);
-        assert_eq!(dir, working_dir.join(format!(".{APP_NAME}")).join("agents"));
+    fn agent_markers_live_in_the_project_working_dir() {
+        let project_working_dir = Path::new("/home/user/project");
+        let dir = agents_dir_in_project_working_dir(project_working_dir);
+        assert_eq!(
+            dir,
+            project_working_dir
+                .join(format!(".{APP_NAME}"))
+                .join("agents")
+        );
         assert!(!dir.starts_with(home_dir()));
     }
 

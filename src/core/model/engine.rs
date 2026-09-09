@@ -176,6 +176,9 @@ pub struct ModelSessionOptions {
     /// session cwd (via `outside_cwd: true`). Forwarded to the harness in
     /// `session/new` as the `write_roots` extension.
     pub write_roots: Vec<String>,
+    /// Root for the harness's agent current-session markers (see
+    /// [`ModelPreferences::agents_dir`]).
+    pub agents_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +251,7 @@ impl ModelEngine {
             session.preferred_session_mode,
             session.agent_bus,
             session.write_roots,
+            session.agents_dir,
             runtime.shutdown,
             runtime.agent_id,
         ))

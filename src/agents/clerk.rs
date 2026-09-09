@@ -86,7 +86,21 @@ impl CoreAgent for ClerkAgent {
             .context("clerk agent requires the cross-agent bus")?;
         let inbox = bus.register(Self::name(), vec![memory_tool_definition()])?;
         let working_dir = ctx.workflow.base_dir.clone();
-        let model = AgentModel::connect(&ctx, &working_dir, ModelPreferences::default())?;
+        // Clerk's agent working dir IS the project working dir, but pin the
+        // marker root explicitly like every other agent — no reliance on
+        // that coincidence.
+        let model = AgentModel::connect(
+            &ctx,
+            &working_dir,
+            ModelPreferences {
+                agents_dir: Some(
+                    crate::paths::agents_dir_in_project_working_dir(Path::new(&working_dir))
+                        .display()
+                        .to_string(),
+                ),
+                ..ModelPreferences::default()
+            },
+        )?;
         let memory_path = memory_file_path(&working_dir);
         let memory_path_for_provider = memory_path.clone();
         let context_guard = bus.register_context(
