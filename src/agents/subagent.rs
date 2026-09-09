@@ -32,9 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::core::agent::CoreAgent;
 use crate::core::banner::Banner;
-use crate::core::bus::{
-    AgentInbox, AgentToolDefinition, CALLER_SESSION_ID_KEY, ContextChannelGuard, ContextProvider,
-};
+use crate::core::bus::{AgentInbox, AgentToolDefinition, ContextChannelGuard, ContextProvider};
 use crate::core::config::uri::ModelUri;
 use crate::core::config::{
     AUTH_COMMAND_DIR_ENV, AUTH_COMMAND_ENV, AcpSpawnConfig, Config, POTLATCH_ACP_PROFILE,
@@ -125,7 +123,10 @@ impl CoreAgent for SubagentAgent {
         }
         if let Some(request) = self.inbox.recv_timeout(INBOX_WAIT)? {
             let payload = request.payload.clone();
-            let result = self.hub.dispatch(&payload).map(Value::String);
+            let result = self
+                .hub
+                .dispatch(&payload, request.caller_session_id.as_deref())
+                .map(Value::String);
             request.respond(result);
         }
         Ok(())
@@ -522,8 +523,10 @@ impl SubagentHub {
     }
 
     /// Dispatch a `subagent` tool call: spawn, poll, message, inject, or
-    /// kill, mirroring the tool's argument shape.
-    fn dispatch(&self, payload: &Value) -> Result<String> {
+    /// kill, mirroring the tool's argument shape. `owner` is the calling
+    /// harness session (bus request metadata) — recorded at spawn so the
+    /// caller's subagents can be closed together when its task retires.
+    fn dispatch(&self, payload: &Value, owner: Option<&str>) -> Result<String> {
         let subagent_id = payload["subagent_id"].as_str();
         let kill = payload["kill"].as_bool().unwrap_or(false);
         let message = payload["message"].as_str().filter(|s| !s.is_empty());
@@ -545,10 +548,6 @@ impl SubagentHub {
         let prompt = payload["prompt"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'prompt' argument"))?;
-        let owner = payload
-            .get(CALLER_SESSION_ID_KEY)
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let model = payload["model"].as_str().unwrap_or_default();
         let tools: Option<Vec<String>> = payload["tools"]
             .as_array()
@@ -558,7 +557,7 @@ impl SubagentHub {
                     .collect()
             })
             .filter(|v: &Vec<String>| !v.is_empty());
-        self.spawn(prompt, model, tools.as_deref(), owner)
+        self.spawn(prompt, model, tools.as_deref(), owner.map(str::to_string))
     }
 
     /// Start a subagent: create an ACP session in the shared harness, set
@@ -1248,11 +1247,14 @@ mod tests {
 
     fn spawn_one(hub: &SubagentHub, prompt: &str) -> String {
         let report = hub
-            .dispatch(&json!({
-                "prompt": prompt,
-                "model": "acp://potlatch/model1?thinking=true",
-                "tools": ["shell"]
-            }))
+            .dispatch(
+                &json!({
+                    "prompt": prompt,
+                    "model": "acp://potlatch/model1?thinking=true",
+                    "tools": ["shell"]
+                }),
+                None,
+            )
             .unwrap();
         report
             .strip_prefix("Subagent started: ")
@@ -1291,7 +1293,7 @@ mod tests {
         );
 
         // The transcript lives under <base>/.potlatch/subagent/transcripts/.
-        let report = hub.dispatch(&json!({ "subagent_id": id })).unwrap();
+        let report = hub.dispatch(&json!({ "subagent_id": id }), None).unwrap();
         let expected = base_dir
             .join(format!(".{APP_NAME}"))
             .join(AGENT_NAME)
@@ -1306,7 +1308,7 @@ mod tests {
         let (hub, _fakes, _dir) = test_hub();
         let id = spawn_one(&hub, "task");
 
-        let report = hub.dispatch(&json!({ "subagent_id": id })).unwrap();
+        let report = hub.dispatch(&json!({ "subagent_id": id }), None).unwrap();
         assert!(report.contains("status: running"), "{report}");
 
         // The reader thread routes the prompt response by request id; tests
@@ -1321,7 +1323,7 @@ mod tests {
         );
 
         let report = hub
-            .dispatch(&json!({ "subagent_id": "subagent-1" }))
+            .dispatch(&json!({ "subagent_id": "subagent-1" }), None)
             .unwrap();
         assert!(report.contains("status: done"), "{report}");
         assert!(report.contains("found 3 bugs"), "{report}");
@@ -1341,7 +1343,7 @@ mod tests {
             }),
         );
         let report = hub
-            .dispatch(&json!({ "subagent_id": "subagent-1" }))
+            .dispatch(&json!({ "subagent_id": "subagent-1" }), None)
             .unwrap();
         assert!(report.contains("status: error"), "{report}");
         assert!(report.contains("Agent loop error: boom"), "{report}");
@@ -1353,8 +1355,11 @@ mod tests {
         let transport = fakes["potlatch"].clone();
         let id = spawn_one(&hub, "first task");
 
-        hub.dispatch(&json!({ "subagent_id": &id, "message": "now check tests" }))
-            .unwrap();
+        hub.dispatch(
+            &json!({ "subagent_id": &id, "message": "now check tests" }),
+            None,
+        )
+        .unwrap();
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         assert_eq!(prompts[1].0, id);
@@ -1369,8 +1374,11 @@ mod tests {
         let transport = fakes["potlatch"].clone();
         let id = spawn_one(&hub, "task");
 
-        hub.dispatch(&json!({ "subagent_id": &id, "inject": "stop and reconsider" }))
-            .unwrap();
+        hub.dispatch(
+            &json!({ "subagent_id": &id, "inject": "stop and reconsider" }),
+            None,
+        )
+        .unwrap();
         let injects = transport.recorded_requests("session/inject");
         assert_eq!(injects.len(), 1);
         assert_eq!(injects[0]["sessionId"], "harness-session-1");
@@ -1384,17 +1392,17 @@ mod tests {
         let id = spawn_one(&hub, "task");
 
         let report = hub
-            .dispatch(&json!({ "subagent_id": &id, "kill": true }))
+            .dispatch(&json!({ "subagent_id": &id, "kill": true }), None)
             .unwrap();
         assert!(report.contains("status: killed"), "{report}");
         // The harness session was closed: its context and jobs are released.
         assert_eq!(transport.recorded_requests("session/close").len(), 1);
 
         // The tombstone still answers polls, and messages are rejected.
-        let report = hub.dispatch(&json!({ "subagent_id": &id })).unwrap();
+        let report = hub.dispatch(&json!({ "subagent_id": &id }), None).unwrap();
         assert!(report.contains("status: killed"), "{report}");
         let err = hub
-            .dispatch(&json!({ "subagent_id": &id, "message": "hello" }))
+            .dispatch(&json!({ "subagent_id": &id, "message": "hello" }), None)
             .unwrap_err();
         assert!(err.to_string().contains("has exited"), "{err}");
     }
@@ -1410,7 +1418,10 @@ mod tests {
         }
 
         let err = hub
-            .dispatch(&json!({ "prompt": "one too many", "model": "model1?thinking=true" }))
+            .dispatch(
+                &json!({ "prompt": "one too many", "model": "model1?thinking=true" }),
+                None,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("subagent limit reached (2 live"),
@@ -1419,7 +1430,7 @@ mod tests {
         assert!(err.to_string().contains("kill a finished"), "{err}");
 
         // Killing one frees a slot (tombstones do not count against the cap).
-        hub.dispatch(&json!({ "subagent_id": &ids[0], "kill": true }))
+        hub.dispatch(&json!({ "subagent_id": &ids[0], "kill": true }), None)
             .unwrap();
         let id = spawn_one(&hub, "fits again");
         assert_eq!(id, "subagent-3");
@@ -1481,10 +1492,13 @@ mod tests {
         );
 
         let potlatch_id = hub
-            .dispatch(&json!({
-                "prompt": "on potlatch",
-                "model": "acp://potlatch/model1?thinking=true"
-            }))
+            .dispatch(
+                &json!({
+                    "prompt": "on potlatch",
+                    "model": "acp://potlatch/model1?thinking=true"
+                }),
+                None,
+            )
             .unwrap()
             .lines()
             .next()
@@ -1493,10 +1507,13 @@ mod tests {
             .unwrap()
             .to_string();
         let cursor_id = hub
-            .dispatch(&json!({
-                "prompt": "on cursor",
-                "model": "acp://cursor/composer-2"
-            }))
+            .dispatch(
+                &json!({
+                    "prompt": "on cursor",
+                    "model": "acp://cursor/composer-2"
+                }),
+                None,
+            )
             .unwrap()
             .lines()
             .next()
@@ -1531,16 +1548,21 @@ mod tests {
 
         // The potlatch subagent has a transcript; the cursor one does not.
         let report = hub
-            .dispatch(&json!({ "subagent_id": &potlatch_id }))
+            .dispatch(&json!({ "subagent_id": &potlatch_id }), None)
             .unwrap();
         assert!(report.contains("transcript:"), "{report}");
-        let report = hub.dispatch(&json!({ "subagent_id": &cursor_id })).unwrap();
+        let report = hub
+            .dispatch(&json!({ "subagent_id": &cursor_id }), None)
+            .unwrap();
         assert!(!report.contains("transcript:"), "{report}");
 
         // Vendor routing holds for follow-ups: a message goes to the same
         // client's session.
-        hub.dispatch(&json!({ "subagent_id": &cursor_id, "message": "continue" }))
-            .unwrap();
+        hub.dispatch(
+            &json!({ "subagent_id": &cursor_id, "message": "continue" }),
+            None,
+        )
+        .unwrap();
         assert_eq!(cursor.prompts.lock().unwrap().len(), 2);
         assert_eq!(potlatch.prompts.lock().unwrap().len(), 1);
     }
@@ -1550,16 +1572,16 @@ mod tests {
         let (hub, _fakes, _dir) = test_hub();
 
         // No prompt and no subagent id: a caller error.
-        let err = hub.dispatch(&json!({})).unwrap_err();
+        let err = hub.dispatch(&json!({}), None).unwrap_err();
         assert!(err.to_string().contains("missing 'prompt'"), "{err}");
 
         // Unknown ids are caller errors.
         let err = hub
-            .dispatch(&json!({ "subagent_id": "subagent-99" }))
+            .dispatch(&json!({ "subagent_id": "subagent-99" }), None)
             .unwrap_err();
         assert!(err.to_string().contains("unknown subagent id"), "{err}");
         let err = hub
-            .dispatch(&json!({ "subagent_id": "subagent-99", "kill": true }))
+            .dispatch(&json!({ "subagent_id": "subagent-99", "kill": true }), None)
             .unwrap_err();
         assert!(err.to_string().contains("unknown subagent id"), "{err}");
     }
@@ -1572,7 +1594,7 @@ mod tests {
         let transport = fakes["potlatch"].clone();
 
         let err = hub
-            .dispatch(&json!({ "prompt": "no model", "tools": ["shell"] }))
+            .dispatch(&json!({ "prompt": "no model", "tools": ["shell"] }), None)
             .unwrap_err();
         assert!(
             err.to_string().contains("'model' argument is required"),
@@ -1581,7 +1603,10 @@ mod tests {
         assert!(err.to_string().contains("model1?thinking=true"), "{err}");
 
         let err = hub
-            .dispatch(&json!({ "prompt": "bad model", "model": "gpt-9", "tools": ["shell"] }))
+            .dispatch(
+                &json!({ "prompt": "bad model", "model": "gpt-9", "tools": ["shell"] }),
+                None,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("unknown subagent model 'gpt-9'"),
@@ -1618,14 +1643,17 @@ mod tests {
 
     #[test]
     fn spawn_records_the_calling_session_as_owner() {
-        // The harness tags every bus tool payload with its session id; the
-        // hub remembers it so the caller's subagents can be closed together.
+        // The harness tags every bus tool call with its session id; the bus
+        // lifts it into the request metadata, and the hub remembers it so
+        // the caller's subagents can be closed together.
         let (hub, _fakes, _dir) = test_hub();
-        hub.dispatch(&json!({
-            "prompt": "task",
-            "model": "acp://potlatch/model1?thinking=true",
-            "__caller_session_id": "caller-session-7"
-        }))
+        hub.dispatch(
+            &json!({
+                "prompt": "task",
+                "model": "acp://potlatch/model1?thinking=true"
+            }),
+            Some("caller-session-7"),
+        )
         .unwrap();
 
         let sessions = hub.shared.sessions.lock().unwrap();
@@ -1640,11 +1668,13 @@ mod tests {
         let (hub, fakes, _dir) = test_hub();
         let transport = fakes["potlatch"].clone();
         for (name, caller) in [("a", "caller-7"), ("b", "caller-7"), ("c", "caller-8")] {
-            hub.dispatch(&json!({
-                "prompt": name,
-                "model": "acp://potlatch/model1?thinking=true",
-                "__caller_session_id": caller
-            }))
+            hub.dispatch(
+                &json!({
+                    "prompt": name,
+                    "model": "acp://potlatch/model1?thinking=true"
+                }),
+                Some(caller),
+            )
             .unwrap();
         }
 
@@ -1661,12 +1691,12 @@ mod tests {
         // The caller's task is over: its entries were fully reclaimed — polls
         // for them are caller errors now.
         let err = hub
-            .dispatch(&json!({ "subagent_id": "subagent-1" }))
+            .dispatch(&json!({ "subagent_id": "subagent-1" }), None)
             .unwrap_err();
         assert!(err.to_string().contains("unknown subagent id"), "{err}");
         // Another caller's subagent is untouched: still running.
         let report = hub
-            .dispatch(&json!({ "subagent_id": "subagent-3" }))
+            .dispatch(&json!({ "subagent_id": "subagent-3" }), None)
             .unwrap();
         assert!(report.contains("status: running"), "{report}");
     }
@@ -1686,11 +1716,13 @@ mod tests {
         let (hub, fakes, _dir) = test_hub();
         let transport = fakes["potlatch"].clone();
         let id = hub
-            .dispatch(&json!({
-                "prompt": "task",
-                "model": "acp://potlatch/model1?thinking=true",
-                "__caller_session_id": "caller-7"
-            }))
+            .dispatch(
+                &json!({
+                    "prompt": "task",
+                    "model": "acp://potlatch/model1?thinking=true"
+                }),
+                Some("caller-7"),
+            )
             .unwrap()
             .lines()
             .next()
@@ -1698,7 +1730,7 @@ mod tests {
             .strip_prefix("Subagent started: ")
             .unwrap()
             .to_string();
-        hub.dispatch(&json!({ "subagent_id": &id, "kill": true }))
+        hub.dispatch(&json!({ "subagent_id": &id, "kill": true }), None)
             .unwrap();
         assert_eq!(transport.recorded_requests("session/close").len(), 1);
 
@@ -1781,7 +1813,7 @@ mod tests {
         }
         drop(sessions);
 
-        let report = hub.dispatch(&json!({ "subagent_id": id })).unwrap();
+        let report = hub.dispatch(&json!({ "subagent_id": id }), None).unwrap();
         assert!(report.contains("status: error"), "{report}");
         assert!(report.contains("harness exited"), "{report}");
     }
