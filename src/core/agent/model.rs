@@ -36,6 +36,12 @@ pub struct ModelPreferences {
     /// `session/new` as the `write_roots` extension; empty keeps the
     /// harness's historical permissive behavior.
     pub write_roots: Vec<String>,
+    /// Root for the harness's agent current-session markers, pinned to the
+    /// project working dir (where `potlatch.toml` lives). The harness
+    /// child's cwd is the agent working dir (its worktree) — without this,
+    /// the markers would land inside the git checkout. Forwarded to the
+    /// child via `POTLATCH_AGENTS_DIR`.
+    pub agents_dir: Option<String>,
 }
 
 /// Result of a typed structured-output completion: the backend-neutral
@@ -92,6 +98,7 @@ impl AgentModel {
                 preferred_session_mode: prefs.preferred_session_mode,
                 agent_bus: ctx.workflow.bus.clone(),
                 write_roots: prefs.write_roots.clone(),
+                agents_dir: prefs.agents_dir.clone(),
             },
         )?;
         Ok(Self {
@@ -211,6 +218,7 @@ impl AgentModel {
                 preferred_session_mode: prefs.preferred_session_mode,
                 agent_bus: None,
                 write_roots: prefs.write_roots.clone(),
+                agents_dir: prefs.agents_dir.clone(),
             },
         )?;
         Ok(Self {

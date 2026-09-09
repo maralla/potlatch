@@ -99,6 +99,10 @@ pub(crate) struct AcpRuntime {
     /// Directories the harness's write/edit tools may touch outside the
     /// session cwd, forwarded to the harness in `session/new`.
     write_roots: Vec<String>,
+    /// Root for the child's agent current-session markers, forwarded via the
+    /// `POTLATCH_AGENTS_DIR` env at spawn (the child's cwd is the agent
+    /// working dir — its worktree — not the project working dir).
+    agents_dir: Option<String>,
     /// Structured-output definitions for the task currently in flight. The
     /// selected backend either passes them to the harness via `session/new` or
     /// renders them into the marker prompt. Set per task by
@@ -121,6 +125,7 @@ impl AcpRuntime {
         preferred_session_mode: Option<&'static str>,
         agent_bus: Option<AgentBus>,
         write_roots: Vec<String>,
+        agents_dir: Option<String>,
         shutdown: Arc<AtomicBool>,
         agent_id: String,
     ) -> Self {
@@ -144,6 +149,7 @@ impl AcpRuntime {
             capability_provider: Mutex::new(None),
             agent_bus,
             write_roots,
+            agents_dir,
         }
     }
 
@@ -496,6 +502,12 @@ impl AcpRuntime {
             .unwrap_or("agent");
         let mut cmd = build_acp_spawn_command(&self.acp_command, &self.acp_env)
             .with_context(|| format!("build ACP spawn command for {program}"))?;
+        if let Some(agents_dir) = &self.agents_dir {
+            // Pin the agent-marker root to the project working dir: the
+            // child's cwd is the agent working dir (its worktree), not the
+            // project dir.
+            cmd.env(crate::paths::AGENTS_DIR_ENV, agents_dir);
+        }
 
         let mut child = cmd
             .current_dir(&self.working_dir)
@@ -910,6 +922,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             Arc::new(AtomicBool::new(false)),
             "worker-0".into(),
         )
@@ -982,6 +995,7 @@ mod tests {
                 None,
                 Some(bus.clone()),
                 Vec::new(),
+                None,
                 Arc::new(AtomicBool::new(false)),
                 "worker-0".into(),
             )

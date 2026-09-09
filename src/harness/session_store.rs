@@ -1,6 +1,7 @@
 //! Filesystem layout for potlatch session data: session data under
-//! `~/.potlatch`, agent current-session markers under the working
-//! directory's `<working-dir>/.potlatch/agents`.
+//! `~/.potlatch`, agent current-session markers under the project working
+//! directory's `<project-working-dir>/.potlatch/agents` (the project
+//! working dir is where `potlatch.toml` lives — never an agent worktree).
 //!
 //! Layout:
 //! - `~/.potlatch/sessions/<session-id>/run.log` — the harness run log for
@@ -8,8 +9,8 @@
 //! - `~/.potlatch/sessions/<session-id>/context` — the session's full
 //!   current context, rewritten on every context update so it always holds
 //!   the latest state.
-//! - `<working-dir>/.potlatch/agents/<agent-id>/current` — the session the
-//!   agent is currently running. Emptied when the task finishes, so a
+//! - `<project-working-dir>/.potlatch/agents/<agent-id>/current` — the
+//!   session the agent is currently running. Emptied when the task finishes, so a
 //!   recovered process resumes only interrupted work, never finished work.
 //!
 //! The marker is cross-process coordination: the harness child writes it at
@@ -19,7 +20,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::paths::{agents_dir_with_working_dir, sessions_dir};
+use crate::paths::{agents_dir_in_project_working_dir, sessions_dir};
 
 /// The two roots of the on-disk layout. Injectable so tests run against a
 /// temp directory instead of the real one.
@@ -31,15 +32,21 @@ pub(crate) struct SessionRoots {
 
 impl SessionRoots {
     /// The real layout: session data under `~/.potlatch`, agent markers
-    /// under the working directory's `.potlatch/agents`. The harness child
-    /// always runs with the working directory as its cwd (its parent spawns
-    /// it that way), so the process's current directory IS the working
-    /// directory.
+    /// under the project working dir's `.potlatch/agents`. The parent pins
+    /// that root via `POTLATCH_AGENTS_DIR` — the harness child's own cwd is
+    /// the agent working dir (its worktree), not the project working dir.
+    /// Standalone harness runs (no parent env) fall back to the cwd.
     pub fn real() -> Self {
-        let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let agents_root = std::env::var(crate::paths::AGENTS_DIR_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                agents_dir_in_project_working_dir(
+                    &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                )
+            });
         Self {
             sessions: sessions_dir(),
-            agents: agents_dir_with_working_dir(&working_dir),
+            agents: agents_root,
         }
     }
 }
