@@ -845,7 +845,13 @@ mod tests {
     struct EchoAgentToolCaller;
 
     impl AgentToolCaller for EchoAgentToolCaller {
-        fn call(&self, _target: &str, _operation: &str, arguments: Value) -> Result<Value> {
+        fn call(
+            &self,
+            _target: &str,
+            _operation: &str,
+            arguments: Value,
+            _session_id: &str,
+        ) -> Result<Value> {
             Ok(arguments)
         }
     }

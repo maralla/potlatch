@@ -57,11 +57,6 @@ struct BusInner {
     lifecycle_listeners: Mutex<Vec<mpsc::Sender<String>>>,
 }
 
-/// Reserved payload key the harness injects into every bus tool call,
-/// naming the harness session that made the call. Bus-served agents use it
-/// to scope per-caller state (e.g. subagent ownership).
-pub const CALLER_SESSION_ID_KEY: &str = "__caller_session_id";
-
 #[derive(Clone)]
 pub(crate) struct AgentBus {
     inner: Arc<BusInner>,
@@ -83,10 +78,10 @@ pub(crate) struct AgentInbox {
 pub(crate) struct AgentRequest {
     pub operation: String,
     pub payload: Value,
-    /// The calling harness session id, lifted out of the payload by the bus
-    /// (the harness proxy injects it as [`CALLER_SESSION_ID_KEY`]). Handlers
-    /// never see it among the tool arguments.
-    pub caller_session_id: Option<String>,
+    /// The calling harness session's id — request metadata set by the
+    /// harness proxy at call time. Handlers never see it among the tool
+    /// arguments.
+    pub session_id: Option<String>,
     response: mpsc::SyncSender<std::result::Result<Value, String>>,
 }
 
@@ -205,23 +200,18 @@ impl AgentBus {
         &self,
         target: &str,
         operation: String,
-        mut payload: Value,
+        payload: Value,
+        session_id: Option<String>,
         timeout: Duration,
     ) -> Result<Value> {
         let deadline = Instant::now() + timeout;
         let sender = self.wait_for_route(target, deadline)?;
         let (response, response_rx) = mpsc::sync_channel(1);
-        // Lift the caller identity out of the tool arguments: it is request
-        // metadata, and handlers deserialize their payloads strictly.
-        let caller_session_id = payload
-            .as_object_mut()
-            .and_then(|object| object.remove(CALLER_SESSION_ID_KEY))
-            .and_then(|value| value.as_str().map(str::to_string));
         sender
             .send(AgentRequest {
                 operation,
                 payload,
-                caller_session_id,
+                session_id,
                 response,
             })
             .with_context(|| format!("agent bus target {target:?} stopped before receiving"))?;
@@ -426,6 +416,7 @@ mod tests {
                 "web",
                 "run".to_string(),
                 serde_json::json!({"query": "rust"}),
+                None,
                 Duration::from_secs(1),
             )
             .unwrap();
