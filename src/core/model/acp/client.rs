@@ -6,6 +6,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -19,6 +20,12 @@ use super::types::{
     AuthenticateParams, InitializeParams, InitializeResult, NewSessionParams, NewSessionResult,
     PromptResult, text_prompt,
 };
+
+/// Upper bound for waiting on a control-plane response (every request except
+/// `session/prompt`): initialize, authenticate, session/new, session/close,
+/// model/mode selection. All sub-second operations against a healthy child.
+/// Generous because a cold CLI start and vendor authenticate can be slow.
+const CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(120);
 
 type PendingTx = std::sync::mpsc::Sender<Result<Value, JsonRpcError>>;
 type PendingMap = HashMap<u64, PendingTx>;
@@ -279,10 +286,29 @@ impl AcpClient {
                 tx.send(line)
                     .map_err(|_| anyhow::anyhow!("ACP writer channel closed"))?;
             }
-            match rx.recv() {
-                Ok(Ok(v)) => Ok(v),
-                Ok(Err(e)) => Err(anyhow::anyhow!("ACP RPC error {}: {}", e.code, e.message)),
-                Err(_) => Err(anyhow::anyhow!("ACP reader stopped before response")),
+            // A `session/prompt` response arrives only when the whole task
+            // turn ends — potentially hours later — and its call is
+            // supervised by the runtime's monitor loop (child exit,
+            // cancellation, shutdown). Every other request is control-plane:
+            // initialize, session/new, session/close, model selection — all
+            // sub-second operations. Waiting forever on a wedged child
+            // parked the calling agent permanently (stuck prompt thread,
+            // supervisor thread, and their captured state), so bound the
+            // control-plane wait and surface a timeout instead.
+            if method == "session/prompt" {
+                match rx.recv() {
+                    Ok(Ok(v)) => Ok(v),
+                    Ok(Err(e)) => Err(anyhow::anyhow!("ACP RPC error {}: {}", e.code, e.message)),
+                    Err(_) => Err(anyhow::anyhow!("ACP reader stopped before response")),
+                }
+            } else {
+                match rx.recv_timeout(CONTROL_PLANE_TIMEOUT) {
+                    Ok(Ok(v)) => Ok(v),
+                    Ok(Err(e)) => Err(anyhow::anyhow!("ACP RPC error {}: {}", e.code, e.message)),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "ACP request `{method}` timed out after {CONTROL_PLANE_TIMEOUT:?}"
+                    )),
+                }
             }
         })();
 

@@ -8,6 +8,7 @@
 //! in real-time (streamed to stdout as they're produced, not buffered).
 
 use std::collections::{HashMap, VecDeque};
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -53,7 +54,7 @@ pub struct SessionChannels {
 
 /// Shared map of session id → channels. Wrapped in `Arc<Mutex<...>>` so both
 /// the reader thread and main thread can access it.
-pub type SharedSessionChannels = Arc<std::sync::Mutex<HashMap<String, SessionChannels>>>;
+pub type SharedSessionChannels = Arc<Mutex<HashMap<String, SessionChannels>>>;
 
 /// A session in the ACP server.
 struct Session {
@@ -110,7 +111,7 @@ impl Session {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             cwd,
-            model: std::env::var("POTLATCH_MODEL").unwrap_or_default(),
+            model: env::var("POTLATCH_MODEL").unwrap_or_default(),
             mode: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             agent: None,
@@ -150,7 +151,7 @@ impl AcpServer {
         Self {
             llm,
             sessions: HashMap::new(),
-            shared_channels: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            shared_channels: Arc::new(Mutex::new(HashMap::new())),
             agent_tool_caller: None,
             roots: SessionRoots::real(),
             output,
@@ -839,7 +840,10 @@ mod tests {
     use crate::harness::client::{EarlyToolExecCallback, ToolExecCallback, Usage};
     use crate::harness::tools::test_util;
     use serde_json::json;
-    use std::time::Instant;
+    use std::io;
+    use std::process;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
 
     struct StubClient;
     struct EchoAgentToolCaller;
@@ -882,12 +886,12 @@ mod tests {
     struct BufferSink(Arc<Mutex<Vec<u8>>>);
 
     impl Write for BufferSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
@@ -931,7 +935,7 @@ mod tests {
     ) -> Option<Outbound> {
         let start_len = buffer.lock().unwrap().len();
         server.handle_message(msg).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let written = written(buffer);
             for line in written[start_len..].lines() {
@@ -946,13 +950,13 @@ mod tests {
                     });
                 }
             }
-            if std::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 panic!(
                     "no response to {} id={:?} within timeout",
                     msg["method"], msg["id"]
                 );
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -1143,7 +1147,7 @@ mod tests {
         // response has already arrived. If turns were serialized globally,
         // the second response could never be observed before the release.
         struct GatedClient {
-            release: Arc<std::sync::atomic::AtomicBool>,
+            release: Arc<AtomicBool>,
         }
         impl ChatClient for GatedClient {
             fn chat(
@@ -1160,7 +1164,7 @@ mod tests {
                     .any(|m| serde_json::to_string(m).unwrap().contains("slow turn"));
                 if is_slow {
                     while !self.release.load(Ordering::SeqCst) {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        thread::sleep(Duration::from_millis(5));
                     }
                 }
                 Ok(ChatResponse {
@@ -1179,7 +1183,7 @@ mod tests {
             }
         }
 
-        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
         let llm: Arc<dyn ChatClient> = Arc::new(GatedClient {
             release: Arc::clone(&release),
         });
@@ -1225,7 +1229,7 @@ mod tests {
             }
         });
         server.handle_message(&quick_prompt).unwrap();
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let quick_done = loop {
             if written(&buffer).contains("quick done") {
                 break true;
@@ -1233,7 +1237,7 @@ mod tests {
             if Instant::now() >= deadline {
                 break false;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(20));
         };
         assert!(
             quick_done,
@@ -1242,7 +1246,7 @@ mod tests {
 
         // Release the slow turn; its response must still arrive.
         release.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let slow_done = loop {
             if written(&buffer).contains("slow done") {
                 break true;
@@ -1250,7 +1254,7 @@ mod tests {
             if Instant::now() >= deadline {
                 break false;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(20));
         };
         assert!(slow_done, "slow turn never completed");
     }
@@ -1295,6 +1299,148 @@ mod tests {
         for update in updates {
             assert_eq!(update["params"]["sessionId"], session_id.as_str());
         }
+    }
+
+    #[test]
+    fn background_jobs_span_the_session_and_die_on_close() {
+        // A session's background jobs live from session/new to session/close:
+        // a turn finishes without touching them (the model may keep polling
+        // or acting on them in later turns), and session/close kills whatever
+        // is still running so no daemon outlives the session's pipes.
+        struct ScriptedClient {
+            call: AtomicUsize,
+            pid_file: PathBuf,
+        }
+        impl ChatClient for ScriptedClient {
+            fn chat(
+                &self,
+                _model: &str,
+                _messages: &[Value],
+                _tools: &[Value],
+                _on_chunk: Option<&StreamCallback>,
+                _on_tool_calls: Option<&ToolExecCallback<'_>>,
+                _on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
+            ) -> Result<ChatResponse> {
+                let call = self.call.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    return Ok(ChatResponse {
+                        content: String::new(),
+                        tool_calls: vec![json!({
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": format!(
+                                    "{{\"command\":\"echo $$ > {}; sleep 30\",\"background\":true}}",
+                                    self.pid_file.display()
+                                )
+                            }
+                        })],
+                        finish_reason: "tool_calls".into(),
+                        usage: Usage::default(),
+                        tool_results: vec![],
+                        elapsed_ms: 0,
+                        reasoning: String::new(),
+                    });
+                }
+                // Before ending the turn, wait until the background job's
+                // bash has written its pid, so the kill assertion below can
+                // never race the spawn.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !self.pid_file.is_file() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert!(self.pid_file.is_file(), "background job never started");
+                Ok(ChatResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    finish_reason: "stop".into(),
+                    usage: Usage::default(),
+                    tool_results: vec![],
+                    elapsed_ms: 0,
+                    reasoning: String::new(),
+                })
+            }
+        }
+
+        let pid_file = env::temp_dir().join(format!("potlatch-job-span-{}", process::id()));
+        let _ = fs::remove_file(&pid_file);
+        let llm: Arc<dyn ChatClient> = Arc::new(ScriptedClient {
+            call: AtomicUsize::new(0),
+            pid_file: pid_file.clone(),
+        });
+        let (mut server, buffer) = buffered_server(llm);
+
+        let response = collect_output(
+            &mut server,
+            &buffer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": { "cwd": "/tmp", "mcpServers": [] }
+            }),
+        )
+        .expect("session/new responds");
+        let sid = match &response {
+            Outbound::Response { result, .. } => result["sessionId"].as_str().unwrap().to_string(),
+            _ => panic!("expected response"),
+        };
+
+        collect_output(
+            &mut server,
+            &buffer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{ "type": "text", "text": "start a background job" }]
+                }
+            }),
+        )
+        .expect("session/prompt responds");
+
+        // The turn finished, the job did not: the process must still be
+        // running so a later turn can poll it.
+        let pid = fs::read_to_string(&pid_file)
+            .expect("background job wrote its pid")
+            .trim()
+            .parse::<i32>()
+            .expect("pid");
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "background job must survive the turn that spawned it"
+        );
+
+        collect_output(
+            &mut server,
+            &buffer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/close",
+                "params": { "sessionId": sid }
+            }),
+        )
+        .expect("session/close responds");
+
+        // Session close tears the session's jobs down: poll until the
+        // SIGKILL is observable.
+        let mut gone = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            gone,
+            "session/close must kill the session's background jobs"
+        );
+        let _ = fs::remove_file(&pid_file);
     }
 
     #[test]
@@ -1598,11 +1744,11 @@ mod tests {
     /// A chat client that records the `tools` schema array it was called with,
     /// so tests can assert which tools a session registered.
     struct ToolsCapturingClient {
-        captured: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        captured: Arc<Mutex<Vec<Value>>>,
     }
 
     impl ToolsCapturingClient {
-        fn new(captured: std::sync::Arc<std::sync::Mutex<Vec<Value>>>) -> Self {
+        fn new(captured: Arc<Mutex<Vec<Value>>>) -> Self {
             Self { captured }
         }
     }
@@ -1631,10 +1777,8 @@ mod tests {
     }
 
     fn run_session_prompt_in_mode(mode: &str) -> Vec<String> {
-        let captured: std::sync::Arc<std::sync::Mutex<Vec<Value>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let llm: Arc<dyn ChatClient> =
-            Arc::new(ToolsCapturingClient::new(std::sync::Arc::clone(&captured)));
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm: Arc<dyn ChatClient> = Arc::new(ToolsCapturingClient::new(Arc::clone(&captured)));
 
         let (mut server, buffer) = buffered_server(llm);
         let new_msg = json!({
@@ -1689,10 +1833,8 @@ mod tests {
         // forwards whatever `parameters` JSON the caller registered, so a
         // tagged union with `oneOf`/`const`/`additionalProperties` reaches the
         // model exactly as the adapter emitted it.
-        let captured: std::sync::Arc<std::sync::Mutex<Vec<Value>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let llm: Arc<dyn ChatClient> =
-            Arc::new(ToolsCapturingClient::new(std::sync::Arc::clone(&captured)));
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm: Arc<dyn ChatClient> = Arc::new(ToolsCapturingClient::new(Arc::clone(&captured)));
         let (mut server, buffer) = buffered_server(llm);
 
         let parameters = json!({
@@ -1780,7 +1922,7 @@ mod tests {
     /// A chat client that captures the messages it was called with, so tests
     /// can assert what context a session restored or initialized.
     struct MessagesCapturingClient {
-        captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+        captured: Arc<Mutex<Vec<Vec<Value>>>>,
     }
 
     impl ChatClient for MessagesCapturingClient {
@@ -1806,7 +1948,7 @@ mod tests {
         }
     }
 
-    fn test_roots(dir: &std::path::Path) -> SessionRoots {
+    fn test_roots(dir: &Path) -> SessionRoots {
         SessionRoots {
             sessions: dir.join("sessions"),
             agents: dir.join("agents"),
@@ -1837,8 +1979,7 @@ mod tests {
     #[test]
     fn session_new_writes_the_current_marker_and_persists_context() {
         let dir = test_util::unique_test_dir();
-        let captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<Value>>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
         let llm: Arc<dyn ChatClient> = Arc::new(MessagesCapturingClient {
             captured: captured.clone(),
         });
@@ -1906,8 +2047,7 @@ mod tests {
     #[test]
     fn a_recovered_agent_resumes_its_interrupted_session() {
         let dir = test_util::unique_test_dir();
-        let captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<Value>>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
         let llm: Arc<dyn ChatClient> = Arc::new(MessagesCapturingClient {
             captured: captured.clone(),
         });
