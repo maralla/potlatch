@@ -597,7 +597,7 @@ mod tests {
         let spawn = harness_config()
             .resolve_client_spawn(
                 "potlatch",
-                &["acp://potlatch/model2?thinking=true".to_string()],
+                &["acp://potlatch/model2?effort=high".to_string()],
             )
             .unwrap();
         assert_eq!(
@@ -624,7 +624,7 @@ mod tests {
                 "potlatch",
                 &[
                     "acp://potlatch/model1".to_string(),
-                    "acp://potlatch/model1?thinking=true".to_string(),
+                    "acp://potlatch/model1?effort=high".to_string(),
                 ],
             )
             .unwrap();
@@ -713,7 +713,7 @@ mod tests {
         let spawn = cfg
             .resolve_client_spawn(
                 "potlatch",
-                &["acp://potlatch/model-b?thinking=true".to_string()],
+                &["acp://potlatch/model-b?effort=high".to_string()],
             )
             .unwrap();
         assert_eq!(
@@ -746,7 +746,7 @@ mod tests {
         let spawn = cfg
             .resolve_client_spawn(
                 "potlatch",
-                &["acp://potlatch/model1?thinking=true".to_string()],
+                &["acp://potlatch/model1?effort=high".to_string()],
             )
             .unwrap();
         assert_eq!(
@@ -771,7 +771,7 @@ mod tests {
             ]
 
             [agent.worker]
-            model = "acp://potlatch/model2?thinking=true"
+            model = "acp://potlatch/model2?effort=high"
             instances = 1
             "#,
         )
@@ -786,10 +786,7 @@ mod tests {
             spawn.env.get("POTLATCH_API_KEY").map(String::as_str),
             Some("EMPTY")
         );
-        assert_eq!(
-            spawn.endpoint_model.as_deref(),
-            Some("model2?thinking=true")
-        );
+        assert_eq!(spawn.endpoint_model.as_deref(), Some("model2?effort=high"));
     }
 
     #[test]

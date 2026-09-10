@@ -1212,7 +1212,7 @@ mod tests {
                 })
                 .collect(),
             vec![
-                "acp://potlatch/model1?thinking=true".to_string(),
+                "acp://potlatch/model1?effort=high".to_string(),
                 "acp://potlatch/model2".to_string(),
             ],
             None,
@@ -1238,7 +1238,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            vec!["acp://potlatch/model1?thinking=true".to_string()],
+            vec!["acp://potlatch/model1?effort=high".to_string()],
             Some(max),
             &base_dir.display().to_string(),
         );
@@ -1250,7 +1250,7 @@ mod tests {
             .dispatch(
                 &json!({
                     "prompt": prompt,
-                    "model": "acp://potlatch/model1?thinking=true",
+                    "model": "acp://potlatch/model1?effort=high",
                     "tools": ["shell"]
                 }),
                 None,
@@ -1280,7 +1280,7 @@ mod tests {
         // The model defaults to the agent's configured endpoint model.
         assert_eq!(
             transport.recorded_requests("session/set_model")[0]["modelId"],
-            "model1?thinking=true"
+            "model1?effort=high"
         );
         // The prompt was fired against the created session.
         assert_eq!(
@@ -1419,7 +1419,7 @@ mod tests {
 
         let err = hub
             .dispatch(
-                &json!({ "prompt": "one too many", "model": "model1?thinking=true" }),
+                &json!({ "prompt": "one too many", "model": "model1?effort=high" }),
                 None,
             )
             .unwrap_err();
@@ -1484,7 +1484,7 @@ mod tests {
         let hub = SubagentHub::with_children(
             children,
             vec![
-                "acp://potlatch/model1?thinking=true".to_string(),
+                "acp://potlatch/model1?effort=high".to_string(),
                 "acp://cursor/composer-2".to_string(),
             ],
             None,
@@ -1495,7 +1495,7 @@ mod tests {
             .dispatch(
                 &json!({
                     "prompt": "on potlatch",
-                    "model": "acp://potlatch/model1?thinking=true"
+                    "model": "acp://potlatch/model1?effort=high"
                 }),
                 None,
             )
@@ -1535,7 +1535,7 @@ mod tests {
         // The set_model payload is the model name (vendor prefix stripped).
         assert_eq!(
             potlatch.recorded_requests("session/set_model")[0]["modelId"],
-            "model1?thinking=true"
+            "model1?effort=high"
         );
         assert_eq!(
             cursor.recorded_requests("session/set_model")[0]["modelId"],
@@ -1600,7 +1600,7 @@ mod tests {
             err.to_string().contains("'model' argument is required"),
             "{err}"
         );
-        assert!(err.to_string().contains("model1?thinking=true"), "{err}");
+        assert!(err.to_string().contains("model1?effort=high"), "{err}");
 
         let err = hub
             .dispatch(
@@ -1623,22 +1623,19 @@ mod tests {
         assert_eq!(id, "subagent-1");
         assert_eq!(
             transport.recorded_requests("session/set_model")[0]["modelId"],
-            "model1?thinking=true"
+            "model1?effort=high"
         );
     }
 
     #[test]
     fn models_context_content_names_the_menu_and_the_requirement() {
         let content =
-            models_context_content(&["model1?thinking=true".to_string(), "model2".to_string()]);
+            models_context_content(&["model1?effort=high".to_string(), "model2".to_string()]);
         assert!(
             content.contains("`model` argument is required"),
             "{content}"
         );
-        assert!(
-            content.contains("model1?thinking=true, model2"),
-            "{content}"
-        );
+        assert!(content.contains("model1?effort=high, model2"), "{content}");
     }
 
     #[test]
@@ -1650,7 +1647,7 @@ mod tests {
         hub.dispatch(
             &json!({
                 "prompt": "task",
-                "model": "acp://potlatch/model1?thinking=true"
+                "model": "acp://potlatch/model1?effort=high"
             }),
             Some("caller-session-7"),
         )
@@ -1671,7 +1668,7 @@ mod tests {
             hub.dispatch(
                 &json!({
                     "prompt": name,
-                    "model": "acp://potlatch/model1?thinking=true"
+                    "model": "acp://potlatch/model1?effort=high"
                 }),
                 Some(caller),
             )
@@ -1719,7 +1716,7 @@ mod tests {
             .dispatch(
                 &json!({
                     "prompt": "task",
-                    "model": "acp://potlatch/model1?thinking=true"
+                    "model": "acp://potlatch/model1?effort=high"
                 }),
                 Some("caller-7"),
             )
@@ -1831,13 +1828,13 @@ mod tests {
     #[test]
     fn subagent_tool_definition_has_the_model_facing_schema() {
         let def = subagent_tool_definition(
-            &["model1?thinking=true".to_string(), "model2".to_string()],
+            &["model1?effort=high".to_string(), "model2".to_string()],
             None,
         );
         assert_eq!(def.name, "subagent");
         assert_eq!(def.operation, SUBAGENT_OPERATION);
         // The configured models are embedded so the caller knows the menu.
-        assert!(def.description.contains("model1?thinking=true"));
+        assert!(def.description.contains("model1?effort=high"));
         assert!(def.description.contains("model2"));
         assert!(def.description.contains("required when spawning"));
         // Without a configured cap the description promises no hard limit;
