@@ -83,7 +83,11 @@ impl ParentRpc {
             self.remove_pending(id);
             return Err(error);
         }
-        match receiver.recv_timeout(Duration::from_secs(45)) {
+        // Must exceed the parent-side bus request timeout (45s): if this
+        // wait fires first, the parent's eventual reply arrives with no
+        // pending entry and gets echoed back onto the ACP stream as a junk
+        // response (surfacing as orphan-response warnings on the parent).
+        match receiver.recv_timeout(Duration::from_secs(60)) {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(anyhow::Error::msg(error)),
             Err(error) => {
