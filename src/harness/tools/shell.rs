@@ -1,6 +1,12 @@
 //! Shell command execution tool with timeout and process group control.
 
 use std::collections::HashMap;
+use std::io::Read;
+#[cfg(unix)]
+use std::io::{Error, ErrorKind};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +30,26 @@ const ORPHAN_PIPE_GRACE: Duration = Duration::from_secs(5);
 /// single `read` call moves a meaningful amount of pipe data, small enough
 /// that the cap is enforced without over-reading past it by much.
 const DRAIN_CHUNK: usize = 8_192;
+/// Longest a drain reader ever blocks without re-checking its `stop` flag.
+/// The reader polls the stream with this timeout instead of blocking in
+/// `read` until EOF, so setting `stop` always ends the thread within one
+/// slice — abandoning a reader could not do that: a thread blocked inside
+/// `read` never re-checks the flag and stays parked (holding its stack, its
+/// pipe fds, and the output buffers) until the pipe's write end closes,
+/// which for a setsid'd daemon or tunnel may be never.
+const DRAIN_POLL_SLICE_MS: i32 = 100;
+/// Finished background jobs retained per session table, under two caps:
+/// entry count and total retained output bytes. Eviction is LRU — the least
+/// recently spawned or polled finished job goes first — and only ever touches
+/// finished jobs; running jobs are never dropped. The table lives from
+/// session/new to session/close, so the caps are what keep a long session
+/// that spawns many jobs bounded (each entry holds its output buffers and
+/// command text).
+const MAX_RETAINED_FINISHED_JOBS: usize = 64;
+/// Total retained output bytes across finished jobs. A single job can hold
+/// up to `2 * MAX_OUTPUT` (both streams), so this bounds the table's buffers
+/// independently of how the model splits its work across jobs.
+const MAX_RETAINED_FINISHED_BYTES: usize = 2 * 1024 * 1024;
 
 /// Whether both reader handles finished within [`ORPHAN_PIPE_GRACE`]. After a
 /// successful kill the child's own pipe ends are closed, so EOF normally
@@ -58,8 +84,11 @@ struct Job {
     stderr_buf: Arc<Mutex<Vec<u8>>>,
     /// Set once the process exits (observed via `try_wait`).
     exit_code: Option<i32>,
-    /// Set when the job was killed via `kill`/`kill_all` rather than exiting.
+    /// Set when the job was killed via `kill` rather than exiting.
     killed: bool,
+    /// Last spawn/poll touch — the LRU clock for eviction of finished jobs.
+    /// A job the model re-polls stays evictable-last even if it is old.
+    last_used: Instant,
 }
 
 /// Read `stream` to EOF into `buf`, storing at most `MAX_OUTPUT` bytes (the
@@ -71,7 +100,56 @@ struct Job {
 /// a concurrent `poll` sees progress without waiting for EOF.
 /// Returns when EOF is seen or `stop` is set; on stop, whatever has arrived
 /// so far stays in `buf`.
-fn drain_capped(stream: &mut impl std::io::Read, buf: &Arc<Mutex<Vec<u8>>>, stop: &AtomicBool) {
+///
+/// Waits in [`DRAIN_POLL_SLICE_MS`] poll slices rather than blocking in
+/// `read` so `stop` always ends the thread promptly, even when a descendant
+/// of the command holds the pipe open and EOF never comes.
+#[cfg(unix)]
+fn drain_capped(stream: &mut (impl Read + AsRawFd), buf: &Arc<Mutex<Vec<u8>>>, stop: &AtomicBool) {
+    let fd = stream.as_raw_fd();
+    let mut chunk = [0u8; DRAIN_CHUNK];
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut fds = [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, DRAIN_POLL_SLICE_MS) };
+        if ready < 0 {
+            let err = Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if ready == 0 {
+            // Slice elapsed with no data — loop back to the stop check.
+            continue;
+        }
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            && fds[0].revents & libc::POLLIN == 0
+        {
+            return;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let mut buf = buf.lock().unwrap();
+                let room = MAX_OUTPUT.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
+    }
+}
+
+/// Non-unix fallback: identical buffer semantics, but a reader blocked in
+/// `read` can only observe `stop` between chunks, so callers on this platform
+/// still abandon (and leak) the thread when no EOF arrives.
+#[cfg(not(unix))]
+fn drain_capped(stream: &mut impl Read, buf: &Arc<Mutex<Vec<u8>>>, stop: &AtomicBool) {
     let mut chunk = [0u8; DRAIN_CHUNK];
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -168,8 +246,11 @@ impl JobTable {
             stderr_buf,
             exit_code: None,
             killed: false,
+            last_used: Instant::now(),
         };
-        self.jobs.lock().unwrap().insert(id.clone(), job);
+        let mut jobs = self.jobs.lock().unwrap();
+        jobs.insert(id.clone(), job);
+        prune_finished_jobs(&mut jobs);
         Ok(id)
     }
 
@@ -188,6 +269,8 @@ impl JobTable {
         {
             job.exit_code = status.code();
         }
+        // A poll is a use: recently polled jobs are evicted last.
+        job.last_used = Instant::now();
 
         let running = job.exit_code.is_none() && !job.killed;
         let status = if job.killed {
@@ -212,10 +295,11 @@ impl JobTable {
             None if job.killed => "exit code: -1 (killed)".to_string(),
             None => "exit code: (still running)".to_string(),
         };
+        let command = job.command.clone();
 
         let mut result = format!(
             "job: {job_id}\ncommand: {}\nstatus: {status}\nelapsed: {:.1}s\n{exit_line}",
-            job.command,
+            command,
             elapsed.as_secs_f64()
         );
         if !stdout_str.is_empty() {
@@ -234,6 +318,10 @@ impl JobTable {
                 result.len()
             );
         }
+        // This poll may have just observed a job's exit: shed oldest finished
+        // entries so the table (and its retained output buffers) stays bounded
+        // even in a session that spawns background jobs liberally.
+        prune_finished_jobs(&mut jobs);
         Ok(result)
     }
 
@@ -268,28 +356,45 @@ impl JobTable {
         self.poll(job_id)
     }
 
-    /// Kill all still-running jobs. Called on session close to avoid leaking
-    /// background processes.
-    pub fn kill_all(&self) {
+    /// Kill every running job and drop all entries, finished or not.
+    ///
+    /// Called on session close: a session's background jobs live from
+    /// session/new to session/close, and nothing they started may outlive
+    /// the session. A daemon or tunnel left behind would otherwise keep its
+    /// output pipes open, pinning this process's reader threads and buffers
+    /// until it dies on its own.
+    pub fn clear(&self) {
         let mut jobs = self.jobs.lock().unwrap();
-        for job in jobs.values_mut() {
-            if job.exit_code.is_some() {
-                continue;
+        kill_running_jobs(&mut jobs);
+        jobs.clear();
+    }
+}
+
+/// SIGKILL every job whose process has not been observed exiting, marking it
+/// killed and reaping the child. Entries are retained; callers decide whether
+/// to drop them afterwards.
+fn kill_running_jobs(jobs: &mut HashMap<String, Job>) {
+    for job in jobs.values_mut() {
+        if job.exit_code.is_some() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::killpg(job.pid as i32, libc::SIGKILL);
             }
-            #[cfg(unix)]
-            {
-                unsafe {
-                    libc::killpg(job.pid as i32, libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = job.child.kill();
-            }
-            job.killed = true;
-            if let Ok(Some(status)) = job.child.try_wait() {
-                job.exit_code = status.code();
-            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = job.child.kill();
+        }
+        job.killed = true;
+        // A SIGKILLed process dies at once, so the blocking wait returns in
+        // milliseconds and the child is reaped here — a try_wait probe could
+        // lose the race and leave a permanent zombie once the entry (holding
+        // the `Child`) is dropped.
+        if let Ok(status) = job.child.wait() {
+            job.exit_code = status.code();
         }
     }
 }
@@ -300,9 +405,47 @@ impl Default for JobTable {
     }
 }
 
+/// Evict finished jobs past the retention caps, least recently used first
+/// (LRU by last spawn/poll touch). Running jobs are never evicted — only
+/// entries whose process has exited or been killed, which hold nothing the
+/// model needs beyond their output. Caps: [`MAX_RETAINED_FINISHED_JOBS`]
+/// entries and [`MAX_RETAINED_FINISHED_BYTES`] of retained output, so a
+/// session that spawns many jobs (or a few very chatty ones) stays bounded
+/// while recently-used output stays readable.
+fn prune_finished_jobs(jobs: &mut HashMap<String, Job>) {
+    let mut finished: Vec<(String, Instant, usize)> = jobs
+        .iter()
+        .filter(|(_, job)| job.exit_code.is_some() || job.killed)
+        .map(|(id, job)| {
+            let bytes = job.stdout_buf.lock().unwrap().len()
+                + job.stderr_buf.lock().unwrap().len()
+                + job.command.len();
+            (id.clone(), job.last_used, bytes)
+        })
+        .collect();
+    let total_bytes: usize = finished.iter().map(|(_, _, bytes)| bytes).sum();
+    if finished.len() <= MAX_RETAINED_FINISHED_JOBS && total_bytes <= MAX_RETAINED_FINISHED_BYTES {
+        return;
+    }
+    finished.sort_by_key(|(_, last_used, _)| *last_used);
+    let mut excess = finished.len().saturating_sub(MAX_RETAINED_FINISHED_JOBS);
+    let mut retained_bytes = total_bytes;
+    for (id, _, bytes) in &finished {
+        if excess == 0 && retained_bytes <= MAX_RETAINED_FINISHED_BYTES {
+            break;
+        }
+        jobs.remove(id);
+        excess = excess.saturating_sub(1);
+        retained_bytes = retained_bytes.saturating_sub(*bytes);
+    }
+}
+
 impl super::SessionState for JobTable {
     fn shutdown(&self) {
-        self.kill_all();
+        // Session close: kill running jobs and drop every entry (and its
+        // output buffers) immediately, not just when the session struct
+        // happens to be dropped.
+        self.clear();
     }
 }
 
@@ -355,7 +498,7 @@ impl Tool for ShellTool {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "If true, spawn the command in the background and return a job id immediately instead of waiting. Poll with `job_id`."
+                        "description": "If true, spawn the command in the background and return a job id immediately instead of waiting. Poll with `job_id` at any time later in the session; jobs live until session close. Or terminate a job with `job_id` + `kill: true`."
                     },
                     "job_id": {
                         "type": "string",
@@ -514,26 +657,19 @@ impl Tool for ShellTool {
 
         // The child is gone. EOF on the output pipes follows the moment every
         // process holding them is dead. Give the readers that moment; if a
-        // grandchild still holds a pipe, abandon that reader (keeping
-        // whatever output arrived) rather than blocking forever.
+        // grandchild still holds a pipe, stop the readers (keeping whatever
+        // output arrived) rather than blocking forever. The drain waits in
+        // poll slices, so both threads observe `stop` and exit within one
+        // slice and join returns — abandoning the handles here would leak the
+        // threads, their stacks, their pipe fds, and the output buffers for
+        // the rest of the process lifetime.
         let collected = wait_for_pipes_or_orphan(&stdout_handle, &stderr_handle);
         if !collected {
-            let (stdout_handle, stderr_handle) = (stdout_handle, stderr_handle);
-            for (finished, handle, stop) in [
-                (stdout_handle.is_finished(), stdout_handle, &stdout_stop),
-                (stderr_handle.is_finished(), stderr_handle, &stderr_stop),
-            ] {
-                if finished {
-                    let _ = handle.join();
-                } else {
-                    stop.store(true, Ordering::SeqCst);
-                    std::mem::forget(handle);
-                }
-            }
-        } else {
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
+            stdout_stop.store(true, Ordering::SeqCst);
+            stderr_stop.store(true, Ordering::SeqCst);
         }
+        let _ = stdout_handle.join();
+        let _ = stderr_handle.join();
         let exit_status = child.wait().ok();
 
         let stdout_guard = stdout_buf.lock().unwrap();
@@ -627,19 +763,19 @@ fn detect_wrong_cd(command: &str, cwd: &str) -> Option<String> {
     // Relative paths (e.g. `cd subdir && go build`) are legitimate: the model
     // is cd-ing into a subdirectory to run a command there, not guessing the
     // wrong project root.
-    let cwd_canonical = std::path::Path::new(cwd)
+    let cwd_canonical = Path::new(cwd)
         .canonicalize()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| cwd.to_string());
 
-    let cd_path_absolute = std::path::Path::new(cd_path).is_absolute();
+    let cd_path_absolute = Path::new(cd_path).is_absolute();
 
     if !cd_path_absolute {
         // Relative cd paths are always legitimate — no warning.
         return None;
     }
 
-    let cd_canonical = std::path::Path::new(cd_path)
+    let cd_canonical = Path::new(cd_path)
         .canonicalize()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| cd_path.to_string());
@@ -692,7 +828,9 @@ fn looks_like_file_write(command: &str) -> bool {
 mod tests {
     use super::*;
     use crate::harness::tools::test_util;
-    use std::io::Cursor;
+    use std::fs;
+    use std::io;
+    use std::process::ChildStdout;
 
     #[test]
     fn drain_capped_stores_at_most_max_output_bytes() {
@@ -702,10 +840,13 @@ mod tests {
         // the first MAX_OUTPUT bytes are ever stored.
         let buf = Arc::new(Mutex::new(Vec::new()));
         let stop = AtomicBool::new(false);
-        let payload = vec![b'x'; MAX_OUTPUT * 4];
-        let mut cursor = Cursor::new(payload);
+        let command = format!("head -c {} /dev/zero | tr '\\0' x", MAX_OUTPUT * 4);
+        let mut holder = PipeHolder::new(&command).expect("spawn output source");
+        let mut read = holder.take_stdout();
 
-        drain_capped(&mut cursor, &buf, &stop);
+        drain_capped(&mut read, &buf, &stop);
+        let _ = holder.child.kill();
+        let _ = holder.child.wait();
 
         let stored = buf.lock().unwrap().clone();
         assert_eq!(stored.len(), MAX_OUTPUT);
@@ -716,11 +857,13 @@ mod tests {
     fn drain_capped_keeps_short_streams_whole() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let stop = AtomicBool::new(false);
-        let mut cursor = Cursor::new(b"short output".to_vec());
+        let mut holder = PipeHolder::new("printf short-output").expect("spawn output source");
+        let mut read = holder.take_stdout();
 
-        drain_capped(&mut cursor, &buf, &stop);
+        drain_capped(&mut read, &buf, &stop);
+        let _ = holder.child.wait();
 
-        assert_eq!(buf.lock().unwrap().as_slice(), b"short output");
+        assert_eq!(buf.lock().unwrap().as_slice(), b"short-output");
     }
 
     #[test]
@@ -761,7 +904,7 @@ mod tests {
     }
 
     impl PipeHolder {
-        fn new(command: &str) -> std::io::Result<Self> {
+        fn new(command: &str) -> io::Result<Self> {
             let child = Command::new("bash")
                 .args(["-c", command])
                 .stdout(Stdio::piped())
@@ -769,7 +912,7 @@ mod tests {
             Ok(Self { child })
         }
 
-        fn take_stdout(&mut self) -> std::process::ChildStdout {
+        fn take_stdout(&mut self) -> ChildStdout {
             self.child.stdout.take().unwrap()
         }
     }
@@ -799,10 +942,10 @@ mod tests {
             if done {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(20));
         }
         // Give the reader threads a moment to finish draining to EOF.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
         let table = jobs.jobs.lock().unwrap();
         let job = table.get(&id).unwrap();
         assert!(
@@ -878,6 +1021,188 @@ mod tests {
         // Clean up the leftover sleeps so the test run is self-contained.
         let _ = Command::new("pkill").args(["-f", "sleep 30"]).status();
         let _ = Command::new("pkill").args(["-f", "sleep 60"]).status();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_pipes_do_not_accumulate_reader_threads() {
+        // Every command whose pipes outlive it used to abandon its reader
+        // threads (mem::forget): blocked in `read`, they never observed
+        // the stop flag and leaked their stacks, pipe fds, and output buffers
+        // for the process lifetime. The poll-slice drain must let each
+        // command's readers exit after the grace window, keeping the process
+        // thread count flat across repeated orphaned commands.
+        let thread_count = || -> usize {
+            fs::read_to_string("/proc/self/status")
+                .expect("read /proc/self/status")
+                .lines()
+                .find_map(|line| line.strip_prefix("Threads:"))
+                .expect("Threads: line")
+                .trim()
+                .parse()
+                .expect("thread count")
+        };
+
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
+        let args = json!({
+            "command": "setsid sh -c 'sleep 30' & echo staged; sleep 60",
+            "timeout_secs": 2,
+        });
+
+        // Warm up: one command settles any lazily-created runtime threads.
+        tool.execute(&args, "/tmp").unwrap();
+        let baseline = thread_count();
+
+        for _ in 0..3 {
+            tool.execute(&args, "/tmp").unwrap();
+        }
+        assert!(
+            thread_count() <= baseline,
+            "orphaned commands must not leak reader threads: baseline {baseline}, now {}",
+            thread_count()
+        );
+
+        // Clean up the leftover sleeps so the test run is self-contained.
+        let _ = Command::new("pkill").args(["-f", "sleep 30"]).status();
+        let _ = Command::new("pkill").args(["-f", "sleep 60"]).status();
+    }
+
+    #[test]
+    fn finished_jobs_evict_least_recently_used_first() {
+        // LRU: eviction touches the least recently spawned/polled finished
+        // job first, so a job the model re-polls survives even when old, and
+        // running jobs are never evicted.
+        let jobs = JobTable::new();
+        let running = jobs.spawn("sleep 60", "/tmp").expect("spawn running job");
+
+        let spawn_finished = |jobs: &JobTable, i: usize| {
+            let id = jobs
+                .spawn(&format!("echo job-{i}"), "/tmp")
+                .expect("spawn job");
+            loop {
+                if jobs.poll(&id).unwrap().contains("exited") {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            id
+        };
+
+        // 64 finished jobs, polled sequentially so their last_use order
+        // matches spawn order (job-0 oldest). A running job in the middle is
+        // never touched again.
+        let first = spawn_finished(&jobs, 0);
+        let middle: Vec<String> = (1..MAX_RETAINED_FINISHED_JOBS)
+            .map(|i| spawn_finished(&jobs, i))
+            .collect();
+
+        // Re-poll the oldest: it becomes the most recently used.
+        jobs.poll(&first).unwrap();
+
+        // One more finished job pushes the table over the cap.
+        let newest = spawn_finished(&jobs, MAX_RETAINED_FINISHED_JOBS);
+
+        let table = jobs.jobs.lock().unwrap();
+        assert!(
+            !table.contains_key(&middle[0]),
+            "least recently used finished job must be evicted"
+        );
+        assert!(
+            table.contains_key(&first),
+            "recently re-polled job must survive eviction"
+        );
+        assert!(
+            table.contains_key(&newest),
+            "the newest job must survive eviction"
+        );
+        assert!(
+            table.contains_key(&running),
+            "running jobs are never evicted"
+        );
+        let finished_count = table
+            .values()
+            .filter(|job| job.exit_code.is_some() || job.killed)
+            .count();
+        assert_eq!(
+            finished_count, MAX_RETAINED_FINISHED_JOBS,
+            "finished jobs are held at the cap"
+        );
+    }
+
+    #[test]
+    fn finished_jobs_are_evicted_when_retained_bytes_exceed_the_cap() {
+        // The byte cap bounds the table's retained output regardless of job
+        // count: chatty jobs evict LRU-style until the total fits.
+        let jobs = JobTable::new();
+        let command = format!("head -c {} /dev/zero | tr '\\0' x", MAX_OUTPUT);
+        let mut ids = Vec::new();
+        for _ in 0..50 {
+            let id = jobs.spawn(&command, "/tmp").expect("spawn chatty job");
+            loop {
+                if jobs.poll(&id).unwrap().contains("exited") {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            ids.push(id);
+        }
+
+        let table = jobs.jobs.lock().unwrap();
+        let retained: usize = table
+            .values()
+            .map(|job| job.stdout_buf.lock().unwrap().len() + job.stderr_buf.lock().unwrap().len())
+            .sum();
+        assert!(
+            retained <= MAX_RETAINED_FINISHED_BYTES,
+            "retained output must fit the byte cap: {retained}"
+        );
+        assert!(
+            table.len() < 50,
+            "byte cap must have forced evictions: {} entries",
+            table.len()
+        );
+        assert!(
+            table.contains_key(ids.last().unwrap()),
+            "the most recently used job must survive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_kills_running_jobs_and_drops_all_entries() {
+        let jobs = JobTable::new();
+        let running = jobs.spawn("sleep 60", "/tmp").unwrap();
+        let finished = jobs.spawn("echo done", "/tmp").unwrap();
+        loop {
+            if jobs.poll(&finished).unwrap().contains("exited") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Spawned jobs are their own process-group leader (process_group(0)).
+        let pgid = jobs.jobs.lock().unwrap().get(&running).unwrap().pid as i32;
+
+        jobs.clear();
+
+        assert!(
+            jobs.jobs.lock().unwrap().is_empty(),
+            "clear must drop every entry, running or finished"
+        );
+        assert!(jobs.poll(&running).is_err());
+        assert!(jobs.poll(&finished).is_err());
+
+        // The running job must actually be dead, not just forgotten: poll
+        // until the process group is gone (SIGKILL delivery is asynchronous).
+        let mut gone = false;
+        for _ in 0..100 {
+            let rc = unsafe { libc::kill(pgid, 0) };
+            if rc == -1 && Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                gone = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone, "clear must kill the running job's process group");
     }
 
     #[test]
@@ -1085,28 +1410,6 @@ mod tests {
         let poll_args = json!({"job_id": id});
         let poll = tool.execute(&poll_args, "/tmp").unwrap();
         assert!(poll.contains("status: killed"));
-    }
-
-    #[test]
-    fn kill_all_kills_all_running_jobs() {
-        let jobs = Arc::new(JobTable::new());
-        let tool = ShellTool::with_job_table(Arc::clone(&jobs));
-
-        let a = jobs.spawn("sleep 60", "/tmp").unwrap();
-        let b = jobs.spawn("sleep 60", "/tmp").unwrap();
-
-        jobs.kill_all();
-
-        let poll_a = tool.execute(&json!({"job_id": a}), "/tmp").unwrap();
-        let poll_b = tool.execute(&json!({"job_id": b}), "/tmp").unwrap();
-        assert!(
-            poll_a.contains("status: killed"),
-            "job a not killed: {poll_a}"
-        );
-        assert!(
-            poll_b.contains("status: killed"),
-            "job b not killed: {poll_b}"
-        );
     }
 
     #[test]
