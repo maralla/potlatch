@@ -42,6 +42,7 @@ use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 use crate::core::runtime::AgentRuntime;
 use crate::core::workflow::AgentBuildContext;
 use crate::paths::{APP_NAME, display_name};
+use crate::util::dies_with_parent;
 
 const REQUEST_TASK: &str = "requests";
 const INBOX_WAIT: Duration = Duration::from_millis(200);
@@ -1009,6 +1010,9 @@ impl AcpChildProcess {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Spawned from the hub's own long-lived thread: register the child to
+        // die with the orchestrator process.
+        dies_with_parent(&mut cmd);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn harness subprocess {:?}", acp.command))?;

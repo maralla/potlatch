@@ -644,6 +644,22 @@ impl AcpServer {
             self.close_registered_session(&session_id);
         }
     }
+
+    /// Tear down every registered session's runtime state without touching
+    /// the recovery markers. Called when the harness process exits (its
+    /// parent closed stdin): background shell jobs are killed and language
+    /// servers stopped, so a graceful harness exit cannot leave the
+    /// session's running commands behind as strays. Markers are left alone —
+    /// whether an interrupted session is resumed is the marker's decision,
+    /// not the exit's.
+    pub fn shutdown_all_sessions(&mut self) {
+        for (session_id, session) in self.sessions.drain() {
+            session.cancel.store(true, Ordering::SeqCst);
+            session.states.shutdown();
+            self.shared_channels.lock().unwrap().remove(&session_id);
+            debug!("harness ACP: shut down session {session_id} on exit");
+        }
+    }
 }
 
 /// Append a section to the transcript file.
@@ -1441,6 +1457,132 @@ mod tests {
             "session/close must kill the session's background jobs"
         );
         let _ = fs::remove_file(&pid_file);
+    }
+
+    #[test]
+    fn harness_exit_kills_running_background_jobs() {
+        // When the harness process exits (parent closed stdin), every
+        // session's runtime state is torn down: a background job still
+        // running must be killed instead of leaking as a stray process.
+        // Same scripted setup as `background_jobs_span_the_session_and_die_on_close`.
+        struct ScriptedClient {
+            call: AtomicUsize,
+            pid_file: PathBuf,
+        }
+        impl ChatClient for ScriptedClient {
+            fn chat(
+                &self,
+                _model: &str,
+                _messages: &[Value],
+                _tools: &[Value],
+                _on_chunk: Option<&StreamCallback>,
+                _on_tool_calls: Option<&ToolExecCallback<'_>>,
+                _on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
+            ) -> Result<ChatResponse> {
+                let call = self.call.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    return Ok(ChatResponse {
+                        content: String::new(),
+                        tool_calls: vec![json!({
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": format!(
+                                    "{{\"command\":\"echo $$ > {}; sleep 30\",\"background\":true}}",
+                                    self.pid_file.display()
+                                )
+                            }
+                        })],
+                        finish_reason: "tool_calls".into(),
+                        usage: Usage::default(),
+                        tool_results: vec![],
+                        elapsed_ms: 0,
+                        reasoning: String::new(),
+                    });
+                }
+                let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                while !self.pid_file.is_file() && Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(self.pid_file.is_file(), "background job never started");
+                Ok(ChatResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    finish_reason: "stop".into(),
+                    usage: Usage::default(),
+                    tool_results: vec![],
+                    elapsed_ms: 0,
+                    reasoning: String::new(),
+                })
+            }
+        }
+
+        fn is_alive(pid: i32) -> bool {
+            let rc = unsafe { libc::kill(pid, 0) };
+            rc == 0
+        }
+
+        let pid_file =
+            std::env::temp_dir().join(format!("potlatch-exit-jobs-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let llm: Arc<dyn ChatClient> = Arc::new(ScriptedClient {
+            call: AtomicUsize::new(0),
+            pid_file: pid_file.clone(),
+        });
+        let (mut server, buffer) = buffered_server(llm);
+
+        let response = collect_output(
+            &mut server,
+            &buffer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": { "cwd": "/tmp", "mcpServers": [] }
+            }),
+        )
+        .expect("session/new responds");
+        let sid = match &response {
+            Outbound::Response { result, .. } => result["sessionId"].as_str().unwrap().to_string(),
+            _ => panic!("expected response"),
+        };
+
+        collect_output(
+            &mut server,
+            &buffer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{ "type": "text", "text": "start a background job" }]
+                }
+            }),
+        )
+        .expect("session/prompt responds");
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("background job wrote its pid")
+            .trim()
+            .parse::<i32>()
+            .expect("pid");
+        assert!(is_alive(pid), "job must be alive before the harness exits");
+
+        // The harness is going away (stdin EOF): the exit cleanup must kill
+        // the session's running background job.
+        server.shutdown_all_sessions();
+        let mut gone = false;
+        for _ in 0..100 {
+            if !is_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone, "harness exit must kill running background jobs");
+        let _ = std::fs::remove_file(&pid_file);
     }
 
     #[test]
