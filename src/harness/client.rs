@@ -46,9 +46,9 @@ pub trait ChatClient: Send + Sync {
     /// speculative execution of read-only tools before `finish_reason` arrives.
     ///
     /// The `model` string may be a plain model name (e.g. `"model1"`) or an
-    /// `acp://` URL (e.g. `"acp://vendor1/model1?thinking=false"`). Implementations
+    /// `acp://` URL (e.g. `"acp://vendor1/model1?effort=high"`). Implementations
     /// that support the URL form parse it via [`ModelSpec::parse`] to extract the
-    /// real model name and options like `thinking`.
+    /// real model name and options like `effort`.
     fn chat(
         &self,
         model: &str,
@@ -67,50 +67,44 @@ pub trait ChatClient: Send + Sync {
 
 /// Parsed model specification from an `acp://` URL.
 ///
-/// Format: `acp://<vendor>/<model>?thinking=false&reasoning_effort=high`
+/// Format: `acp://<vendor>/<model>?effort=<value>`
 ///
 /// When the model string is a plain name (no `acp://` prefix), it's treated as
-/// the model name with default options. The `thinking` query param controls
-/// whether reasoning is enabled. The `reasoning_effort` query param controls
-/// the effort level (e.g. `low`, `high`, `max`) for models that support it
-/// (currently DeepSeek).
+/// the model name with default options. The `effort` query param controls
+/// reasoning: its value is **model-defined** — potlatch never validates or
+/// defaults it, it is forwarded to the backend verbatim as the standard
+/// OpenAI-compatible `reasoning_effort` field (e.g. `low`, `medium`, `high`,
+/// or whatever the serving model understands). Omitting `effort` disables
+/// reasoning.
 ///
 /// Examples:
-/// - `"model1"` → `ModelSpec { model: "model1", thinking: false, .. }`
-/// - `"acp://vendor1/model1?thinking=true"` → `ModelSpec { model: "model1", thinking: true, .. }`
-/// - `"acp://deepseek/deepseek-v4-flash?thinking=true&reasoning_effort=high"`
+/// - `"model1"` → `ModelSpec { model: "model1", effort: None, .. }` (reasoning off)
+/// - `"acp://vendor1/model1?effort=high"` → `ModelSpec { model: "model1", effort: Some("high"), .. }`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
     /// The actual model name to send to the API (e.g. `"model1"`).
     pub model: String,
-    /// Whether to enable thinking/reasoning tokens. Defaults to `false`.
-    pub thinking: bool,
-    /// Reasoning effort level (e.g. `"low"`, `"high"`, `"max"`). Only
-    /// meaningful when `thinking` is true and the model supports effort
-    /// control (currently DeepSeek). `None` leaves the backend default.
-    pub reasoning_effort: Option<String>,
+    /// Model-defined reasoning effort, forwarded verbatim. `None` disables
+    /// reasoning; the set of valid values is defined by the serving model,
+    /// not by potlatch.
+    pub effort: Option<String>,
 }
 
 impl ModelSpec {
     /// Parse a model string that may be a plain name, an `acp://` URL, or a
-    /// plain name carrying a `?thinking=` query. The latter arrives via the ACP
+    /// plain name carrying an `?effort=` query. The latter arrives via the ACP
     /// `session/set_model` command: the orchestrator forwards the config URI's
-    /// model segment verbatim (e.g. `model1?thinking=true`), so the harness
+    /// model segment verbatim (e.g. `model1?effort=high`), so the harness
     /// must honor the query even without the `acp://` prefix.
     pub fn parse(s: &str) -> Self {
         let trimmed = s.trim();
         let rest = trimmed.strip_prefix("acp://").unwrap_or(trimmed);
-        // Split path and query: `vendor/model?thinking=false`
+        // Split path and query: `vendor/model?effort=high`
         let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
         // Extract model name: take the last path segment after `/`.
         let model = path.rsplit('/').next().unwrap_or(path).to_string();
-        let thinking = parse_query_bool(query, "thinking").unwrap_or(false);
-        let reasoning_effort = parse_query_str(query, "reasoning_effort");
-        ModelSpec {
-            model,
-            thinking,
-            reasoning_effort,
-        }
+        let effort = parse_query_str(query, "effort");
+        ModelSpec { model, effort }
     }
 
     /// Whether this model uses the DeepSeek thinking-mode API (the model name
@@ -120,24 +114,7 @@ impl ModelSpec {
     }
 }
 
-/// Parse a boolean query parameter from a query string like `thinking=false`.
-/// Returns `None` when the parameter is absent.
-fn parse_query_bool(query: &str, key: &str) -> Option<bool> {
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && k == key
-        {
-            return match v.to_lowercase().as_str() {
-                "false" | "0" | "no" | "off" => Some(false),
-                "true" | "1" | "yes" | "on" => Some(true),
-                _ => None,
-            };
-        }
-    }
-    None
-}
-
-/// Parse a string query parameter from a query string like `reasoning_effort=high`.
+/// Parse a string query parameter from a query string like `effort=high`.
 /// Returns `None` when the parameter is absent or empty.
 fn parse_query_str(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
@@ -611,21 +588,25 @@ fn build_chat_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
         "stream_options": {"include_usage": true},
     });
 
-    if spec.is_deepseek() {
-        // DeepSeek uses `{"thinking": {"type": "enabled/disabled"}}` in the
-        // request body (OpenAI extra_body format). When thinking is enabled,
-        // send `reasoning_effort` — defaulting to "max" when unspecified.
-        if !spec.thinking {
+    match spec.effort.as_deref() {
+        // The effort value is model-defined and forwarded verbatim in the
+        // standard OpenAI-compatible field; backends that don't support it
+        // ignore it.
+        Some(effort) => body["reasoning_effort"] = json!(effort),
+        // Reasoning disabled (effort absent) — each family has its own
+        // off-switch.
+        None if spec.is_deepseek() => {
+            // DeepSeek uses `{"thinking": {"type": "disabled"}}` in the
+            // request body (OpenAI extra_body format).
             body["thinking"] = json!({"type": "disabled"});
-        } else {
-            let effort = spec.reasoning_effort.as_deref().unwrap_or("max");
-            body["reasoning_effort"] = json!(effort);
         }
-    } else if !spec.thinking {
-        // Non-DeepSeek reasoning models (Model1, etc.) served via
-        // sglang/vLLM honor this chat-template kwarg to skip the reasoning
-        // phase entirely. Harmless on backends that don't recognize it.
-        body["chat_template_kwargs"] = json!({"enable_thinking": false});
+        None => {
+            // Non-DeepSeek reasoning models (Model1, etc.) served via
+            // sglang/vLLM honor this chat-template kwarg to skip the
+            // reasoning phase entirely. Harmless on backends that don't
+            // recognize it.
+            body["chat_template_kwargs"] = json!({"enable_thinking": false});
+        }
     }
 
     if !tools.is_empty() {
@@ -897,105 +878,86 @@ mod tests {
         let spec = ModelSpec::parse("model1");
         assert_eq!(spec.model, "model1");
         assert!(
-            !spec.thinking,
-            "plain model name defaults to thinking=false"
+            spec.effort.is_none(),
+            "plain model name defaults to reasoning disabled"
         );
     }
 
     #[test]
-    fn model_spec_parses_bare_name_with_thinking_query() {
+    fn model_spec_parses_bare_name_with_effort_query() {
         // The orchestrator forwards the config URI's model segment verbatim via
         // ACP session/set_model, so the harness receives a bare name carrying
-        // the ?thinking= query (e.g. `model1?thinking=true`). The query
-        // must be honored and stripped from the model name sent to the API.
-        let spec = ModelSpec::parse("model1?thinking=true");
+        // the ?effort= query (e.g. `model1?effort=high`). The query must be
+        // honored and stripped from the model name sent to the API.
+        let spec = ModelSpec::parse("model1?effort=high");
         assert_eq!(spec.model, "model1");
-        assert!(spec.thinking);
-
-        let spec = ModelSpec::parse("model1?thinking=false");
-        assert_eq!(spec.model, "model1");
-        assert!(!spec.thinking);
+        assert_eq!(spec.effort.as_deref(), Some("high"));
     }
 
     #[test]
-    fn model_spec_parses_acp_url_with_thinking_false() {
-        let spec = ModelSpec::parse("acp://vendor1/model1?thinking=false");
-        assert_eq!(spec.model, "model1");
-        assert!(!spec.thinking);
+    fn model_spec_effort_value_is_opaque() {
+        // The value is model-defined: potlatch forwards whatever the operator
+        // wrote without validating it against a fixed set.
+        for value in ["low", "medium", "high", "max", "turbo-instant"] {
+            let spec = ModelSpec::parse(&format!("model1?effort={value}"));
+            assert_eq!(spec.effort.as_deref(), Some(value));
+        }
     }
 
     #[test]
-    fn model_spec_parses_acp_url_with_thinking_true() {
-        let spec = ModelSpec::parse("acp://vendor1/model1?thinking=true");
+    fn model_spec_parses_acp_url_with_effort() {
+        let spec = ModelSpec::parse("acp://vendor1/model1?effort=low");
         assert_eq!(spec.model, "model1");
-        assert!(spec.thinking);
+        assert_eq!(spec.effort.as_deref(), Some("low"));
     }
 
     #[test]
     fn model_spec_parses_acp_url_without_query() {
         let spec = ModelSpec::parse("acp://openai/gpt-4o");
         assert_eq!(spec.model, "gpt-4o");
-        assert!(!spec.thinking, "missing thinking param defaults to false");
+        assert!(spec.effort.is_none(), "missing effort defaults to disabled");
     }
 
     #[test]
     fn model_spec_parses_acp_url_with_vendor_prefix() {
         // The vendor segment is stripped; only the model name matters.
-        let spec = ModelSpec::parse("acp://vendor1/model1?thinking=false");
+        let spec = ModelSpec::parse("acp://vendor1/model1?effort=high");
         assert_eq!(spec.model, "model1");
     }
 
     #[test]
     fn model_spec_parses_nested_model_path() {
         // Some vendors use org/model format.
-        let spec = ModelSpec::parse("acp://hf/Qwen/QwQ-32B?thinking=true");
+        let spec = ModelSpec::parse("acp://hf/Qwen/QwQ-32B?effort=high");
         assert_eq!(spec.model, "QwQ-32B");
-        assert!(spec.thinking);
-    }
-
-    #[test]
-    fn model_spec_parses_thinking_param_variants() {
-        assert!(!ModelSpec::parse("acp://v/m?thinking=false").thinking);
-        assert!(!ModelSpec::parse("acp://v/m?thinking=0").thinking);
-        assert!(!ModelSpec::parse("acp://v/m?thinking=no").thinking);
-        assert!(!ModelSpec::parse("acp://v/m?thinking=off").thinking);
-        assert!(ModelSpec::parse("acp://v/m?thinking=true").thinking);
-        assert!(ModelSpec::parse("acp://v/m?thinking=1").thinking);
-        assert!(ModelSpec::parse("acp://v/m?thinking=yes").thinking);
-        assert!(ModelSpec::parse("acp://v/m?thinking=on").thinking);
+        assert_eq!(spec.effort.as_deref(), Some("high"));
     }
 
     #[test]
     fn model_spec_ignores_unknown_query_params() {
-        let spec = ModelSpec::parse("acp://v/m?foo=bar&thinking=false&baz=1");
+        let spec = ModelSpec::parse("acp://v/m?foo=bar&effort=high&baz=1");
         assert_eq!(spec.model, "m");
-        assert!(!spec.thinking);
+        assert_eq!(spec.effort.as_deref(), Some("high"));
+
+        let spec = ModelSpec::parse("acp://v/m?foo=bar&baz=1");
+        assert_eq!(
+            spec.effort, None,
+            "no effort param means reasoning disabled"
+        );
     }
 
     #[test]
     fn model_spec_handles_empty_string() {
         let spec = ModelSpec::parse("");
         assert_eq!(spec.model, "");
-        assert!(!spec.thinking);
-    }
-
-    // --- reasoning_effort query param tests ---
-
-    #[test]
-    fn model_spec_parses_reasoning_effort() {
-        let spec = ModelSpec::parse(
-            "acp://deepseek/deepseek-v4-flash?thinking=true&reasoning_effort=high",
-        );
-        assert_eq!(spec.model, "deepseek-v4-flash");
-        assert!(spec.thinking);
-        assert_eq!(spec.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(spec.effort, None);
     }
 
     #[test]
-    fn model_spec_reasoning_effort_defaults_to_none() {
-        let spec = ModelSpec::parse("acp://deepseek/deepseek-v4-flash?thinking=true");
-        assert!(spec.thinking);
-        assert!(spec.reasoning_effort.is_none());
+    fn model_spec_empty_effort_value_means_disabled() {
+        // `?effort=` carries no value: nothing to forward, reasoning off.
+        let spec = ModelSpec::parse("acp://v/m?effort=");
+        assert_eq!(spec.effort, None);
     }
 
     #[test]
@@ -1006,16 +968,20 @@ mod tests {
         assert!(!ModelSpec::parse("acp://cursor/gpt-4o").is_deepseek());
     }
 
-    // --- build_chat_body thinking format tests ---
+    // --- build_chat_body effort format tests ---
 
     #[test]
-    fn build_chat_body_deepseek_disabled_thinking() {
+    fn build_chat_body_without_effort_disables_deepseek_reasoning() {
         let body = build_chat_body(
-            "acp://deepseek/deepseek-v4-flash?thinking=false",
+            "acp://deepseek/deepseek-v4-flash",
             &[json!({"role": "user", "content": "hi"})],
             &[],
         );
         assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "no effort field when reasoning is disabled"
+        );
         assert!(
             body.get("chat_template_kwargs").is_none(),
             "deepseek should not use chat_template_kwargs"
@@ -1023,36 +989,40 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_body_deepseek_enabled_thinking_with_effort() {
+    fn build_chat_body_forwards_model_defined_effort_verbatim() {
+        // The effort value is model-defined: whatever the operator wrote in
+        // the URI is sent as the standard reasoning_effort field, unchanged.
+        for value in ["low", "medium", "high", "max"] {
+            let body = build_chat_body(
+                &format!("acp://deepseek/deepseek-v4-flash?effort={value}"),
+                &[json!({"role": "user", "content": "hi"})],
+                &[],
+            );
+            assert_eq!(body["reasoning_effort"], json!(value));
+            assert!(
+                body.get("thinking").is_none(),
+                "no explicit thinking toggle when effort is set"
+            );
+            assert!(body.get("chat_template_kwargs").is_none());
+        }
+    }
+
+    #[test]
+    fn build_chat_body_effort_applies_to_non_deepseek_models() {
         let body = build_chat_body(
-            "acp://deepseek/deepseek-v4-flash?thinking=true&reasoning_effort=high",
+            "acp://vendor1/model1?effort=high",
             &[json!({"role": "user", "content": "hi"})],
             &[],
         );
         assert_eq!(body["reasoning_effort"], json!("high"));
-        assert!(
-            body.get("thinking").is_none(),
-            "no explicit thinking toggle when enabled (default)"
-        );
-        assert!(body.get("chat_template_kwargs").is_none());
-    }
-
-    #[test]
-    fn build_chat_body_deepseek_enabled_thinking_without_effort() {
-        let body = build_chat_body(
-            "acp://deepseek/deepseek-v4-flash?thinking=true",
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-        );
-        assert_eq!(body["reasoning_effort"], json!("max"));
         assert!(body.get("thinking").is_none());
         assert!(body.get("chat_template_kwargs").is_none());
     }
 
     #[test]
-    fn build_chat_body_non_deepseek_disabled_thinking() {
+    fn build_chat_body_without_effort_disables_non_deepseek_reasoning() {
         let body = build_chat_body(
-            "acp://vendor1/model1?thinking=false",
+            "acp://vendor1/model1",
             &[json!({"role": "user", "content": "hi"})],
             &[],
         );
@@ -1060,17 +1030,7 @@ mod tests {
             body["chat_template_kwargs"],
             json!({"enable_thinking": false})
         );
-        assert!(body.get("thinking").is_none());
-    }
-
-    #[test]
-    fn build_chat_body_non_deepseek_enabled_thinking() {
-        let body = build_chat_body(
-            "acp://vendor1/model1?thinking=true",
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-        );
-        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("thinking").is_none());
     }
 

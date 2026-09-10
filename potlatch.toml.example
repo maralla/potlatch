@@ -126,5 +126,5 @@ model = "acp://cursor/claude-sonnet-4-5"
 # profile's same endpoint. `max_live_subagents` optionally caps how many
 # subagents may be live at once — omit it for no cap. Subagent transcripts
 # are written under .potlatch/subagent/transcripts/ (potlatch vendor only).
-provided_models = ["acp://potlatch/model1?thinking=true"]
+provided_models = ["acp://potlatch/model1?effort=high"]
 # max_live_subagents = 8
