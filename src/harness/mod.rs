@@ -328,6 +328,16 @@ fn run_reader_thread(
             continue;
         }
 
+        // A response-shaped message the child's own requests don't claim is
+        // a late or duplicate reply (e.g. the parent answered after this
+        // side's wait expired). Never forward it to the ACP server —
+        // `handle_message` would respond to its id, echoing junk onto the
+        // stream that the parent reports as an orphan response.
+        if msg.get("method").is_none() && msg.get("id").is_some() {
+            tracing::debug!("harness: dropping unmatched response for id {}", msg["id"]);
+            continue;
+        }
+
         // Route session/inject directly via shared channels. This works
         // mid-run: the inject_tx pushes to the agent loop's inject channel,
         // which is drained at the top of the next iteration.
