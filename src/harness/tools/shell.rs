@@ -1005,9 +1005,11 @@ mod tests {
         // `read_to_end` forever).
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         // The grandchild inherits the command's stdout and outlives the kill:
-        // `sleep 30` holds the pipe write end open for the grace window.
+        // `sleep 301` holds the pipe write end open for the grace window. The
+        // sleep durations are unique to this test so the pattern-based pkill
+        // cleanup below can never kill another test's `sleep` job.
         let args = json!({
-            "command": "setsid sh -c 'sleep 30' & echo staged; sleep 60",
+            "command": "setsid sh -c 'sleep 301' & echo staged; sleep 302",
             "timeout_secs": 2,
         });
         let start = Instant::now();
@@ -1019,8 +1021,8 @@ mod tests {
             "orphaned pipes must not block return, took {elapsed:?}"
         );
         // Clean up the leftover sleeps so the test run is self-contained.
-        let _ = Command::new("pkill").args(["-f", "sleep 30"]).status();
-        let _ = Command::new("pkill").args(["-f", "sleep 60"]).status();
+        let _ = Command::new("pkill").args(["-f", "sleep 301"]).status();
+        let _ = Command::new("pkill").args(["-f", "sleep 302"]).status();
     }
 
     #[cfg(unix)]
@@ -1045,7 +1047,7 @@ mod tests {
 
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({
-            "command": "setsid sh -c 'sleep 30' & echo staged; sleep 60",
+            "command": "setsid sh -c 'sleep 303' & echo staged; sleep 304",
             "timeout_secs": 2,
         });
 
@@ -1063,8 +1065,8 @@ mod tests {
         );
 
         // Clean up the leftover sleeps so the test run is self-contained.
-        let _ = Command::new("pkill").args(["-f", "sleep 30"]).status();
-        let _ = Command::new("pkill").args(["-f", "sleep 60"]).status();
+        let _ = Command::new("pkill").args(["-f", "sleep 303"]).status();
+        let _ = Command::new("pkill").args(["-f", "sleep 304"]).status();
     }
 
     #[test]
