@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use crate::util::dies_with_parent;
+
 use super::Tool;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -592,6 +594,9 @@ impl Tool for ShellTool {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        // A foreground command's lifetime is bounded by this turn's thread:
+        // if the harness dies mid-command, the command must not keep running.
+        dies_with_parent(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -1025,7 +1030,7 @@ mod tests {
         let _ = Command::new("pkill").args(["-f", "sleep 302"]).status();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn orphaned_pipes_do_not_accumulate_reader_threads() {
         // Every command whose pipes outlive it used to abandon its reader

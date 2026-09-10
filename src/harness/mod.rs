@@ -27,6 +27,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 use crate::core::model::acp::jsonrpc::Outbound;
 use crate::paths::sessions_dir;
@@ -225,14 +227,37 @@ pub fn run_acp_server() -> Result<()> {
     ));
     let shared_stdout = parent::SharedOutput::stdout();
     let parent_rpc = Arc::new(parent::ParentRpc::new(shared_stdout.clone()));
-    let mut server = acp::AcpServer::with_output(llm_client, shared_stdout.clone())
-        .with_agent_tool_caller(parent_rpc.clone());
+    let server = Arc::new(Mutex::new(
+        acp::AcpServer::with_output(llm_client, shared_stdout.clone())
+            .with_agent_tool_caller(parent_rpc.clone()),
+    ));
+
+    // Signals: SIGTERM/SIGHUP/SIGINT (a ctrl-C on the parent's terminal
+    // reaches this child through the process group) must not terminate the
+    // process by default disposition — that would orphan the sessions'
+    // running background jobs and language servers. Catch them, run the same
+    // session teardown as a graceful exit, and only then exit.
+    let mut signals =
+        Signals::new([SIGINT, SIGHUP, SIGTERM]).context("register harness signal handlers")?;
+    let signal_server = Arc::clone(&server);
+    std::thread::Builder::new()
+        .name("harness-signals".into())
+        .spawn(move || {
+            // Block until the first signal arrives, tear down, and exit —
+            // one signal is all this process ever handles.
+            if let Some(signal) = signals.forever().next() {
+                tracing::warn!("harness: received signal {signal}, shutting down sessions");
+                signal_server.lock().unwrap().shutdown_all_sessions();
+                std::process::exit(0);
+            }
+        })
+        .context("spawn harness signal thread")?;
 
     // Shared channels map: session_id → inject_tx + cancel flag.
     // The reader thread uses this to handle session/inject and session/cancel
     // directly, bypassing the main thread (which may be blocked in
     // session/prompt).
-    let shared_channels = server.shared_channels();
+    let shared_channels = server.lock().unwrap().shared_channels();
 
     // mpsc channel: reader thread → main thread for all non-inject/non-cancel
     // messages. Messages queue here when the main thread is blocked in
@@ -257,35 +282,50 @@ pub fn run_acp_server() -> Result<()> {
 
     // Main thread: process messages from the reader thread.
     drop(msg_tx); // Close our copy so msg_rx closes when the reader thread exits.
-    while let Ok(msg) = msg_rx.recv() {
-        let method = msg["method"].as_str().unwrap_or("(unknown)").to_string();
-        tracing::info!("ACP request: {method}");
+    let exit_result = loop {
+        match msg_rx.recv() {
+            Ok(msg) => {
+                let method = msg["method"].as_str().unwrap_or("(unknown)").to_string();
+                tracing::info!("ACP request: {method}");
 
-        // Responses (and turn notifications) are written by the server to the
-        // shared stdout it owns; the main thread only reacts to session/new
-        // by switching to the per-session log file.
-        let response = server.handle_message(&msg)?;
+                // Responses (and turn notifications) are written by the server to the
+                // shared stdout it owns; the main thread only reacts to session/new
+                // by switching to the per-session log file.
+                let response = match server.lock().unwrap().handle_message(&msg) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        tracing::error!("harness ACP: handler error: {e:#}");
+                        break Err(e);
+                    }
+                };
 
-        // When a task session is created, switch to the per-session log
-        // file. Multiplexed sessions (subagent agents keep many alive on one
-        // connection) stay on the process log: switching per session/new
-        // would send concurrent sessions' logs into whichever file was set
-        // last.
-        if method == "session/new"
-            && msg["params"]["multiplex"] != true
-            && let Some(Outbound::Response { result, .. }) = &response
-            && let Some(sid) = result.get("sessionId").and_then(|v| v.as_str())
-        {
-            set_session_log(&log_writer, sid);
-            tracing::info!(
-                "harness ACP: session {} created, registered tools: {:?}",
-                sid,
-                server.session_tool_names(sid)
-            );
+                // When a task session is created, switch to the per-session log
+                // file. Multiplexed sessions (subagent agents keep many alive on one
+                // connection) stay on the process log: switching per session/new
+                // would send concurrent sessions' logs into whichever file was set
+                // last.
+                if method == "session/new"
+                    && msg["params"]["multiplex"] != true
+                    && let Some(Outbound::Response { result, .. }) = &response
+                    && let Some(sid) = result.get("sessionId").and_then(|v| v.as_str())
+                {
+                    set_session_log(&log_writer, sid);
+                    tracing::info!(
+                        "harness ACP: session {} created, registered tools: {:?}",
+                        sid,
+                        server.lock().unwrap().session_tool_names(sid)
+                    );
+                }
+            }
+            Err(_) => break Ok(()),
         }
-    }
+    };
 
-    Ok(())
+    // stdin closed or a handler failed: the process is going away. Kill the
+    // sessions' background shell jobs and language servers so the exit cannot
+    // leave running commands behind as strays.
+    server.lock().unwrap().shutdown_all_sessions();
+    exit_result
 }
 
 /// Reader thread body: reads stdin continuously, parses JSON-RPC, and routes

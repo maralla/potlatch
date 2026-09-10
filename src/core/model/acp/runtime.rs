@@ -25,7 +25,7 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
@@ -45,6 +45,7 @@ use crate::core::bus::AgentBus;
 use crate::core::config::build_acp_spawn_command;
 use crate::core::config::uri::ModelUri;
 use crate::paths::APP_NAME;
+use crate::util::dies_with_parent;
 
 const TASK_CONTEXT_RESET_GUIDANCE: &str = r#"IMPORTANT CONTEXT HANDLING:
 Treat this assignment as a fresh task. Do not rely on prior chat history or assumptions from earlier assignments unless this prompt explicitly refers to them. Use only the repository state, issue/MR context, and instructions present in this task.
@@ -55,6 +56,9 @@ Treat this assignment as a fresh task. Do not rely on prior chat history or assu
 /// ACP child exited, or `session/prompt` itself errored). Unrelated to
 /// structured-output repair, which lives above this layer.
 const MAX_TRANSPORT_RETRIES: u32 = 5;
+/// How long a disposed ACP child gets to exit on its own (stdin EOF → its
+/// shutdown path kills the session's background jobs) before it is killed.
+const DISPOSE_GRACE: Duration = Duration::from_secs(3);
 
 struct AcpSession {
     client: Arc<AcpClient>,
@@ -66,9 +70,17 @@ struct AcpSession {
 fn dispose_acp_session(s: AcpSession) {
     let _ = s.client.session_cancel(&s.session_id);
     let mut s = s;
+    // Drop the client first: it closes the child's stdin, so a live child
+    // exits through its own shutdown path — which kills the session's
+    // background shell jobs and language servers — instead of being
+    // SIGKILLed with them still running (they would leak as strays).
+    drop(s.client);
+    let deadline = Instant::now() + DISPOSE_GRACE;
+    while Instant::now() < deadline && matches!(s.child.try_wait(), Ok(None)) {
+        thread::sleep(Duration::from_millis(50));
+    }
     let _ = s.child.kill();
     let _ = s.child.wait();
-    drop(s.client);
 }
 
 fn close_acp_session_best_effort(client: &AcpClient, session_id: &str) {
@@ -509,6 +521,11 @@ impl AcpRuntime {
             cmd.env(crate::paths::AGENTS_DIR_ENV, agents_dir);
         }
 
+        // The child is spawned from this agent's supervisor thread, which
+        // lives for the whole process: register it to die with the parent so
+        // a killed or crashed orchestrator cannot leave ACP subprocesses
+        // running.
+        dies_with_parent(&mut cmd);
         let mut child = cmd
             .current_dir(&self.working_dir)
             .stdin(Stdio::piped())
