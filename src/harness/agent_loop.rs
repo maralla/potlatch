@@ -52,6 +52,11 @@ pub struct AgentLoop {
     recent_calls: VecDeque<(String, String)>,
     /// Number of stuck signals encountered.
     stuck_count: u32,
+    /// Count of LLM request/response rounds this session's loop has run —
+    /// the monotonic turn number the per-request log line reports. Persists
+    /// across `session/prompt` calls (the loop is reused for the whole
+    /// session), so log lines stay unique and greppable within a run.log.
+    turn: u64,
     /// Where the current context snapshot is persisted after every update.
     /// `None` disables persistence (sessions created without a resumable
     /// identity, e.g. unlogged subagent sessions).
@@ -85,6 +90,7 @@ impl AgentLoop {
             todo,
             recent_calls: VecDeque::with_capacity(8),
             stuck_count: 0,
+            turn: 0,
             context_path: None,
         }
     }
@@ -506,8 +512,13 @@ impl AgentLoop {
                 }
             };
 
+            // One LLM request/response round is one turn. Counted only when a
+            // response actually arrived, so a failed request (including the
+            // malformed-arguments retry above) does not consume a number.
+            self.turn += 1;
             info!(
-                "harness: turn {} messages, model={}, elapsed={}, tokens in={} out={} cached={} finish={} tool_calls={}",
+                "harness: turn {} ({} messages), model={}, elapsed={}, tokens in={} out={} cached={} finish={} tool_calls={}",
+                self.turn,
                 messages.len(),
                 self.model,
                 format_duration(response.elapsed_ms),
@@ -1059,6 +1070,72 @@ mod tests {
 
         let result = agent.run("test cancel", "/tmp", None).unwrap();
         assert!(result.contains("cancelled"));
+    }
+
+    #[test]
+    fn turn_counter_counts_llm_rounds_monotonically() {
+        // The per-request log line reports `turn N` — a genuine, monotonic
+        // turn number for the session's loop (one number per LLM
+        // request/response round, spanning prompts), not the request's
+        // message count.
+        let llm = Arc::new(FakeChatClient::new(vec![
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![json!({
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
+                })],
+                finish_reason: "tool_calls".into(),
+                usage: Usage::default(),
+                tool_results: vec![],
+                elapsed_ms: 0,
+                reasoning: String::new(),
+            },
+            ChatResponse {
+                content: "first prompt done".into(),
+                tool_calls: vec![],
+                finish_reason: "stop".into(),
+                usage: Usage::default(),
+                tool_results: vec![],
+                elapsed_ms: 0,
+                reasoning: String::new(),
+            },
+            ChatResponse {
+                content: "second prompt done".into(),
+                tool_calls: vec![],
+                finish_reason: "stop".into(),
+                usage: Usage::default(),
+                tool_results: vec![],
+                elapsed_ms: 0,
+                reasoning: String::new(),
+            },
+        ]));
+
+        let tools = ToolRegistry::with_builtin_tools(
+            &mut SessionStates::new(),
+            "",
+            &Default::default(),
+            None,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut agent = AgentLoop::new(
+            llm,
+            tools,
+            "test-model".into(),
+            100_000,
+            cancel,
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        agent.init_context("/tmp", &[]);
+
+        // First prompt: a tool-call round plus the final stop round = 2 turns.
+        agent.run("first prompt", "/tmp", None).unwrap();
+        assert_eq!(agent.turn, 2);
+
+        // The counter spans prompts in the same session — it does not reset.
+        agent.run("second prompt", "/tmp", None).unwrap();
+        assert_eq!(agent.turn, 3);
     }
 
     #[test]
