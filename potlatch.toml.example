@@ -28,12 +28,17 @@ repo_url = "https://gitlab.com/group/project"
 # 2. Multiple endpoints selected by model name. The `endpoints` table maps
 #    each model name (the last path segment of the model URI, with any
 #    `?query` stripped) to its own fields. The `{field}` placeholders in
-#    `env` are resolved from the matching endpoint entry:
+#    `env` are resolved from the matching endpoint entry. An entry may also
+#    declare an `alias`: it is then addressed as `acp://<vendor>/<alias>`
+#    while the backend still receives the real `model` name — one model can
+#    be exposed under several names, possibly through different endpoints.
+#    An aliased entry is addressed only by its alias; aliases and model
+#    names must be unique within the profile.
 # [acp.potlatch]
 # acp_command = ["potlatch", "harness"]
 # endpoints = [
-#   { model = "model1",       endpoint = "http://endpoint1.example", key = "EMPTY" },
-#   { model = "model2", endpoint = "http://endpoint2.example", key = "EMPTY" },
+#   { model = "model1", alias = "model-x", endpoint = "http://endpoint1.example", key = "EMPTY" },
+#   { model = "model1", alias = "model-y", endpoint = "http://endpoint2.example", key = "EMPTY" },
 # ]
 # env = [
 #   "POTLATCH_BASE_URL={endpoint}",
