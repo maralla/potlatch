@@ -34,6 +34,16 @@ repo_url = "https://gitlab.com/group/project"
 #    be exposed under several names, possibly through different endpoints.
 #    An aliased entry is addressed only by its alias; aliases and model
 #    names must be unique within the profile.
+#
+#    API protocol: endpoints speaking the Anthropic Messages API
+#    (`/v1/messages`, x-api-key auth) are supported alongside
+#    OpenAI-compatible ones. Select the protocol per endpoint with the
+#    `api` field (`api = "anthropic"` or `api = "openai"` — the default is
+#    openai); it is forwarded to the harness as POTLATCH_API automatically,
+#    or reference it explicitly with `POTLATCH_API={api}`. A profile-level
+#    `api` applies to every endpoint that doesn't declare one. The `effort`
+#    query param maps to extended thinking on Anthropic: keywords
+#    low/medium/high/max (or a numeric literal) set the thinking budget.
 # [acp.potlatch]
 # acp_command = ["potlatch", "harness"]
 # endpoints = [

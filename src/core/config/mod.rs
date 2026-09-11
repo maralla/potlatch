@@ -1,8 +1,9 @@
-mod acp;
+pub(crate) mod acp;
 mod agent;
 pub(crate) mod duration;
 pub mod uri;
 
+use acp::apply_api_flavor;
 pub use acp::{
     AcpClientProfile, AcpSpawnConfig, POTLATCH_ACP_PROFILE, build_acp_spawn_command,
     build_profile_command, parse_acp_profiles, resolve_profile_env,
@@ -170,11 +171,19 @@ impl Config {
             None => endpoint_model_name,
         };
 
+        let mut env = resolve_profile_env(profile, Some(&bare_model))?;
+        apply_api_flavor(
+            &mut env,
+            endpoint
+                .and_then(|e| e.api.as_deref())
+                .or_else(|| profile.fields.get("api").map(String::as_str)),
+        );
+
         Ok(AcpSpawnConfig {
             command: build_profile_command(profile),
             model_uri: Some(model_uri),
             endpoint_model: Some(endpoint_model),
-            env: resolve_profile_env(profile, Some(&bare_model))?,
+            env,
             auth_command: endpoint.and_then(|e| e.auth_command.clone()),
             config_dir: self.config_dir.clone(),
             model_aliases: profile.model_aliases(),
@@ -248,10 +257,16 @@ impl Config {
             build_profile_command(profile)
         };
 
-        let env = resolve_profile_env(
+        let mut env = resolve_profile_env(
             profile,
             endpoint.map(|e| e.alias.as_deref().unwrap_or(&e.model)),
         )?;
+        apply_api_flavor(
+            &mut env,
+            endpoint
+                .and_then(|e| e.api.as_deref())
+                .or_else(|| profile.fields.get("api").map(String::as_str)),
+        );
         Ok(AcpSpawnConfig {
             command,
             model_uri: None,

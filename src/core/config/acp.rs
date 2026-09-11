@@ -44,6 +44,10 @@ pub struct EndpointEntry {
     /// its `model` name stops being an address. Must be unique within the
     /// profile.
     pub alias: Option<String>,
+    /// Which wire protocol the backend speaks: `"anthropic"` (Messages API,
+    /// `/v1/messages`, x-api-key auth) or `"openai"` (chat completions — the
+    /// default when absent). Forwarded to the harness as `POTLATCH_API`.
+    pub api: Option<String>,
     pub fields: HashMap<String, String>,
     /// `auth_provider` command argv. When set, the harness runs this command
     /// before talking to the endpoint and applies the returned headers
@@ -158,9 +162,22 @@ pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfi
                 if let Some(alias) = &alias {
                     fields.insert("alias".into(), alias.clone());
                 }
+                let api = match fields.remove("api") {
+                    Some(raw) => {
+                        // Validate eagerly: a typo must fail at config load,
+                        // not on the first request.
+                        Some(ApiFlavor::parse_configured(&raw)?.env_value().to_string())
+                    }
+                    None => None,
+                };
+                // `api` stays accessible as an {api} reference.
+                if let Some(api) = &api {
+                    fields.insert("api".into(), api.clone());
+                }
                 endpoint_list.push(EndpointEntry {
                     model,
                     alias,
+                    api,
                     fields,
                     auth_command,
                 });
@@ -190,6 +207,11 @@ pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfi
             .filter(|(k, _)| !RESERVED_KEYS.contains(&k.as_str()))
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
+        if let Some(api) = fields.get("api") {
+            // Validate a profile-level protocol selection eagerly.
+            ApiFlavor::parse_configured(api)
+                .with_context(|| format!("invalid `api` in [acp.{name}]"))?;
+        }
 
         let profile = AcpClientProfile {
             acp_command,
@@ -358,6 +380,64 @@ fn substitute_placeholders(
 /// Return the argv for an ACP profile as configured. No injection — the config's
 /// `acp_command` is used verbatim. Any CLI flags the agent needs (e.g. `--base-url`)
 /// must be explicitly specified in the config file.
+/// Which wire protocol an endpoint backend speaks. Selected statically via
+/// the endpoint entry's `api` field (or the profile-level `api` field) and
+/// forwarded to the harness as `POTLATCH_API`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApiFlavor {
+    /// OpenAI-compatible `/v1/chat/completions` (the default).
+    #[default]
+    OpenAi,
+    /// Anthropic Messages API `/v1/messages`.
+    Anthropic,
+}
+
+impl ApiFlavor {
+    /// Parse a configured `api` value. Accepts the two known protocols
+    /// case-insensitively; anything else is a config error — a typo must not
+    /// silently route Anthropic traffic to an OpenAI parser.
+    pub fn parse_configured(raw: &str) -> Result<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "openai" => Ok(Self::OpenAi),
+            "anthropic" => Ok(Self::Anthropic),
+            other => Err(anyhow::anyhow!(
+                "invalid api `{other}` (use \"anthropic\" or \"openai\")"
+            )),
+        }
+    }
+
+    /// The value `POTLATCH_API` carries for this flavor.
+    pub fn env_value(&self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    /// Parse the harness-side `POTLATCH_API` env value. Absent or empty
+    /// selects the default (OpenAI); an unrecognized value is a hard error —
+    /// a typo must not silently misroute traffic.
+    pub fn from_env(raw: Option<&str>) -> Result<Self> {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            None => Ok(Self::default()),
+            Some(value) => Self::parse_configured(value),
+        }
+    }
+}
+
+/// Inject the endpoint's API flavor into the resolved env as
+/// `POTLATCH_API` (read by the harness to pick its wire protocol). The
+/// entry-level `api` field wins over a profile-level one; an env line the
+/// profile already sets is left untouched.
+pub(crate) fn apply_api_flavor(env: &mut HashMap<String, String>, api: Option<&str>) {
+    // An unspecified api defaults to the OpenAI wire protocol — inserted
+    // explicitly so an inherited shell POTLATCH_API cannot flip an endpoint
+    // that never asked for another protocol.
+    let flavor = api.unwrap_or("openai");
+    env.entry("POTLATCH_API".to_string())
+        .or_insert_with(|| flavor.to_string());
+}
+
 pub fn build_profile_command(profile: &AcpClientProfile) -> Vec<String> {
     profile.acp_command.clone()
 }
@@ -537,6 +617,7 @@ mod tests {
             ]),
             alias: None,
             auth_command: None,
+            api: None,
         }
     }
 
@@ -625,6 +706,65 @@ mod tests {
         // The error lists the addressable names.
         let err = select_endpoint(&p, "nope").unwrap_err();
         assert!(err.to_string().contains("model1, model-x"), "{err:#}");
+    }
+
+    #[test]
+    fn parse_endpoints_entry_with_api_flavor() {
+        let root: Value = toml::from_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "claude-4", api = "Anthropic", endpoint = "http://a.example" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let p = &parse_acp_profiles(&root).unwrap()["potlatch"];
+        assert_eq!(
+            p.endpoints[0].api.as_deref(),
+            Some("anthropic"),
+            "the flavor is normalized to lowercase"
+        );
+        // The api stays referenceable as an {api} placeholder.
+        let env = resolve_profile_env(p, Some("claude-4")).unwrap();
+        assert_eq!(env.get("API").map(String::as_str), None);
+    }
+
+    #[test]
+    fn parse_endpoints_rejects_unknown_api_flavors() {
+        let root: Value = toml::from_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "m", api = "anthropics", endpoint = "http://a.example" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let err = parse_acp_profiles(&root).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid api `anthropics`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_profile_level_api() {
+        let root: Value = toml::from_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            api = "gemini"
+            "#,
+        )
+        .unwrap();
+        let err = parse_acp_profiles(&root).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid `api` in [acp.potlatch]"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1063,6 +1203,209 @@ mod tests {
     }
 
     #[test]
+    fn resolve_acp_spawn_forwards_the_api_flavor() {
+        use super::super::Config;
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "claude-4", api = "anthropic", endpoint = "http://anthropic.example", key = "EMPTY" },
+              { model = "model1", api = "openai", endpoint = "http://openai.example", key = "EMPTY" },
+            ]
+            env = [
+              "POTLATCH_BASE_URL={endpoint}",
+              "POTLATCH_API={api}",
+            ]
+
+            [agent.claude]
+            model = "acp://potlatch/claude-4"
+            instances = 1
+
+            [agent.openai]
+            model = "acp://potlatch/model1"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+
+        let claude = cfg.resolve_acp_spawn(cfg.agent("claude").unwrap()).unwrap();
+        assert_eq!(
+            claude.env.get("POTLATCH_API").map(String::as_str),
+            Some("anthropic"),
+            "the entry's api field is forwarded as POTLATCH_API"
+        );
+
+        let openai = cfg.resolve_acp_spawn(cfg.agent("openai").unwrap()).unwrap();
+        assert_eq!(
+            openai.env.get("POTLATCH_API").map(String::as_str),
+            Some("openai"),
+            "the {{api}} placeholder resolves to the entry's own flavor"
+        );
+    }
+
+    #[test]
+    fn resolve_acp_spawn_injects_api_when_the_env_does_not_set_it() {
+        use super::super::Config;
+        // No POTLATCH_API env line: the entry's flavor is auto-injected.
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "claude-4", api = "anthropic", endpoint = "http://a.example", key = "EMPTY" },
+            ]
+            env = ["POTLATCH_BASE_URL={endpoint}"]
+
+            [agent.claude]
+            model = "acp://potlatch/claude-4"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let spawn = cfg.resolve_acp_spawn(cfg.agent("claude").unwrap()).unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_API").map(String::as_str),
+            Some("anthropic"),
+            "the flavor is injected without a manual env line"
+        );
+    }
+
+    #[test]
+    fn resolve_acp_spawn_defaults_unspecified_entries_to_openai() {
+        use super::super::Config;
+        // An entry without an api field defaults to the OpenAI wire
+        // protocol — inserted explicitly, so an inherited shell
+        // POTLATCH_API cannot flip it.
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", endpoint = "http://openai.example", key = "EMPTY" },
+            ]
+            env = ["POTLATCH_BASE_URL={endpoint}"]
+
+            [agent.m]
+            model = "acp://potlatch/model1"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let spawn = cfg.resolve_acp_spawn(cfg.agent("m").unwrap()).unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_API").map(String::as_str),
+            Some("openai"),
+            "unspecified api defaults to openai"
+        );
+    }
+
+    #[test]
+    fn api_flavor_from_env_defaults_to_openai() {
+        use crate::core::config::acp::ApiFlavor;
+        assert_eq!(ApiFlavor::from_env(None).unwrap(), ApiFlavor::OpenAi);
+        assert_eq!(
+            ApiFlavor::from_env(Some("")).unwrap(),
+            ApiFlavor::OpenAi,
+            "empty is unspecified, not an error"
+        );
+        assert_eq!(ApiFlavor::from_env(Some("  ")).unwrap(), ApiFlavor::OpenAi);
+        assert_eq!(
+            ApiFlavor::from_env(Some("anthropic")).unwrap(),
+            ApiFlavor::Anthropic
+        );
+        assert!(ApiFlavor::from_env(Some("gemini")).is_err());
+    }
+
+    #[test]
+    fn resolve_acp_spawn_falls_back_to_the_profile_level_api() {
+        use super::super::Config;
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            api = "anthropic"
+            base_url = "http://anthropic.example"
+            api_key = "EMPTY"
+            env = [
+              "POTLATCH_BASE_URL={base_url}",
+            ]
+
+            [agent.claude]
+            model = "acp://potlatch/claude-4"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let spawn = cfg.resolve_acp_spawn(cfg.agent("claude").unwrap()).unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_API").map(String::as_str),
+            Some("anthropic"),
+            "the profile-level api applies when the endpoint has none"
+        );
+    }
+
+    #[test]
+    fn resolve_acp_spawn_keeps_an_explicit_env_api_over_the_profile_fallback() {
+        use super::super::Config;
+        // Entry has no api; the profile has one; but the env line already
+        // sets POTLATCH_API explicitly — the explicit line wins.
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            api = "anthropic"
+            base_url = "http://mixed.example"
+            api_key = "EMPTY"
+            env = [
+              "POTLATCH_BASE_URL={base_url}",
+              "POTLATCH_API=openai",
+            ]
+
+            [agent.m]
+            model = "acp://potlatch/m"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let spawn = cfg.resolve_acp_spawn(cfg.agent("m").unwrap()).unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_API").map(String::as_str),
+            Some("openai"),
+            "an explicit env POTLATCH_API is never overwritten"
+        );
+    }
+
+    #[test]
+    fn resolve_client_spawn_forwards_the_api_flavor() {
+        use super::super::Config;
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", alias = "model-x", api = "anthropic", endpoint = "http://a.example", key = "EMPTY" },
+            ]
+            env = ["POTLATCH_BASE_URL={endpoint}"]
+
+            [agent.subagent]
+            provided_models = ["acp://potlatch/model-x?effort=high"]
+            "#,
+        )
+        .unwrap();
+        let models = vec!["acp://potlatch/model-x?effort=high".to_string()];
+        let spawn = cfg.resolve_client_spawn("potlatch", &models).unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_API").map(String::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            spawn.model_aliases.get("model-x").map(String::as_str),
+            Some("model1")
+        );
+    }
+
+    #[test]
     fn resolve_acp_spawn_forwards_auth_provider() {
         use super::super::Config;
         let cfg = Config::from_toml_str(
@@ -1101,6 +1444,7 @@ mod tests {
             ]),
             alias: None,
             auth_command: None,
+            api: None,
         };
         let p = profile(
             vec!["URL={ep}", "TOKEN={secret}", "MODEL={model}"],
@@ -1123,6 +1467,7 @@ mod tests {
             fields: HashMap::from([("endpoint".into(), "http://x".into())]),
             alias: None,
             auth_command: None,
+            api: None,
         };
         let p = profile(vec!["X={nonexistent}"], vec![], vec![entry]);
         let err = resolve_profile_env(&p, Some("test")).unwrap_err();
@@ -1139,6 +1484,7 @@ mod tests {
             ]),
             alias: None,
             auth_command: None,
+            api: None,
         };
         let p = profile(vec!["URL={endpoint}?token={key}"], vec![], vec![entry]);
         let env = resolve_profile_env(&p, Some("test")).unwrap();
@@ -1183,6 +1529,7 @@ mod tests {
             fields: HashMap::from([("endpoint".into(), "http://x".into())]),
             alias: None,
             auth_command: None,
+            api: None,
         };
         let p = profile(vec!["KEY={key}"], vec![], vec![entry]);
         let err = resolve_profile_env(&p, Some("test")).unwrap_err();

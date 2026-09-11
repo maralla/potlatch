@@ -4,9 +4,10 @@ use std::thread;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use std::io;
+use std::io::Error;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
+use std::process;
 
 /// Register `cmd` to be killed (SIGKILL) when the spawning process dies
 /// (Linux `PR_SET_PDEATHSIG`), so a child that outlives its owner — a shell
@@ -29,14 +30,14 @@ pub fn dies_with_parent(cmd: &mut Command) {
 
 #[cfg(target_os = "linux")]
 fn parent_death_signal(cmd: &mut Command) {
-    let parent_pid = std::process::id();
+    let parent_pid = process::id();
     // Safety: `pre_exec` runs the closure in the forked child before exec.
     // Both calls are async-signal-safe: `prctl` is a direct syscall, and
     // `_exit` is the sanctioned immediate exit for a pre-exec child.
     unsafe {
         cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
             if libc::getppid() as u32 != parent_pid {
                 // The parent died between fork and registration: the child
@@ -80,8 +81,8 @@ mod tests {
     fn sleep_respects_shutdown() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let s = shutdown.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
             s.store(true, Ordering::SeqCst);
         });
         assert!(sleep(&shutdown, Duration::from_secs(10)));

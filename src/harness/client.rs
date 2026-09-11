@@ -63,6 +63,37 @@ pub trait ChatClient: Send + Sync {
     fn list_models(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+
+    /// Whether this client replays assistant reasoning back to the model.
+    /// When true, the context must not strip `reasoning_content` from old
+    /// entries: the reasoning is functionally required by the protocol
+    /// (Anthropic extended thinking rejects assistant tool-use turns whose
+    /// thinking blocks were dropped). Defaults to false — reasoning is
+    /// optional context for OpenAI-style models and is stripped under budget
+    /// pressure.
+    fn preserves_reasoning(&self) -> bool {
+        false
+    }
+}
+
+/// Join an API base onto a protocol path, inserting `/v1` for bare hosts.
+/// A base that already contains a path (`http://host/v1`,
+/// `http://gateway/api`) is used unchanged — gateways routing under a longer
+/// prefix 404 when another `/v1` is inserted.
+pub(crate) fn join_api_path(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base_has_path(base) {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/v1{path}")
+    }
+}
+
+/// True when `base` (scheme stripped) still contains a `/`, i.e. it
+/// points at a path rather than a bare host.
+fn base_has_path(base: &str) -> bool {
+    let after_scheme = base.split_once("://").map(|(_, rest)| rest).unwrap_or(base);
+    after_scheme.contains('/')
 }
 
 /// Parsed model specification from an `acp://` URL.
@@ -240,18 +271,13 @@ impl OpenAiClient {
     /// default OpenAI-compatible layout.
     fn url(&self, path: &str) -> String {
         let base = self.base_url.trim_end_matches('/');
-        if Self::base_has_path(base) {
-            format!("{base}{path}")
-        } else {
-            format!("{base}/v1{path}")
+        // An endpoint that already carries the full chat-completions path is
+        // posted verbatim — the operator specified the exact URL.
+        if path == "/chat/completions" && base.ends_with("/chat/completions") {
+            return base.to_string();
         }
-    }
-
-    /// True when `base` (scheme stripped) still contains a `/`, i.e. it
-    /// points at a path rather than a bare host.
-    fn base_has_path(base: &str) -> bool {
-        let after_scheme = base.split_once("://").map(|(_, rest)| rest).unwrap_or(base);
-        after_scheme.contains('/')
+        let root = base.strip_suffix("/chat/completions").unwrap_or(base);
+        join_api_path(root, path)
     }
 }
 
@@ -620,7 +646,7 @@ fn build_chat_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
 /// transient HTTP status codes (429 rate-limit, 500/502/503/504 server errors).
 /// Permanent client/validation errors (400, 401, 403, 404) propagate
 /// immediately without retry.
-fn is_transient_llm_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_transient_llm_error(err: &anyhow::Error) -> bool {
     // Search the full error chain — reqwest wraps the underlying network error
     // as a source, and our own `.context()` adds another layer.
     let full = err
@@ -779,6 +805,25 @@ mod tests {
     }
 
     #[test]
+    fn url_post_verbatim_when_the_endpoint_carries_the_full_path() {
+        let client = OpenAiClient::with_auth_provider(
+            "https://gateway.example/openai/chat/completions".into(),
+            "EMPTY".into(),
+            None,
+        );
+        assert_eq!(
+            client.url("/chat/completions"),
+            "https://gateway.example/openai/chat/completions",
+            "a complete operation URL is used verbatim, never doubled"
+        );
+        // Other paths still join onto the base as a prefix.
+        assert_eq!(
+            client.url("/models"),
+            "https://gateway.example/openai/models"
+        );
+    }
+
+    #[test]
     fn url_inserts_v1_for_bare_hosts() {
         let client =
             OpenAiClient::with_auth_provider("http://localhost:11434".into(), "EMPTY".into(), None);
@@ -800,11 +845,11 @@ mod tests {
 
     #[test]
     fn base_has_path_ignores_the_scheme_slashes() {
-        assert!(!OpenAiClient::base_has_path("http://prod.example"));
-        assert!(OpenAiClient::base_has_path("http://prod.example/v1"));
+        assert!(!base_has_path("http://prod.example"));
+        assert!(base_has_path("http://prod.example/v1"));
         // The `//` in the scheme itself does not count as a path.
-        assert!(!OpenAiClient::base_has_path("https://prod.example"));
-        assert!(!OpenAiClient::base_has_path("prod.example"));
+        assert!(!base_has_path("https://prod.example"));
+        assert!(!base_has_path("prod.example"));
     }
 
     #[test]

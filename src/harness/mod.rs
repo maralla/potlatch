@@ -11,6 +11,7 @@
 
 pub mod acp;
 pub mod agent_loop;
+pub mod anthropic;
 pub mod auth_provider;
 pub mod client;
 pub mod context;
@@ -29,9 +30,12 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use tracing::info;
 
+use crate::core::config::acp::ApiFlavor;
 use crate::core::model::acp::jsonrpc::Outbound;
 use crate::paths::sessions_dir;
+use client::ChatClient;
 
 /// A writer that wraps an `Option<File>` behind a `Mutex`, implementing `io::Write`.
 /// When the inner file is `None`, writes are silently dropped.
@@ -220,11 +224,27 @@ pub fn run_acp_server() -> Result<()> {
         tracing::info!("auth provider configured: {}", auth.program());
     }
 
-    let llm_client = Arc::new(client::OpenAiClient::with_auth_provider(
-        base_url,
-        api_key,
-        auth_provider.map(Arc::new),
-    ));
+    let llm_client: Arc<dyn ChatClient> = {
+        // Which wire protocol the endpoint speaks: the `api` field of the
+        // selected endpoint entry (or the profile) is forwarded as
+        // `POTLATCH_API`; unset selects the OpenAI wire protocol. An
+        // unrecognized value is a hard error — a typo must not misroute
+        // traffic.
+        let flavor = ApiFlavor::from_env(std::env::var("POTLATCH_API").ok().as_deref())?;
+        info!("harness: endpoint API flavor: {:?}", flavor);
+        match flavor {
+            ApiFlavor::Anthropic => Arc::new(anthropic::AnthropicClient::new(
+                base_url,
+                api_key,
+                auth_provider.map(Arc::new),
+            )),
+            ApiFlavor::OpenAi => Arc::new(client::OpenAiClient::with_auth_provider(
+                base_url,
+                api_key,
+                auth_provider.map(Arc::new),
+            )),
+        }
+    };
     let shared_stdout = parent::SharedOutput::stdout();
     let parent_rpc = Arc::new(parent::ParentRpc::new(shared_stdout.clone()));
     let server = Arc::new(Mutex::new(
