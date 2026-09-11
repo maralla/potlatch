@@ -601,10 +601,9 @@ acp_command = ["agent", "acp"]"#
         let mut script: Vec<_> = (0..MAX_STRUCTURED_OUTPUT_REPAIRS - 1)
             .map(|_| handoff_with_tool("sample_tool", json!({"decision": "maybe"})))
             .collect();
-        script.push(handoff_with_tool(
-            "sample_tool",
-            json!({"decision": "approve", "extra": 1}),
-        ));
+        // The final failure must survive lenient wire parsing (unknown tags
+        // still fail; stray fields no longer do).
+        script.push(handoff_with_tool("sample_tool", json!({"decision": 5})));
         let (result, _prompts) = resolve_with_script(
             AgentHandoff {
                 response: "nothing".into(),

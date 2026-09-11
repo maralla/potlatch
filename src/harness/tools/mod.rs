@@ -381,10 +381,22 @@ impl ToolRegistry {
     /// Register a structured-output tool: a side-channel cell tool whose name,
     /// description, and parameter schema are caller-defined. The harness
     /// captures the model's call and returns it in the `session/prompt`
-    /// response via [`Self::take_structured_outputs`].
-    pub fn register_structured_output(&mut self, name: &str, description: &str, parameters: Value) {
-        let (tool, cell) =
-            structured_output::StructuredOutputTool::new(name.to_string(), description, parameters);
+    /// response via [`Self::take_structured_outputs`]. A terminal contract's
+    /// successful record is the run's deliverable: the result tells the
+    /// model the task is complete so it ends its turn.
+    pub fn register_structured_output(
+        &mut self,
+        name: &str,
+        description: &str,
+        parameters: Value,
+        terminal: bool,
+    ) {
+        let (tool, cell) = structured_output::StructuredOutputTool::with_terminal(
+            name.to_string(),
+            description,
+            parameters,
+            terminal,
+        );
         self.structured_outputs.insert(name.to_string(), cell);
         self.register(Arc::new(tool));
     }

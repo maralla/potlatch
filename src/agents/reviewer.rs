@@ -53,15 +53,20 @@ enum ReviewerOutput {
     },
 }
 
+/// Wire structs are deliberately LENIENT about unknown fields: the JSON
+/// schema tells the model what to send, but models with different habits
+/// still add extras (GPT-family models habitually attach a `summary` to
+/// every decision). Rejecting extras here would send the repair loop after
+/// an unfixable "problem" — the model cannot unlearn the habit — and burn
+/// repair turns re-emitting the same output. Unknown fields are ignored;
+/// the known fields carry the decision.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ApproveWire {
     #[serde(default)]
     summary: Option<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RequestChangesWire {
     feedback: String,
     #[serde(default)]
@@ -121,6 +126,7 @@ structured_output! {
                 ),
             }
         );
+        terminal;
     /// Tolerated: a decision spelled with different case or padding
     /// (`"APPROVE"`, `" approve "`).
         normalize(value) {
@@ -129,10 +135,9 @@ structured_output! {
     }
 }
 
-/// The model-generated brief of a merge request, used as the description of an
-/// issue created when the MR has no linked issue.
+/// The model-generated brief of a merge request, used as the description of
+/// an issue created when the MR has no linked issue.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct MrBriefOutput {
     description: String,
 }
@@ -2477,13 +2482,21 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_output_rejects_fields_from_the_other_decision() {
-        let error = conformance::assert_rejects::<ReviewerOutput>(
-            json!({"decision": "approve", "feedback": "- Fix X"}),
-        );
-        assert!(
-            error.starts_with("$.feedback: unexpected property"),
-            "{error}"
+    fn reviewer_output_drops_fields_from_the_other_decision() {
+        // GPT-family models attach habit fields to decisions (an empty
+        // `summary` on `request_changes`, branch fields from the other
+        // side). The contract tolerates and drops them: a repair loop
+        // cannot fix the habit, and rejecting re-opens it.
+        let output = conformance::assert_accepts::<ReviewerOutput>(json!({
+            "decision": "approve",
+            "feedback": "- Fix X",
+            "summary": ""
+        }));
+        assert_eq!(
+            output,
+            ReviewerOutput::Approve {
+                summary: Some(String::new())
+            }
         );
     }
 

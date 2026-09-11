@@ -11,10 +11,10 @@
 
 pub mod acp;
 pub mod agent_loop;
-pub mod anthropic;
 pub mod auth_provider;
 pub mod client;
 pub mod context;
+pub mod model;
 mod parent;
 pub mod prompt;
 pub(crate) mod session_store;
@@ -233,12 +233,17 @@ pub fn run_acp_server() -> Result<()> {
         let flavor = ApiFlavor::from_env(std::env::var("POTLATCH_API").ok().as_deref())?;
         info!("harness: endpoint API flavor: {:?}", flavor);
         match flavor {
-            ApiFlavor::Anthropic => Arc::new(anthropic::AnthropicClient::new(
+            ApiFlavor::Anthropic => Arc::new(model::AnthropicClient::new(
                 base_url,
                 api_key,
                 auth_provider.map(Arc::new),
             )),
             ApiFlavor::OpenAi => Arc::new(client::OpenAiClient::with_auth_provider(
+                base_url,
+                api_key,
+                auth_provider.map(Arc::new),
+            )),
+            ApiFlavor::OpenAiResponses => Arc::new(model::OpenAiResponsesClient::new(
                 base_url,
                 api_key,
                 auth_provider.map(Arc::new),

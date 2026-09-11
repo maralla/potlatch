@@ -390,18 +390,21 @@ pub enum ApiFlavor {
     OpenAi,
     /// Anthropic Messages API `/v1/messages`.
     Anthropic,
+    /// OpenAI Responses API `/v1/responses` (stateless mode).
+    OpenAiResponses,
 }
 
 impl ApiFlavor {
-    /// Parse a configured `api` value. Accepts the two known protocols
+    /// Parse a configured `api` value. Accepts the known protocols
     /// case-insensitively; anything else is a config error — a typo must not
     /// silently route Anthropic traffic to an OpenAI parser.
     pub fn parse_configured(raw: &str) -> Result<Self> {
         match raw.trim().to_lowercase().as_str() {
             "openai" => Ok(Self::OpenAi),
             "anthropic" => Ok(Self::Anthropic),
+            "responses" | "openai-responses" => Ok(Self::OpenAiResponses),
             other => Err(anyhow::anyhow!(
-                "invalid api `{other}` (use \"anthropic\" or \"openai\")"
+                "invalid api `{other}` (use \"openai\", \"anthropic\" or \"responses\")"
             )),
         }
     }
@@ -411,6 +414,7 @@ impl ApiFlavor {
         match self {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
+            Self::OpenAiResponses => "responses",
         }
     }
 

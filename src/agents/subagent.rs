@@ -48,14 +48,21 @@ const REQUEST_TASK: &str = "requests";
 const INBOX_WAIT: Duration = Duration::from_millis(200);
 const SUBAGENT_OPERATION: &str = "subagent";
 const AGENT_NAME: &str = "subagent";
+
 /// Context channel publishing the configured subagent models to callers'
 /// sessions (rendered as a `## subagent models` system message).
 const MODELS_CONTEXT_CHANNEL: &str = "subagent models";
 
-/// Accumulated output kept per subagent session; text past the cap is
-/// dropped (the head is kept). A long-running subagent must not grow its
-/// buffer without limit for the hub's lifetime.
+/// Accumulated output kept per subagent session; past the cap the oldest
+/// bytes are dropped (the newest output is what a poll must surface).
 const MAX_OUTPUT: usize = 50_000;
+
+/// Accumulated output up to this size is inlined in a poll result. Larger
+/// output is not: the caller's tool-result cap would behead it anyway, so
+/// the poll directs the model to the transcript file — the durable full
+/// record — instead. The threshold keeps header + output under the
+/// caller's tool-result window.
+const POLL_INLINE_MAX_BYTES: usize = 3_000;
 
 /// How long a control-plane request (session/new, session/close, ...) may
 /// take before the tool call fails. Bus callers enforce 45s themselves.
@@ -219,7 +226,9 @@ fn subagent_tool_definition(
             "Spawn a subagent — a separate {d} harness session with its own LLM context, \
              run by the platform's subagent agent. The subagent runs asynchronously in the \
              background. Returns a subagent_id immediately; poll with subagent_id to get \
-             accumulated output. Use for parallel exploration, independent research tasks, or \
+             accumulated output (short output is returned in place; large output is not \
+             inlined — read the reported transcript file instead). Use for parallel \
+             exploration, independent research tasks, or \
              dividing complex work. The subagent has no context from the parent session — \
              provide everything it needs in the prompt. The `model` argument is required when \
              spawning and must be one of the configured subagent models: {models}. Send \
@@ -576,7 +585,13 @@ impl SubagentHub {
     /// harness session (bus request metadata) — recorded at spawn so the
     /// caller's subagents can be closed together when its task retires.
     fn dispatch(&self, payload: &Value, owner: Option<&str>) -> Result<String> {
-        let subagent_id = payload["subagent_id"].as_str();
+        // An empty `subagent_id` counts as absent: models sometimes fill
+        // every schema property with defaults, and an empty id would route
+        // a fresh spawn request to a poll of a nonexistent subagent.
+        let subagent_id = payload["subagent_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
         let kill = payload["kill"].as_bool().unwrap_or(false);
         let message = payload["message"].as_str().filter(|s| !s.is_empty());
         let inject = payload["inject"].as_str().filter(|s| !s.is_empty());
@@ -770,8 +785,45 @@ impl SubagentHub {
             result.push_str(&format!("\nerror: {err}"));
         }
         if !output.is_empty() {
-            result.push_str("\noutput:\n");
-            result.push_str(&output);
+            if output.len() <= POLL_INLINE_MAX_BYTES {
+                result.push_str("\noutput:\n");
+                result.push_str(&output);
+            } else if let Some(transcript) = &transcript {
+                // Large output stays out of band: the transcript file holds
+                // the full durable record, and the model reads it with its
+                // own tools (paged, only the parts it needs). The transcript
+                // can be long, so also report where the final result lies.
+                let location = std::fs::read_to_string(transcript)
+                    .ok()
+                    .and_then(|ref text| final_response_location(text))
+                    .map(|(line, turn)| match turn {
+                        0 => format!("the final response starts at line {line}"),
+                        n => format!("the final response is turn {n}, starting at line {line}"),
+                    })
+                    .unwrap_or_else(|| {
+                        "the final response is the last '## Assistant' section".to_string()
+                    });
+                result.push_str(&format!(
+                    "\noutput: {} bytes accumulated — too large to inline here; \
+                     read the transcript file for the full content: {}\n{}",
+                    output.len(),
+                    transcript.display(),
+                    location
+                ));
+            } else {
+                // No transcript (non-harness vendor): fall back to the tail,
+                // the newest output is what a poll is for.
+                let mut start = output.len() - POLL_INLINE_MAX_BYTES;
+                while start > 0 && !output.is_char_boundary(start) {
+                    start -= 1;
+                }
+                result.push_str(&format!(
+                    "\noutput (newest {} of {} bytes):\n{}",
+                    output.len() - start,
+                    output.len(),
+                    &output[start..]
+                ));
+            }
         }
 
         if result.len() > MAX_OUTPUT {
@@ -909,12 +961,20 @@ fn transcript_path(base_dir: &str, num: u64) -> PathBuf {
 }
 
 /// Append `text` to the buffer, keeping at most [`MAX_OUTPUT`] bytes (the
-/// head) and discarding the rest, on a char boundary.
+/// tail — the newest output is what a poll must surface) and discarding the
+/// oldest, on char boundaries.
 fn append_capped(buf: &mut String, text: &str) {
-    let room = MAX_OUTPUT.saturating_sub(buf.len());
-    if room > 0 {
-        buf.push_str(truncate_at_char_boundary(text, room.min(text.len())));
+    buf.push_str(text);
+    if buf.len() <= MAX_OUTPUT {
+        return;
     }
+    const DROPPED_MARKER: &str = "[...earlier output dropped...]\n";
+    let keep = MAX_OUTPUT - DROPPED_MARKER.len();
+    let mut start = buf.len() - keep;
+    while start > 0 && !buf.is_char_boundary(start) {
+        start -= 1;
+    }
+    *buf = format!("{DROPPED_MARKER}{}", &buf[start..]);
 }
 
 fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
@@ -926,6 +986,28 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Locate the final response in a subagent transcript: the last
+/// `## Assistant` section (the harness writes one only for turns that
+/// produced text, so the last one always carries content) plus the
+/// `=== Turn N ===` marker enclosing it. Returns the 1-based line number of
+/// the `## Assistant` header and the turn number (0 when the section sits
+/// before any marker). Poll results point here so the model can read just
+/// the final section of a long transcript instead of scanning it all.
+fn final_response_location(transcript: &str) -> Option<(usize, u32)> {
+    let mut last: Option<(usize, u32)> = None;
+    let mut current_turn: Option<u32> = None;
+    for (idx, line) in transcript.lines().enumerate() {
+        if let Some(rest) = line.strip_prefix("=== Turn ") {
+            if let Ok(n) = rest.trim_end_matches(" ===").trim().parse::<u32>() {
+                current_turn = Some(n);
+            }
+        } else if line.trim() == "## Assistant" {
+            last = Some((idx + 1, current_turn.unwrap_or(0)));
+        }
+    }
+    last
 }
 
 /// Extract text from a `session/update` notification's
@@ -1249,9 +1331,13 @@ mod tests {
     }
 
     fn test_hub() -> (SubagentHub, HashMap<String, Arc<FakeTransport>>, PathBuf) {
+        // Unique per call: tests run in parallel in one process, and the
+        // hub's spawn writes (truncates) the transcript path under this dir.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let base_dir = std::env::temp_dir().join(format!(
-            "potlatch-subagent-agent-test-{}",
-            std::process::id()
+            "potlatch-subagent-agent-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         let mut fakes: HashMap<String, Arc<FakeTransport>> = HashMap::new();
         let potlatch = Arc::new(FakeTransport {
@@ -1391,6 +1477,80 @@ mod tests {
             .join("subagent-1.log");
         assert!(report.contains(&expected.display().to_string()), "{report}");
         assert!(expected.is_file());
+    }
+
+    #[test]
+    fn poll_inlines_short_output_and_points_at_the_transcript_for_large() {
+        let (hub, _fakes, _dir) = test_hub();
+        let id = spawn_one(&hub, "task");
+
+        // Short output: inlined in place. The first fake session is
+        // harness-session-1 (spawn_one is the hub's first spawn).
+        hub.shared.append_output(
+            "potlatch",
+            "harness-session-1",
+            "short finding: the sink is nil-safe",
+        );
+        let report = hub.dispatch(&json!({ "subagent_id": &id }), None).unwrap();
+        assert!(
+            report.contains("short finding: the sink is nil-safe"),
+            "{report}"
+        );
+
+        // Large output: not inlined; the model is directed to the transcript,
+        // and told where in it the final response lies.
+        let transcript_path = {
+            let sessions = hub.shared.sessions.lock().unwrap();
+            sessions[&id]
+                .transcript_path
+                .clone()
+                .expect("transcript path")
+        };
+        let transcript_text = "\n=== Turn 1 ===\n\n## Assistant\n\nfirst response\n\n## Thinking\n\nearly thoughts\n\n=== Turn 2 ===\n\n## Tool Calls\n\n- **shell**: `ls`\n\n=== Turn 3 ===\n\n## Assistant\n\nfinal report: the sink is sound\n";
+        std::fs::write(&transcript_path, transcript_text).unwrap();
+        hub.shared
+            .append_output("potlatch", "harness-session-1", &"x".repeat(20_000));
+        let report = hub.dispatch(&json!({ "subagent_id": &id }), None).unwrap();
+        assert!(
+            !report.contains("xxxxx"),
+            "large output must not be inlined: {}",
+            &report[..report.len().min(400)]
+        );
+        assert!(
+            report.contains("too large to inline") && report.contains("transcript file"),
+            "{report}"
+        );
+        let expected_line = transcript_text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == "## Assistant")
+            .last()
+            .map(|(i, _)| i + 1)
+            .unwrap();
+        assert!(
+            report.contains(&format!(
+                "the final response is turn 3, starting at line {expected_line}"
+            )),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn final_response_location_finds_the_last_assistant_section() {
+        let transcript = "\n=== Turn 1 ===\n\n## Assistant\n\nfirst\n\n=== Turn 2 ===\n\n## Tool Calls\n\n- **shell**: `ls`\n\n=== Turn 3 ===\n\n## Assistant\n\nfinal\n";
+        let (line, turn) = final_response_location(transcript).unwrap();
+        assert_eq!(turn, 3);
+        // 1-based line of the last '## Assistant' header.
+        assert_eq!(
+            transcript.lines().nth(line - 1).unwrap().trim(),
+            "## Assistant"
+        );
+
+        // No assistant section at all: None.
+        assert_eq!(
+            final_response_location("\n=== Turn 1 ===\n\n## Tool Calls\n"),
+            None
+        );
     }
 
     #[test]
@@ -1677,6 +1837,44 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_treats_an_empty_subagent_id_as_absent() {
+        // Models sometimes fill every schema property with defaults: an
+        // empty `subagent_id` alongside a `prompt` must count as absent and
+        // spawn — not route to a poll of a nonexistent subagent (observed
+        // as `unknown subagent id: ` spins on the Responses endpoint).
+        let (hub, _fakes, _dir) = test_hub();
+        let report = hub
+            .dispatch(
+                &json!({
+                    "prompt": "explore the repo",
+                    "model": "acp://potlatch/model1?effort=high",
+                    "subagent_id": "",
+                    "message": "",
+                    "kill": false
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(
+            report.starts_with("Subagent started: "),
+            "an empty subagent_id must fall through to spawn: {report}"
+        );
+
+        // A whitespace-only id counts as empty too.
+        let report = hub
+            .dispatch(
+                &json!({
+                    "prompt": "explore again",
+                    "model": "acp://potlatch/model1?effort=high",
+                    "subagent_id": "   "
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(report.starts_with("Subagent started: "), "{report}");
+    }
+
+    #[test]
     fn spawn_requires_a_configured_model() {
         // The `model` argument is mandatory on spawn and must be one of the
         // configured models; the error always names the menu.
@@ -1840,22 +2038,27 @@ mod tests {
     }
 
     #[test]
-    fn append_capped_stores_at_most_max_output_bytes() {
+    fn append_capped_keeps_the_newest_output() {
         let mut buf = String::new();
         append_capped(&mut buf, &"x".repeat(MAX_OUTPUT * 3));
         assert_eq!(buf.len(), MAX_OUTPUT);
+        // The tail survives: the newest append is at the end, the head is
+        // dropped with a marker.
         append_capped(&mut buf, "more");
         assert_eq!(buf.len(), MAX_OUTPUT);
+        assert!(buf.ends_with("more"));
+        assert!(buf.starts_with("[...earlier output dropped...]"));
     }
 
     #[test]
     fn append_capped_truncates_on_a_char_boundary() {
-        // The cap lands mid-codepoint: the 2-byte "é" is dropped whole rather
-        // than split, leaving the buffer one byte short of the cap.
+        // The cap lands mid-codepoint: the boundary search moves backward so
+        // the kept tail never splits a codepoint.
         let mut buf = "a".repeat(MAX_OUTPUT - 1);
         append_capped(&mut buf, "éé");
-        assert_eq!(buf.len(), MAX_OUTPUT - 1);
+        assert_eq!(buf.len(), MAX_OUTPUT);
         assert!(buf.is_char_boundary(buf.len()));
+        assert!(buf.ends_with("éé"));
     }
 
     #[test]

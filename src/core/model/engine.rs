@@ -31,6 +31,7 @@ fn structured_output_contract_json(tool: &StructuredOutputTool) -> Value {
         "name": tool.name,
         "description": tool.description,
         "parameters": schema_wire_json(&tool.parameters),
+        "terminal": tool.terminal,
     })
 }
 
@@ -439,6 +440,7 @@ acp_command = ["agent", "acp"]"#
                     )
                     .property("note", Schema::string("A note.")),
             ),
+            terminal: false,
         };
 
         let wire = structured_output_contracts_json(std::slice::from_ref(&tool));
@@ -448,6 +450,7 @@ acp_command = ["agent", "acp"]"#
             json!({
                 "name": "qa_report",
                 "description": "Emit findings",
+                "terminal": false,
                 "parameters": {
                     "type": "object",
                     "description": "QA report.",
@@ -488,6 +491,7 @@ acp_command = ["agent", "acp"]"#
                     ),
                 ),
             ),
+            terminal: false,
         };
 
         let wire = structured_output_contract_json(&tool);
@@ -534,9 +538,11 @@ acp_command = ["agent", "acp"]"#
                             .required_property("feedback", Schema::string("What to fix.")),
                     ),
             ),
+            terminal: true,
         };
 
         let wire = structured_output_contract_json(&tool);
+        assert_eq!(wire["terminal"], json!(true));
         assert_eq!(
             wire["parameters"],
             json!({
@@ -573,6 +579,7 @@ acp_command = ["agent", "acp"]"#
                     .describe("Shape.")
                     .property("x", Schema::boolean("x flag")),
             ),
+            terminal: false,
         };
         let wire = structured_output_contract_json(&tool);
         assert!(wire["parameters"].get("required").is_none());

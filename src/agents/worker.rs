@@ -64,7 +64,6 @@ const HANDOFF_TOOL: &str = "handoff";
 /// optional because the worker's fallbacks (issue title, placeholder
 /// description) are better defaults than forcing the model to invent text.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ImplementedMetadata {
     #[serde(default)]
     mr_title: Option<String>,
@@ -78,7 +77,6 @@ struct ImplementedMetadata {
 /// The discriminator says which kind of blockage it is; `reason` carries the
 /// explanation, and `public_comment` overrides the text posted to GitLab.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BlockedOutcome {
     reason: String,
     #[serde(default)]
@@ -88,7 +86,6 @@ struct BlockedOutcome {
 /// Everything a feedback run can report once it has addressed (or decided not
 /// to change anything for) the reviewer's comments.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct FeedbackResolution {
     #[serde(default)]
     mr_title: Option<String>,
@@ -195,13 +192,11 @@ impl<'de> Deserialize<'de> for WorkerFeedbackOutput {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ExistingMrWire {
     existing_mr_iid: u64,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WaitDependencyWire {
     depends_on_issue: u64,
 }
@@ -293,6 +288,7 @@ structured_output! {
                 ),
             }
         );
+        terminal;
     /// Tolerated: an outcome spelled with different case or padding, and an
     /// IID sent as `"#7"` / `"!12"` instead of a number.
         normalize(value) {
@@ -350,6 +346,7 @@ structured_output! {
                 ),
             }
         );
+        terminal;
     /// Tolerated: an outcome spelled with different case or padding, and the
     /// comment-control booleans sent as `"true"`/`"false"` strings.
         normalize(value) {
@@ -5036,16 +5033,18 @@ mod tests {
     }
 
     #[test]
-    fn implementation_output_rejects_contradictory_branch_fields() {
-        let error = conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+    fn implementation_output_drops_fields_from_other_branches() {
+        // Habit fields and cross-branch fields are tolerated and dropped:
+        // rejecting them re-opens a repair loop the model cannot win.
+        let output = conformance::assert_accepts::<WorkerImplementationOutput>(serde_json::json!({
             "outcome": "implemented",
             "mr_title": "Add feature",
             "depends_on_issue": 7
         }));
-        assert!(
-            error.starts_with("$.depends_on_issue: unexpected property"),
-            "{error}"
-        );
+        let WorkerImplementationOutput::Implemented(metadata) = output else {
+            panic!("expected the implemented branch, got {output:?}");
+        };
+        assert_eq!(metadata.mr_title.as_deref(), Some("Add feature"));
     }
 
     #[test]
@@ -5757,15 +5756,15 @@ mod tests {
                 existing_mr_iid: 42
             }
         );
-        let error = conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+        let output = conformance::assert_accepts::<WorkerImplementationOutput>(serde_json::json!({
             "outcome": "implemented",
             "mr_title": "Fix bug",
             "existing_mr_iid": 42
         }));
-        assert!(
-            error.starts_with("$.existing_mr_iid: unexpected property"),
-            "{error}"
-        );
+        let WorkerImplementationOutput::Implemented(metadata) = output else {
+            panic!("expected the implemented branch, got {output:?}");
+        };
+        assert_eq!(metadata.mr_title.as_deref(), Some("Fix bug"));
     }
 
     // -----------------------------------------------------------------

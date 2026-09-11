@@ -32,8 +32,8 @@ use anyhow::{Context as _, Error, Result, anyhow, bail};
 use serde_json::error::Category;
 use serde_json::{Value, from_str, json};
 
-use super::auth_provider::AuthProvider;
-use super::client::{
+use crate::harness::auth_provider::AuthProvider;
+use crate::harness::client::{
     ChatClient, ChatResponse, EarlyToolExecCallback, ModelSpec, StreamCallback, ToolExecCallback,
     Usage, is_transient_llm_error,
 };

@@ -16,11 +16,20 @@ use super::client::{ChatClient, ChatResponse, StreamCallback};
 use super::context::{Context, ContextEntry, ContextKind, Role};
 use super::prompt;
 use super::tools::ToolRegistry;
+use super::tools::structured_output::COMPLETION_NOTICE;
 
 /// Maximum character length for a tool result stored in context. Larger results
 /// are truncated with a marker, keeping the first portion (most relevant for
 /// file reads and search results) and a note about the truncation.
 const MAX_TOOL_RESULT_CHARS: usize = 4_000;
+
+/// Per-entry and total caps for context content replayed into compaction /
+/// collapse prompts. Uncapped, the compaction request approaches the very
+/// context size that triggered compaction — observed to stall a gateway
+/// that hangs on large payloads, burning the whole retry budget. The caps
+/// keep the compaction call itself small and fast.
+const COMPACT_ENTRY_MAX_CHARS: usize = 6_000;
+const COMPACT_TOTAL_MAX_CHARS: usize = 48_000;
 
 /// A signal to break the agent loop.
 enum LoopControl {
@@ -260,20 +269,7 @@ impl AgentLoop {
                     return Vec::new();
                 }
 
-                // Build a single prompt: summarize each output.
-                let mut prompt = String::from(
-                    "Summarize each of the following tool outputs concisely. \
-                     For each one, keep all errors, warnings, file paths, line numbers, \
-                     function/class names, and key results. Remove redundant lines, \
-                     repetition, and verbose output. Preserve the essential information \
-                     the agent would need to continue working.\n\n\
-                     Respond with one summary per output, separated by a line containing \
-                     exactly '---SUMMARY---'. Do not include the original output.\n",
-                );
-                for (i, (label, content)) in entries.iter().enumerate() {
-                    prompt.push_str(&format!("\n=== OUTPUT {i} ({label}) ===\n{content}\n"));
-                }
-
+                let prompt = build_compaction_prompt(entries);
                 let messages = vec![json!({
                     "role": "user",
                     "content": prompt
@@ -310,18 +306,7 @@ impl AgentLoop {
             // into a single summary. This breaks the tool-call chain and starts
             // fresh: system prompt + summary + original user prompt.
             let summarizer: &super::context::Summarizer<'_> = &|entries: &[ContextEntry]| {
-                // Build a text representation of the conversation for the LLM.
-                let mut transcript = String::new();
-                for entry in entries {
-                    let role_label = match entry.role {
-                        Role::System => "SYSTEM",
-                        Role::User => "USER",
-                        Role::Assistant => "ASSISTANT",
-                        Role::Tool => "TOOL",
-                    };
-                    transcript.push_str(&format!("[{role_label}]\n{}\n\n", entry.content));
-                }
-
+                let transcript = build_collapse_transcript(entries);
                 let prompt = format!(
                     "Summarize the following agent conversation so the agent can continue working \
                      without re-reading files or re-running commands. Your summary MUST include \
@@ -553,13 +538,6 @@ impl AgentLoop {
                 info!(target: "harness", "harness: reasoning preview: {preview}");
             }
 
-            // Also emit the full response text (for non-streaming fallback or completeness)
-            if let Some(cb) = on_chunk
-                && !response.content.is_empty()
-            {
-                cb(&response.content);
-            }
-
             // Invoke the turn callback (for transcript logging) with the full
             // ChatResponse — content, reasoning, tool calls, etc.
             if let Some(cb) = on_turn {
@@ -663,11 +641,23 @@ impl AgentLoop {
         };
 
         for (name, tc_id, result) in tool_results {
-            // Skip storing todo/plan tool results in context — the todo
-            // list is already injected as a system message every turn and
-            // the plan output lives in the side-channel cell. Storing these
-            // tool responses would be pure duplication.
+            // The todo state is re-injected as a system message every turn
+            // and the plan output lives in the side-channel cell — storing
+            // the full result would duplicate them. But the tool CALL is
+            // already in the history (push_assistant_with_tools), and every
+            // protocol requires the call to be answered: store a compact
+            // confirmation, not the full output.
             if name == "todo" || name == "plan" {
+                let confirmation = if name == "todo" {
+                    "Todo list updated.".to_string()
+                } else {
+                    // Plan is a terminal contract: the confirmation carries
+                    // the completion notice so the model stops instead of
+                    // re-emitting the plan.
+                    format!("Plan recorded.{COMPLETION_NOTICE}")
+                };
+                let kind = classify_tool_result(&name, &confirmation);
+                self.context.push_tool_result(kind, confirmation, &tc_id);
                 continue;
             }
             // Compress empty search results to a short note — the full
@@ -880,6 +870,65 @@ fn preview_lines(result: &str, max_lines: usize) -> String {
     out
 }
 
+/// Cap embedded content for compaction/collapse prompts: per-entry and
+/// total budgets, on char boundaries, with explicit markers so the LLM knows
+/// content was elided.
+fn cap_embedded(content: &str, used: &mut usize) -> String {
+    let room = COMPACT_TOTAL_MAX_CHARS.saturating_sub(*used);
+    if room == 0 {
+        return "[omitted: summary request budget exhausted]".to_string();
+    }
+    let count = content.chars().count();
+    if count <= COMPACT_ENTRY_MAX_CHARS.min(room) {
+        *used += content.len();
+        return content.to_string();
+    }
+    let take = COMPACT_ENTRY_MAX_CHARS.min(room);
+    let head: String = content.chars().take(take).collect();
+    *used += head.len();
+    format!("{head}\n[...entry truncated for the summary request...]")
+}
+
+/// Build the compaction prompt: one summary per tool output, separated by
+/// `---SUMMARY---`. Entry content is capped so the compaction request stays
+/// small even when the context is huge — the request must complete for the
+/// compaction to produce LLM summaries at all.
+fn build_compaction_prompt(entries: &[(String, String)]) -> String {
+    let mut prompt = String::from(
+        "Summarize each of the following tool outputs concisely. \
+         For each one, keep all errors, warnings, file paths, line numbers, \
+         function/class names, and key results. Remove redundant lines, \
+         repetition, and verbose output. Preserve the essential information \
+         the agent would need to continue working.\n\n\
+         Respond with one summary per output, separated by a line containing \
+         exactly '---SUMMARY---'. Do not include the original output.\n",
+    );
+    let mut used = 0usize;
+    for (i, (label, content)) in entries.iter().enumerate() {
+        let capped = cap_embedded(content, &mut used);
+        prompt.push_str(&format!("\n=== OUTPUT {i} ({label}) ===\n{capped}\n"));
+    }
+    prompt
+}
+
+/// Build the conversation transcript embedded in the collapse (full-summary)
+/// prompt, with the same content caps as [`build_compaction_prompt`].
+fn build_collapse_transcript(entries: &[ContextEntry]) -> String {
+    let mut transcript = String::new();
+    let mut used = 0usize;
+    for entry in entries {
+        let role_label = match entry.role {
+            Role::System => "SYSTEM",
+            Role::User => "USER",
+            Role::Assistant => "ASSISTANT",
+            Role::Tool => "TOOL",
+        };
+        let capped = cap_embedded(&entry.content, &mut used);
+        transcript.push_str(&format!("[{role_label}]\n{capped}\n\n"));
+    }
+    transcript
+}
+
 /// Truncate a tool result to `MAX_TOOL_RESULT_CHARS`, preserving the beginning
 /// (which typically contains the most useful output) and appending a marker.
 fn truncate_tool_result(result: &str) -> String {
@@ -985,6 +1034,45 @@ mod tests {
 
         let result = agent.run("run echo hi", "/tmp", None).unwrap();
         assert!(result.contains("Done"));
+    }
+
+    #[test]
+    fn compaction_prompt_is_bounded_regardless_of_entry_sizes() {
+        // One entry huge enough to stall a payload-sensitive gateway on its
+        // own, plus enough small entries to breach the total budget.
+        let mut entries: Vec<(String, String)> = vec![("tool read".into(), "x".repeat(200_000))];
+        for i in 0..40 {
+            entries.push((format!("tool grep {i}"), "y".repeat(20_000)));
+        }
+        let prompt = build_compaction_prompt(&entries);
+        // The embedded content stays within the total budget (plus small
+        // per-entry markers and instruction text).
+        let embedded: usize = prompt
+            .split("=== OUTPUT")
+            .skip(1)
+            .map(|section| section.len())
+            .sum();
+        assert!(embedded <= COMPACT_TOTAL_MAX_CHARS + 40 * 100);
+        // Entries past the budget are marked omitted, not silently dropped:
+        // the prompt still carries one OUTPUT section per entry.
+        assert_eq!(prompt.matches("=== OUTPUT").count(), entries.len());
+        assert!(prompt.contains("[omitted: summary request budget exhausted]"));
+    }
+
+    #[test]
+    fn collapse_transcript_is_bounded_regardless_of_entry_sizes() {
+        let entries: Vec<ContextEntry> = (0..30)
+            .map(|_| ContextEntry {
+                role: Role::Tool,
+                kind: ContextKind::ToolResult,
+                content: "z".repeat(50_000),
+                tokens: 12_500,
+                tool_call_id: None,
+            })
+            .collect();
+        let transcript = build_collapse_transcript(&entries);
+        assert!(transcript.len() < COMPACT_TOTAL_MAX_CHARS + 30 * 100);
+        assert!(transcript.contains("[...entry truncated for the summary request...]"));
     }
 
     #[test]
