@@ -3,11 +3,11 @@ mod agent;
 pub(crate) mod duration;
 pub mod uri;
 
-use acp::apply_api_flavor;
 pub use acp::{
     AcpClientProfile, AcpSpawnConfig, POTLATCH_ACP_PROFILE, build_acp_spawn_command,
     build_profile_command, parse_acp_profiles, resolve_profile_env,
 };
+use acp::{apply_api_flavor, apply_context_tokens};
 pub use agent::{AgentSection, parse_agent_sections};
 
 use crate::core::config::uri::ModelUri;
@@ -178,6 +178,7 @@ impl Config {
                 .and_then(|e| e.api.as_deref())
                 .or_else(|| profile.fields.get("api").map(String::as_str)),
         );
+        apply_context_tokens(&mut env, endpoint.and_then(|e| e.context_tokens));
 
         Ok(AcpSpawnConfig {
             command: build_profile_command(profile),
@@ -267,6 +268,7 @@ impl Config {
                 .and_then(|e| e.api.as_deref())
                 .or_else(|| profile.fields.get("api").map(String::as_str)),
         );
+        apply_context_tokens(&mut env, endpoint.and_then(|e| e.context_tokens));
         Ok(AcpSpawnConfig {
             command,
             model_uri: None,

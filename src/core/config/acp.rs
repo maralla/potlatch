@@ -48,6 +48,15 @@ pub struct EndpointEntry {
     /// `/v1/messages`, x-api-key auth) or `"openai"` (chat completions — the
     /// default when absent). Forwarded to the harness as `POTLATCH_API`.
     pub api: Option<String>,
+    /// The endpoint's maximum context size in tokens. Injected to the
+    /// harness as `POTLATCH_CONTEXT_TOKENS`; the harness compacts a
+    /// session's context before it reaches this size (the default applies
+    /// when absent). Set it when a gateway misbehaves on large payloads —
+    /// observed stalls on requests near the model's nominal capacity —
+    /// so compaction keeps requests comfortably below it. One ACP child
+    /// serves exactly one endpoint, so the value holds for all of the
+    /// vendor's sessions.
+    pub context_tokens: Option<usize>,
     pub fields: HashMap<String, String>,
     /// `auth_provider` command argv. When set, the harness runs this command
     /// before talking to the endpoint and applies the returned headers
@@ -170,6 +179,21 @@ pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfi
                     }
                     None => None,
                 };
+                // `context_tokens` is parsed eagerly: a malformed value must
+                // fail at config load, not on the first session.
+                let context_tokens = match fields.remove("context_tokens") {
+                    Some(raw) => {
+                        let tokens =
+                            parse_token_count(&raw).with_context(|| {
+                                format!("endpoints entry `{model}` has an invalid `context_tokens` value {raw:?}")
+                            })?;
+                        if tokens == 0 {
+                            bail!("endpoints entry `{model}` has a zero `context_tokens`");
+                        }
+                        Some(tokens)
+                    }
+                    None => None,
+                };
                 // `api` stays accessible as an {api} reference.
                 if let Some(api) = &api {
                     fields.insert("api".into(), api.clone());
@@ -178,6 +202,7 @@ pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfi
                     model,
                     alias,
                     api,
+                    context_tokens,
                     fields,
                     auth_command,
                 });
@@ -429,6 +454,26 @@ impl ApiFlavor {
     }
 }
 
+/// Parse a token count in plain or human-friendly form: `"120000"`,
+/// `"120K"`, `"120k"`, `"1M"`. The suffix is case-insensitive and may carry
+/// surrounding whitespace; anything else is a config error (rejected at
+/// load, not on the first session).
+fn parse_token_count(raw: &str) -> Result<usize> {
+    let trimmed = raw.trim();
+    let (digits, multiplier) = match trimmed.as_bytes().last() {
+        Some(b'k') | Some(b'K') => (&trimmed[..trimmed.len() - 1], 1_000),
+        Some(b'm') | Some(b'M') => (&trimmed[..trimmed.len() - 1], 1_000_000),
+        _ => (trimmed, 1),
+    };
+    let value: usize = digits
+        .trim()
+        .parse()
+        .with_context(|| "invalid token count — expected e.g. \"120000\", \"120K\", or \"1M\"")?;
+    value
+        .checked_mul(multiplier)
+        .with_context(|| format!("token count {raw:?} overflows"))
+}
+
 /// Inject the endpoint's API flavor into the resolved env as
 /// `POTLATCH_API` (read by the harness to pick its wire protocol). The
 /// entry-level `api` field wins over a profile-level one; an env line the
@@ -440,6 +485,18 @@ pub(crate) fn apply_api_flavor(env: &mut HashMap<String, String>, api: Option<&s
     let flavor = api.unwrap_or("openai");
     env.entry("POTLATCH_API".to_string())
         .or_insert_with(|| flavor.to_string());
+}
+
+/// Inject the endpoint's context size as `POTLATCH_CONTEXT_TOKENS` (read by
+/// the harness as the session context budget). Only a configured endpoint
+/// injects it: absent means the harness default applies.
+pub(crate) fn apply_context_tokens(
+    env: &mut HashMap<String, String>,
+    context_tokens: Option<usize>,
+) {
+    if let Some(tokens) = context_tokens {
+        env.insert("POTLATCH_CONTEXT_TOKENS".to_string(), tokens.to_string());
+    }
 }
 
 pub fn build_profile_command(profile: &AcpClientProfile) -> Vec<String> {
@@ -622,6 +679,7 @@ mod tests {
             alias: None,
             auth_command: None,
             api: None,
+            context_tokens: None,
         }
     }
 
@@ -858,7 +916,7 @@ mod tests {
             [acp.potlatch]
             acp_command = ["potlatch", "harness"]
             endpoints = [
-              { model = "model2", endpoint = "http://endpoint2.example", key = "EMPTY" },
+              { model = "model2", endpoint = "http://endpoint2.example", key = "EMPTY", context_tokens = "120000" },
               { model = "deepseek-v4-flash", endpoint = "http://deepseek-flash.example" },
             ]
             env = [
@@ -872,6 +930,9 @@ mod tests {
         let p = profiles.get("potlatch").unwrap();
         assert_eq!(p.endpoints.len(), 2);
         assert_eq!(p.endpoints[0].model, "model2");
+        assert_eq!(p.endpoints[0].context_tokens, Some(120_000));
+        // No `context_tokens` when omitted — the harness default applies.
+        assert_eq!(p.endpoints[1].context_tokens, None);
         assert_eq!(
             p.endpoints[0].fields.get("endpoint").map(String::as_str),
             Some("http://endpoint2.example")
@@ -900,6 +961,68 @@ mod tests {
             "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn resolve_client_spawn_forwards_the_endpoint_context_tokens() {
+        let config = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", endpoint = "http://endpoint1.example", key = "EMPTY", context_tokens = "120000" },
+            ]
+            env = [
+              "POTLATCH_BASE_URL={endpoint}",
+              "POTLATCH_API_KEY={key}",
+            ]
+            "#,
+        )
+        .unwrap();
+        let spawn = config
+            .resolve_client_spawn("potlatch", &["acp://potlatch/model1".to_string()])
+            .unwrap();
+        assert_eq!(
+            spawn.env.get("POTLATCH_CONTEXT_TOKENS").map(String::as_str),
+            Some("120000")
+        );
+
+        // Without the field, nothing is injected: the harness default holds.
+        let spawn = harness_config()
+            .resolve_client_spawn("potlatch", &["acp://potlatch/model1".to_string()])
+            .unwrap();
+        assert!(!spawn.env.contains_key("POTLATCH_CONTEXT_TOKENS"));
+    }
+
+    #[test]
+    fn config_accepts_human_friendly_context_tokens() {
+        use super::parse_token_count;
+        assert_eq!(parse_token_count("120000").unwrap(), 120_000);
+        assert_eq!(parse_token_count("120K").unwrap(), 120_000);
+        assert_eq!(parse_token_count("120k").unwrap(), 120_000);
+        assert_eq!(parse_token_count(" 128K ").unwrap(), 128_000);
+        assert_eq!(parse_token_count("1M").unwrap(), 1_000_000);
+        assert_eq!(parse_token_count("1m").unwrap(), 1_000_000);
+        // Garbage fails with guidance, and zero stays rejected upstream.
+        assert!(parse_token_count("big").is_err());
+        assert!(parse_token_count("K").is_err());
+        assert!(parse_token_count("1.5M").is_err());
+        assert_eq!(parse_token_count("0K").unwrap(), 0);
+    }
+
+    #[test]
+    fn config_rejects_invalid_context_tokens() {
+        let error = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", endpoint = "http://endpoint1.example", context_tokens = "big" },
+            ]
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("context_tokens"), "{error}");
     }
 
     #[test]
@@ -1449,6 +1572,7 @@ mod tests {
             alias: None,
             auth_command: None,
             api: None,
+            context_tokens: None,
         };
         let p = profile(
             vec!["URL={ep}", "TOKEN={secret}", "MODEL={model}"],
@@ -1472,6 +1596,7 @@ mod tests {
             alias: None,
             auth_command: None,
             api: None,
+            context_tokens: None,
         };
         let p = profile(vec!["X={nonexistent}"], vec![], vec![entry]);
         let err = resolve_profile_env(&p, Some("test")).unwrap_err();
@@ -1489,6 +1614,7 @@ mod tests {
             alias: None,
             auth_command: None,
             api: None,
+            context_tokens: None,
         };
         let p = profile(vec!["URL={endpoint}?token={key}"], vec![], vec![entry]);
         let env = resolve_profile_env(&p, Some("test")).unwrap();
@@ -1534,6 +1660,7 @@ mod tests {
             alias: None,
             auth_command: None,
             api: None,
+            context_tokens: None,
         };
         let p = profile(vec!["KEY={key}"], vec![], vec![entry]);
         let err = resolve_profile_env(&p, Some("test")).unwrap_err();

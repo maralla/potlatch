@@ -46,10 +46,18 @@ repo_url = "https://gitlab.com/group/project"
 #    `effort` query param maps to extended thinking (keywords
 #    low/medium/high/max or a numeric literal set the budget); on
 #    Responses endpoints it maps to the reasoning effort parameter.
+#
+#    `context_tokens` (optional) sets the session context budget for the
+#    endpoint — forwarded to the harness as POTLATCH_CONTEXT_TOKENS.
+#    Accepts plain or human-friendly counts: "120000", "120K", "1M".
+#    Compaction triggers at 60% of the budget, so a smaller value keeps
+#    requests well below a gateway's real capacity. Set it when a backend
+#    misbehaves on large payloads (observed: stalls on requests near the
+#    model's nominal size). Default: 200000.
 # [acp.potlatch]
 # acp_command = ["potlatch", "harness"]
 # endpoints = [
-#   { model = "model1", alias = "model-x", endpoint = "http://endpoint1.example", key = "EMPTY" },
+#   { model = "model1", alias = "model-x", endpoint = "http://endpoint1.example", key = "EMPTY", context_tokens = "120000" },
 #   { model = "model1", alias = "model-y", endpoint = "http://endpoint2.example", key = "EMPTY" },
 # ]
 # env = [

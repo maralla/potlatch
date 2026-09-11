@@ -37,6 +37,19 @@ use crate::core::model::acp::jsonrpc::Outbound;
 /// 60% and targets 30% of this value (see `Context::enforce_budget`).
 const CONTEXT_TOKEN_BUDGET: usize = 200_000;
 
+/// The session context budget: `POTLATCH_CONTEXT_TOKENS` injected by the
+/// endpoint config when set, else the built-in default. Read per session —
+/// cheap, and the child serves one endpoint so the value is constant.
+fn context_token_budget() -> usize {
+    parse_context_budget(std::env::var("POTLATCH_CONTEXT_TOKENS").ok().as_deref())
+}
+
+fn parse_context_budget(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(CONTEXT_TOKEN_BUDGET)
+}
+
 /// Channel handles for a session, shared between the main thread (which owns
 /// the `AcpServer` and runs agent loops) and the reader thread (which reads
 /// stdin continuously). The reader thread uses these to handle `session/inject`
@@ -427,7 +440,7 @@ impl AcpServer {
             Arc::clone(&self.llm),
             tools,
             session.model.clone(),
-            CONTEXT_TOKEN_BUDGET,
+            context_token_budget(),
             Arc::clone(&session.cancel),
             Arc::clone(&inject_queue),
         );
@@ -857,6 +870,16 @@ fn extract_prompt_text(prompt: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_budget_parses_the_endpoint_override() {
+        use super::parse_context_budget;
+        assert_eq!(parse_context_budget(Some("120000")), 120_000);
+        assert_eq!(parse_context_budget(Some(" 90000 ")), 90_000);
+        // Unset, unparsable, or zero: the built-in default.
+        assert_eq!(parse_context_budget(None), 200_000);
+        assert_eq!(parse_context_budget(Some("big")), 200_000);
+        assert_eq!(parse_context_budget(Some("0")), 200_000);
+    }
 
     use super::super::context::Context;
     use super::*;
