@@ -148,7 +148,7 @@ impl Config {
             .context("no model configured for this agent")?;
 
         let model_uri = model.as_configured().to_string();
-        let endpoint_model = model.endpoint_model_name().to_string();
+        let endpoint_model_name = model.endpoint_model_name().to_string();
         let bare_model = model.bare_model_name().to_string();
 
         let profile = self
@@ -156,14 +156,28 @@ impl Config {
             .get(&model.vendor)
             .with_context(|| format!("unknown acp client `{}`", model.vendor))?;
 
+        let endpoint = acp::select_endpoint(profile, &bare_model)?;
+        // An aliased request is rewritten to the entry's real model name for
+        // the backend; any query suffix (e.g. `?effort=high`) is preserved.
+        let endpoint_model = match endpoint {
+            Some(entry) => {
+                let wire_bare = entry.wire_model_name(&bare_model);
+                match endpoint_model_name.strip_prefix(&bare_model) {
+                    Some(query) => format!("{wire_bare}{query}"),
+                    None => wire_bare.to_string(),
+                }
+            }
+            None => endpoint_model_name,
+        };
+
         Ok(AcpSpawnConfig {
             command: build_profile_command(profile),
             model_uri: Some(model_uri),
             endpoint_model: Some(endpoint_model),
             env: resolve_profile_env(profile, Some(&bare_model))?,
-            auth_command: acp::select_endpoint(profile, &bare_model)?
-                .and_then(|e| e.auth_command.clone()),
+            auth_command: endpoint.and_then(|e| e.auth_command.clone()),
             config_dir: self.config_dir.clone(),
+            model_aliases: profile.model_aliases(),
         })
     }
 
@@ -197,20 +211,24 @@ impl Config {
         // One ACP child serves one endpoint (its base_url/auth are baked
         // into the child's env): every provided model of this vendor must
         // select the same one. Profiles without an `endpoints` table are
-        // single-endpoint by construction — nothing to select.
+        // single-endpoint by construction — nothing to select. Entries are
+        // compared by their addressable name (alias or bare model), which is
+        // unique per profile — two aliases of one model on different
+        // endpoints are different endpoints.
+        let addressable_name =
+            |e: &acp::EndpointEntry| e.alias.clone().unwrap_or_else(|| e.model.clone());
         let mut endpoint: Option<&acp::EndpointEntry> = None;
         for model in provided_models {
             let uri = ModelUri::parse(model).with_context(|| format!("invalid model '{model}'"))?;
             match acp::select_endpoint(profile, uri.bare_model_name())? {
                 None => {}
                 Some(entry) => match endpoint {
-                    Some(selected) if selected.model == entry.model => {}
+                    Some(selected) if addressable_name(selected) == addressable_name(entry) => {}
                     Some(selected) => anyhow::bail!(
                         "provided_models of vendor '{vendor}' must all belong to one ACP \
-                         endpoint (the shared child serves exactly one): '{selected}' and \
-                         '{entry}' differ",
-                        selected = selected.model,
-                        entry = entry.model
+                         endpoint (the shared child serves exactly one): '{}' and '{}' differ",
+                        addressable_name(selected),
+                        addressable_name(entry)
                     ),
                     None => endpoint = Some(entry),
                 },
@@ -230,7 +248,10 @@ impl Config {
             build_profile_command(profile)
         };
 
-        let env = resolve_profile_env(profile, endpoint.map(|e| e.model.as_str()))?;
+        let env = resolve_profile_env(
+            profile,
+            endpoint.map(|e| e.alias.as_deref().unwrap_or(&e.model)),
+        )?;
         Ok(AcpSpawnConfig {
             command,
             model_uri: None,
@@ -238,6 +259,7 @@ impl Config {
             env,
             auth_command: endpoint.and_then(|e| e.auth_command.clone()),
             config_dir: self.config_dir.clone(),
+            model_aliases: profile.model_aliases(),
         })
     }
 }

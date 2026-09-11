@@ -437,6 +437,10 @@ struct SubagentHub {
     provided_models: Vec<String>,
     /// Live-subagent cap configured by the operator. `None` = unlimited.
     max_live_subagents: Option<usize>,
+    /// Bare alias → real model name (from the vendor profile's endpoint
+    /// entries). A spawn addressed by an alias sends the real name to the
+    /// backend via `session/set_model`.
+    model_aliases: HashMap<String, String>,
     base_dir: String,
 }
 
@@ -464,6 +468,7 @@ impl SubagentHub {
         }
 
         let mut children = HashMap::new();
+        let mut model_aliases = HashMap::new();
         for (vendor, models) in &by_vendor {
             let acp = config.resolve_client_spawn(vendor, models)?;
             let demux = Arc::new(Demux::default());
@@ -484,6 +489,7 @@ impl SubagentHub {
                     .with_context(|| format!("harness ACP initialize failed for vendor {vendor}"));
             }
             children.insert(vendor.clone(), transport as Arc<dyn HarnessTransport>);
+            model_aliases.extend(acp.model_aliases);
         }
 
         Ok(Self {
@@ -491,6 +497,7 @@ impl SubagentHub {
             shared,
             provided_models: provided_models.to_vec(),
             max_live_subagents,
+            model_aliases,
             base_dir: base_dir.to_string(),
         })
     }
@@ -503,6 +510,24 @@ impl SubagentHub {
         max_live_subagents: Option<usize>,
         base_dir: &str,
     ) -> Self {
+        Self::with_children_and_aliases(
+            children,
+            provided_models,
+            max_live_subagents,
+            HashMap::new(),
+            base_dir,
+        )
+    }
+
+    /// Construct around existing transports (tests) with an alias map.
+    #[cfg(test)]
+    fn with_children_and_aliases(
+        children: HashMap<String, Arc<dyn HarnessTransport>>,
+        provided_models: Vec<String>,
+        max_live_subagents: Option<usize>,
+        model_aliases: HashMap<String, String>,
+        base_dir: &str,
+    ) -> Self {
         Self {
             children,
             shared: Arc::new(HubShared {
@@ -511,7 +536,30 @@ impl SubagentHub {
             }),
             provided_models,
             max_live_subagents,
+            model_aliases,
             base_dir: base_dir.to_string(),
+        }
+    }
+
+    /// The wire `modelId` for a `session/set_model` call: an aliased model
+    /// segment is rewritten to the profile entry's real model name; the query
+    /// suffix (e.g. `?effort=high`) is preserved either way.
+    fn wire_model_id(&self, model_segment: &str) -> String {
+        match model_segment.split_once('?') {
+            Some((bare, query)) => {
+                let wire = self
+                    .model_aliases
+                    .get(bare)
+                    .map(String::as_str)
+                    .unwrap_or(bare);
+                format!("{wire}?{query}")
+            }
+            None => self
+                .model_aliases
+                .get(model_segment)
+                .map(String::as_str)
+                .unwrap_or(model_segment)
+                .to_string(),
         }
     }
 
@@ -629,7 +677,13 @@ impl SubagentHub {
 
         child.request(
             "session/set_model",
-            json!({ "sessionId": session_id, "modelId": uri.endpoint_model_name() }),
+            json!({
+                "sessionId": session_id,
+                // An aliased model is rewritten to the profile entry's real
+                // model name; the query suffix (e.g. `?effort=high`) is
+                // preserved either way.
+                "modelId": self.wire_model_id(uri.endpoint_model_name()),
+            }),
         )?;
 
         // Register before firing the prompt so notifications from the first
@@ -1267,6 +1321,38 @@ mod tests {
             .next()
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn spawn_rewrites_an_aliased_model_to_the_real_name() {
+        // A provided model may be an endpoint alias: the caller addresses the
+        // subagent by the alias, but the backend receives the entry's real
+        // model name (query suffix preserved).
+        let transport = Arc::new(FakeTransport::default());
+        let hub = SubagentHub::with_children_and_aliases(
+            HashMap::from([(
+                "potlatch".to_string(),
+                Arc::clone(&transport) as Arc<dyn HarnessTransport>,
+            )]),
+            vec!["acp://potlatch/model-x?effort=high".to_string()],
+            None,
+            HashMap::from([("model-x".to_string(), "model1".to_string())]),
+            ".",
+        );
+
+        hub.dispatch(
+            &json!({
+                "prompt": "explore",
+                "model": "acp://potlatch/model-x?effort=high"
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            transport.recorded_requests("session/set_model")[0]["modelId"],
+            "model1?effort=high"
+        );
     }
 
     #[test]

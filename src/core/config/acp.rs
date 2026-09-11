@@ -35,12 +35,33 @@ pub struct AcpClientProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointEntry {
     pub model: String,
+    /// Optional alternative name for addressing this entry from a model URI
+    /// (`acp://<vendor>/<alias>`). Lets one model be exposed under several
+    /// names — possibly through different endpoints: two entries may share
+    /// the same `model` as long as each carries a distinct alias. The
+    /// backend still receives the real `model` name; the alias is a routing
+    /// key only. An entry with an alias is addressed **only** by the alias —
+    /// its `model` name stops being an address. Must be unique within the
+    /// profile.
+    pub alias: Option<String>,
     pub fields: HashMap<String, String>,
     /// `auth_provider` command argv. When set, the harness runs this command
     /// before talking to the endpoint and applies the returned headers
     /// (`{"expiration": <unix-seconds>, "headers": {..}}`) to its requests,
     /// cached until the expiration.
     pub auth_command: Option<Vec<String>>,
+}
+
+impl EndpointEntry {
+    /// The model name to send to the backend for a request addressed by
+    /// `requested` (the URI's bare model segment): an alias resolves to the
+    /// entry's real `model` name; a direct model match passes through.
+    pub fn wire_model_name<'a>(&'a self, requested: &'a str) -> &'a str {
+        match &self.alias {
+            Some(alias) if alias == requested => &self.model,
+            _ => requested,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,6 +80,10 @@ pub struct AcpSpawnConfig {
     /// auth-provider command from here, so `./auth-tool.py` or `auth-tool.py` resolve
     /// relative to the config, not the agent's repo checkout.
     pub config_dir: Option<PathBuf>,
+    /// Alias → real model name for the vendor profile's endpoint entries.
+    /// Consumers that forward model names to the backend (the subagent hub's
+    /// `session/set_model`) rewrite an aliased request to the real name.
+    pub model_aliases: HashMap<String, String>,
 }
 
 pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfile>> {
@@ -119,11 +144,43 @@ pub fn parse_acp_profiles(root: &Value) -> Result<HashMap<String, AcpClientProfi
                     .with_context(|| "endpoints entry missing required `model` field")?;
                 // `model` stays accessible as a {model} reference.
                 fields.insert("model".into(), model.clone());
+                let alias = match fields.remove("alias") {
+                    Some(raw) => {
+                        let trimmed = raw.trim().to_string();
+                        if trimmed.is_empty() {
+                            bail!("endpoints entry `{model}` has an empty `alias`");
+                        }
+                        Some(trimmed)
+                    }
+                    None => None,
+                };
+                // `alias` stays accessible as an {alias} reference.
+                if let Some(alias) = &alias {
+                    fields.insert("alias".into(), alias.clone());
+                }
                 endpoint_list.push(EndpointEntry {
                     model,
+                    alias,
                     fields,
                     auth_command,
                 });
+            }
+
+            // Addressable names must be unique: an entry with an alias is
+            // addressed by the alias (its model name is no longer an
+            // address — that is what lets one model be exposed several times
+            // through different endpoints); an unaliased entry is addressed
+            // by its model name.
+            let mut addressable: HashMap<String, String> = HashMap::new();
+            for entry in &endpoint_list {
+                let name = entry.alias.as_ref().unwrap_or(&entry.model);
+                if let Some(previous) = addressable.insert(name.clone(), entry.model.clone()) {
+                    bail!(
+                        "duplicate endpoint name `{name}` in [acp.{name}] endpoints (two entries \
+                         resolve to `{previous}` and `{}`) — aliases and model names must be unique",
+                        entry.model
+                    );
+                }
             }
         }
 
@@ -203,9 +260,12 @@ pub fn resolve_profile_env(
     Ok(env)
 }
 
-/// Pick the `EndpointEntry` whose `model` matches `model_name`.
-/// Returns `Ok(None)` when the profile has no `endpoints` table. Returns
-/// an error when the profile has endpoints but none match.
+/// Pick the `EndpointEntry` addressed by `model_name`: an entry with an
+/// alias is addressed only by that alias (its real model name is not an
+/// address — that is what lets one model be exposed several times through
+/// different endpoints); an unaliased entry by its model name. Returns
+/// `Ok(None)` when the profile has no `endpoints` table. Returns an error
+/// when the profile has endpoints but none match.
 pub(crate) fn select_endpoint<'a>(
     profile: &'a AcpClientProfile,
     model_name: &str,
@@ -216,7 +276,7 @@ pub(crate) fn select_endpoint<'a>(
     profile
         .endpoints
         .iter()
-        .find(|e| e.model == model_name)
+        .find(|e| e.alias.as_ref().unwrap_or(&e.model).as_str() == model_name)
         .map(Some)
         .with_context(|| {
             format!(
@@ -224,7 +284,7 @@ pub(crate) fn select_endpoint<'a>(
                 profile
                     .endpoints
                     .iter()
-                    .map(|e| e.model.as_str())
+                    .map(|e| e.alias.as_deref().unwrap_or(e.model.as_str()))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -300,6 +360,19 @@ fn substitute_placeholders(
 /// must be explicitly specified in the config file.
 pub fn build_profile_command(profile: &AcpClientProfile) -> Vec<String> {
     profile.acp_command.clone()
+}
+
+impl AcpClientProfile {
+    /// Alias → real model name for every endpoint entry that declares one.
+    /// Consumers that forward model names to a backend (e.g. the subagent
+    /// hub's `session/set_model`) use this to rewrite an aliased request to
+    /// the entry's real model name.
+    pub fn model_aliases(&self) -> HashMap<String, String> {
+        self.endpoints
+            .iter()
+            .filter_map(|e| e.alias.as_ref().map(|a| (a.clone(), e.model.clone())))
+            .collect()
+    }
 }
 
 /// Build the subprocess `Command` for an ACP server.
@@ -462,8 +535,104 @@ mod tests {
                 ("key".into(), "EMPTY".into()),
                 ("model".into(), model.into()),
             ]),
+            alias: None,
             auth_command: None,
         }
+    }
+
+    fn endpoint_entry_with_alias(model: &str, alias: &str, endpoint: &str) -> EndpointEntry {
+        EndpointEntry {
+            alias: Some(alias.into()),
+            ..endpoint_entry(model, endpoint)
+        }
+    }
+
+    #[test]
+    fn parse_endpoints_entry_with_alias() {
+        let root: Value = toml::from_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", alias = "model-x", endpoint = "http://endpoint1.example" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let p = &parse_acp_profiles(&root).unwrap()["potlatch"];
+        assert_eq!(p.endpoints[0].alias.as_deref(), Some("model-x"));
+    }
+
+    #[test]
+    fn parse_endpoints_rejects_duplicate_names_and_aliases() {
+        // Two entries sharing one alias collide.
+        let root: Value = toml::from_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", alias = "shared", endpoint = "http://a.example" },
+              { model = "model2", alias = "shared", endpoint = "http://b.example" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let err = parse_acp_profiles(&root).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate endpoint name `shared`"),
+            "{err:#}"
+        );
+
+        // An alias colliding with an unaliased entry's model name is the
+        // same ambiguity.
+        let root: Value = toml::from_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", endpoint = "http://a.example" },
+              { model = "model2", alias = "model1", endpoint = "http://b.example" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let err = parse_acp_profiles(&root).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate endpoint name `model1`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn select_endpoint_matches_by_alias() {
+        let p = profile(
+            vec![],
+            vec![],
+            vec![
+                endpoint_entry("model1", "http://endpoint1.example"),
+                endpoint_entry_with_alias("model1", "model-x", "http://endpoint2.example"),
+            ],
+        );
+        assert_eq!(
+            select_endpoint(&p, "model-x").unwrap().unwrap().fields["endpoint"],
+            "http://endpoint2.example"
+        );
+        // Plain model names still match directly.
+        assert_eq!(
+            select_endpoint(&p, "model1").unwrap().unwrap().fields["endpoint"],
+            "http://endpoint1.example"
+        );
+        // The error lists the addressable names.
+        let err = select_endpoint(&p, "nope").unwrap_err();
+        assert!(err.to_string().contains("model1, model-x"), "{err:#}");
+    }
+
+    #[test]
+    fn wire_model_name_rewrites_alias_to_real_model() {
+        let entry = endpoint_entry_with_alias("model1", "model-x", "http://x.example");
+        assert_eq!(entry.wire_model_name("model-x"), "model1");
+        assert_eq!(entry.wire_model_name("model1"), "model1");
+        assert_eq!(entry.wire_model_name("other"), "other");
     }
 
     fn endpoint_profile() -> AcpClientProfile {
@@ -790,6 +959,110 @@ mod tests {
     }
 
     #[test]
+    fn resolve_acp_spawn_rewrites_aliased_model_to_real_name() {
+        use super::super::Config;
+        let cfg = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", alias = "model-x", endpoint = "http://endpoint-x.example", key = "EMPTY" },
+              { model = "model1", alias = "model-y", endpoint = "http://endpoint-y.example", key = "EMPTY" },
+            ]
+            env = [
+              "POTLATCH_BASE_URL={endpoint}",
+              "POTLATCH_API_KEY={key}",
+            ]
+
+            [agent.x]
+            model = "acp://potlatch/model-x?effort=high"
+            instances = 1
+
+            [agent.y]
+            model = "acp://potlatch/model-y"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+
+        let x = cfg.resolve_acp_spawn(cfg.agent("x").unwrap()).unwrap();
+        // The alias selects its endpoint, and the backend receives the real
+        // model name with the caller's query preserved.
+        assert_eq!(x.endpoint_model.as_deref(), Some("model1?effort=high"));
+        assert_eq!(
+            x.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            Some("http://endpoint-x.example")
+        );
+
+        let y = cfg.resolve_acp_spawn(cfg.agent("y").unwrap()).unwrap();
+        assert_eq!(y.endpoint_model.as_deref(), Some("model1"));
+        assert_eq!(
+            y.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            Some("http://endpoint-y.example")
+        );
+
+        // The alias map is published for consumers that forward model names
+        // (the subagent hub's session/set_model).
+        assert_eq!(
+            x.model_aliases.get("model-x").map(String::as_str),
+            Some("model1")
+        );
+
+        // An aliased entry is addressed only by its alias: the model name
+        // stops being an address (its whole point is disambiguating several
+        // entries that share one model).
+        let cfg2 = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", alias = "model-x", endpoint = "http://endpoint-x.example", key = "EMPTY" },
+              { model = "model2", endpoint = "http://endpoint2.example", key = "EMPTY" },
+            ]
+            env = ["POTLATCH_BASE_URL={endpoint}"]
+
+            [agent.via_alias]
+            model = "acp://potlatch/model-x"
+            instances = 1
+
+            [agent.direct]
+            model = "acp://potlatch/model2"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let via_alias = cfg2
+            .resolve_acp_spawn(cfg2.agent("via_alias").unwrap())
+            .unwrap();
+        assert_eq!(via_alias.endpoint_model.as_deref(), Some("model1"));
+        let direct = cfg2
+            .resolve_acp_spawn(cfg2.agent("direct").unwrap())
+            .unwrap();
+        assert_eq!(direct.endpoint_model.as_deref(), Some("model2"));
+        // Addressing the aliased entry by its model name is refused — the
+        // name is no longer an address; the error says what is.
+        let cfg3 = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", alias = "model-x", endpoint = "http://endpoint-x.example", key = "EMPTY" },
+            ]
+            env = ["POTLATCH_BASE_URL={endpoint}"]
+
+            [agent.by_model]
+            model = "acp://potlatch/model1"
+            instances = 1
+            "#,
+        )
+        .unwrap();
+        let err = cfg3
+            .resolve_acp_spawn(cfg3.agent("by_model").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("available: model-x"), "{err:#}");
+    }
+
+    #[test]
     fn resolve_acp_spawn_forwards_auth_provider() {
         use super::super::Config;
         let cfg = Config::from_toml_str(
@@ -826,6 +1099,7 @@ mod tests {
                 ("secret".into(), "abc123".into()),
                 ("model".into(), "test".into()),
             ]),
+            alias: None,
             auth_command: None,
         };
         let p = profile(
@@ -847,6 +1121,7 @@ mod tests {
         let entry = EndpointEntry {
             model: "test".into(),
             fields: HashMap::from([("endpoint".into(), "http://x".into())]),
+            alias: None,
             auth_command: None,
         };
         let p = profile(vec!["X={nonexistent}"], vec![], vec![entry]);
@@ -862,6 +1137,7 @@ mod tests {
                 ("endpoint".into(), "http://x".into()),
                 ("key".into(), "K".into()),
             ]),
+            alias: None,
             auth_command: None,
         };
         let p = profile(vec!["URL={endpoint}?token={key}"], vec![], vec![entry]);
@@ -905,6 +1181,7 @@ mod tests {
         let entry = EndpointEntry {
             model: "test".into(),
             fields: HashMap::from([("endpoint".into(), "http://x".into())]),
+            alias: None,
             auth_command: None,
         };
         let p = profile(vec!["KEY={key}"], vec![], vec![entry]);
