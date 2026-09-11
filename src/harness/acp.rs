@@ -387,7 +387,11 @@ impl AcpServer {
                     def.get("description").and_then(Value::as_str),
                     def.get("parameters"),
                 ) {
-                    tools.register_structured_output(name, desc, params.clone());
+                    let terminal = def
+                        .get("terminal")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    tools.register_structured_output(name, desc, params.clone(), terminal);
                 }
             }
         }
@@ -885,10 +889,13 @@ mod tests {
             _model: &str,
             _messages: &[Value],
             _tools: &[Value],
-            _on_chunk: Option<&StreamCallback>,
+            on_chunk: Option<&StreamCallback>,
             _on_tool_calls: Option<&ToolExecCallback<'_>>,
             _on_early_tool_call: Option<&EarlyToolExecCallback<'_>>,
         ) -> Result<ChatResponse> {
+            if let Some(cb) = on_chunk {
+                cb("Task completed successfully.");
+            }
             Ok(ChatResponse {
                 content: "Task completed successfully.".into(),
                 tool_calls: vec![],

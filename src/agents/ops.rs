@@ -36,7 +36,6 @@ const MIN_LOG_BYTES_FOR_ANALYSIS: usize = 20;
 /// `issues` array, before the empty-field defensive filtering in
 /// [`normalize_ops_issues`] is applied.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawOpsIssue {
     #[serde(default)]
     title: String,
@@ -53,7 +52,6 @@ struct RawOpsIssue {
 /// captured JSON against [`OpsOutput::schema`] and deserializes it (see
 /// [`AgentModel::complete_typed`]).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct OpsOutput {
     #[serde(default)]
     issues: Vec<RawOpsIssue>,
@@ -179,7 +177,6 @@ enum TypedOpsLogSourceSettings {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct OpsSshLogSourceSettings {
     ssh_user: String,
     ssh_host: String,
@@ -2323,14 +2320,14 @@ mod tests {
     }
 
     #[test]
-    fn ops_output_rejects_undeclared_issue_properties() {
-        let error = conformance::assert_rejects::<OpsOutput>(serde_json::json!({
+    fn ops_output_drops_undeclared_issue_properties() {
+        // Undeclared fields are tolerated and dropped: rejecting them
+        // re-opens a repair loop the model cannot win.
+        let output = conformance::assert_accepts::<OpsOutput>(serde_json::json!({
             "issues": [{"title": "t", "description": "d", "log_line": "ERR", "severity": "high"}]
         }));
-        assert!(
-            error.starts_with("$.issues[0].severity: unexpected property"),
-            "{error}"
-        );
+        assert_eq!(output.issues.len(), 1);
+        assert_eq!(output.issues[0].title, "t");
     }
 
     #[test]

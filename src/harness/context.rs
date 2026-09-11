@@ -585,25 +585,52 @@ impl Context {
     }
 
     /// Serialize to OpenAI chat messages format.
+    ///
+    /// Every assistant `tool_call` must be answered by a matching tool
+    /// message — the strict endpoints (Azure OpenAI, litellm-fronted
+    /// gateways) reject the whole request otherwise. Historical contexts can
+    /// contain orphaned calls (an interrupted turn, or results skipped by an
+    /// older build), so any call without a recorded output gets a synthetic
+    /// tool message here.
     pub fn to_messages(&self) -> Vec<Value> {
         let mut messages = Vec::with_capacity(self.entries.len());
+        let mut unanswered: Vec<String> = Vec::new();
+
+        let flush_unanswered = |messages: &mut Vec<Value>, unanswered: &mut Vec<String>| {
+            for id in unanswered.drain(..) {
+                messages.push(json!({
+                    "role": "tool",
+                    "content": "[tool output not recorded]",
+                    "tool_call_id": id,
+                }));
+            }
+        };
+
         for entry in &self.entries {
             match entry.role {
                 Role::System => {
+                    flush_unanswered(&mut messages, &mut unanswered);
                     messages.push(json!({
                         "role": "system",
                         "content": entry.content,
                     }));
                 }
                 Role::User => {
+                    flush_unanswered(&mut messages, &mut unanswered);
                     messages.push(json!({
                         "role": "user",
                         "content": entry.content,
                     }));
                 }
                 Role::Assistant => {
+                    flush_unanswered(&mut messages, &mut unanswered);
                     // Assistant entries with tool_calls are stored as raw JSON
                     if let Ok(parsed) = serde_json::from_str::<Value>(&entry.content) {
+                        for call in parsed["tool_calls"].as_array().unwrap_or(&Vec::new()) {
+                            if let Some(id) = call["id"].as_str() {
+                                unanswered.push(id.to_string());
+                            }
+                        }
                         messages.push(parsed);
                     } else {
                         messages.push(json!({
@@ -613,6 +640,9 @@ impl Context {
                     }
                 }
                 Role::Tool => {
+                    if let Some(id) = &entry.tool_call_id {
+                        unanswered.retain(|pending| pending != id);
+                    }
                     messages.push(json!({
                         "role": "tool",
                         "content": entry.content,
@@ -621,6 +651,7 @@ impl Context {
                 }
             }
         }
+        flush_unanswered(&mut messages, &mut unanswered);
         messages
     }
 
@@ -1264,6 +1295,106 @@ mod tests {
         assert!(messages[2]["tool_calls"].is_array());
         assert_eq!(messages[3]["role"], "tool");
         assert_eq!(messages[3]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn to_messages_synthesizes_outputs_for_orphaned_tool_calls() {
+        // Historical contexts can carry an assistant tool_call whose result
+        // was never recorded (an interrupted turn, or results skipped by an
+        // older build). Strict endpoints reject unpaired calls, so
+        // to_messages must synthesize the missing tool message.
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::User, ContextKind::UserPrompt, "do the task");
+        ctx.push_assistant_with_tools(
+            None,
+            &[json!({
+                "id": "call_orphan",
+                "type": "function",
+                "function": {"name": "todo", "arguments": "{}"}
+            })],
+            "",
+        );
+        // The turn was interrupted; the next prompt continues with a paired
+        // call. The synthetic output for the orphan must be flushed BEFORE
+        // the next user message (strict endpoints reject a tool result that
+        // follows anything but its own call).
+        ctx.push(Role::User, ContextKind::UserPrompt, "continuing the task");
+        ctx.push_assistant_with_tools(
+            Some("following up"),
+            &[json!({
+                "id": "call_next",
+                "type": "function",
+                "function": {"name": "shell", "arguments": "{}"}
+            })],
+            "",
+        );
+        ctx.push_tool_result(
+            ContextKind::ToolResult,
+            "result of the next call",
+            "call_next",
+        );
+
+        let messages = ctx.to_messages();
+        let orphan_outputs: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m["tool_call_id"] == json!("call_orphan"))
+            .collect();
+        assert_eq!(
+            orphan_outputs.len(),
+            1,
+            "the orphaned call gets exactly one synthetic output: {messages:?}"
+        );
+        assert_eq!(
+            orphan_outputs[0]["content"],
+            json!("[tool output not recorded]")
+        );
+        // Position: the synthetic output sits before the next call's result.
+        let orphan_pos = messages
+            .iter()
+            .position(|m| m["tool_call_id"] == json!("call_orphan"))
+            .unwrap();
+        let next_pos = messages
+            .iter()
+            .position(|m| m["tool_call_id"] == json!("call_next"))
+            .unwrap();
+        assert!(orphan_pos < next_pos);
+    }
+
+    #[test]
+    fn to_messages_pairs_todo_calls_with_confirmations() {
+        // The agent loop stores a compact confirmation for todo/plan calls
+        // (the full state rides in the per-turn system injection). The
+        // pairing must be complete for strict endpoints.
+        let mut ctx = Context::new(100_000);
+        ctx.push(Role::User, ContextKind::UserPrompt, "plan the work");
+        ctx.push_assistant_with_tools(
+            None,
+            &[json!({
+                "id": "call_todo",
+                "type": "function",
+                "function": {"name": "todo", "arguments": "{}"}
+            })],
+            "",
+        );
+        ctx.push_tool_result(ContextKind::ToolResult, "Todo list updated.", "call_todo");
+
+        let messages = ctx.to_messages();
+        let calls: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m["tool_calls"].as_array())
+            .flat_map(|calls| calls.iter())
+            .filter_map(|c| c["id"].as_str())
+            .collect();
+        let outputs: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m["tool_call_id"].as_str())
+            .collect();
+        for call in &calls {
+            assert!(
+                outputs.contains(call),
+                "every tool call must be answered: {call}"
+            );
+        }
     }
 
     #[test]

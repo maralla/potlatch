@@ -17,17 +17,30 @@ use super::Tool;
 /// structured-output tool call.
 pub type StructuredOutputCell = Arc<Mutex<Option<Value>>>;
 
+/// Appended to a terminal structured output's result. A terminal call's
+/// record IS the run's deliverable — the neutral ack gave a reviewer no
+/// completion signal and it re-emitted the identical review three times.
+pub(crate) const COMPLETION_NOTICE: &str = " This submission is the task's final deliverable — do not call any more tools; end your turn now.";
+
 pub struct StructuredOutputTool {
     name: String,
     schema: Value,
     cell: StructuredOutputCell,
+    terminal: bool,
 }
 
 impl StructuredOutputTool {
     /// Create a new structured-output tool and return both the tool and its
     /// cell. The caller stores the cell to read the captured JSON after the
-    /// agent loop completes.
-    pub fn new(name: String, description: &str, parameters: Value) -> (Self, StructuredOutputCell) {
+    /// agent loop completes. `terminal` marks a contract whose successful
+    /// call is the run's final deliverable — the result then tells the model
+    /// the task is complete so it ends its turn.
+    pub fn with_terminal(
+        name: String,
+        description: &str,
+        parameters: Value,
+        terminal: bool,
+    ) -> (Self, StructuredOutputCell) {
         let cell: StructuredOutputCell = Arc::new(Mutex::new(None));
         let schema = json!({
             "description": description,
@@ -38,6 +51,7 @@ impl StructuredOutputTool {
                 name,
                 schema,
                 cell: Arc::clone(&cell),
+                terminal,
             },
             cell,
         )
@@ -98,7 +112,11 @@ impl Tool for StructuredOutputTool {
         }
         // Store in the side-channel cell (last call wins).
         *self.cell.lock().unwrap() = Some(args);
-        Ok(format!("{} recorded.", self.name))
+        if self.terminal {
+            Ok(format!("{} recorded.{COMPLETION_NOTICE}", self.name))
+        } else {
+            Ok(format!("{} recorded.", self.name))
+        }
     }
 }
 
@@ -205,11 +223,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_result_tells_the_model_to_stop() {
+        let (tool, _cell) = StructuredOutputTool::with_terminal(
+            "review".into(),
+            "The review decision.",
+            json!({"type": "object", "properties": {}}),
+            true,
+        );
+        let result = tool
+            .execute(&json!({"decision": "approve"}), "/tmp")
+            .unwrap();
+        // The completion notice IS the deliverable under test: without it
+        // the model re-emits the decision (observed: three identical
+        // reviews in a row).
+        assert!(result.starts_with("review recorded."));
+        assert!(result.contains(COMPLETION_NOTICE));
+        assert!(result.contains("end your turn"));
+    }
+
+    #[test]
     fn stores_args_in_cell() {
-        let (tool, cell) = StructuredOutputTool::new(
+        let (tool, cell) = StructuredOutputTool::with_terminal(
             "handoff".into(),
             "Emit structured output.",
             json!({"type": "object", "properties": {"mr_title": {"type": "string"}}}),
+            false,
         );
         let args = json!({"mr_title": "Add tests"});
         let result = tool.execute(&args, "/tmp").unwrap();
@@ -220,10 +258,11 @@ mod tests {
 
     #[test]
     fn rejects_null_arguments_as_a_transport_failure() {
-        let (tool, cell) = StructuredOutputTool::new(
+        let (tool, cell) = StructuredOutputTool::with_terminal(
             "review".into(),
             "Emit the review decision.",
             json!({"type": "object"}),
+            false,
         );
         let result = tool.execute(&Value::Null, "/tmp");
         let error = result.unwrap_err().to_string();
@@ -235,10 +274,11 @@ mod tests {
 
     #[test]
     fn rejects_empty_object_arguments_as_a_transport_failure() {
-        let (tool, cell) = StructuredOutputTool::new(
+        let (tool, cell) = StructuredOutputTool::with_terminal(
             "review".into(),
             "Emit the review decision.",
             json!({"type": "object"}),
+            false,
         );
         let result = tool.execute(&json!({}), "/tmp");
         let error = result.unwrap_err().to_string();
@@ -250,10 +290,11 @@ mod tests {
 
     #[test]
     fn rejects_non_object_arguments_with_the_received_value() {
-        let (tool, _cell) = StructuredOutputTool::new(
+        let (tool, _cell) = StructuredOutputTool::with_terminal(
             "review".into(),
             "Emit the review decision.",
             json!({"type": "object"}),
+            false,
         );
         let result = tool.execute(&json!([1, 2, 3]), "/tmp");
         let error = result.unwrap_err().to_string();
@@ -290,7 +331,12 @@ mod tests {
                 }
             ]
         });
-        let (tool, cell) = StructuredOutputTool::new("plan".into(), "Plan the issue.", parameters);
+        let (tool, cell) = StructuredOutputTool::with_terminal(
+            "plan".into(),
+            "Plan the issue.",
+            parameters,
+            false,
+        );
 
         tool.execute(
             &json!({
@@ -326,8 +372,12 @@ mod tests {
                 }
             }
         });
-        let (tool, cell) =
-            StructuredOutputTool::new("configure".into(), "Configure it.", parameters);
+        let (tool, cell) = StructuredOutputTool::with_terminal(
+            "configure".into(),
+            "Configure it.",
+            parameters,
+            false,
+        );
 
         tool.execute(
             &json!({"config": "{\"labels\":\"[\\\"one\\\",\\\"two\\\"]\"}"}),
@@ -350,7 +400,8 @@ mod tests {
                 "metadata": {"type": "object"}
             }
         });
-        let (tool, cell) = StructuredOutputTool::new("report".into(), "Report it.", parameters);
+        let (tool, cell) =
+            StructuredOutputTool::with_terminal("report".into(), "Report it.", parameters, false);
 
         tool.execute(&json!({"items": "not json", "metadata": "[1,2]"}), "/tmp")
             .unwrap();
@@ -363,10 +414,11 @@ mod tests {
 
     #[test]
     fn second_call_overwrites_first() {
-        let (tool, cell) = StructuredOutputTool::new(
+        let (tool, cell) = StructuredOutputTool::with_terminal(
             "handoff".into(),
             "Emit structured output.",
             json!({"type": "object"}),
+            false,
         );
         tool.execute(&json!({"mr_title": "A"}), "/tmp").unwrap();
         tool.execute(&json!({"mr_title": "B"}), "/tmp").unwrap();
@@ -376,10 +428,11 @@ mod tests {
 
     #[test]
     fn rejects_non_object_args() {
-        let (tool, _cell) = StructuredOutputTool::new(
+        let (tool, _cell) = StructuredOutputTool::with_terminal(
             "handoff".into(),
             "Emit structured output.",
             json!({"type": "object"}),
+            false,
         );
         let result = tool.execute(&json!("not an object"), "/tmp");
         assert!(result.is_err());
@@ -387,17 +440,18 @@ mod tests {
 
     #[test]
     fn cell_starts_empty() {
-        let (_tool, cell) = StructuredOutputTool::new(
+        let (_tool, cell) = StructuredOutputTool::with_terminal(
             "handoff".into(),
             "Emit structured output.",
             json!({"type": "object"}),
+            false,
         );
         assert!(cell.lock().unwrap().is_none());
     }
 
     #[test]
     fn schema_carries_name_and_description() {
-        let (tool, _cell) = StructuredOutputTool::new(
+        let (tool, _cell) = StructuredOutputTool::with_terminal(
             "handoff".into(),
             "Emit your output as structured JSON.",
             json!({
@@ -406,6 +460,7 @@ mod tests {
                     "mr_title": {"type": "string"}
                 }
             }),
+            false,
         );
         assert_eq!(tool.name(), "handoff");
         assert_eq!(

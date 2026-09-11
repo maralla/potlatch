@@ -59,7 +59,6 @@ const ASK_POLL_INTERVAL: Duration = Duration::from_secs(4);
 /// array, before the empty-title/description defensive filtering in
 /// [`normalize_sub_issues`] is applied.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 struct RawSubIssue {
     #[serde(default)]
     title: String,
@@ -155,13 +154,11 @@ enum PmoOutput {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct GuideWorkerWire {
     instructions: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ProposePlanWire {
     plan_text: String,
     #[serde(default)]
@@ -169,29 +166,24 @@ struct ProposePlanWire {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct KeepPlanWire {}
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SplitWire {
     sub_issues: Vec<RawSubIssue>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AlreadyDoneWire {
     reason: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NeedsClarificationWire {
     question: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WaitForDependencyWire {
     dependency_issue_iid: u64,
 }
@@ -316,6 +308,7 @@ structured_output! {
                 ),
             }
         );
+        terminal;
     /// Tolerated: a decision spelled with different case, the dependency IID
     /// under one of its legacy names or sent as `"#727"`, and a sub-issue
     /// priority outside 1-3 (dropped, so the sub-issue inherits the parent's).
@@ -4187,15 +4180,19 @@ mod tests {
     }
 
     #[test]
-    fn pmo_output_rejects_fields_from_another_decision() {
-        let error = conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+    fn pmo_output_drops_fields_from_another_decision() {
+        // Cross-branch and habit fields are tolerated and dropped: rejecting
+        // them re-opens a repair loop the model cannot win.
+        let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
             "decision": "already_done",
             "reason": "done",
             "sub_issues": []
         }));
-        assert!(
-            error.starts_with("$.sub_issues: unexpected property"),
-            "{error}"
+        assert_eq!(
+            output,
+            PmoOutput::AlreadyDone {
+                reason: "done".into()
+            }
         );
     }
 
@@ -4363,10 +4360,12 @@ mod tests {
             })),
             PmoOutput::KeepPlan
         );
-        conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+        // A stray field from another branch is tolerated and dropped.
+        let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
             "decision": "keep_plan",
             "reason": "No change needed"
         }));
+        assert_eq!(output, PmoOutput::KeepPlan);
     }
 
     #[test]
@@ -4374,11 +4373,18 @@ mod tests {
         conformance::assert_rejects::<PmoOutput>(serde_json::json!({
             "decision": "propose_plan"
         }));
-        conformance::assert_rejects::<PmoOutput>(serde_json::json!({
+        // A stray field from another branch is tolerated and dropped.
+        let output = conformance::assert_accepts::<PmoOutput>(serde_json::json!({
             "decision": "needs_clarification",
             "question": "Which config?",
             "plan_text": "This belongs only to propose_plan."
         }));
+        assert_eq!(
+            output,
+            PmoOutput::NeedsClarification {
+                question: "Which config?".into()
+            }
+        );
     }
 
     #[test]

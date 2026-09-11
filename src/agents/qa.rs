@@ -80,7 +80,6 @@ impl Severity {
 /// `findings` array, before the empty-title/description defensive filtering
 /// in [`normalize_qa_findings`] is applied.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawQaFinding {
     #[serde(default)]
     title: String,
@@ -96,7 +95,6 @@ struct RawQaFinding {
 /// `qa_report` tool's `clarifications` array, before the empty-question
 /// filtering in [`normalize_clarifications`] is applied.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawClarification {
     #[serde(default)]
     question: String,
@@ -109,7 +107,6 @@ struct RawClarification {
 /// deserializes the captured JSON into this type (see
 /// [`AgentModel::complete_typed`]).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct QaOutput {
     #[serde(default)]
     findings: Vec<RawQaFinding>,
@@ -2001,14 +1998,14 @@ mod tests {
     }
 
     #[test]
-    fn qa_output_rejects_undeclared_finding_properties() {
-        let error = conformance::assert_rejects::<QaOutput>(serde_json::json!({
+    fn qa_output_drops_undeclared_finding_properties() {
+        // Undeclared fields are tolerated and dropped: rejecting them
+        // re-opens a repair loop the model cannot win.
+        let output = conformance::assert_accepts::<QaOutput>(serde_json::json!({
             "findings": [{"title": "Bug", "description": "d", "severity": "high", "owner": "me"}]
         }));
-        assert!(
-            error.starts_with("$.findings[0].owner: unexpected property"),
-            "{error}"
-        );
+        assert_eq!(output.findings.len(), 1);
+        assert_eq!(output.findings[0].title, "Bug");
     }
 
     #[test]

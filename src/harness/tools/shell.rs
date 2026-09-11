@@ -522,7 +522,14 @@ impl Tool for ShellTool {
     }
 
     fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
-        let job_id = args["job_id"].as_str();
+        // An empty `job_id` counts as absent: models sometimes fill every
+        // schema property with defaults, and an empty poll target would
+        // otherwise shadow the `command` and spin the loop on
+        // "unknown job id" errors.
+        let job_id = args["job_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
         let kill = args["kill"].as_bool().unwrap_or(false);
 
         // Polling or killing a background job takes precedence — `command`
@@ -1417,6 +1424,39 @@ mod tests {
         let poll_args = json!({"job_id": id});
         let poll = tool.execute(&poll_args, "/tmp").unwrap();
         assert!(poll.contains("status: killed"));
+    }
+
+    #[test]
+    fn empty_job_id_with_a_command_executes_the_command() {
+        // Models sometimes fill every schema property with defaults: an
+        // empty `job_id` alongside a `command` must count as absent and run
+        // the command — not route to a background-job poll that can only
+        // fail with "unknown job id" and spin the loop on identical retries.
+        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
+        let result = tool
+            .execute(
+                &json!({
+                    "command": "echo executed",
+                    "background": false,
+                    "job_id": "",
+                    "kill": false
+                }),
+                "/tmp",
+            )
+            .unwrap();
+        assert!(
+            result.contains("executed") && result.contains("exit code: 0"),
+            "the command must run: {result}"
+        );
+
+        // Whitespace-only ids count as empty too.
+        let result = tool
+            .execute(&json!({"job_id": "   ", "command": "echo spaced"}), "/tmp")
+            .unwrap();
+        assert!(
+            result.contains("spaced"),
+            "whitespace-only job_id must not route to poll: {result}"
+        );
     }
 
     #[test]

@@ -35,7 +35,6 @@ const MEMORY_OPERATION: &str = "memory_write";
 const MAX_MEMORY_BYTES: usize = 16_384;
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 pub struct ClerkAgentSettings {}
 
 pub struct ClerkAgent {
@@ -261,7 +260,6 @@ Recency: recently added facts (at the end of the memory) are more likely to stil
 /// The structured output of a memory reorganization: the full reorganized
 /// markdown content.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct MemoryReorgOutput {
     content: String,
 }

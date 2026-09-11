@@ -141,10 +141,6 @@ impl ObjectSchema {
         self.properties.push((name, field));
         self
     }
-
-    pub fn property_names(&self) -> Vec<&str> {
-        self.properties.iter().map(|(n, _)| n.as_str()).collect()
-    }
 }
 
 /// A tagged union of object shapes, selected by a string discriminator
@@ -206,6 +202,11 @@ pub struct StructuredOutputTool {
     pub name: String,
     pub description: String,
     pub parameters: Schema,
+    /// A successful call is the run's final deliverable (`review`,
+    /// `handoff`, `plan`): the harness result then tells the model the task
+    /// is complete, so it ends its turn instead of re-emitting the decision
+    /// (observed: a reviewer submitted the identical review three times).
+    pub terminal: bool,
 }
 
 /// Declare a typed structured-output contract without repeating the schema
@@ -216,6 +217,43 @@ pub struct StructuredOutputTool {
 /// builders. It keeps reusable field groups composable without teaching the
 /// macro about role-specific concepts.
 macro_rules! structured_output {
+    // Terminal contract: `terminal;` marks a successful call as the run's
+    // final deliverable, so the harness result tells the model to stop.
+    (
+        impl $output:ty {
+            tool_name: $tool_name:expr;
+            tool_description: $tool_description:expr;
+            schema: $schema_kind:ident $schema_args:tt;
+            terminal;
+            $(
+                $(#[$normalize_meta:meta])*
+                normalize($value:ident) $normalize:block
+            )?
+        }
+    ) => {
+        impl $crate::core::agent::StructuredOutput for $output {
+            fn tool_name() -> &'static str {
+                $tool_name
+            }
+
+            fn tool_description() -> &'static str {
+                $tool_description
+            }
+
+            fn schema() -> $crate::core::agent::Schema {
+                structured_output!(@schema $schema_kind $schema_args)
+            }
+
+            fn is_terminal() -> bool {
+                true
+            }
+
+            $(
+                $(#[$normalize_meta])*
+                fn normalize($value: &mut serde_json::Value) $normalize
+            )?
+        }
+    };
     (
         impl $output:ty {
             tool_name: $tool_name:expr;
@@ -476,7 +514,7 @@ fn validate_at(schema: &Schema, value: &Value, path: &str) -> Result<(), SchemaE
             }
             Ok(())
         }
-        Schema::Object(object) => validate_object(object, value, path, None),
+        Schema::Object(object) => validate_object(object, value, path),
         Schema::OneOf(one_of) => validate_one_of(one_of, value, path),
     }
 }
@@ -516,12 +554,7 @@ fn validate_one_of(one_of: &OneOfSchema, value: &Value, path: &str) -> Result<()
             format!("expected one of [{tags}], got {tag:?}"),
         ));
     };
-    validate_object(
-        &variant.fields,
-        value,
-        path,
-        Some(one_of.discriminator.as_str()),
-    )
+    validate_object(&variant.fields, value, path)
 }
 
 /// The top-level keys an arguments object actually carried, quoted and
@@ -537,12 +570,7 @@ fn received_keys(value: &Value) -> String {
     quoted_list(keys.into_iter())
 }
 
-fn validate_object(
-    object: &ObjectSchema,
-    value: &Value,
-    path: &str,
-    discriminator: Option<&str>,
-) -> Result<(), SchemaError> {
+fn validate_object(object: &ObjectSchema, value: &Value, path: &str) -> Result<(), SchemaError> {
     let Some(map) = value.as_object() else {
         return Err(SchemaError::new(
             path,
@@ -550,23 +578,10 @@ fn validate_object(
         ));
     };
 
-    let mut allowed: Vec<&str> = Vec::new();
-    if let Some(tag) = discriminator {
-        allowed.push(tag);
-    }
-    allowed.extend(object.property_names());
-
-    for key in map.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(SchemaError::new(
-                child_path(path, key),
-                format!(
-                    "unexpected property; allowed properties here are [{}]",
-                    quoted_list(allowed.iter().copied())
-                ),
-            ));
-        }
-    }
+    // Unknown properties are deliberately NOT rejected: the schema guides
+    // the model, and the wire structs drop extras. A strict check here
+    // re-opened the repair loop for model habit fields (an empty `summary`
+    // attached to every decision), which re-prompting cannot fix.
 
     for name in &object.required {
         if map.get(name).filter(|v| !v.is_null()).is_none() {
@@ -641,7 +656,14 @@ pub trait StructuredOutput: DeserializeOwned + Sized {
             name: Self::tool_name().to_string(),
             description: Self::tool_description().to_string(),
             parameters: Self::schema(),
+            terminal: Self::is_terminal(),
         }
+    }
+
+    /// Whether a successful call is the run's final deliverable. Defaults to
+    /// false; terminal contracts opt in via the macro's `terminal;` mark.
+    fn is_terminal() -> bool {
+        false
     }
 
     /// The full decode pipeline for one captured tool call: normalize, then
@@ -849,20 +871,23 @@ pub mod conformance {
                 maximal.unwrap_err()
             );
 
+            // Undeclared properties are tolerated and dropped by the wire
+            // structs: GPT-family models attach habit fields to decisions
+            // (an empty `summary` on `request_changes`), and a repair loop
+            // cannot fix that — re-prompting just re-emits the same payload.
+            // The schema still guides the model; the wire ignores extras.
             let mut polluted = sample.maximal.clone();
             polluted
                 .as_object_mut()
                 .expect("structured output values are objects")
                 .insert("potlatch_unexpected_property".into(), json!(true));
-            let error = T::decode(polluted).expect_err(&format!(
-                "{}: {label} accepted an undeclared property; the contract must be closed",
-                tool.name
-            ));
-            assert!(
-                error.to_string().contains("unexpected property"),
-                "{}: {label} rejected an undeclared property with the wrong error: {error}",
-                tool.name
-            );
+            T::decode(polluted).unwrap_or_else(|error| {
+                panic!(
+                    "{}: {label} rejected an undeclared property: {error} — \
+                     undeclared properties must be tolerated and dropped",
+                    tool.name
+                )
+            });
         }
     }
 
@@ -1043,6 +1068,22 @@ mod tests {
     use serde_json::json;
 
     #[derive(Debug, Deserialize, PartialEq)]
+    struct TerminalOutput {
+        verdict: String,
+    }
+
+    structured_output! {
+        impl TerminalOutput {
+            tool_name: "terminal_output";
+            tool_description: "A terminal contract.";
+            schema: object("A terminal object.", {
+                required verdict: string("The verdict."),
+            });
+            terminal;
+        }
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
     struct MacroOutput {
         title: String,
         priority: Option<i64>,
@@ -1115,10 +1156,8 @@ mod tests {
     #[test]
     fn object_builder_preserves_property_order_and_required() {
         let schema = sample_object();
-        assert_eq!(
-            schema.property_names(),
-            vec!["title", "priority", "draft", "tags"]
-        );
+        let names: Vec<&str> = schema.properties.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["title", "priority", "draft", "tags"]);
         assert_eq!(schema.required, vec!["title".to_string()]);
     }
 
@@ -1182,15 +1221,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_undeclared_properties() {
-        let error = validate(
+    fn validate_tolerates_undeclared_properties() {
+        // Unknown properties pass validation: the schema guides the model,
+        // and the wire structs drop extras. A strict check here re-opened
+        // the repair loop for model habit fields that re-prompting cannot
+        // fix.
+        validate(
             &Schema::object(sample_object()),
             &json!({"title": "T", "surprise": 1}),
         )
-        .unwrap_err();
-        assert_eq!(error.path, "$.surprise");
-        assert!(error.message.contains("unexpected property"));
-        assert!(error.message.contains("\"title\""));
+        .expect("undeclared properties must be tolerated");
     }
 
     #[test]
@@ -1318,23 +1358,23 @@ mod tests {
     }
 
     #[test]
-    fn validate_confines_properties_to_the_selected_branch() {
+    fn validate_branch_extra_fields_are_tolerated_but_required_still_fires() {
         let schema = sample_union();
-        let error = validate(
+
+        // A cross-branch field is tolerated (dropped by the wire structs).
+        validate(
             &schema,
             &json!({"decision": "approve", "feedback": "fix it"}),
         )
-        .unwrap_err();
-        assert_eq!(error.path, "$.feedback");
-        assert!(error.message.contains("unexpected property"));
+        .expect("cross-branch fields must be tolerated");
 
+        // A missing required property still fails, and the message names it.
         let error = validate(&schema, &json!({"decision": "request_changes"})).unwrap_err();
         assert_eq!(error.path, "$.feedback");
         assert!(error.message.contains("required property is missing"));
     }
 
     #[derive(Debug, serde::Deserialize, PartialEq)]
-    #[serde(deny_unknown_fields)]
     struct SampleOutput {
         decision: String,
         #[serde(default)]
@@ -1362,6 +1402,17 @@ mod tests {
         fn normalize(value: &mut Value) {
             compat::normalize_tag(value, "decision");
         }
+    }
+
+    #[test]
+    fn terminal_mark_sets_the_flag_and_the_definition() {
+        assert!(TerminalOutput::is_terminal());
+        let def = TerminalOutput::tool_definition();
+        assert!(def.terminal, "terminal must reach the tool definition");
+
+        // Non-terminal contracts stay false (MacroOutput declares no mark).
+        assert!(!MacroOutput::is_terminal());
+        assert!(!MacroOutput::tool_definition().terminal);
     }
 
     #[test]
