@@ -95,6 +95,13 @@ impl AgentLoop {
         }
     }
 
+    /// Preserve `reasoning_content` under budget pressure. Set from the
+    /// client's `preserves_reasoning()`: protocols that replay signed
+    /// thinking blocks require the reasoning to survive.
+    pub fn set_keep_reasoning(&mut self, keep: bool) {
+        self.context.set_keep_reasoning(keep);
+    }
+
     /// Persist the context snapshot after every update. The file always
     /// holds the latest context, so a crashed process resumes from the last
     /// completed update. Setting the path does not write anything: a fresh
@@ -213,6 +220,10 @@ impl AgentLoop {
         on_chunk: Option<&StreamCallback>,
         on_turn: Option<&super::client::TurnCallback>,
     ) -> Result<String> {
+        // A new prompt starts with a fresh stuck budget: the counter is
+        // detected per turn within this prompt, and a previous prompt's
+        // stuck streak must not abort this one before its first turn.
+        self.stuck_count = 0;
         // Push the user prompt into the existing context (system prompt + facts
         // were already initialized by `init_context` at session creation).
         self.context

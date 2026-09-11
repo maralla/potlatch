@@ -103,6 +103,10 @@ pub struct Context {
     entries: Vec<ContextEntry>,
     total_tokens: usize,
     token_budget: usize,
+    /// When true, `reasoning_content` is never stripped from old entries:
+    /// protocols that replay signed thinking blocks (Anthropic extended
+    /// thinking) require it. Set by the client via [`Self::set_keep_reasoning`].
+    keep_reasoning: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +144,14 @@ impl Context {
             entries: Vec::new(),
             total_tokens: 0,
             token_budget,
+            keep_reasoning: false,
         }
+    }
+
+    /// Whether old `reasoning_content` is preserved under budget pressure.
+    /// Protocols that replay signed thinking blocks require it.
+    pub fn set_keep_reasoning(&mut self, keep: bool) {
+        self.keep_reasoning = keep;
     }
 
     pub fn total_tokens(&self) -> usize {
@@ -178,6 +189,11 @@ impl Context {
     /// was modified. This reclaims tokens from stale reasoning without breaking
     /// the tool-call chain (which the OpenAI API requires to stay intact).
     fn strip_old_reasoning(&mut self) -> bool {
+        if self.keep_reasoning {
+            // The protocol replays signed thinking blocks: stripping the
+            // reasoning would make the next request unreadable to the API.
+            return false;
+        }
         // Count tool-call entries from the end to find the cutoff: entries with
         // fewer than KEEP_LAST_REASONING tool-call entries after them keep
         // their reasoning.
@@ -720,6 +736,7 @@ impl Context {
             entries,
             total_tokens: 0,
             token_budget,
+            keep_reasoning: false,
         };
         restored.recount_tokens();
         Some(restored)

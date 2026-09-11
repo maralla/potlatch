@@ -428,6 +428,9 @@ impl AcpServer {
             Arc::clone(&inject_queue),
         );
         if let Some(context_path) = session.context_path.clone() {
+            if self.llm.preserves_reasoning() {
+                agent.set_keep_reasoning(true);
+            }
             agent.set_context_path(context_path);
             // restore_context falls back to init_context itself when no
             // transcript restores; initing again here would double the
