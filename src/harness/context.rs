@@ -128,14 +128,11 @@ pub enum BudgetAction {
     Collapsed,
 }
 /// Receives a list of `(label, content)` pairs and returns a list of summaries
-/// (same length, same order). When `None`, a naive first/last-lines heuristic
-/// is used instead.
+/// (same length, same order). Backs Phase 1 compaction.
 pub type Compactor<'a> = dyn Fn(&[(String, String)]) -> Vec<String> + Send + Sync + 'a;
 
 /// Callback that summarizes the entire conversation into a single text block.
-/// Used when the non-evictable entries (tool calls, edit results) exceed the
-/// budget and per-entry compaction can't bring it down. The conversation is
-/// collapsed into a summary, breaking the tool-call chain and starting fresh.
+/// Backs the collapse phase.
 pub type Summarizer<'a> = dyn Fn(&[ContextEntry]) -> String + Send + Sync + 'a;
 
 impl Context {
@@ -388,17 +385,23 @@ impl Context {
     ///
     /// Phases (in order of increasing information loss):
     /// 0. **Collapse** — if non-evictable entries alone exceed the threshold,
-    ///    the entire conversation is summarized into a single system message via
-    ///    the `summarizer` callback. This breaks the tool-call chain (which
-    ///    can't be evicted piecemeal) and starts fresh: system prompt + summary
-    ///    + original user prompt.
-    /// 1. **Compact** — large evictable entries are summarized in a single LLM call.
+    ///    the entire conversation is summarized into a single system message
+    ///    (via the `summarizer` when the context is under the hard limit, a
+    ///    heuristic otherwise). This breaks the tool-call chain (which can't
+    ///    be evicted piecemeal) and starts fresh.
+    /// 1. **Compact** — large evictable entries are summarized (LLM via the
+    ///    `compactor` under the hard limit, head previews at/over it).
     /// 2. **Truncate** — remaining evictable entries are cut to a few lines.
     /// 3. **Evict** — oldest evictable entries are removed entirely.
     ///
-    /// Non-evictable entries (system prompt, user prompt, assistant text, tool
-    /// calls, edit results) are never touched by phases 1–3. Phase 0 is the
-    /// escape hatch when they accumulate beyond the budget.
+    /// The model is consulted only while the context is UNDER the hard
+    /// limit ([`Self::token_budget`], the endpoint's configured capacity):
+    /// an LLM call at over-limit size is exactly the request that stalls
+    /// payload-sensitive gateways, so past the limit every phase falls back
+    /// to heuristics and makes progress without the network. Non-evictable
+    /// entries (system prompt, user prompt, assistant text, tool calls,
+    /// edit results) are never touched by phases 1–3. Phase 0 is the escape
+    /// hatch when they accumulate beyond the budget.
     pub fn enforce_budget(
         &mut self,
         compactor: Option<&Compactor<'_>>,
@@ -414,6 +417,11 @@ impl Context {
         if self.total_tokens <= trigger {
             return BudgetAction::None;
         }
+
+        // At/over the hard limit the context itself is the problem: make
+        // progress with heuristics only. Under it, LLM summaries are worth
+        // their cost.
+        let over_limit = self.total_tokens >= self.token_budget;
 
         // Phase 0: Strip reasoning_content from old tool-call entries.
         // Reasoning models (Model1, DeepSeek R1) emit a thinking trace that is
@@ -439,10 +447,15 @@ impl Context {
             .map(|(_, e)| e.tokens)
             .sum();
 
-        if non_evictable_tokens >= target
-            && let Some(summ) = summarizer
-        {
-            self.collapse(summ);
+        if non_evictable_tokens >= target {
+            if !over_limit && let Some(summ) = summarizer {
+                self.collapse(summ);
+            } else {
+                // Heuristic: the summary replaces the whole conversation, so
+                // keep it to a fraction of the target (chars ≈ tokens × 4,
+                // halved for slack).
+                self.collapse_heuristic(target * 4 / 2);
+            }
             return BudgetAction::Collapsed;
         }
 
@@ -457,17 +470,16 @@ impl Context {
             .collect();
 
         if !to_compact.is_empty() {
-            let inputs: Vec<(String, String)> = to_compact
-                .iter()
-                .map(|(_, label, content)| (label.clone(), content.clone()))
-                .collect();
-
-            let summaries: Vec<String> = match compactor {
-                Some(c) => c(&inputs),
-                None => inputs
+            let summaries: Vec<String> = if !over_limit && let Some(c) = compactor {
+                c(&to_compact
                     .iter()
-                    .map(|(label, content)| compact_summary(content, label))
-                    .collect(),
+                    .map(|(_, label, content)| (label.clone(), content.clone()))
+                    .collect::<Vec<_>>())
+            } else {
+                to_compact
+                    .iter()
+                    .map(|(_, label, content)| compact_summary(content, label))
+                    .collect()
             };
 
             // Apply summaries back to entries
@@ -525,13 +537,26 @@ impl Context {
         BudgetAction::Evicted
     }
 
+    /// Heuristic collapse: replace the conversation with entry previews (no
+    /// model call). The summary must be a fraction of the budget, or a small
+    /// context would GROW by collapsing.
+    fn collapse_heuristic(&mut self, max_summary_chars: usize) {
+        let summary = collapse_summary(&self.entries, max_summary_chars);
+        self.rebuild_after_collapse(&summary);
+    }
+
     /// Collapse the entire conversation into a summary, then restart with
     /// system prompt + summary + original user prompt. This breaks the tool-call
     /// chain (which can't be evicted piecemeal) and gives the model a fresh start.
     fn collapse(&mut self, summarizer: &Summarizer<'_>) {
-        // Summarize the entire conversation.
+        // Summarize the entire conversation via the callback.
         let summary = summarizer(&self.entries);
+        self.rebuild_after_collapse(&summary);
+    }
 
+    /// Rebuild the context after a collapse: system prompt + summary +
+    /// original user prompt.
+    fn rebuild_after_collapse(&mut self, summary: &str) {
         // Preserve the system prompt entries (they're at the front).
         let system_entries: Vec<ContextEntry> = self
             .entries
@@ -564,6 +589,7 @@ impl Context {
              compacted — refer to this summary for what has been done, what files were changed, \
              and what remains.\n\n{summary}"
         );
+        let _ = summary;
         let summary_tokens = Self::estimate_tokens(&summary_text) + 4;
         new_total += summary_tokens;
         new_entries.push(ContextEntry {
@@ -869,6 +895,33 @@ fn role_from_name(name: &str) -> Option<Role> {
 /// output, with a marker showing the original size, the first few lines (most
 /// relevant), a marker, and the last few lines (often contains errors or final
 /// results).
+/// Heuristic conversation summary for the collapse phase: role-labeled head
+/// previews of the most recent entries. No model call — see
+/// [`Context::enforce_budget`].
+fn collapse_summary(entries: &[ContextEntry], max_chars: usize) -> String {
+    const KEEP: usize = 50;
+    const PREVIEW_CHARS: usize = 240;
+    let start = entries.len().saturating_sub(KEEP);
+    let mut parts: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for entry in entries[start..].iter().rev() {
+        // Most recent entries carry the most state — include them first,
+        // stopping at the char budget. At least one entry always lands.
+        let preview: String = entry.content.chars().take(PREVIEW_CHARS).collect();
+        let part = format!("[{}] {preview}", entry.kind.label());
+        if used + part.len() > max_chars && !parts.is_empty() {
+            break;
+        }
+        used += part.len();
+        parts.push(part);
+    }
+    parts.reverse();
+    if start > 0 || parts.len() < entries[start..].len() {
+        parts.insert(0, "[...older entries elided...]".to_string());
+    }
+    parts.join("\n")
+}
+
 fn compact_summary(content: &str, label: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let char_count = content.len();
@@ -1108,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_compactor_is_used_when_provided() {
+    fn compaction_replaces_large_entries_with_head_summaries() {
         let mut ctx = Context::new(500);
         ctx.push(Role::System, ContextKind::System, "sys");
         ctx.push(
@@ -1117,33 +1170,26 @@ mod tests {
             "line 1\nline 2\nline 3\n".repeat(100),
         );
 
-        // Custom compactor that receives all entries at once and returns summaries.
-        let compactor: &Compactor<'_> = &|entries: &[(String, String)]| {
-            entries
-                .iter()
-                .map(|(label, content)| {
-                    format!(
-                        "[llm summary of {label}, {} chars]\nKey result: all good",
-                        content.len()
-                    )
-                })
-                .collect()
-        };
-
-        ctx.enforce_budget(Some(compactor), None);
+        ctx.enforce_budget(None, None);
 
         let entries = ctx.entries();
         let shell_entry = entries
             .iter()
             .find(|e| e.kind == ContextKind::ShellOutput)
             .expect("shell output should survive (compacted)");
-        assert!(shell_entry.content.contains("[llm summary of"));
-        assert!(shell_entry.content.contains("Key result: all good"));
+        // The heuristic summary keeps the head and marks the compaction.
+        assert!(
+            shell_entry.content.contains("[compacted"),
+            "{}",
+            shell_entry.content
+        );
+        assert!(shell_entry.content.contains("line 1"));
+        assert!(shell_entry.content.contains("[...truncated...]"));
     }
 
     #[test]
-    fn llm_compactor_receives_all_entries_in_single_call() {
-        let mut ctx = Context::new(200);
+    fn compaction_shrinks_the_context_below_the_target() {
+        let mut ctx = Context::new(2_000);
         ctx.push(Role::System, ContextKind::System, "sys");
         // Three large evictable entries
         for i in 0..3 {
@@ -1153,30 +1199,192 @@ mod tests {
                 format!("entry {i}\n").repeat(100),
             );
         }
+        assert!(ctx.total_tokens() > 1_200, "must start over the trigger");
 
-        // Track how many times the compactor is called — should be exactly once.
-        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let call_count_clone = std::sync::Arc::clone(&call_count);
-        let compactor: &Compactor<'_> = &|entries: &[(String, String)]| {
-            call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            // Verify we received all 3 entries
-            assert_eq!(
-                entries.len(),
-                3,
-                "compactor should receive all entries at once"
+        ctx.enforce_budget(None, None);
+
+        // 60% trigger, 30% target: compaction must land under the target.
+        assert!(
+            ctx.total_tokens() <= 600,
+            "context {} must be at or under the 30% target",
+            ctx.total_tokens()
+        );
+    }
+
+    #[test]
+    fn compaction_uses_the_llm_under_the_limit() {
+        let mut ctx = Context::new(2_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        // Over the 60% trigger (1200), under the hard limit (2000).
+        for i in 0..3 {
+            ctx.push(
+                Role::Tool,
+                ContextKind::ShellOutput,
+                format!("entry {i}\n").repeat(150),
             );
+        }
+        assert!(
+            ctx.total_tokens() > 1_200 && ctx.total_tokens() < 2_000,
+            "setup must sit between trigger and limit, got {}",
+            ctx.total_tokens()
+        );
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = std::sync::Arc::clone(&calls);
+        let compactor: &Compactor<'_> = &|entries| {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             entries
                 .iter()
-                .map(|(label, _)| format!("[summary for {label}]"))
+                .map(|(label, _)| format!("[llm summary for {label}]"))
                 .collect()
         };
-
         ctx.enforce_budget(Some(compactor), None);
+
         assert_eq!(
-            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "compactor should be called exactly once"
+            "the LLM compaction runs while under the limit"
         );
+        assert!(
+            ctx.entries()
+                .iter()
+                .any(|e| e.content.contains("[llm summary for")),
+            "LLM summaries are applied"
+        );
+    }
+
+    #[test]
+    fn compaction_skips_the_llm_over_the_limit() {
+        let mut ctx = Context::new(2_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        // Past the hard limit: the model call is exactly what stalls here.
+        for i in 0..3 {
+            ctx.push(
+                Role::Tool,
+                ContextKind::ShellOutput,
+                format!("entry {i}\n").repeat(340),
+            );
+        }
+        assert!(
+            ctx.total_tokens() >= 2_000,
+            "setup must sit at/over the limit, got {}",
+            ctx.total_tokens()
+        );
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = std::sync::Arc::clone(&calls);
+        let compactor: &Compactor<'_> = &|_| {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        };
+        ctx.enforce_budget(Some(compactor), None);
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "over the limit the model must not be consulted"
+        );
+        assert!(
+            ctx.entries()
+                .iter()
+                .any(|e| e.content.contains("[compacted")),
+            "the heuristic summaries apply"
+        );
+    }
+
+    #[test]
+    fn collapse_uses_the_summarizer_under_the_limit() {
+        let mut ctx = Context::new(2_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        // Non-evictable bulk over the target (600), total under the limit.
+        for i in 0..8 {
+            ctx.push_assistant_with_tools(
+                Some(&format!("step {i}")),
+                &[json!({
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": "edit", "arguments": "{}"}
+                })],
+                "",
+            );
+            ctx.push_tool_result(
+                ContextKind::EditResult,
+                format!("done {i} successfully with a longish tail\n").repeat(20),
+                format!("call_{i}"),
+            );
+        }
+        assert!(
+            ctx.total_tokens() > 600 && ctx.total_tokens() < 2_000,
+            "setup must sit between target and limit, got {}",
+            ctx.total_tokens()
+        );
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = std::sync::Arc::clone(&calls);
+        let summarizer: &Summarizer<'_> = &|entries| {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            format!("LLM summary of {} entries", entries.len())
+        };
+        let action = ctx.enforce_budget(None, Some(summarizer));
+
+        assert_eq!(action, BudgetAction::Collapsed);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the LLM collapse runs while under the limit"
+        );
+        assert!(
+            ctx.entries()
+                .iter()
+                .any(|e| e.content.contains("LLM summary of")),
+            "the LLM summary is embedded"
+        );
+    }
+
+    #[test]
+    fn collapse_skips_the_summarizer_over_the_limit() {
+        let mut ctx = Context::new(2_000);
+        ctx.push(Role::System, ContextKind::System, "sys");
+        ctx.push(Role::User, ContextKind::UserPrompt, "do task");
+        // Non-evictable bulk over the target AND total at/over the limit.
+        for i in 0..14 {
+            ctx.push_assistant_with_tools(
+                Some(&format!("step {i}")),
+                &[json!({
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": "edit", "arguments": "{}"}
+                })],
+                "",
+            );
+            ctx.push_tool_result(
+                ContextKind::EditResult,
+                format!("done {i} successfully with a longish tail\n").repeat(40),
+                format!("call_{i}"),
+            );
+        }
+        assert!(
+            ctx.total_tokens() >= 2_000,
+            "setup must sit at/over the limit, got {}",
+            ctx.total_tokens()
+        );
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = std::sync::Arc::clone(&calls);
+        let summarizer: &Summarizer<'_> = &|_| {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "should never be used".to_string()
+        };
+        let action = ctx.enforce_budget(None, Some(summarizer));
+
+        assert_eq!(action, BudgetAction::Collapsed);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "over the limit the model must not be consulted"
+        );
+        assert!(ctx.total_tokens() < 2_000, "the collapse must reduce");
     }
 
     #[test]
@@ -1208,11 +1416,7 @@ mod tests {
         let before_len = ctx.entries().len();
         assert!(before_tokens > 150, "should exceed threshold");
 
-        // Summarizer that returns a short summary.
-        let summarizer: &Summarizer<'_> =
-            &|entries: &[ContextEntry]| format!("Summary: {} entries processed", entries.len());
-
-        ctx.enforce_budget(None, Some(summarizer));
+        ctx.enforce_budget(None, None);
 
         let after_tokens = ctx.total_tokens();
         let after_len = ctx.entries().len();
@@ -1240,7 +1444,12 @@ mod tests {
                 .iter()
                 .any(|e| e.content.contains("Conversation Summary"))
         );
-        assert!(ctx.entries().iter().any(|e| e.content.contains("Summary:")));
+        // The heuristic summary carries role-labeled entry previews.
+        assert!(
+            ctx.entries()
+                .iter()
+                .any(|e| e.content.contains("[tool result]"))
+        );
     }
 
     #[test]
@@ -1262,8 +1471,7 @@ mod tests {
             );
         }
 
-        let summarizer: &Summarizer<'_> = &|_| "Task in progress".to_string();
-        ctx.enforce_budget(None, Some(summarizer));
+        ctx.enforce_budget(None, None);
 
         // System prompt and user prompt must survive
         let contents: Vec<&str> = ctx.entries().iter().map(|e| e.content.as_str()).collect();
@@ -1624,9 +1832,11 @@ mod tests {
         // With KEEP_LAST_REASONING=2, the last 2 tool-call entries keep their
         // reasoning; older ones have it stripped. The tool_calls JSON itself
         // must survive so the OpenAI conversation stays valid.
-        // Use a small budget so the total exceeds the 60% trigger and forces
-        // enforce_budget to actually run its reduction phases.
-        let mut ctx = Context::new(200);
+        // The trigger must be crossed by EVICTABLE bulk so the reduction
+        // phases run, while the non-evictable tool-call chain stays under
+        // the collapse threshold (collapse would replace the chain and
+        // defeat the test's subject).
+        let mut ctx = Context::new(10_000);
         ctx.push(Role::System, ContextKind::System, "sys");
         ctx.push(Role::User, ContextKind::UserPrompt, "do task");
         // Four tool-call turns, each with reasoning.
@@ -1642,26 +1852,24 @@ mod tests {
             );
             ctx.push_tool_result(
                 ContextKind::ShellOutput,
-                format!("result {i}"),
+                format!("result {i}\n").repeat(400),
                 format!("call_{i}"),
             );
         }
-        // Sanity: total must exceed the 60% trigger (120) for stripping to run.
+        // Sanity: total must exceed the 60% trigger (6000) for stripping to run.
         assert!(
-            ctx.total_tokens() > 120,
+            ctx.total_tokens() > 6_000,
             "test setup should exceed trigger, got {}",
             ctx.total_tokens()
         );
 
         let before_tokens = ctx.total_tokens();
         let action = ctx.enforce_budget(None, None);
-        // Stripping should have run. It may bring us under target (60) or not;
-        // either way reasoning on old entries is gone.
+        // A reduction ran (anything but none); collapse must NOT — the
+        // non-evictable chain is under the collapse threshold.
         assert!(
-            action == BudgetAction::ReasoningStripped
-                || action == BudgetAction::Truncated
-                || action == BudgetAction::Evicted,
-            "expected a reduction action, got {action:?}"
+            action != BudgetAction::None && action != BudgetAction::Collapsed,
+            "expected a reduction without collapse, got {action:?}"
         );
 
         let messages = ctx.to_messages();

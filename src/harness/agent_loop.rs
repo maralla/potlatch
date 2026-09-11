@@ -26,8 +26,8 @@ const MAX_TOOL_RESULT_CHARS: usize = 4_000;
 /// Per-entry and total caps for context content replayed into compaction /
 /// collapse prompts. Uncapped, the compaction request approaches the very
 /// context size that triggered compaction — observed to stall a gateway
-/// that hangs on large payloads, burning the whole retry budget. The caps
-/// keep the compaction call itself small and fast.
+/// that hangs on large payloads. The caps keep the compaction call itself
+/// small and fast.
 const COMPACT_ENTRY_MAX_CHARS: usize = 6_000;
 const COMPACT_TOTAL_MAX_CHARS: usize = 48_000;
 
@@ -258,9 +258,9 @@ impl AgentLoop {
                 }
             }
 
-            // Build messages and enforce context budget. When compacting, use
-            // the LLM to summarize all large entries in a single call so the
-            // most important info (errors, key results, file paths) is preserved.
+            // Build messages and enforce context budget. Under the hard
+            // limit the summaries are LLM-written (better retention); at/over
+            // it enforce_budget falls back to heuristics without the model.
             let model = &self.model;
             let llm = &self.llm;
             let tool_schemas = &self.tool_schemas;
