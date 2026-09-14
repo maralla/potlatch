@@ -181,7 +181,20 @@ impl<'de> Deserialize<'de> for WorkerFeedbackOutput {
     {
         let (outcome, fields) = tagged::parts(deserializer, "outcome")?;
         match outcome.as_str() {
-            "addressed" => tagged::branch(fields).map(Self::Addressed),
+            "addressed" => tagged::branch(fields).and_then(|resolution: FeedbackResolution| {
+                let summary_empty = resolution
+                    .changes_summary
+                    .as_deref()
+                    .is_none_or(|summary| summary.trim().is_empty());
+                if summary_empty {
+                    return Err(serde::de::Error::custom(
+                        "changes_summary must be a non-empty sentence summarizing the \
+                             substance of the changes — it is used as the commit message and \
+                             posted with your reply",
+                    ));
+                }
+                Ok(Self::Addressed(resolution))
+            }),
             "cannot_resolve" => tagged::branch(fields).map(Self::CannotResolve),
             outcome => Err(serde::de::Error::unknown_variant(
                 outcome,
@@ -217,12 +230,20 @@ fn mr_metadata_properties(schema: ObjectSchema) -> ObjectSchema {
                 "Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections.",
             ),
         )
-        .property(
-            "changes_summary",
-            Schema::string(
-                "A concise sentence summarizing the substance of the changes you made (used as the commit message).",
-            ),
-        )
+}
+
+/// The `changes_summary` field: optional for the implementation contract
+/// (core falls back to the issue title for the commit message), REQUIRED for
+/// the feedback contract — without it the tail posts a generic fallback as a
+/// human-facing reply (observed on MR !283), and a missing field is exactly
+/// what the schema repair loop can fix.
+fn changes_summary_property() -> (&'static str, Schema) {
+    (
+        "changes_summary",
+        Schema::string(
+            "A concise sentence summarizing the substance of the changes you made (used as the commit message and posted with your reply).",
+        ),
+    )
 }
 
 /// The `reason` + `public_comment` pair every blocked branch carries.
@@ -247,7 +268,10 @@ structured_output! {
             {
                 "implemented" => (
                     format!("You made the code changes; {} commits, pushes, and opens the merge request.", display_name()),
-                    fields(mr_metadata_properties(ObjectSchema::new()))
+                    fields(mr_metadata_properties(ObjectSchema::new()).property(
+                        changes_summary_property().0,
+                        changes_summary_property().1,
+                    ))
                 ),
                 "existing_mr" => (
                     format!("You found an already-open merge request that implements this issue; {} tracks it instead of opening a new one.", display_name()),
@@ -310,6 +334,7 @@ structured_output! {
                 "addressed" => (
                     "You handled the reviewer feedback — in code, in merge request metadata, or by explaining that the branch already satisfies it.",
                     fields(mr_metadata_properties(ObjectSchema::new())
+                    .required_property(changes_summary_property().0, changes_summary_property().1)
                     .property(
                         "reason",
                         Schema::string(
@@ -2953,8 +2978,14 @@ struct FeedbackTailInput {
 
 impl FeedbackTailInput {
     fn commit_message(&self) -> String {
+        // The contract rejects an addressed outcome without a non-empty
+        // changes_summary (see the decode nudge), so this is always a real
+        // sentence.
         build_commit_message(
-            &extract_changes_summary(self.resolution.changes_summary.as_deref()),
+            self.resolution
+                .changes_summary
+                .as_deref()
+                .unwrap_or_default(),
             self.issue_iid.unwrap_or(0),
         )
     }
@@ -3155,13 +3186,18 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
     }
 
     if let Some(body) = reply_body.as_deref() {
+        let replied_to_discussions = !ids_to_resolve.is_empty();
         for discussion_id in &ids_to_resolve {
             port.reply_to_discussion(discussion_id, body);
             if resolve_discussions {
                 port.resolve_discussion(discussion_id);
             }
         }
-        if input.plain_comments_present && should_post_plain_comment {
+        // A plain top-level comment with the SAME body would duplicate the
+        // discussion replies (observed on MR !283: one answer in the thread
+        // and again at the top level). Post top-level only when no
+        // discussion carried the reply.
+        if input.plain_comments_present && should_post_plain_comment && !replied_to_discussions {
             port.post_plain_comment(body);
         }
     }
@@ -3866,16 +3902,6 @@ fn build_commit_message(title: &str, issue_iid: u64) -> String {
     }
 }
 
-fn extract_changes_summary(changes_summary: Option<&str>) -> String {
-    if let Some(s) = changes_summary {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return strip_markdown_formatting(trimmed);
-        }
-    }
-    "Changes made to address reviewer feedback.".to_string()
-}
-
 /// Strips leading `Resolved without code changes:` / `Addressed feedback:` from the posted reply.
 /// If there is no substantive text after that prefix, returns the original string unchanged.
 fn strip_worker_reply_boilerplate(text: &str) -> String {
@@ -3939,7 +3965,8 @@ fn build_feedback_resolution_reply(
     diff_highlights: Option<&str>,
 ) -> Option<String> {
     if has_new_changes {
-        let summary = extract_changes_summary(resolution.changes_summary.as_deref());
+        // The decode nudge guarantees a non-empty summary here.
+        let summary = resolution.changes_summary.as_deref().unwrap_or_default();
         if let Some(diff) = diff_highlights
             && !diff.trim().is_empty()
         {
@@ -5132,6 +5159,7 @@ mod tests {
     fn feedback_output_tolerates_stringified_comment_controls() {
         let output = conformance::assert_accepts::<WorkerFeedbackOutput>(serde_json::json!({
             "outcome": "addressed",
+            "changes_summary": "Capped the retry backoff",
             "mark_discussions_resolved": "true",
             "post_plain_comment": "False"
         }));
@@ -5140,6 +5168,34 @@ mod tests {
         };
         assert_eq!(resolution.mark_discussions_resolved, Some(true));
         assert!(!resolution.post_plain_comment);
+    }
+
+    #[test]
+    fn feedback_output_nudges_a_non_empty_changes_summary() {
+        // Missing → the schema's required-property error names the field;
+        // empty and whitespace-only pass the schema but are rejected by the
+        // branch decoder, so the repair loop makes the model write the
+        // sentence: it is the commit message and the reply's substance.
+        let error = conformance::assert_rejects::<WorkerFeedbackOutput>(serde_json::json!({
+            "outcome": "addressed"
+        }));
+        assert_eq!(error, "$.changes_summary: required property is missing");
+
+        for empty in ["", "   "] {
+            let error = conformance::assert_rejects::<WorkerFeedbackOutput>(serde_json::json!({
+                "outcome": "addressed",
+                "changes_summary": empty
+            }));
+            assert!(
+                error.contains("changes_summary must be a non-empty sentence"),
+                "{error}"
+            );
+        }
+
+        conformance::assert_accepts::<WorkerFeedbackOutput>(serde_json::json!({
+            "outcome": "addressed",
+            "changes_summary": "Capped the retry backoff"
+        }));
     }
 
     #[test]
@@ -7706,7 +7762,10 @@ mod tests {
     }
 
     #[test]
-    fn feedback_posts_plain_comment_last() {
+    fn feedback_plain_comment_is_skipped_when_discussions_carried_the_reply() {
+        // The same body in the discussion thread AND at the top level is
+        // duplication (observed on MR !283): the top-level post fires only
+        // when no discussion carried the reply.
         let resolution = FeedbackResolution {
             changes_summary: Some("Reduced the retry delay".to_string()),
             post_plain_comment: true,
@@ -7721,14 +7780,10 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(
-            &trace[trace.len() - 3..],
-            &[
-                "reply(d1|Reduced the retry delay)",
-                "resolve(d1)",
-                "plain_comment(Reduced the retry delay)",
-            ]
+            &trace[trace.len() - 2..],
+            &["reply(d1|Reduced the retry delay)", "resolve(d1)"]
         );
-        assert_eq!(port.plain_replies, vec!["Reduced the retry delay"]);
+        assert!(port.plain_replies.is_empty(), "no top-level duplicate");
     }
 
     #[test]
