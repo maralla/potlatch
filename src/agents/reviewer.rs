@@ -1329,6 +1329,12 @@ INSTRUCTIONS:
 13. Only raise NEW issues not already covered in previous comments
 14. Readability and maintainability must be ensured
 
+CONCURRENCY AND STATE SAFETY (review every change that touches shared state, background jobs, queues, retries, or status transitions):
+- Data races: concurrent access to shared state without synchronization (locks, atomics, channels, transactions); check-then-act windows where a check and the act that depends on it are not atomic.
+- Inconsistent status: multi-step state transitions that can fail halfway and leave an object in a partial or contradictory status (e.g. marked done before the durable write, deleted before the dependent record is updated).
+- Missing atomicity: read-modify-write sequences that must be a single atomic operation; idempotency of retries for operations that can be re-run after a partial failure.
+- If the change introduces such a defect, reject with the exact interleaving that breaks it, not just the rule name.
+
 MR TITLE AND DESCRIPTION (STRICT — reject if violated):
 - The MR title MUST be a concise, meaningful summary of the code changes. Reject if the title is generic (e.g. "Implementation changes", "Update", "Fix"), just an issue number, or contains markdown formatting like ** or backticks.
 - The MR description MUST explain the goal, implementation approach, and testing. Judge using the full `## MR description` text in the task context file (not the MR title line alone). Reject only if that text is empty, a single generic sentence (e.g. "Implementation completed."), or does not describe the actual changes. If it includes substantive detail (sections like Goal / Implementation / Testing, or equivalent prose), it satisfies this requirement even when the first line is only `Closes #N` or similar.

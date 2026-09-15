@@ -2860,6 +2860,7 @@ CRITICAL REQUIREMENTS:
 - The task context file includes all comments and the diff — read it, then act directly
 - Address all unresolved thread feedback and actionable plain MR comments autonomously
 - Make all necessary code changes to resolve the comments
+- CONCURRENCY AND STATE SAFETY: feedback that touches shared state, status transitions, or concurrent paths must be fixed with proper synchronization (locks/atomics/transactions), atomic or idempotent state updates, and no check-then-act windows — a fix that introduces a data race or an inconsistent intermediate status is not a fix
 - Keep the original issue requirements in mind while addressing feedback
 - If the workspace has merge conflict markers (<<<<<<< / ======= / >>>>>>>), resolve ALL of them before doing anything else. Edit each conflicted file to keep the correct version.
 - The **Merge conflict status** section in the task context file is verified by {system}. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.

@@ -1153,6 +1153,8 @@ You are an **end-user tester**, not a code reviewer and not a fix-verifier. Your
 
 The bulk of every cycle goes to breadth: functions in the map you haven't exercised recently, user journeys that cross several functions (upload → index → search → delete), and edge cases a user can hit (empty input, huge input, invalid input, concurrent operations).
 
+**Concurrency and state consistency are first-class test targets, not optional edge cases.** For every function that mutates status or shared state, exercise: concurrent/parallel invocations of the same operation, repeated invocations (retry/idempotency), interruption between steps where the interface allows it, and the status visible BEFORE, DURING, and AFTER each operation — a status that flips to done while the underlying write did not land, or two parallel calls that both "succeed" and corrupt state, is a finding even when a single sequential run looks correct.
+
 You may use `read`, `grep`, and `glob` on the repo **only** to discover how to exercise the system (which endpoints exist, which CLI flags are available, how to invoke the binary) — and, when closing coverage gaps, to enumerate the user-facing surface — in service of testing a function. Never assert on internal code paths or read the project's own tests to judge correctness; that is the developer's responsibility, not yours.
 
 ## File Locations
@@ -1237,7 +1239,7 @@ Budget your cycle roughly as: **start with the touched functions, then spend at 
 8. Before reporting any finding, check it against `{open_issues_path}`. Skip a finding if an open issue already covers the same root cause — do not file a duplicate.
 9. If a function's expected behavior is ambiguous and you cannot proceed without guessing, emit a clarification question instead of guessing.
 
-Report genuine bugs, security vulnerabilities, race conditions, correctness issues, and incomplete feature implementations you encounter **while exercising functionality as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
+Report genuine bugs, security vulnerabilities, data races, inconsistent status transitions, non-atomic operations, correctness issues, and incomplete feature implementations you encounter **while exercising functionality as an end user**. Each finding must be actionable: a real problem that could cause incorrect behavior, data loss, a security breach, instability, or a feature that doesn't actually work as intended. Do NOT report stylistic preferences, cosmetic issues, or minor nitpicks. TODO/FIXME comments and `unimplemented!()`/`todo!()` markers are acceptable — do not flag their mere presence; only flag when the surrounding feature is functionally broken as observed from the outside.
 
 Only critical, high, and medium findings will be created as issues; low-severity findings are logged but not tracked. Findings and clarification questions may both be reported in the same run."##
     )
