@@ -77,6 +77,33 @@ impl EndpointEntry {
     }
 }
 
+/// One harness child for a group of provided models whose endpoint
+/// configuration is identical. Models on different endpoints start
+/// different children; entries differing only in `model`/`alias` share one.
+#[derive(Debug, Clone)]
+pub struct ClientSpawnGroup {
+    /// Opaque group identity: the spawn config's determining fields.
+    pub(crate) identity: String,
+    /// The full model URIs the group's child serves.
+    pub models: Vec<String>,
+    /// The spawn configuration (env/auth baked from the endpoint).
+    pub spawn: AcpSpawnConfig,
+}
+
+/// The spawn-determining identity of a client child: command, resolved env,
+/// and auth provider. Models whose configs share this identity collapse
+/// into one child.
+pub fn spawn_identity(
+    command: &[String],
+    env: &HashMap<String, String>,
+    auth_command: &Option<Vec<String>>,
+) -> String {
+    let mut env_pairs: Vec<(String, String)> =
+        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    env_pairs.sort();
+    format!("{command:?}|{env_pairs:?}|{auth_command:?}")
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AcpSpawnConfig {
     pub command: Vec<String>,
@@ -983,7 +1010,11 @@ mod tests {
             .resolve_client_spawn("potlatch", &["acp://potlatch/model1".to_string()])
             .unwrap();
         assert_eq!(
-            spawn.env.get("POTLATCH_CONTEXT_TOKENS").map(String::as_str),
+            spawn[0]
+                .spawn
+                .env
+                .get("POTLATCH_CONTEXT_TOKENS")
+                .map(String::as_str),
             Some("120000")
         );
 
@@ -991,7 +1022,7 @@ mod tests {
         let spawn = harness_config()
             .resolve_client_spawn("potlatch", &["acp://potlatch/model1".to_string()])
             .unwrap();
-        assert!(!spawn.env.contains_key("POTLATCH_CONTEXT_TOKENS"));
+        assert!(!spawn[0].spawn.env.contains_key("POTLATCH_CONTEXT_TOKENS"));
     }
 
     #[test]
@@ -1030,32 +1061,41 @@ mod tests {
         // The provided models pick the endpoint whose env/auth the shared
         // ACP child is spawned with. Query suffixes are stripped before
         // matching.
-        let spawn = harness_config()
+        let groups = harness_config()
             .resolve_client_spawn(
                 "potlatch",
                 &["acp://potlatch/model2?effort=high".to_string()],
             )
             .unwrap();
+        assert_eq!(groups.len(), 1);
         assert_eq!(
-            spawn.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            groups[0]
+                .spawn
+                .env
+                .get("POTLATCH_BASE_URL")
+                .map(String::as_str),
             Some("http://endpoint2.example")
         );
         assert_eq!(
-            spawn.env.get("POTLATCH_API_KEY").map(String::as_str),
+            groups[0]
+                .spawn
+                .env
+                .get("POTLATCH_API_KEY")
+                .map(String::as_str),
             Some("EMPTY")
         );
         // The platform's own harness vendor runs THIS executable.
         let exe = std::env::current_exe().unwrap();
-        assert_eq!(spawn.command[0], exe.display().to_string());
-        assert_eq!(spawn.command[1], "harness");
-        assert_eq!(spawn.model_uri, None);
+        assert_eq!(groups[0].spawn.command[0], exe.display().to_string());
+        assert_eq!(groups[0].spawn.command[1], "harness");
+        assert_eq!(groups[0].spawn.model_uri, None);
     }
 
     #[test]
     fn resolve_client_spawn_accepts_models_sharing_one_endpoint() {
         // Two provided models whose bare names resolve to the same endpoint
         // are fine.
-        let spawn = harness_config()
+        let groups = harness_config()
             .resolve_client_spawn(
                 "potlatch",
                 &[
@@ -1064,17 +1104,22 @@ mod tests {
                 ],
             )
             .unwrap();
+        assert_eq!(groups.len(), 1);
         assert_eq!(
-            spawn.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            groups[0]
+                .spawn
+                .env
+                .get("POTLATCH_BASE_URL")
+                .map(String::as_str),
             Some("http://endpoint1.example")
         );
     }
 
     #[test]
-    fn resolve_client_spawn_rejects_models_spanning_endpoints() {
-        // One ACP child serves one endpoint: models from different endpoints
-        // of the same vendor cannot share it.
-        let error = harness_config()
+    fn resolve_client_spawn_splits_models_spanning_endpoints() {
+        // One ACP child per endpoint: models from different endpoints of the
+        // same vendor get their own children, each with its endpoint's env.
+        let groups = harness_config()
             .resolve_client_spawn(
                 "potlatch",
                 &[
@@ -1082,8 +1127,55 @@ mod tests {
                     "acp://potlatch/model2".to_string(),
                 ],
             )
-            .unwrap_err();
-        assert!(error.to_string().contains("one ACP endpoint"), "{error}");
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        let (first, second) = (&groups[0], &groups[1]);
+        let urls: Vec<&str> = [first, second]
+            .iter()
+            .map(|g| {
+                g.spawn
+                    .env
+                    .get("POTLATCH_BASE_URL")
+                    .map(String::as_str)
+                    .unwrap()
+            })
+            .collect();
+        assert!(urls.contains(&"http://endpoint1.example"));
+        assert!(urls.contains(&"http://endpoint2.example"));
+        assert_eq!(first.models.len() + second.models.len(), 2);
+    }
+
+    #[test]
+    fn resolve_client_spawn_collapses_entries_with_identical_config() {
+        // Two entries whose endpoint/key/api are identical (only the model
+        // names differ) share ONE child: the child's env is its endpoint
+        // binding, and identical envs are the same endpoint.
+        let config = Config::from_toml_str(
+            r#"
+            [acp.potlatch]
+            acp_command = ["potlatch", "harness"]
+            endpoints = [
+              { model = "model1", endpoint = "http://endpoint1.example", key = "EMPTY" },
+              { model = "model1-alias", endpoint = "http://endpoint1.example", key = "EMPTY" },
+            ]
+            env = [
+              "POTLATCH_BASE_URL={endpoint}",
+              "POTLATCH_API_KEY={key}",
+            ]
+            "#,
+        )
+        .unwrap();
+        let groups = config
+            .resolve_client_spawn(
+                "potlatch",
+                &[
+                    "acp://potlatch/model1".to_string(),
+                    "acp://potlatch/model1-alias".to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(groups.len(), 1, "identical configs collapse");
+        assert_eq!(groups[0].models.len(), 2);
     }
 
     #[test]
@@ -1121,7 +1213,7 @@ mod tests {
         let spawn = cfg
             .resolve_client_spawn("cursor", &["composer-2".to_string()])
             .unwrap();
-        assert_eq!(spawn.command, vec!["agent", "acp"]);
+        assert_eq!(spawn[0].spawn.command, vec!["agent", "acp"]);
     }
 
     #[test]
@@ -1153,11 +1245,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            spawn.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            spawn[0]
+                .spawn
+                .env
+                .get("POTLATCH_BASE_URL")
+                .map(String::as_str),
             Some("http://model-b.example")
         );
         assert_eq!(
-            spawn.env.get("POTLATCH_API_KEY").map(String::as_str),
+            spawn[0]
+                .spawn
+                .env
+                .get("POTLATCH_API_KEY")
+                .map(String::as_str),
             Some("EMPTY")
         );
     }
@@ -1186,7 +1286,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            spawn.env.get("POTLATCH_BASE_URL").map(String::as_str),
+            spawn[0]
+                .spawn
+                .env
+                .get("POTLATCH_BASE_URL")
+                .map(String::as_str),
             Some("http://endpoint1.example")
         );
     }
@@ -1523,11 +1627,15 @@ mod tests {
         let models = vec!["acp://potlatch/model-x?effort=high".to_string()];
         let spawn = cfg.resolve_client_spawn("potlatch", &models).unwrap();
         assert_eq!(
-            spawn.env.get("POTLATCH_API").map(String::as_str),
+            spawn[0].spawn.env.get("POTLATCH_API").map(String::as_str),
             Some("anthropic")
         );
         assert_eq!(
-            spawn.model_aliases.get("model-x").map(String::as_str),
+            spawn[0]
+                .spawn
+                .model_aliases
+                .get("model-x")
+                .map(String::as_str),
             Some("model1")
         );
     }

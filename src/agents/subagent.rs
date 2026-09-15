@@ -302,6 +302,9 @@ enum Status {
 struct SubagentSession {
     /// The vendor whose ACP client serves this session.
     vendor: String,
+    /// The child key routing to this session's ACP client — one child per
+    /// endpoint group, so the model (not just the vendor) picks the client.
+    child_key: String,
     /// The ACP session id inside that client. `None` once killed — the
     /// tombstone then only remembers the status so later polls answer
     /// sanely.
@@ -479,26 +482,36 @@ impl SubagentHub {
         let mut children = HashMap::new();
         let mut model_aliases = HashMap::new();
         for (vendor, models) in &by_vendor {
-            let acp = config.resolve_client_spawn(vendor, models)?;
-            let demux = Arc::new(Demux::default());
-            let (transport, stdout) =
-                AcpChildProcess::spawn(base_dir, &acp, demux.clone(), vendor.clone())?;
-            // The reader must be running before the handshake: it reads the
-            // child's stdout and delivers the initialize response to the
-            // waiting request.
-            let shared_for_reader = Arc::clone(&shared);
-            let vendor_for_reader = vendor.clone();
-            thread::Builder::new()
-                .name(format!("subagent-reader-{vendor}"))
-                .spawn(move || run_reader(stdout, demux, shared_for_reader, vendor_for_reader))
-                .with_context(|| format!("spawn reader thread for vendor {vendor}"))?;
-            if let Err(error) = transport.request("initialize", json!({})) {
-                transport.shutdown();
-                return Err(error)
-                    .with_context(|| format!("harness ACP initialize failed for vendor {vendor}"));
+            // One child per endpoint group: entries with identical spawn
+            // config (endpoint, key, auth, ...) collapse; different
+            // endpoints each get their own child.
+            for group in config.resolve_client_spawn(vendor, models)? {
+                let demux = Arc::new(Demux::default());
+                let (transport, stdout) =
+                    AcpChildProcess::spawn(base_dir, &group.spawn, demux.clone(), vendor.clone())?;
+                // The reader must be running before the handshake: it reads the
+                // child's stdout and delivers the initialize response to the
+                // waiting request.
+                let shared_for_reader = Arc::clone(&shared);
+                let vendor_for_reader = vendor.clone();
+                thread::Builder::new()
+                    .name(format!("subagent-reader-{vendor}"))
+                    .spawn(move || run_reader(stdout, demux, shared_for_reader, vendor_for_reader))
+                    .with_context(|| format!("spawn reader thread for vendor {vendor}"))?;
+                if let Err(error) = transport.request("initialize", json!({})) {
+                    transport.shutdown();
+                    return Err(error).with_context(|| {
+                        format!("harness ACP initialize failed for vendor {vendor}")
+                    });
+                }
+                let transport: Arc<dyn HarnessTransport> = transport;
+                for model in &group.models {
+                    let uri = ModelUri::parse(model)
+                        .with_context(|| format!("invalid provided model '{model}'"))?;
+                    children.insert(child_key(&uri), Arc::clone(&transport));
+                }
+                model_aliases.extend(group.spawn.model_aliases);
             }
-            children.insert(vendor.clone(), transport as Arc<dyn HarnessTransport>);
-            model_aliases.extend(acp.model_aliases);
         }
 
         Ok(Self {
@@ -572,12 +585,12 @@ impl SubagentHub {
         }
     }
 
-    /// The ACP client serving `vendor`'s subagent sessions.
-    fn child_for(&self, vendor: &str) -> Result<Arc<dyn HarnessTransport>> {
+    /// The ACP client behind a child key (see [`child_key`]).
+    fn child_by_key(&self, key: &str) -> Result<Arc<dyn HarnessTransport>> {
         self.children
-            .get(vendor)
+            .get(key)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no ACP client configured for vendor '{vendor}'"))
+            .ok_or_else(|| anyhow::anyhow!("no ACP client configured for '{key}'"))
     }
 
     /// Dispatch a `subagent` tool call: spawn, poll, message, inject, or
@@ -649,7 +662,12 @@ impl SubagentHub {
         );
         let uri =
             ModelUri::parse(model).with_context(|| format!("invalid subagent model '{model}'"))?;
-        let child = self.child_for(&uri.vendor)?;
+        let key = child_key(&uri);
+        let child = self
+            .children
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no ACP client configured for '{model}'"))?;
 
         let num = self.shared.next_session_num.fetch_add(1, Ordering::Relaxed);
         let id = format!("subagent-{num}");
@@ -707,6 +725,7 @@ impl SubagentHub {
             id.clone(),
             SubagentSession {
                 vendor: uri.vendor.clone(),
+                child_key: key.clone(),
                 session_id: Some(session_id.clone()),
                 owner,
                 started_at: Instant::now(),
@@ -839,8 +858,8 @@ impl SubagentHub {
     /// Send a follow-up message to a running or finished subagent as a new
     /// turn. Context persists across turns inside the shared harness.
     fn message(&self, subagent_id: &str, message: &str) -> Result<String> {
-        let (vendor, session_id) = self.live_routing(subagent_id)?;
-        let child = self.child_for(&vendor)?;
+        let (child_key, session_id) = self.live_routing(subagent_id)?;
+        let child = self.child_by_key(&child_key)?;
         // Mark running before firing: a fast turn may complete before the
         // fire call returns, and Done must not be overwritten afterwards.
         if let Some(session) = self.shared.sessions.lock().unwrap().get_mut(subagent_id) {
@@ -858,8 +877,8 @@ impl SubagentHub {
 
     /// Inject a message into a running subagent's context mid-turn.
     fn inject(&self, subagent_id: &str, message: &str) -> Result<String> {
-        let (vendor, session_id) = self.live_routing(subagent_id)?;
-        let result = self.child_for(&vendor)?.request(
+        let (child_key, session_id) = self.live_routing(subagent_id)?;
+        let result = self.child_by_key(&child_key)?.request(
             "session/inject",
             json!({ "sessionId": session_id, "message": message }),
         )?;
@@ -872,7 +891,7 @@ impl SubagentHub {
     /// Kill a subagent: close its harness session (which tears down its
     /// context and background jobs) and leave only a tombstone behind.
     fn kill(&self, subagent_id: &str) -> Result<String> {
-        let (vendor, session_id) = {
+        let (child_key, session_id) = {
             let mut sessions = self.shared.sessions.lock().unwrap();
             let Some(session) = sessions.get_mut(subagent_id) else {
                 bail!("unknown subagent id: {subagent_id}");
@@ -882,12 +901,12 @@ impl SubagentHub {
             // The output has nowhere to go once the session is closed; free
             // it instead of keeping it in the tombstone.
             session.output.lock().unwrap().clear();
-            (session.vendor.clone(), session_id)
+            (session.child_key.clone(), session_id)
         };
         if let Some(session_id) = session_id {
             // Best effort: the client may already be gone.
             let _ = self
-                .child_for(&vendor)?
+                .child_by_key(&child_key)?
                 .request("session/close", json!({ "sessionId": session_id }));
         }
         Ok(format!("subagent: {subagent_id}\nstatus: killed"))
@@ -939,7 +958,7 @@ impl SubagentHub {
                 "subagent {subagent_id} has exited (killed); spawn a new subagent instead"
             )
         })?;
-        Ok((session.vendor.clone(), session_id))
+        Ok((session.child_key.clone(), session_id))
     }
 }
 
@@ -949,6 +968,12 @@ impl Drop for SubagentHub {
             child.shutdown();
         }
     }
+}
+
+/// The children-map key for a model URI: the vendor plus the model's
+/// addressable name (alias or bare model).
+fn child_key(uri: &ModelUri) -> String {
+    format!("{}/{}", uri.vendor, uri.bare_model_name())
 }
 
 /// `<current-directory>/.potlatch/<agent-name>/transcripts/subagent-<n>.log`
@@ -1350,7 +1375,7 @@ mod tests {
                 .iter()
                 .map(|(vendor, fake)| {
                     (
-                        vendor.clone(),
+                        format!("{vendor}/model1"),
                         Arc::clone(fake) as Arc<dyn HarnessTransport>,
                     )
                 })
@@ -1377,7 +1402,7 @@ mod tests {
         });
         let hub = SubagentHub::with_children(
             [(
-                "potlatch".to_string(),
+                "potlatch/model1".to_string(),
                 Arc::clone(&transport) as Arc<dyn HarnessTransport>,
             )]
             .into_iter()
@@ -1417,7 +1442,7 @@ mod tests {
         let transport = Arc::new(FakeTransport::default());
         let hub = SubagentHub::with_children_and_aliases(
             HashMap::from([(
-                "potlatch".to_string(),
+                "potlatch/model-x".to_string(),
                 Arc::clone(&transport) as Arc<dyn HarnessTransport>,
             )]),
             vec!["acp://potlatch/model-x?effort=high".to_string()],
@@ -1729,8 +1754,8 @@ mod tests {
         });
         let cursor = Arc::new(FakeTransport::default());
         let mut children: HashMap<String, Arc<dyn HarnessTransport>> = HashMap::new();
-        children.insert("potlatch".to_string(), potlatch.clone());
-        children.insert("cursor".to_string(), cursor.clone());
+        children.insert("potlatch/model1".to_string(), potlatch.clone());
+        children.insert("cursor/composer-2".to_string(), cursor.clone());
         let hub = SubagentHub::with_children(
             children,
             vec![

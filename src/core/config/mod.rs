@@ -7,7 +7,7 @@ pub use acp::{
     AcpClientProfile, AcpSpawnConfig, POTLATCH_ACP_PROFILE, build_acp_spawn_command,
     build_profile_command, parse_acp_profiles, resolve_profile_env,
 };
-use acp::{apply_api_flavor, apply_context_tokens};
+use acp::{ClientSpawnGroup, apply_api_flavor, apply_context_tokens, spawn_identity};
 pub use agent::{AgentSection, parse_agent_sections};
 
 use crate::core::config::uri::ModelUri;
@@ -206,44 +206,23 @@ impl Config {
     /// platform's own harness vendor spawns the running executable
     /// (`potlatch harness`); every other vendor uses its profile's
     /// `acp_command`.
+    /// Resolve the spawn configs for the subagent ACP clients of one vendor.
+    /// The models are grouped by endpoint configuration: entries whose
+    /// spawn-determining settings are identical (endpoint, key, auth
+    /// provider, api, context tokens — everything except `model` and
+    /// `alias`) collapse into ONE harness child serving all of them;
+    /// different endpoints each start their own child.
     pub fn resolve_client_spawn(
         &self,
         vendor: &str,
         provided_models: &[String],
-    ) -> Result<AcpSpawnConfig> {
+    ) -> Result<Vec<ClientSpawnGroup>> {
         let profile = self.acp_clients.get(vendor).with_context(|| {
             format!(
                 "the `[acp.{vendor}]` profile is required for the \
                 subagent clients of vendor '{vendor}'"
             )
         })?;
-
-        // One ACP child serves one endpoint (its base_url/auth are baked
-        // into the child's env): every provided model of this vendor must
-        // select the same one. Profiles without an `endpoints` table are
-        // single-endpoint by construction — nothing to select. Entries are
-        // compared by their addressable name (alias or bare model), which is
-        // unique per profile — two aliases of one model on different
-        // endpoints are different endpoints.
-        let addressable_name =
-            |e: &acp::EndpointEntry| e.alias.clone().unwrap_or_else(|| e.model.clone());
-        let mut endpoint: Option<&acp::EndpointEntry> = None;
-        for model in provided_models {
-            let uri = ModelUri::parse(model).with_context(|| format!("invalid model '{model}'"))?;
-            match acp::select_endpoint(profile, uri.bare_model_name())? {
-                None => {}
-                Some(entry) => match endpoint {
-                    Some(selected) if addressable_name(selected) == addressable_name(entry) => {}
-                    Some(selected) => anyhow::bail!(
-                        "provided_models of vendor '{vendor}' must all belong to one ACP \
-                         endpoint (the shared child serves exactly one): '{}' and '{}' differ",
-                        addressable_name(selected),
-                        addressable_name(entry)
-                    ),
-                    None => endpoint = Some(entry),
-                },
-            }
-        }
 
         let command = if vendor == acp::POTLATCH_ACP_PROFILE {
             // The platform's own harness: run THIS binary — no PATH lookup.
@@ -258,26 +237,48 @@ impl Config {
             build_profile_command(profile)
         };
 
-        let mut env = resolve_profile_env(
-            profile,
-            endpoint.map(|e| e.alias.as_deref().unwrap_or(&e.model)),
-        )?;
-        apply_api_flavor(
-            &mut env,
-            endpoint
-                .and_then(|e| e.api.as_deref())
-                .or_else(|| profile.fields.get("api").map(String::as_str)),
-        );
-        apply_context_tokens(&mut env, endpoint.and_then(|e| e.context_tokens));
-        Ok(AcpSpawnConfig {
-            command,
-            model_uri: None,
-            endpoint_model: None,
-            env,
-            auth_command: endpoint.and_then(|e| e.auth_command.clone()),
-            config_dir: self.config_dir.clone(),
-            model_aliases: profile.model_aliases(),
-        })
+        // Resolve every model to its full spawn config, then group by the
+        // config's identity: two models share a child iff their env, auth
+        // provider, and command are identical — the child's env IS its
+        // endpoint binding.
+        let mut groups: Vec<ClientSpawnGroup> = Vec::new();
+        for model in provided_models {
+            let uri = ModelUri::parse(model).with_context(|| format!("invalid model '{model}'"))?;
+            let endpoint = acp::select_endpoint(profile, uri.bare_model_name())?;
+
+            let mut env = resolve_profile_env(
+                profile,
+                endpoint.map(|e| e.alias.as_deref().unwrap_or(&e.model)),
+            )?;
+            apply_api_flavor(
+                &mut env,
+                endpoint
+                    .and_then(|e| e.api.as_deref())
+                    .or_else(|| profile.fields.get("api").map(String::as_str)),
+            );
+            apply_context_tokens(&mut env, endpoint.and_then(|e| e.context_tokens));
+            let auth_command = endpoint.and_then(|e| e.auth_command.clone());
+
+            let identity = spawn_identity(&command, &env, &auth_command);
+            if let Some(group) = groups.iter_mut().find(|group| group.identity == identity) {
+                group.models.push(model.clone());
+                continue;
+            }
+            groups.push(ClientSpawnGroup {
+                identity,
+                models: vec![model.clone()],
+                spawn: AcpSpawnConfig {
+                    command: command.clone(),
+                    model_uri: None,
+                    endpoint_model: None,
+                    env,
+                    auth_command,
+                    config_dir: self.config_dir.clone(),
+                    model_aliases: profile.model_aliases(),
+                },
+            });
+        }
+        Ok(groups)
     }
 }
 
