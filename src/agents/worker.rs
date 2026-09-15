@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -2629,6 +2629,61 @@ fn plan_mr_metadata_update(
 
 /// Returns `Ok(true)` if the agent decided the issue cannot be resolved and
 /// the MR was closed + issue rejected.
+/// Durable per-MR feedback bookkeeping: what the last feedback run already
+/// saw and answered. Without it a worker cycle re-runs the feedback flow on
+/// every poll for any comment that cannot be resolved away (plain comments
+/// never clear), and each run posts a fresh "already done" reply — observed
+/// as a same-meaning reply loop with dozens of comments on one MR.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct MrFeedbackState {
+    /// The newest note id present when the run started (the run's own
+    /// replies get higher ids; re-fetching after the run captures them).
+    last_comment_id: u64,
+    /// Discussion ids present at run time — the threads the run already
+    /// had a chance to answer.
+    seen_discussions: Vec<String>,
+}
+
+fn mr_feedback_state_path(sessions_dir: &str, agent_id: &str, mr_iid: u64) -> PathBuf {
+    Path::new(sessions_dir).join(format!("{agent_id}_mr_feedback_{mr_iid}.json"))
+}
+
+fn load_mr_feedback_state(path: &Path) -> MrFeedbackState {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_mr_feedback_state(path: &Path, state: &MrFeedbackState) -> Result<()> {
+    fs::write(path, serde_json::to_string_pretty(state)?)
+        .with_context(|| format!("save MR feedback state {}", path.display()))
+}
+
+/// Whether a feedback run is warranted: something the last run did not see
+/// or answer must have changed — a merge-conflict state, an unresolved
+/// thread the run never replied, or a comment newer than the run's newest
+/// seen note. Otherwise the run would repeat its previous no-op reply.
+fn feedback_run_needed(
+    prior: &MrFeedbackState,
+    unresolved_ids: &[String],
+    comments: &[Comment],
+    has_conflicts: bool,
+) -> bool {
+    if has_conflicts {
+        return true;
+    }
+    if unresolved_ids
+        .iter()
+        .any(|id| !prior.seen_discussions.contains(id))
+    {
+        return true;
+    }
+    comments
+        .iter()
+        .any(|comment| comment.id > prior.last_comment_id)
+}
+
 fn handle_mr_comments(
     state: &AgentState,
     model: &AgentModel,
@@ -2650,6 +2705,28 @@ fn handle_mr_comments(
         && plain_comments.is_empty()
         && (comments_only_mode || !latest_mr.has_conflicts)
     {
+        return Ok(false);
+    }
+
+    // A run needs something NEW to address: an unseen unresolved thread, a
+    // comment posted after the last run, or a conflict state. Without this
+    // gate a plain comment that can never be resolved re-triggers the flow
+    // every cycle, and each run posts another same-meaning reply.
+    let state_path = mr_feedback_state_path(state.sessions_dir, state.agent_id, mr_iid);
+    let prior_state = load_mr_feedback_state(&state_path);
+    if !feedback_run_needed(
+        &prior_state,
+        &unresolved_ids,
+        &all_comments,
+        latest_mr.has_conflicts,
+    ) {
+        // Steady-state for any MR with unresolvable comments: expected on
+        // every cycle, so debug-only — an info line here floods the UI.
+        debug!(
+            "MR !{}: no new feedback since the last run ({} comment(s) seen); skipping",
+            mr_iid,
+            all_comments.len()
+        );
         return Ok(false);
     }
 
@@ -2939,6 +3016,23 @@ INSTRUCTIONS:
     };
     run_feedback_tail(&mut port, &input)?;
 
+    // Record what the run saw INCLUDING its own replies (re-fetch: the
+    // replies are new notes with higher ids) so the next cycle cannot
+    // re-trigger on them.
+    let seen_comment_id = state
+        .forge
+        .get_mr_comments(mr_iid)
+        .ok()
+        .and_then(|comments| comments.iter().map(|c| c.id).max())
+        .unwrap_or(prior_state.last_comment_id);
+    save_mr_feedback_state(
+        &state_path,
+        &MrFeedbackState {
+            last_comment_id: seen_comment_id,
+            seen_discussions: input.unresolved_ids.clone(),
+        },
+    )?;
+
     Ok(false)
 }
 
@@ -3140,8 +3234,14 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
     // One reply per addressed comment: each comment in the prompt carries
     // its discussion id, and the model answers each one separately. A
     // comment without its own entry stays open and silent — a shared
-    // paragraph under a specific question answers nothing, and a thread
-    // must not be resolved without a real answer under it.
+    // paragraph under a specific question answers nothing.
+    //
+    // Whether a reply repeats an earlier one is NOT decided here by
+    // comparing text: paraphrases make that unreliable. Repetition is
+    // prevented upstream by the run gate — this flow only executes when a
+    // note newer than the last run's newest note exists, and the state
+    // saved after this run records those notes, so an unanswered cycle
+    // cannot re-trigger itself.
     let per_discussion: std::collections::HashMap<&str, &DiscussionReply> = input
         .resolution
         .discussion_replies
@@ -7493,6 +7593,62 @@ mod tests {
         );
         // No reply at all under the thread the model did not answer.
         assert!(!trace.contains(&"reply(d2|".to_string()), "{trace:?}");
+    }
+
+    #[test]
+    fn feedback_run_needed_when_a_comment_is_newer_than_the_last_run() {
+        use super::Comment as ForgeComment;
+        let prior = MrFeedbackState {
+            last_comment_id: 10,
+            seen_discussions: vec!["d1".into()],
+        };
+        let comments = vec![ForgeComment {
+            id: 10,
+            body: "old".into(),
+            author: "reviewer".into(),
+            discussion_id: "d1".into(),
+            discussion_resolvable: true,
+            location: None,
+            location_details: None,
+        }];
+        // Nothing new: the only comment was already seen, and d1 answered.
+        assert!(!feedback_run_needed(
+            &prior,
+            &[String::from("d1")],
+            &comments,
+            false
+        ));
+        // A new comment (id 11) warrants a run.
+        let mut with_new = comments.clone();
+        with_new.push(ForgeComment {
+            id: 11,
+            body: "follow-up".into(),
+            author: "reviewer".into(),
+            discussion_id: "d1".into(),
+            discussion_resolvable: true,
+            location: None,
+            location_details: None,
+        });
+        assert!(feedback_run_needed(
+            &prior,
+            &[String::from("d1")],
+            &with_new,
+            false
+        ));
+        // An unseen unresolved thread warrants a run.
+        assert!(feedback_run_needed(
+            &prior,
+            &[String::from("d1"), String::from("d2")],
+            &comments,
+            false
+        ));
+        // A conflict state warrants a run regardless.
+        assert!(feedback_run_needed(
+            &prior,
+            &[String::from("d1")],
+            &comments,
+            true
+        ));
     }
 
     #[test]
