@@ -770,23 +770,6 @@ pub mod compat {
     }
 
     /// Coerce a boolean sent as `"true"`/`"False"`. Anything else is removed.
-    pub fn normalize_bool(value: &mut Value, key: &str) {
-        let Some(map) = object_mut(value) else { return };
-        let Some(raw) = map.get(key) else { return };
-        let parsed = raw.as_bool().or_else(|| {
-            raw.as_str()
-                .and_then(|text| text.trim().to_ascii_lowercase().parse::<bool>().ok())
-        });
-        match parsed {
-            Some(flag) => {
-                map.insert(key.to_string(), Value::Bool(flag));
-            }
-            None => {
-                map.remove(key);
-            }
-        }
-    }
-
     /// Fold a free-form enum value into the allowed set: trim/lower-case it,
     /// and replace anything unrecognized with `fallback`.
     pub fn normalize_enum(value: &mut Value, key: &str, allowed: &[&str], fallback: &str) {
@@ -1478,17 +1461,6 @@ mod tests {
             compat::normalize_iid(&mut value, "iid");
             assert_eq!(value, json!({}), "raw value should have been dropped");
         }
-    }
-
-    #[test]
-    fn compat_normalize_bool_accepts_stringified_booleans() {
-        let mut value = json!({"flag": "True"});
-        compat::normalize_bool(&mut value, "flag");
-        assert_eq!(value, json!({"flag": true}));
-
-        let mut value = json!({"flag": "maybe"});
-        compat::normalize_bool(&mut value, "flag");
-        assert_eq!(value, json!({}));
     }
 
     #[test]

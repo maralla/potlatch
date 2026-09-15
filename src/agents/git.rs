@@ -535,15 +535,6 @@ impl GitRepo {
         Ok(has_untracked)
     }
 
-    pub fn diff_shortstat_since(&self, base_ref: &str) -> Result<String> {
-        let output = Command::new("git")
-            .args(["diff", "--shortstat", &format!("{}..HEAD", base_ref)])
-            .current_dir(&self.path)
-            .output()
-            .context("Failed to compute short diff stat since base")?;
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
     pub fn changed_files_since(&self, base_ref: &str) -> Result<Vec<String>> {
         let output = Command::new("git")
             .args(["diff", "--name-only", &format!("{}..HEAD", base_ref)])

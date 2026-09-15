@@ -83,6 +83,17 @@ struct BlockedOutcome {
     public_comment: Option<String>,
 }
 
+/// One review thread's individual reply: the model answers a specific
+/// discussion by id instead of posting one shared paragraph everywhere, and
+/// states per thread whether the reply fully resolves it — resolving is a
+/// per-thread decision, never a run-wide blanket.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct DiscussionReply {
+    discussion: String,
+    reply: String,
+    resolve: bool,
+}
+
 /// Everything a feedback run can report once it has addressed (or decided not
 /// to change anything for) the reviewer's comments.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -93,14 +104,12 @@ struct FeedbackResolution {
     mr_description: Option<String>,
     #[serde(default)]
     changes_summary: Option<String>,
+    /// The reply channel: one entry per addressed comment, keyed by its
+    /// discussion id (resolvable threads and plain-comment discussions
+    /// alike). Threads without an entry stay open — a shared paragraph
+    /// under a specific question answers nothing.
     #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    public_comment: Option<String>,
-    #[serde(default)]
-    mark_discussions_resolved: Option<bool>,
-    #[serde(default)]
-    post_plain_comment: bool,
+    discussion_replies: Vec<DiscussionReply>,
 }
 
 /// The outcome of a worker *implementation* run, as a tagged union on
@@ -234,9 +243,8 @@ fn mr_metadata_properties(schema: ObjectSchema) -> ObjectSchema {
 
 /// The `changes_summary` field: optional for the implementation contract
 /// (core falls back to the issue title for the commit message), REQUIRED for
-/// the feedback contract — without it the tail posts a generic fallback as a
-/// human-facing reply (observed on MR !283), and a missing field is exactly
-/// what the schema repair loop can fix.
+/// the feedback contract — without it the tail would have no commit message,
+/// and a missing field is exactly what the schema repair loop can fix.
 fn changes_summary_property() -> (&'static str, Schema) {
     (
         "changes_summary",
@@ -334,32 +342,36 @@ structured_output! {
                 "addressed" => (
                     "You handled the reviewer feedback — in code, in merge request metadata, or by explaining that the branch already satisfies it.",
                     fields(mr_metadata_properties(ObjectSchema::new())
-                    .required_property(changes_summary_property().0, changes_summary_property().1)
-                    .property(
-                        "reason",
-                        Schema::string(
-                            "Why no code change was needed, when you resolved the feedback without touching the branch.",
-                        ),
+                        .required_property(changes_summary_property().0, changes_summary_property().1)
+                        .required_property(
+                            "discussion_replies",
+                            Schema::array(
+                                "One reply per addressed comment: each unresolved comment in the prompt carries its discussion id — answer EVERY thread you are addressing here, with text specific to that thread. A thread without an entry stays open. Plain (non-resolvable) comments are replied the same way, by their discussion id.",
+                                Schema::object(
+                                    ObjectSchema::new()
+                                        .describe("One comment's individual reply.")
+                                        .required_property(
+                                            "discussion",
+                                            Schema::string(
+                                                "The discussion id of the comment, copied from the comments list.",
+                                            ),
+                                        )
+                                        .required_property(
+                                            "reply",
+                                            Schema::string(
+                                                "The exact reply text to post on that comment's thread. It must match the committed code/MR metadata and contain only final comment text.",
+                                            ),
+                                        )
+                                        .required_property(
+                                            "resolve",
+                                            Schema::boolean(
+                                                "Whether this reply fully resolves the comment's thread — true only when the request is completed in code/MR metadata and nothing needs further review; false for partial progress, disagreement, or anything still needing review. Plain (non-resolvable) comments have no resolve state: use false.",
+                                            ),
+                                        ),
+                                ),
+                            ),
+                        )
                     )
-                    .property(
-                        "public_comment",
-                        Schema::string(
-                            "The exact concise human-facing reply to post on review threads. It must match the committed code/MR metadata and contain only final comment text: no progress updates, command output, validation section, test/lint lists, or unrelated backlog notes.",
-                        ),
-                    )
-                    .property(
-                        "mark_discussions_resolved",
-                        Schema::boolean(
-                            format!("Whether {d} may mark open review discussions resolved after posting your reply. True only when the request is fully fixed in code/MR metadata, or the branch was verified to already satisfy it and the public comment explains how. For merge-conflict feedback, true only after a pushed branch merges cleanly with no conflict markers. False for partial progress, disagreement, or anything still needing review. Omit to let {d} infer from branch changes; set explicitly for metadata-only fixes.",
-                            d = display_name()),
-                        ),
-                    )
-                    .property(
-                        "post_plain_comment",
-                        Schema::boolean(
-                            "Whether to post a new plain (non-resolvable) merge request comment with `public_comment`. True only when a plain MR comment needs a new public reply; omit or use false when no reply is needed or it would only repeat that no changes were necessary.",
-                        ),
-                    ))
                 ),
                 "cannot_resolve" => (
                     format!("The feedback cannot be resolved autonomously; {d} abandons the merge request and reports back.",
@@ -372,12 +384,9 @@ structured_output! {
             }
         );
         terminal;
-    /// Tolerated: an outcome spelled with different case or padding, and the
-    /// comment-control booleans sent as `"true"`/`"false"` strings.
+    /// Tolerated: an outcome spelled with different case or padding.
         normalize(value) {
             compat::normalize_tag(value, "outcome");
-            compat::normalize_bool(value, "mark_discussions_resolved");
-            compat::normalize_bool(value, "post_plain_comment");
         }
     }
 }
@@ -2917,7 +2926,6 @@ INSTRUCTIONS:
         pre_agent_sha,
         requires_conflict_resolution,
         unresolved_ids,
-        plain_comments_present: !plain_comments.is_empty(),
         issue_iid: issue_number,
         surface_before: MrSurfaceObservation::from_mr(&latest_mr),
         resolution,
@@ -2970,7 +2978,6 @@ struct FeedbackTailInput {
     pre_agent_sha: String,
     requires_conflict_resolution: bool,
     unresolved_ids: Vec<String>,
-    plain_comments_present: bool,
     issue_iid: Option<u64>,
     surface_before: MrSurfaceObservation,
     resolution: FeedbackResolution,
@@ -3015,14 +3022,11 @@ trait FeedbackTailPort {
     fn complete_merge_if_ready(&mut self, message: &str) -> Result<bool>;
     fn merge_conflicts_present(&self) -> Result<bool>;
     fn up_to_date_with_target(&self, target_branch: &str) -> Result<bool>;
-    fn diff_highlights(&self, base_ref: &str) -> Option<String>;
     fn push_source_branch(&mut self) -> Result<()>;
     fn merge_request_surface(&self, mr_iid: u64) -> Result<MrSurfaceObservation>;
-    fn origin_head(&self, source_branch: &str) -> Option<String>;
     fn unresolved_discussion_ids(&self, mr_iid: u64) -> Vec<String>;
     fn reply_to_discussion(&mut self, discussion_id: &str, body: &str);
     fn resolve_discussion(&mut self, discussion_id: &str);
-    fn post_plain_comment(&mut self, body: &str);
 }
 
 /// Finish a feedback run directly: metadata first, required git operations,
@@ -3086,9 +3090,6 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
         conflicts_unresolved = port.merge_conflicts_present()?;
     }
 
-    let diff_highlights = has_new_changes
-        .then(|| port.diff_highlights(&input.pre_agent_sha))
-        .flatten();
     if has_new_changes && conflicts_unresolved {
         warn!(
             "MR !{}: not pushing — merge conflicts with origin/{} are still unresolved",
@@ -3116,14 +3117,9 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
         );
     }
     let surface_changed = input.surface_before.differs_from(&surface_after);
-    let origin_head = port
-        .origin_head(&input.source_branch)
-        .unwrap_or_else(|| input.pre_agent_sha.clone());
-    let branch_tip_changed = origin_head.trim() != input.pre_agent_sha.trim();
-    let implicit_resolve_discussions = has_new_changes || branch_tip_changed;
-    if surface_changed && !implicit_resolve_discussions {
+    if surface_changed {
         info!(
-            "MR !{} metadata changed without branch updates; discussions will remain open unless explicitly requested",
+            "MR !{} metadata changed during the feedback run",
             input.mr_iid
         );
     }
@@ -3133,10 +3129,6 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
     } else {
         input.unresolved_ids.clone()
     };
-    let should_post_plain_comment = input.resolution.post_plain_comment;
-    let needs_reply_body =
-        !ids_to_resolve.is_empty() || (input.plain_comments_present && should_post_plain_comment);
-
     if input.requires_conflict_resolution && conflicts_unresolved {
         info!(
             "MR !{}: merge conflicts with origin/{} remain; skipping replies until the branch merges cleanly",
@@ -3145,61 +3137,51 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
         return Ok(());
     }
 
-    let reply_body = if needs_reply_body {
-        let reply_raw = if let Some(block) =
-            extract_worker_public_comment(input.resolution.public_comment.as_deref())
-        {
-            block
-        } else if let Some(reply) = build_feedback_resolution_reply(
-            &input.resolution,
-            has_new_changes,
-            diff_highlights.as_deref(),
-        ) {
-            reply
-        } else {
-            return Err(anyhow::anyhow!(
-                "worker produced no source changes and no feedback reply for MR !{}",
+    // One reply per addressed comment: each comment in the prompt carries
+    // its discussion id, and the model answers each one separately. A
+    // comment without its own entry stays open and silent — a shared
+    // paragraph under a specific question answers nothing, and a thread
+    // must not be resolved without a real answer under it.
+    let per_discussion: std::collections::HashMap<&str, &DiscussionReply> = input
+        .resolution
+        .discussion_replies
+        .iter()
+        .filter(|reply| !reply.reply.trim().is_empty())
+        .map(|reply| (reply.discussion.trim(), reply))
+        .collect();
+
+    for discussion_id in &ids_to_resolve {
+        let Some(reply) = per_discussion.get(discussion_id.as_str()) else {
+            info!(
+                "MR !{}: discussion {discussion_id} got no per-thread reply; it stays open",
                 input.mr_iid
-            ));
+            );
+            continue;
         };
-        Some(strip_worker_reply_boilerplate(&reply_raw))
-    } else {
-        None
-    };
-
-    let resolve_discussions = feedback_discussions_may_be_resolved(
-        &input.resolution,
-        implicit_resolve_discussions,
-        conflicts_unresolved,
-    );
-    if conflicts_unresolved && input.resolution.mark_discussions_resolved == Some(true) {
-        warn!(
-            "MR !{}: ignoring agent request to mark discussions resolved while merge conflicts remain",
-            input.mr_iid
-        );
-    }
-    if !resolve_discussions && !ids_to_resolve.is_empty() {
-        info!(
-            "MR !{}: posting feedback replies without resolving discussions (no mark_discussions_resolved signal and no implicit resolving actions)",
-            input.mr_iid
-        );
+        let body = strip_worker_reply_boilerplate(&reply.reply);
+        if body.is_empty() {
+            continue;
+        }
+        port.reply_to_discussion(discussion_id, &body);
+        // Resolving is per-thread: only the model's own per-thread claim
+        // resolves a discussion.
+        if reply.resolve {
+            port.resolve_discussion(discussion_id);
+        }
     }
 
-    if let Some(body) = reply_body.as_deref() {
-        let replied_to_discussions = !ids_to_resolve.is_empty();
-        for discussion_id in &ids_to_resolve {
-            port.reply_to_discussion(discussion_id, body);
-            if resolve_discussions {
-                port.resolve_discussion(discussion_id);
-            }
+    // Plain (non-resolvable) comments have no resolvable thread, but they DO
+    // have a discussion id — the model replies them by id as well.
+    for reply in &input.resolution.discussion_replies {
+        let id = reply.discussion.trim();
+        if ids_to_resolve.iter().any(|existing| existing == id) {
+            continue; // already handled with its thread above
         }
-        // A plain top-level comment with the SAME body would duplicate the
-        // discussion replies (observed on MR !283: one answer in the thread
-        // and again at the top level). Post top-level only when no
-        // discussion carried the reply.
-        if input.plain_comments_present && should_post_plain_comment && !replied_to_discussions {
-            port.post_plain_comment(body);
+        let body = strip_worker_reply_boilerplate(&reply.reply);
+        if body.is_empty() {
+            continue;
         }
+        port.reply_to_discussion(id, &body);
     }
     Ok(())
 }
@@ -3268,10 +3250,6 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
         self.git_repo.verify_up_to_date_with_target(target_branch)
     }
 
-    fn diff_highlights(&self, base_ref: &str) -> Option<String> {
-        build_diff_highlights_since(self.git_repo, base_ref)
-    }
-
     fn push_source_branch(&mut self) -> Result<()> {
         self.git_repo.push(&self.source_branch)
     }
@@ -3280,12 +3258,6 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
         Ok(MrSurfaceObservation::from_mr(
             &self.forge.get_merge_request(mr_iid)?,
         ))
-    }
-
-    fn origin_head(&self, source_branch: &str) -> Option<String> {
-        self.git_repo
-            .rev_parse(&format!("origin/{source_branch}"))
-            .ok()
     }
 
     fn unresolved_discussion_ids(&self, mr_iid: u64) -> Vec<String> {
@@ -3306,15 +3278,6 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
     fn resolve_discussion(&mut self, discussion_id: &str) {
         if let Err(e) = self.forge.resolve_discussion(self.mr_iid, discussion_id) {
             warn!("Failed to resolve discussion {}: {}", discussion_id, e);
-        }
-    }
-
-    fn post_plain_comment(&mut self, body: &str) {
-        if let Err(e) = self.forge.add_mr_comment(self.mr_iid, body) {
-            warn!(
-                "Failed to post MR !{} reply for plain comments: {}",
-                self.mr_iid, e
-            );
         }
     }
 }
@@ -3950,59 +3913,6 @@ fn strip_worker_reply_boilerplate(text: &str) -> String {
 }
 
 /// Whether to call GitLab `resolve` on discussions after posting the worker reply.
-fn should_resolve_mr_feedback_discussions(
-    resolution: &FeedbackResolution,
-    implicit_from_actions: bool,
-) -> bool {
-    resolution
-        .mark_discussions_resolved
-        .unwrap_or(implicit_from_actions)
-}
-
-fn build_feedback_resolution_reply(
-    resolution: &FeedbackResolution,
-    has_new_changes: bool,
-    diff_highlights: Option<&str>,
-) -> Option<String> {
-    if has_new_changes {
-        // The decode nudge guarantees a non-empty summary here.
-        let summary = resolution.changes_summary.as_deref().unwrap_or_default();
-        if let Some(diff) = diff_highlights
-            && !diff.trim().is_empty()
-        {
-            return Some(format!(
-                "Addressed feedback:\n\n{}\n\nDiff highlights:\n{}",
-                summary, diff
-            ));
-        }
-        return Some(format!("Addressed feedback:\n\n{}", summary));
-    }
-    extract_no_change_resolution_reason(resolution)
-        .map(|reason| format!("Resolved without code changes:\n\n{}", reason))
-}
-
-fn build_diff_highlights_since(git_repo: &GitRepo, base_ref: &str) -> Option<String> {
-    let files = git_repo.changed_files_since(base_ref).ok()?;
-    if files.is_empty() {
-        return None;
-    }
-    let shortstat = git_repo.diff_shortstat_since(base_ref).unwrap_or_default();
-
-    const MAX_FILES: usize = 8;
-    let mut lines: Vec<String> = files
-        .iter()
-        .take(MAX_FILES)
-        .map(|f| format!("- {}", f))
-        .collect();
-    if files.len() > MAX_FILES {
-        lines.push(format!("- ... and {} more files", files.len() - MAX_FILES));
-    }
-    if !shortstat.trim().is_empty() {
-        lines.push(format!("- {}", shortstat.trim()));
-    }
-    Some(lines.join("\n"))
-}
-
 fn build_mr_diff_context(
     project_name: &str,
     mr: &MergeRequest,
@@ -4248,29 +4158,6 @@ fn build_merge_conflict_status_section(
     }
 
     Ok(lines.join("\n"))
-}
-
-fn feedback_discussions_may_be_resolved(
-    resolution: &FeedbackResolution,
-    implicit_from_actions: bool,
-    conflicts_unresolved: bool,
-) -> bool {
-    if conflicts_unresolved {
-        return false;
-    }
-    should_resolve_mr_feedback_discussions(resolution, implicit_from_actions)
-}
-
-/// The reason to post for a "resolved without code changes" reply: the
-/// `reason` field if the model explained itself, otherwise `changes_summary`
-/// (the model sometimes describes a no-op resolution there instead).
-fn extract_no_change_resolution_reason(resolution: &FeedbackResolution) -> Option<String> {
-    [&resolution.reason, &resolution.changes_summary]
-        .into_iter()
-        .flatten()
-        .map(|text| text.trim())
-        .find(|text| !text.is_empty())
-        .map(strip_markdown_formatting)
 }
 
 // ---------------------------------------------------------------------------
@@ -5142,32 +5029,20 @@ mod tests {
             conformance::assert_accepts::<WorkerFeedbackOutput>(serde_json::json!({
                 "outcome": "addressed",
                 "changes_summary": "Fixed the null check",
-                "public_comment": "Done.",
-                "mark_discussions_resolved": true,
-                "post_plain_comment": false
+                "discussion_replies": [
+                    { "discussion": "d1", "reply": "Done.", "resolve": true }
+                ]
             })),
             WorkerFeedbackOutput::Addressed(FeedbackResolution {
                 changes_summary: Some("Fixed the null check".to_string()),
-                public_comment: Some("Done.".to_string()),
-                mark_discussions_resolved: Some(true),
+                discussion_replies: vec![DiscussionReply {
+                    discussion: "d1".into(),
+                    reply: "Done.".into(),
+                    resolve: true,
+                }],
                 ..Default::default()
             })
         );
-    }
-
-    #[test]
-    fn feedback_output_tolerates_stringified_comment_controls() {
-        let output = conformance::assert_accepts::<WorkerFeedbackOutput>(serde_json::json!({
-            "outcome": "addressed",
-            "changes_summary": "Capped the retry backoff",
-            "mark_discussions_resolved": "true",
-            "post_plain_comment": "False"
-        }));
-        let WorkerFeedbackOutput::Addressed(resolution) = output else {
-            panic!("expected an addressed outcome");
-        };
-        assert_eq!(resolution.mark_discussions_resolved, Some(true));
-        assert!(!resolution.post_plain_comment);
     }
 
     #[test]
@@ -5184,7 +5059,8 @@ mod tests {
         for empty in ["", "   "] {
             let error = conformance::assert_rejects::<WorkerFeedbackOutput>(serde_json::json!({
                 "outcome": "addressed",
-                "changes_summary": empty
+                "changes_summary": empty,
+                "discussion_replies": []
             }));
             assert!(
                 error.contains("changes_summary must be a non-empty sentence"),
@@ -5194,7 +5070,8 @@ mod tests {
 
         conformance::assert_accepts::<WorkerFeedbackOutput>(serde_json::json!({
             "outcome": "addressed",
-            "changes_summary": "Capped the retry backoff"
+            "changes_summary": "Reduced the retry delay",
+            "discussion_replies": []
         }));
     }
 
@@ -5488,62 +5365,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_feedback_resolution_reply_includes_reason_without_code_changes() {
-        let output = FeedbackResolution {
-            reason: Some("Existing validation already covered this case.".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_feedback_resolution_reply(&output, false, None),
-            Some(
-                "Resolved without code changes:\n\nExisting validation already covered this case."
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn test_build_feedback_resolution_reply_uses_changes_summary_when_changes_exist() {
-        let output = FeedbackResolution {
-            changes_summary: Some("Add missing null check in parser.".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_feedback_resolution_reply(&output, true, None),
-            Some("Addressed feedback:\n\nAdd missing null check in parser.".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_feedback_resolution_reply_includes_diff_highlights() {
-        let output = FeedbackResolution {
-            changes_summary: Some("Tighten input validation.".to_string()),
-            ..Default::default()
-        };
-        let diff = "- src/validation.rs\n- 1 file changed, 4 insertions(+)";
-        assert_eq!(
-            build_feedback_resolution_reply(&output, true, Some(diff)),
-            Some("Addressed feedback:\n\nTighten input validation.\n\nDiff highlights:\n- src/validation.rs\n- 1 file changed, 4 insertions(+)".to_string())
-        );
-    }
-
-    #[test]
-    fn build_feedback_resolution_reply_requires_reason_without_code_changes() {
-        let output = FeedbackResolution::default();
-        assert_eq!(build_feedback_resolution_reply(&output, false, None), None);
-    }
-
-    #[test]
-    fn feedback_discussions_may_be_resolved_blocks_while_conflicts_remain() {
-        let out = FeedbackResolution {
-            mark_discussions_resolved: Some(true),
-            ..Default::default()
-        };
-        assert!(!feedback_discussions_may_be_resolved(&out, true, true));
-        assert!(feedback_discussions_may_be_resolved(&out, true, false));
-    }
-
-    #[test]
     fn strip_worker_reply_boilerplate_removes_prefix_when_suffix_present() {
         assert_eq!(
             strip_worker_reply_boilerplate(
@@ -5575,112 +5396,6 @@ mod tests {
         assert_eq!(
             strip_worker_reply_boilerplate(input),
             "I’ll run a full readonly review from local state.\nFixed null checks.\nError: S: [unavailable] Error"
-        );
-    }
-
-    #[test]
-    fn should_resolve_mr_feedback_discussions_defaults_follow_implicit_actions() {
-        let out = FeedbackResolution::default();
-        assert!(!should_resolve_mr_feedback_discussions(&out, false));
-        assert!(should_resolve_mr_feedback_discussions(&out, true));
-    }
-
-    #[test]
-    fn mark_discussions_resolved_reads_structured_field() {
-        let out_no = FeedbackResolution {
-            mark_discussions_resolved: Some(false),
-            ..Default::default()
-        };
-        assert!(!should_resolve_mr_feedback_discussions(&out_no, true));
-        let out_yes = FeedbackResolution {
-            mark_discussions_resolved: Some(true),
-            ..Default::default()
-        };
-        assert!(should_resolve_mr_feedback_discussions(&out_yes, false));
-    }
-
-    #[test]
-    fn plain_comment_posting_requires_explicit_field() {
-        // A public comment on its own never posts a plain MR comment; the
-        // model has to ask for it.
-        let default = FeedbackResolution {
-            public_comment: Some("No further changes were needed.".to_string()),
-            ..Default::default()
-        };
-        assert!(!default.post_plain_comment);
-
-        let requested = FeedbackResolution {
-            post_plain_comment: true,
-            public_comment: Some("Posted by request.".to_string()),
-            ..Default::default()
-        };
-        assert!(requested.post_plain_comment);
-    }
-
-    #[test]
-    fn no_change_reply_requires_explicit_resolve_field() {
-        let out = FeedbackResolution {
-            public_comment: Some("No new code changes were needed in this run.".to_string()),
-            ..Default::default()
-        };
-        assert!(!should_resolve_mr_feedback_discussions(&out, false));
-
-        let explicit = FeedbackResolution {
-            mark_discussions_resolved: Some(true),
-            public_comment: Some("No new code changes were needed in this run.".to_string()),
-            ..Default::default()
-        };
-        assert!(should_resolve_mr_feedback_discussions(&explicit, false));
-    }
-
-    #[test]
-    fn no_change_reply_text_requires_structured_reason_field() {
-        let out = FeedbackResolution::default();
-        assert_eq!(build_feedback_resolution_reply(&out, false, None), None);
-
-        let explicit = FeedbackResolution {
-            reason: Some(
-                "No new code changes were needed in this run. The branch already satisfies the requested behavior."
-                    .to_string(),
-            ),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_feedback_resolution_reply(&explicit, false, None),
-            Some("Resolved without code changes:\n\nNo new code changes were needed in this run. The branch already satisfies the requested behavior.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_no_change_resolution_reason_returns_none_when_absent() {
-        let out = FeedbackResolution::default();
-        assert_eq!(extract_no_change_resolution_reason(&out), None);
-    }
-
-    #[test]
-    fn extract_no_change_resolution_reason_prefers_reason_over_changes_summary() {
-        let out = FeedbackResolution {
-            reason: Some(
-                "Property deletion already removes stored data on schema update.".to_string(),
-            ),
-            changes_summary: Some("unrelated summary".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            extract_no_change_resolution_reason(&out),
-            Some("Property deletion already removes stored data on schema update.".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_no_change_resolution_reason_falls_back_to_changes_summary() {
-        let out = FeedbackResolution {
-            changes_summary: Some("Resolved via metadata update only.".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            extract_no_change_resolution_reason(&out),
-            Some("Resolved via metadata update only.".to_string())
         );
     }
 
@@ -7348,7 +7063,6 @@ mod tests {
             pre_agent_sha: "sha-before".to_string(),
             requires_conflict_resolution: false,
             unresolved_ids: unresolved_ids.iter().map(|id| id.to_string()).collect(),
-            plain_comments_present: false,
             issue_iid: Some(7),
             surface_before: feedback_surface("Reduce the retry delay", false),
             resolution,
@@ -7367,7 +7081,6 @@ mod tests {
         metadata: Vec<(String, String)>,
         replies: Vec<(String, String)>,
         resolutions: Vec<String>,
-        plain_replies: Vec<String>,
         changes_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
         conflict_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
         staged_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
@@ -7375,9 +7088,7 @@ mod tests {
         staged_conflicts: bool,
         merge_completed: bool,
         up_to_date: bool,
-        highlights: Option<String>,
         surface_after: MrSurfaceObservation,
-        origin_head: Option<String>,
         refetched_ids: Vec<String>,
         failing_operations: Vec<String>,
     }
@@ -7389,7 +7100,6 @@ mod tests {
                 metadata: Vec::new(),
                 replies: Vec::new(),
                 resolutions: Vec::new(),
-                plain_replies: Vec::new(),
                 changes_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
                 conflict_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
                 staged_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
@@ -7397,9 +7107,7 @@ mod tests {
                 staged_conflicts: false,
                 merge_completed: false,
                 up_to_date: true,
-                highlights: Some("- src/lib.rs\n- 1 file changed".to_string()),
                 surface_after: feedback_surface("Reduce the retry delay", false),
-                origin_head: None,
                 refetched_ids: Vec::new(),
                 failing_operations: Vec::new(),
             }
@@ -7438,11 +7146,6 @@ mod tests {
 
         fn with_surface_after(mut self, surface: MrSurfaceObservation) -> Self {
             self.surface_after = surface;
-            self
-        }
-
-        fn with_origin_head(mut self, head: &str) -> Self {
-            self.origin_head = Some(head.to_string());
             self
         }
 
@@ -7534,11 +7237,6 @@ mod tests {
             Ok(self.up_to_date)
         }
 
-        fn diff_highlights(&self, base_ref: &str) -> Option<String> {
-            self.record(format!("diff_highlights({base_ref})"));
-            self.highlights.clone()
-        }
-
         fn push_source_branch(&mut self) -> Result<()> {
             self.required("push_source_branch")
         }
@@ -7546,11 +7244,6 @@ mod tests {
         fn merge_request_surface(&self, mr_iid: u64) -> Result<MrSurfaceObservation> {
             self.required(&format!("merge_request_surface({mr_iid})"))?;
             Ok(self.surface_after.clone())
-        }
-
-        fn origin_head(&self, source_branch: &str) -> Option<String> {
-            self.record(format!("origin_head({source_branch})"));
-            self.origin_head.clone()
         }
 
         fn unresolved_discussion_ids(&self, mr_iid: u64) -> Vec<String> {
@@ -7568,11 +7261,6 @@ mod tests {
             self.record(format!("resolve({discussion_id})"));
             self.resolutions.push(discussion_id.to_string());
         }
-
-        fn post_plain_comment(&mut self, body: &str) {
-            self.record(format!("plain_comment({body})"));
-            self.plain_replies.push(body.to_string());
-        }
     }
 
     fn run_feedback(
@@ -7586,40 +7274,54 @@ mod tests {
 
     #[test]
     fn feedback_commits_pushes_then_replies_and_resolves_in_order() {
-        let mut port = FakeFeedbackPort::new()
-            .with_changes(&[true])
-            .with_origin_head("sha-after");
-        let (result, trace) = run_feedback(
-            &mut port,
-            feedback_input(&["d1", "d2"], addressed("Reduced the retry delay")),
-        );
+        let resolution = FeedbackResolution {
+            changes_summary: Some("Reduced the retry delay".into()),
+            discussion_replies: vec![
+                DiscussionReply {
+                    discussion: "d1".into(),
+                    reply: "Reduced the delay to 30s.".into(),
+                    resolve: true,
+                },
+                DiscussionReply {
+                    discussion: "d2".into(),
+                    reply: "Reduced the delay to 30s.".into(),
+                    resolve: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut port = FakeFeedbackPort::new().with_changes(&[true]);
+        let (result, trace) = run_feedback(&mut port, feedback_input(&["d1", "d2"], resolution));
 
         assert!(result.is_ok());
-        let commit = format!("commit({})", build_commit_message("Reduced the retry delay", 7));
+        let commit = format!(
+            "commit({})",
+            build_commit_message("Reduced the retry delay", 7)
+        );
         let push = trace
             .iter()
             .position(|step| step == "push_source_branch")
             .unwrap();
         let reply = trace
             .iter()
-            .position(|step| step == "reply(d1|Reduced the retry delay)")
+            .position(|step| step == "reply(d1|Reduced the delay to 30s.)")
             .unwrap();
         assert!(trace.iter().position(|step| step == &commit).unwrap() < push);
         assert!(push < reply);
         assert_eq!(
             &trace[reply..],
             &[
-                "reply(d1|Reduced the retry delay)",
+                "reply(d1|Reduced the delay to 30s.)",
                 "resolve(d1)",
-                "reply(d2|Reduced the retry delay)",
+                "reply(d2|Reduced the delay to 30s.)",
                 "resolve(d2)",
             ]
         );
         assert_eq!(
             port.replies,
             vec![
-                ("d1".to_string(), "Reduced the retry delay".to_string()),
-                ("d2".to_string(), "Reduced the retry delay".to_string()),
+                ("d1".to_string(), "Reduced the delay to 30s.".to_string()),
+                ("d2".to_string(), "Reduced the delay to 30s.".to_string()),
             ]
         );
     }
@@ -7656,8 +7358,7 @@ mod tests {
         let mut port = FakeFeedbackPort::new()
             .merging(true)
             .with_changes(&[false, true])
-            .completing_merge()
-            .with_origin_head("sha-after");
+            .completing_merge();
         let (result, trace) = run_feedback(
             &mut port,
             feedback_input(&["d1"], addressed("Resolved conflicts")),
@@ -7713,26 +7414,28 @@ mod tests {
     fn feedback_refetches_discussions_when_triggered_by_conflicts_alone() {
         let mut port = FakeFeedbackPort::new()
             .with_changes(&[true])
-            .with_origin_head("sha-after")
             .refetching_ids(&["conflict-thread"]);
         let (result, trace) =
             run_feedback(&mut port, feedback_input(&[], addressed("Merged main")));
 
         assert!(result.is_ok());
+        // No per-thread reply for the thread: it gets none and stays open.
         assert_eq!(
-            &trace[trace.len() - 3..],
-            &[
-                "unresolved_discussion_ids(12)",
-                "reply(conflict-thread|Merged main)",
-                "resolve(conflict-thread)",
-            ]
+            trace.last().map(String::as_str),
+            Some("unresolved_discussion_ids(12)")
         );
+        assert!(port.replies.is_empty());
+        assert!(port.resolutions.is_empty());
     }
 
     #[test]
     fn feedback_without_branch_changes_replies_without_resolving() {
         let resolution = FeedbackResolution {
-            reason: Some("The branch already handles this case".to_string()),
+            discussion_replies: vec![DiscussionReply {
+                discussion: "d1".into(),
+                reply: "The branch already handles this case.".into(),
+                resolve: false,
+            }],
             ..Default::default()
         };
         let mut port = FakeFeedbackPort::new()
@@ -7742,7 +7445,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(
             trace.last().map(String::as_str),
-            Some("reply(d1|The branch already handles this case)")
+            Some("reply(d1|The branch already handles this case.)")
         );
         assert!(port.resolutions.is_empty());
     }
@@ -7750,8 +7453,11 @@ mod tests {
     #[test]
     fn feedback_resolves_without_branch_changes_when_explicitly_requested() {
         let resolution = FeedbackResolution {
-            reason: Some("Already handled".to_string()),
-            mark_discussions_resolved: Some(true),
+            discussion_replies: vec![DiscussionReply {
+                discussion: "d1".into(),
+                reply: "Already handled.".into(),
+                resolve: true,
+            }],
             ..Default::default()
         };
         let mut port = FakeFeedbackPort::new();
@@ -7762,92 +7468,125 @@ mod tests {
     }
 
     #[test]
-    fn feedback_plain_comment_is_skipped_when_discussions_carried_the_reply() {
-        // The same body in the discussion thread AND at the top level is
-        // duplication (observed on MR !283): the top-level post fires only
-        // when no discussion carried the reply.
+    fn feedback_implicit_resolution_resolves_only_replied_threads() {
+        // Branch changes alone say the code moved — not that every thread's
+        // question was answered. Only threads with their own per-thread
+        // reply are resolved; a thread the model did not answer stays open
+        // and receives no reply at all.
         let resolution = FeedbackResolution {
-            changes_summary: Some("Reduced the retry delay".to_string()),
-            post_plain_comment: true,
+            changes_summary: Some("Tightened the input validation".into()),
+            discussion_replies: vec![DiscussionReply {
+                discussion: "d1".into(),
+                reply: "Done — fixed.".into(),
+                resolve: true,
+            }],
             ..Default::default()
         };
-        let mut input = feedback_input(&["d1"], resolution);
-        input.plain_comments_present = true;
-        let mut port = FakeFeedbackPort::new()
-            .with_changes(&[true])
-            .with_origin_head("sha-after");
-        let (result, trace) = run_feedback(&mut port, input);
+        let mut port = FakeFeedbackPort::new().with_changes(&[true]);
+        let (result, trace) = run_feedback(&mut port, feedback_input(&["d1", "d2"], resolution));
 
         assert!(result.is_ok());
-        assert_eq!(
-            &trace[trace.len() - 2..],
-            &["reply(d1|Reduced the retry delay)", "resolve(d1)"]
+        assert!(trace.contains(&"resolve(d1)".to_string()));
+        assert!(
+            !trace.contains(&"resolve(d2)".to_string()),
+            "a thread without its own reply must stay open: {trace:?}"
         );
-        assert!(port.plain_replies.is_empty(), "no top-level duplicate");
+        // No reply at all under the thread the model did not answer.
+        assert!(!trace.contains(&"reply(d2|".to_string()), "{trace:?}");
     }
 
     #[test]
-    fn feedback_posts_plain_comment_without_discussions() {
+    fn feedback_replies_each_thread_with_its_own_answer() {
+        // Two threads, two different questions: each thread receives its own
+        // reply, never another thread's.
         let resolution = FeedbackResolution {
-            public_comment: Some("Acknowledged the plain comment.".to_string()),
-            post_plain_comment: true,
+            changes_summary: Some("Tightened the input validation".into()),
+            discussion_replies: vec![
+                DiscussionReply {
+                    discussion: "d1".into(),
+                    reply: "Done — the check now runs before the write.".into(),
+                    resolve: false,
+                },
+                DiscussionReply {
+                    discussion: "d2".into(),
+                    reply: "Both call sites were updated.".into(),
+                    resolve: false,
+                },
+            ],
             ..Default::default()
         };
-        let mut input = feedback_input(&[], resolution);
-        input.plain_comments_present = true;
-        let mut port = FakeFeedbackPort::new();
-
-        let (result, trace) = run_feedback(&mut port, input);
+        let mut port = FakeFeedbackPort::new().with_changes(&[true]);
+        let (result, _trace) = run_feedback(&mut port, feedback_input(&["d1", "d2"], resolution));
 
         assert!(result.is_ok());
-        assert_eq!(port.plain_replies, vec!["Acknowledged the plain comment."]);
         assert_eq!(
-            trace.last().map(String::as_str),
-            Some("plain_comment(Acknowledged the plain comment.)")
+            port.replies,
+            vec![
+                (
+                    "d1".to_string(),
+                    "Done — the check now runs before the write.".to_string()
+                ),
+                (
+                    "d2".to_string(),
+                    "Both call sites were updated.".to_string()
+                ),
+            ]
         );
-        assert!(port.replies.is_empty());
+    }
+
+    #[test]
+    fn feedback_skips_empty_per_thread_replies() {
+        // An empty reply text must not post a blank comment: the thread
+        // gets no reply and stays open.
+        let resolution = FeedbackResolution {
+            changes_summary: Some("Tightened the input validation".into()),
+            discussion_replies: vec![DiscussionReply {
+                discussion: "d1".into(),
+                reply: "   ".into(),
+                resolve: false,
+            }],
+            ..Default::default()
+        };
+        let mut port = FakeFeedbackPort::new().with_changes(&[true]);
+        let (result, _trace) = run_feedback(&mut port, feedback_input(&["d1"], resolution));
+
+        assert!(result.is_ok());
+        assert!(port.replies.is_empty(), "{:?}", port.replies);
         assert!(port.resolutions.is_empty());
     }
 
     #[test]
-    fn feedback_omits_plain_comment_when_not_requested() {
+    fn feedback_replies_plain_comments_by_their_discussion_id() {
+        // Plain (non-resolvable) comments are answered the same per-thread
+        // way: the model targets their discussion id, the tail replies the
+        // discussion without resolving it.
         let resolution = FeedbackResolution {
-            public_comment: Some("No public reply requested.".to_string()),
+            changes_summary: Some("Reduced the retry delay".into()),
+            discussion_replies: vec![DiscussionReply {
+                discussion: "plain-d".into(),
+                reply: "Acknowledged the plain comment.".into(),
+                resolve: false,
+            }],
             ..Default::default()
         };
-        let mut input = feedback_input(&[], resolution);
-        input.plain_comments_present = true;
-        let mut port = FakeFeedbackPort::new();
-
-        let (result, trace) = run_feedback(&mut port, input);
+        let mut port = FakeFeedbackPort::new().with_changes(&[true]);
+        let (result, trace) = run_feedback(&mut port, feedback_input(&["d1"], resolution));
 
         assert!(result.is_ok());
-        assert!(port.plain_replies.is_empty());
-        assert!(!trace.iter().any(|step| step.starts_with("plain_comment(")));
-    }
-
-    #[test]
-    fn feedback_omits_plain_comment_when_none_are_present() {
-        let resolution = FeedbackResolution {
-            public_comment: Some("Nothing to reply to.".to_string()),
-            post_plain_comment: true,
-            ..Default::default()
-        };
-        let mut port = FakeFeedbackPort::new();
-
-        let (result, trace) = run_feedback(&mut port, feedback_input(&[], resolution));
-
-        assert!(result.is_ok());
-        assert!(port.plain_replies.is_empty());
-        assert!(!trace.iter().any(|step| step.starts_with("plain_comment(")));
+        assert!(port.replies.contains(&(
+            "plain-d".to_string(),
+            "Acknowledged the plain comment.".to_string()
+        )));
+        // Plain discussions are never resolved.
+        assert!(port.resolutions.is_empty(), "{:?}", port.resolutions);
+        assert!(!trace.contains(&"resolve(plain-d)".to_string()));
     }
 
     #[test]
     fn feedback_skips_commit_when_nothing_is_staged() {
         let mut port = FakeFeedbackPort::new()
             .with_changes(&[true])
-            .with_staged(&[false])
-            .with_origin_head("sha-after");
+            .with_staged(&[false]);
         let (result, trace) = run_feedback(
             &mut port,
             feedback_input(&["d1"], addressed("Committed it itself")),
@@ -7863,10 +7602,16 @@ mod tests {
         let mut port = FakeFeedbackPort::new()
             .with_changes(&[true])
             .with_conflicts(&[true]);
-        let (result, trace) = run_feedback(
-            &mut port,
-            feedback_input(&["d1"], addressed("Half-resolved")),
-        );
+        let resolution = FeedbackResolution {
+            changes_summary: Some("Partially addressed".into()),
+            discussion_replies: vec![DiscussionReply {
+                discussion: "d1".into(),
+                reply: "Half-resolved — the rest waits for the merge.".into(),
+                resolve: false,
+            }],
+            ..Default::default()
+        };
+        let (result, trace) = run_feedback(&mut port, feedback_input(&["d1"], resolution));
 
         assert!(result.is_ok());
         assert!(!trace.contains(&"push_source_branch".to_string()));
@@ -7879,20 +7624,25 @@ mod tests {
         );
         assert_eq!(
             trace.last().map(String::as_str),
-            Some("reply(d1|Half-resolved)")
+            Some("reply(d1|Half-resolved — the rest waits for the merge.)")
         );
+        // Conflicts remain: the thread is not resolved.
+        assert!(port.resolutions.is_empty());
     }
 
     #[test]
-    fn feedback_fails_on_silent_no_op() {
+    fn feedback_silent_no_op_leaves_threads_open() {
+        // A run with no changes and no replies addresses nothing: no error,
+        // no posts — the threads simply stay open for the reviewer.
         let mut port = FakeFeedbackPort::new();
-        let (result, _) = run_feedback(
+        let (result, trace) = run_feedback(
             &mut port,
             feedback_input(&["d1"], FeedbackResolution::default()),
         );
 
-        let error = result.expect_err("a silent no-op run must fail the feedback tail");
-        assert!(error.to_string().contains("no feedback reply"), "{error}");
+        assert!(result.is_ok());
+        assert!(!trace.iter().any(|step| step.starts_with("reply(")));
+        assert!(port.resolutions.is_empty());
     }
 
     #[test]
