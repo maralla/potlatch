@@ -401,10 +401,44 @@ fn find_near_matches(content: &str, needle: &str) -> Vec<(usize, String, f64)> {
     candidates
 }
 
+/// Slide one line into (`entering`) or out of the window's line multiset,
+/// updating the count of window lines that the needle also contains.
+fn slide_line<'a>(
+    window_counts: &mut std::collections::HashMap<&'a str, usize>,
+    matched: &mut usize,
+    line: &'a str,
+    entering: bool,
+    needle_line_counts: &std::collections::HashMap<&'a str, usize>,
+) {
+    let key = line.trim();
+    let needle_has = needle_line_counts.get(key).copied().unwrap_or(0);
+    let entry = window_counts.entry(key).or_insert(0);
+    if entering {
+        if *entry < needle_has {
+            *matched += 1;
+        }
+        *entry += 1;
+    } else {
+        *entry -= 1;
+        if *entry < needle_has {
+            *matched -= 1;
+        }
+    }
+}
+
 /// Slide a window of lines over `content` and score each window against
-/// `needle` using a normalized LCS similarity derived from `dissimilar`'s diff.
-/// Only windows scoring above [`NEAR_MATCH_THRESHOLD`] are returned.
+/// `needle`, returning the windows scoring above [`NEAR_MATCH_THRESHOLD`].
+///
+/// The full LCS similarity ([`similarity_score`], quadratic in the compared
+/// text) is expensive: on a multi-thousand-line file with a multi-hundred-line
+/// needle it ran for minutes when an edit failed to match. So every window is
+/// first scored with a cheap line-overlap prefilter, and only the top
+/// [`NEAR_MATCH_LCS_CANDIDATES`] windows by that prefilter get the expensive
+/// LCS score.
 fn fuzzy_line_window_matches(content: &str, needle: &str) -> Vec<(usize, String, f64)> {
+    const LCS_CANDIDATES: usize = 8;
+    const PREFILTER_MIN_OVERLAP: f64 = 0.3;
+
     let lines: Vec<&str> = content.lines().collect();
 
     // Window size: match the needle's line count, but allow a little slack
@@ -418,34 +452,96 @@ fn fuzzy_line_window_matches(content: &str, needle: &str) -> Vec<(usize, String,
         _ => vec![base_window - 1, base_window, base_window + 1],
     };
 
-    let mut best_by_line: std::collections::HashMap<usize, (String, f64)> =
+    // Prefilter index: trimmed needle line -> its count in the needle.
+    let mut needle_line_counts: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
+    for line in &needle_lines {
+        *needle_line_counts.entry(line.trim()).or_insert(0) += 1;
+    }
+    let needle_line_total = needle_lines.len().max(1);
 
+    // (overlap, window_size, start_line) — ranked by the cheap prefilter.
+    let mut ranked: Vec<(f64, usize, usize)> = Vec::new();
     for &window_size in &window_sizes {
         if window_size == 0 || window_size > lines.len() {
             continue;
         }
-        for start in 0..=(lines.len() - window_size) {
-            let window: Vec<&str> = lines[start..start + window_size].to_vec();
-            let window_text = window.join("\n");
-            let score = similarity_score(&window_text, needle);
-            if score >= NEAR_MATCH_THRESHOLD {
-                let line_num = start + 1;
-                let snippet: String = window_text.chars().take(60).collect();
-                let entry = best_by_line
-                    .entry(line_num)
-                    .or_insert((snippet.clone(), 0.0));
-                if score > entry.1 {
-                    *entry = (snippet, score);
-                }
+        // Multiset line overlap between the window and the needle, computed
+        // incrementally: O(1) per line amortized.
+        let mut window_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut matched = 0usize;
+        for line in &lines[..window_size] {
+            slide_line(
+                &mut window_counts,
+                &mut matched,
+                line,
+                true,
+                &needle_line_counts,
+            );
+        }
+        let overlap = |matched: usize, window_size: usize| {
+            matched as f64 / needle_line_total.max(window_size) as f64
+        };
+        if overlap(matched, window_size) >= PREFILTER_MIN_OVERLAP {
+            ranked.push((overlap(matched, window_size), window_size, 0));
+        }
+        for start in 1..=(lines.len() - window_size) {
+            slide_line(
+                &mut window_counts,
+                &mut matched,
+                lines[start - 1],
+                false,
+                &needle_line_counts,
+            );
+            slide_line(
+                &mut window_counts,
+                &mut matched,
+                lines[start + window_size - 1],
+                true,
+                &needle_line_counts,
+            );
+            let o = overlap(matched, window_size);
+            if o >= PREFILTER_MIN_OVERLAP {
+                ranked.push((o, window_size, start));
+            }
+        }
+    }
+
+    // Top-K windows by prefilter overlap, then by earlier position.
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.2.cmp(&b.2))
+    });
+    ranked.truncate(LCS_CANDIDATES);
+
+    let mut best_by_line: std::collections::HashMap<usize, (String, f64)> =
+        std::collections::HashMap::new();
+    for (_, window_size, start) in &ranked {
+        let window_text = lines[*start..*start + window_size].join("\n");
+        let score = similarity_score(&window_text, needle);
+        if score >= NEAR_MATCH_THRESHOLD {
+            let line_num = start + 1;
+            let snippet: String = window_text.chars().take(60).collect();
+            let entry = best_by_line
+                .entry(line_num)
+                .or_insert((snippet.clone(), 0.0));
+            if score > entry.1 {
+                *entry = (snippet, score);
             }
         }
     }
 
     // Also try character-level sliding windows for single-line needles, since
     // the line-window approach above would otherwise miss intra-line drift.
+    // Guarded by a length ratio so the LCS cost stays bounded on huge files.
     if needle_lines.len() <= 1 && needle.len() >= MIN_FUZZY_NEEDLE_LEN {
         for (i, line) in lines.iter().enumerate() {
+            let len_gap = line.len().abs_diff(needle.len());
+            if len_gap * 2 > needle.len().max(line.len()) {
+                continue;
+            }
             let score = similarity_score(line, needle);
             if score >= NEAR_MATCH_THRESHOLD {
                 let line_num = i + 1;

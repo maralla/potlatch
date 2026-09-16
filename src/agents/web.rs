@@ -70,35 +70,130 @@ impl ChromeWebBackend {
     fn new() -> Self {
         Self { browser: None }
     }
+}
 
-    fn browser(&mut self) -> Result<&mut ChromeBrowser> {
-        if self.browser.is_none() {
-            self.browser = Some(ChromeBrowser::launch()?);
+impl ChromeWebBackend {
+    /// Take the browser out for an enveloped operation, launching a fresh
+    /// one when a previous timeout abandoned it.
+    fn take_or_launch_browser(&mut self) -> Result<ChromeBrowser> {
+        match self.browser.take() {
+            Some(browser) => Ok(browser),
+            None => ChromeBrowser::launch(),
         }
-        self.browser
-            .as_mut()
-            .context("web browser failed to initialize")
     }
 }
 
 impl WebBackend for ChromeWebBackend {
     fn search(&mut self, query: &str, max_results: usize) -> Result<String> {
-        let result = search_google(self.browser()?, query, max_results);
+        let browser = self.take_or_launch_browser()?;
+        let query = query.to_string();
+        let (browser, result) = run_browser_enveloped(browser, move |mut browser| {
+            let result = search_google(&mut browser, &query, max_results);
+            (browser, result)
+        });
         if result.as_ref().is_err_and(should_relaunch_browser) {
             // A failed CDP operation can leave the tab or process unusable.
             // Relaunch lazily for the next independent request.
-            self.browser.take();
+            self.browser = None;
+        } else {
+            self.browser = browser;
         }
         result
     }
 
     fn fetch_rendered_markdown(&mut self, url: &str) -> Result<String> {
-        let result = self.browser()?.fetch_rendered_markdown(url);
-        if result.is_err() {
-            self.browser.take();
+        // Non-HTML content never needs the browser: raw file endpoints, JSON
+        // APIs, and plain-text error pages (raw.githubusercontent returns
+        // text/plain even for 404s) are fetched over plain HTTP. Rendering
+        // them through Chrome was observed to wedge the browser and, with
+        // the agent single-instance, time out every later web call.
+        if let Some(body) = fetch_non_html_body(url)? {
+            return Ok(body);
         }
+
+        let browser = self.take_or_launch_browser()?;
+        let url = url.to_string();
+        let (browser, result) = run_browser_enveloped(browser, move |browser| {
+            let result = browser.fetch_rendered_markdown(&url);
+            (browser, result)
+        });
+        self.browser = browser;
         result
     }
+}
+
+/// Run one browser operation under a hard wall-clock envelope slightly under
+/// the agent-bus timeout (45s). The browser is returned on completion so it
+/// is reused across requests; on timeout it stays with the wedged thread and
+/// the next operation relaunches a fresh one — the single web agent must
+/// never stay wedged behind an operation the caller already gave up on.
+fn run_browser_enveloped<T: Send + 'static>(
+    browser: ChromeBrowser,
+    operation: impl FnOnce(ChromeBrowser) -> (ChromeBrowser, Result<T>) + Send + 'static,
+) -> (Option<ChromeBrowser>, Result<T>) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(operation(browser));
+    });
+    match receiver.recv_timeout(BROWSER_ENVELOPE) {
+        Ok((browser, result)) => (Some(browser), result),
+        Err(_) => (
+            None,
+            Err(anyhow::anyhow!(
+                "browser operation exceeded {BROWSER_ENVELOPE:?}; the browser was abandoned and will relaunch"
+            )),
+        ),
+    }
+}
+
+/// The hard wall-clock for one browser-backed web operation. Slightly under
+/// the agent-bus envelope (45s) so a timeout surfaces as this error instead
+/// of a bus timeout that leaves the single web agent wedged.
+const BROWSER_ENVELOPE: Duration = Duration::from_secs(40);
+
+/// Fetch `url` over plain HTTP and return the body when it is NOT an HTML
+/// document (those go through the browser for rendering). `Ok(None)` means
+/// the browser path should handle it.
+fn fetch_non_html_body(url: &str) -> Result<Option<String>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(concat!(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ",
+            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+        ))
+        .build()
+        .context("build plain HTTP client for web fetch")?;
+    let response = client
+        .get(url)
+        .send()
+        .context("fetch {url} over plain HTTP")?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if content_type.contains("text/html") || content_type.contains("application/xhtml") {
+        return Ok(None);
+    }
+    let status = response.status();
+    let body = response.text().context("read non-HTML response body")?;
+    if !status.is_success() {
+        anyhow::bail!("HTTP {status} fetching {url}: {}", first_lines(&body));
+    }
+    Ok(Some(body))
+}
+
+/// The first non-empty lines of a body, for an error message.
+fn first_lines(body: &str) -> String {
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .chars()
+        .take(300)
+        .collect()
 }
 
 fn should_relaunch_browser(error: &anyhow::Error) -> bool {
