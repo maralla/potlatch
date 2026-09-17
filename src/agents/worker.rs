@@ -3955,7 +3955,11 @@ fn build_commit_message(title: &str, issue_iid: u64) -> String {
     let first_line = title.lines().next().unwrap_or(title).trim();
     // Truncate to a reasonable commit title length
     let title_truncated = if first_line.len() > 72 {
-        format!("{}...", &first_line[..69])
+        let mut end = 69;
+        while !first_line.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &first_line[..end])
     } else {
         first_line.to_string()
     };
@@ -7850,5 +7854,27 @@ mod tests {
 
         assert!(run.result.is_ok());
         assert_eq!(run.trace, polling_steps());
+    }
+
+    #[test]
+    fn commit_message_truncation_stays_on_a_char_boundary() {
+        // A multibyte character straddling the 69-byte cut must not panic
+        // (regression: '—' occupies bytes 68..71) and must be dropped whole.
+        let em_dash_straddling = "x".repeat(68) + "—" + &"y".repeat(40);
+        let truncated = build_commit_message(&em_dash_straddling, 0);
+        assert_eq!(truncated, format!("{}...", "x".repeat(68)));
+
+        // An ASCII title long enough to truncate is cut at exactly 69 bytes.
+        let long_ascii = "a".repeat(80);
+        assert_eq!(
+            build_commit_message(&long_ascii, 0),
+            format!("{}...", "a".repeat(69))
+        );
+
+        // Short titles and the issue reference pass through untouched.
+        assert_eq!(
+            build_commit_message("Short title", 7),
+            "Short title\n\nRefs #7"
+        );
     }
 }
