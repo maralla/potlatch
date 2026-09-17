@@ -18,7 +18,7 @@ use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
-use crate::core::bus::{AgentInbox, AgentRequest, AgentToolDefinition};
+use crate::core::bus::{AgentBus, AgentInbox, AgentRequest, AgentToolDefinition};
 use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::JitterPolicy;
 use crate::core::periodic::PeriodicTaskSpec;
@@ -385,6 +385,24 @@ pub(crate) struct OpsAgent {
     inbox: Option<AgentInbox>,
 }
 
+/// The ops route on the cross-agent bus: the `grafana_query` tool rides it
+/// like the web agent's tools, but only when metrics datasources are
+/// configured — without them the agent publishes no route, so no session is
+/// offered the tool.
+fn register_bus_route(
+    bus: Option<&AgentBus>,
+    grafana: &[grafana::GrafanaMetricsSource],
+) -> Result<Option<AgentInbox>> {
+    if grafana.is_empty() {
+        return Ok(None);
+    }
+    let bus = bus.context("ops agent requires the cross-agent bus for grafana_query")?;
+    Ok(Some(bus.register(
+        OpsAgent::name(),
+        vec![grafana_query_tool_definition(grafana)],
+    )?))
+}
+
 /// The `grafana_query` bus tool: metrics only. `query` is a datasource
 /// expression (PromQL for a Prometheus datasource); the optional `from`/`to`
 /// bounds use Grafana time syntax (`now-1h`, RFC3339, ...) and default to the
@@ -615,18 +633,7 @@ impl CoreAgent for OpsAgent {
             config,
             inbox: None,
         };
-
-        // The `grafana_query` tool rides the cross-agent bus, like the web
-        // agent's tools; only registered when the datasource is configured.
-        if !agent.config.grafana.is_empty() {
-            let bus = bus
-                .as_ref()
-                .context("ops agent requires the cross-agent bus for grafana_query")?;
-            agent.inbox = Some(bus.register(
-                Self::name(),
-                vec![grafana_query_tool_definition(&agent.config.grafana)],
-            )?);
-        }
+        agent.inbox = register_bus_route(bus.as_ref(), &agent.config.grafana)?;
         Ok(agent)
     }
 
@@ -1359,6 +1366,21 @@ mod tests {
         ))
     }
 
+    fn metrics_source(name: &str) -> grafana::GrafanaMetricsSource {
+        grafana::GrafanaMetricsSettings {
+            name: name.to_string(),
+            description: "Primary metrics datasource.".to_string(),
+            url: "https://grafana.example.com".to_string(),
+            datasource_uid: "prom-uid".to_string(),
+            datasource_type: "prometheus".to_string(),
+            org_id: 1,
+            username: "ops".to_string(),
+            password: "secret".to_string(),
+        }
+        .into_source()
+        .unwrap()
+    }
+
     fn observation(host: &str) -> LogSourceObservation {
         LogSourceObservation::from_source(&log_source(host))
     }
@@ -1368,6 +1390,35 @@ mod tests {
             OpsLogSourceSettings::Ssh(source) => source,
             OpsLogSourceSettings::Typed(_) => panic!("expected SSH settings"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Bus registration: the `grafana_query` tool is published only when the
+    // ops settings configure metrics datasources.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn grafana_query_is_registered_only_when_datasources_are_configured() {
+        let bus = AgentBus::new();
+
+        // No metrics datasources configured: no route is published, so no
+        // session is ever offered the `grafana_query` tool.
+        let inbox = register_bus_route(Some(&bus), &[]).unwrap();
+        assert!(inbox.is_none());
+        assert!(bus.registered_tools(Duration::ZERO).unwrap().is_empty());
+
+        // With datasources the tool is published, their names forming the
+        // datasource enum in the schema.
+        let inbox = register_bus_route(Some(&bus), &[metrics_source("metrics")]).unwrap();
+        assert!(inbox.is_some());
+        let tools = bus.registered_tools(Duration::ZERO).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "grafana_query");
+        assert_eq!(tools[0].target, OpsAgent::name());
+        assert_eq!(
+            tools[0].parameters["properties"]["datasource"]["enum"],
+            serde_json::json!(["metrics"])
+        );
     }
 
     /// The joined analysis input the cycle assembles for `hosts`, in
