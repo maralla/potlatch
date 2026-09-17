@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +18,9 @@ use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
 use crate::core::banner::Banner;
+use crate::core::bus::{AgentInbox, AgentRequest, AgentToolDefinition};
 use crate::core::config::{AgentSection, Config};
+use crate::core::periodic::JitterPolicy;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
 use crate::core::workflow::AgentBuildContext;
@@ -127,6 +130,7 @@ struct OpsConfig {
     poll_interval: Duration,
     log_window_interval: Duration,
     log_sources: Vec<OpsLogSource>,
+    grafana: Vec<grafana::GrafanaMetricsSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +164,11 @@ pub(crate) struct OpsAgentSettings {
     log_path: Option<String>,
     #[serde(default)]
     logs: Vec<OpsLogSourceSettings>,
+    /// The Grafana metrics datasources behind the `grafana_query` tool.
+    /// Accepts a single datasource table or an array of them; empty = the
+    /// tool is not registered.
+    #[serde(default, deserialize_with = "grafana_metrics_settings")]
+    grafana: Vec<grafana::GrafanaMetricsSettings>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,6 +190,28 @@ struct OpsSshLogSourceSettings {
     ssh_user: String,
     ssh_host: String,
     log_path: String,
+}
+
+/// The `grafana` settings accept either one datasource table or an array of
+/// them; both normalize to a list so the rest of the agent sees one shape.
+fn grafana_metrics_settings<'de, D>(
+    deserializer: D,
+) -> Result<Vec<grafana::GrafanaMetricsSettings>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RawGrafanaMetricsSettings {
+        Many(Vec<grafana::GrafanaMetricsSettings>),
+        One(grafana::GrafanaMetricsSettings),
+    }
+    Ok(
+        match RawGrafanaMetricsSettings::deserialize(deserializer)? {
+            RawGrafanaMetricsSettings::Many(list) => list,
+            RawGrafanaMetricsSettings::One(one) => vec![one],
+        },
+    )
 }
 
 fn default_ops_poll_interval() -> Duration {
@@ -237,6 +268,9 @@ impl OpsAgentSettings {
             .context("log_window_interval is too large for [agent.ops]")?;
         for (idx, source) in settings.logs.iter().enumerate() {
             source.validate(idx)?;
+        }
+        for (idx, grafana) in settings.grafana.iter().enumerate() {
+            grafana.validate(idx)?;
         }
         Ok(settings)
     }
@@ -342,9 +376,142 @@ struct OpsIssueProposal {
     log_line: String,
 }
 
+const REQUEST_TASK: &str = "requests";
+const INBOX_WAIT: Duration = Duration::from_millis(200);
+
 pub(crate) struct OpsAgent {
     runtime: AgentWorkspace,
     config: OpsConfig,
+    inbox: Option<AgentInbox>,
+}
+
+/// The `grafana_query` bus tool: metrics only. `query` is a datasource
+/// expression (PromQL for a Prometheus datasource); the optional `from`/`to`
+/// bounds use Grafana time syntax (`now-1h`, RFC3339, ...) and default to the
+/// last hour; up to 120 samples per series.
+pub(crate) fn grafana_query_tool_definition(
+    sources: &[grafana::GrafanaMetricsSource],
+) -> AgentToolDefinition {
+    let mut description = "Query metrics from the configured Grafana datasources. Use it to read metric time series (request rates, latencies, error counts, resource usage) when diagnosing the system. Metrics only — this tool cannot read logs or dashboards. Configured datasources:".to_string();
+    for source in sources {
+        description.push_str(&format!("\n- {} — {}", source.name, source.description));
+    }
+    description.push_str(
+        "\nSelect the datasource with the 'datasource' argument (omit for the first one).",
+    );
+    // The datasource names form an enum in the schema: the model sees the
+    // valid values directly, and a wrong name is rejected by schema
+    // validation before the tool runs.
+    let names: Vec<&str> = sources.iter().map(|source| source.name.as_str()).collect();
+    let mut required = vec!["query"];
+    if sources.len() > 1 {
+        required.push("datasource");
+    }
+    AgentToolDefinition {
+        name: "grafana_query".to_string(),
+        description,
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The metrics query expression (PromQL for a Prometheus datasource). Example: sum(rate(http_requests_total[5m])) by (handler)"
+                },
+                "datasource": {
+                    "type": "string",
+                    "enum": names,
+                    "description": "The configured datasource to query (from the list in this tool's description). Omit to use the first one."
+                },
+                "from": {
+                    "type": "string",
+                    "description": "Range start in Grafana time syntax (e.g. now-1h, now-6h, or an RFC3339 timestamp). Default: now-1h."
+                },
+                "to": {
+                    "type": "string",
+                    "description": "Range end in Grafana time syntax. Default: now."
+                },
+                "max_data_points": {
+                    "type": "integer",
+                    "description": "Maximum samples per series (default 120, max 1000)."
+                }
+            },
+            "required": required,
+            "additionalProperties": false
+        }),
+        operation: "grafana_query".to_string(),
+    }
+}
+
+impl OpsAgent {
+    /// Answer one `grafana_query` bus request.
+    fn handle_grafana_request(&mut self, request: AgentRequest) {
+        let query = (|| {
+            let payload = &request.payload;
+            let expr = payload
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|expr| !expr.is_empty())
+                .context("grafana_query requires a non-empty 'query' argument")?
+                .to_string();
+            let datasource = payload
+                .get("datasource")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            let from = payload
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("now-1h")
+                .to_string();
+            let to = payload
+                .get("to")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("now")
+                .to_string();
+            let max_data_points = payload
+                .get("max_data_points")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(120)
+                .min(1_000) as u32;
+            Ok(grafana::MetricsQuery {
+                datasource,
+                expr,
+                from,
+                to,
+                max_data_points,
+            })
+        })();
+        let result = query.and_then(|query| {
+            // The datasource is picked by its configured name; omitting it
+            // selects the first one.
+            let source = self
+                .config
+                .grafana
+                .iter()
+                .find(|source| source.name == query.datasource)
+                .or_else(|| {
+                    query
+                        .datasource
+                        .is_empty()
+                        .then_some(self.config.grafana.first())
+                        .flatten()
+                })
+                .context(format!(
+                    "unknown datasource '{}' for grafana_query; the configured datasources are: {}",
+                    query.datasource,
+                    self.config
+                        .grafana
+                        .iter()
+                        .map(|source| source.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))?;
+            grafana::query_metrics(source, &query)
+        });
+        request.respond(result.map(Value::String));
+    }
 }
 
 impl CoreAgent for OpsAgent {
@@ -377,14 +544,33 @@ impl CoreAgent for OpsAgent {
     }
 
     fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
-        vec![PeriodicTaskSpec::polling(
+        let mut tasks = vec![PeriodicTaskSpec::polling(
             "log_scrape",
             self.config.poll_interval,
-        )]
+        )];
+        // The grafana_query bus requests: pumped between scrape cycles.
+        if self.inbox.is_some() {
+            tasks.push(PeriodicTaskSpec {
+                id: REQUEST_TASK,
+                interval: Duration::ZERO,
+                jitter: JitterPolicy::BeforeEachCycle,
+                jitter_max_ms: 0,
+                autostart: true,
+            });
+        }
+        tasks
     }
 
     fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
         match task_id {
+            REQUEST_TASK => {
+                if let Some(inbox) = &self.inbox
+                    && let Some(request) = inbox.recv_timeout(INBOX_WAIT)?
+                {
+                    self.handle_grafana_request(request);
+                }
+                Ok(())
+            }
             "log_scrape" => {
                 let scope = scope_label_filter(&self.runtime.scope_label);
                 let model = &self.runtime.model;
@@ -406,6 +592,9 @@ impl CoreAgent for OpsAgent {
     fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
         let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         AgentState::from_runtime(&runtime).ensure_sessions_dir()?;
+        // The bus handle is cloned before the settings move: the context
+        // derefs to the spawn context, and a partial move would block it.
+        let bus = ctx.workflow.bus.clone();
         let agent_settings = ctx.settings;
         let config = OpsConfig {
             poll_interval: agent_settings.poll_interval,
@@ -415,8 +604,30 @@ impl CoreAgent for OpsAgent {
                 .into_iter()
                 .map(OpsLogSourceSettings::into_source)
                 .collect::<Result<Vec<_>>>()?,
+            grafana: agent_settings
+                .grafana
+                .into_iter()
+                .map(grafana::GrafanaMetricsSettings::into_source)
+                .collect::<Result<Vec<_>>>()?,
         };
-        Ok(Self { runtime, config })
+        let mut agent = Self {
+            runtime,
+            config,
+            inbox: None,
+        };
+
+        // The `grafana_query` tool rides the cross-agent bus, like the web
+        // agent's tools; only registered when the datasource is configured.
+        if !agent.config.grafana.is_empty() {
+            let bus = bus
+                .as_ref()
+                .context("ops agent requires the cross-agent bus for grafana_query")?;
+            agent.inbox = Some(bus.register(
+                Self::name(),
+                vec![grafana_query_tool_definition(&agent.config.grafana)],
+            )?);
+        }
+        Ok(agent)
     }
 
     fn on_shutdown(&mut self) {}
@@ -1871,6 +2082,71 @@ mod tests {
         assert_eq!(grafana.filter, "level:ERROR");
         let debug = format!("{settings:?}");
         assert!(!debug.contains("\"secret\""));
+    }
+
+    #[test]
+    fn ops_settings_accept_multiple_grafana_metrics_datasources() {
+        let settings = OpsAgentSettings::from_raw(
+            &toml::from_str(
+                r#"
+                logs = [
+                    { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app.log" },
+                ]
+                grafana = [
+                    { name = "metrics", description = "Primary metrics datasource.", url = "https://grafana.example.com", datasource_uid = "prom-uid", username = "ops", password = "secret" },
+                    { name = "edge", description = "Edge node metrics.", url = "https://grafana.example.com", datasource_uid = "edge-uid", username = "ops", password = "secret" },
+                ]
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(settings.grafana.len(), 2);
+        assert_eq!(settings.grafana[0].name, "metrics");
+        assert_eq!(settings.grafana[1].datasource_uid, "edge-uid");
+        // The datasource passwords must not leak through the debug output.
+        assert!(!format!("{settings:?}").contains("secret"));
+    }
+
+    #[test]
+    fn ops_settings_accept_a_single_grafana_metrics_table() {
+        let settings = OpsAgentSettings::from_raw(
+            &toml::from_str(
+                r#"
+                logs = [
+                    { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app.log" },
+                ]
+                grafana = { name = "metrics", description = "Primary metrics datasource.", url = "https://grafana.example.com", datasource_uid = "prom-uid", username = "ops", password = "secret" }
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(settings.grafana.len(), 1);
+        assert_eq!(settings.grafana[0].name, "metrics");
+    }
+
+    #[test]
+    fn ops_settings_report_the_offending_grafana_metrics_index() {
+        let error = OpsAgentSettings::from_raw(
+            &toml::from_str(
+                r#"
+                logs = [
+                    { ssh_user = "deploy", ssh_host = "prod.example.com", log_path = "/var/log/app.log" },
+                ]
+                grafana = [
+                    { name = "metrics", description = "Primary metrics datasource.", url = "https://grafana.example.com", datasource_uid = "prom-uid", username = "ops", password = "secret" },
+                    { name = "", description = "Edge node metrics.", url = "https://grafana.example.com", datasource_uid = "edge-uid", username = "ops", password = "secret" },
+                ]
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("grafana[1]"), "actual error: {rendered}");
     }
 
     #[test]

@@ -123,6 +123,19 @@ logs = [
   # { type = "grafana", url = "https://grafana.example.com", datasource_uid = "elastic-uid", index = "application-logs", org_id = 1, username = "ops", password = "replace-me", filter = '{"term":{"service.name":"api"}}' },
 ]
 
+# GRAFANA METRICS (optional): the datasources behind the ops agent's
+# `grafana_query` tool, configured alongside `logs` above. When configured,
+# the tool is published on the cross-agent bus; other agents use it to read
+# metric time series (rates, latencies, error counts, resource usage).
+# Metrics only — the tool cannot read logs or dashboards. Each entry's
+# `name` (what the model passes as `datasource`) and `description` (what it
+# is for) are published in the tool schema. `datasource_type` defaults to
+# "prometheus". Keep credentials in the uncommitted local config.
+# grafana = [
+#   { name = "metrics", description = "Primary metrics datasource.", url = "https://grafana.example.com", datasource_uid = "prom-uid", datasource_type = "prometheus", org_id = 1, username = "ops", password = "replace-me" },
+#   { name = "edge", description = "Edge node metrics.", url = "https://grafana.example.com", datasource_uid = "edge-uid", datasource_type = "prometheus", org_id = 1, username = "ops", password = "replace-me" },
+# ]
+
 [agent.qa]
 # QA agent: monitors the configured branches for new commits and runs
 # regression testing and security analysis against the running system.

@@ -69,17 +69,17 @@ fn default_org_id() -> u64 {
     DEFAULT_ORG_ID
 }
 
-fn validate_nonempty(value: &str, field: &str, idx: usize) -> Result<()> {
+fn validate_nonempty(value: &str, field: &str, section: &str, idx: usize) -> Result<()> {
     ensure!(
         !value.trim().is_empty(),
-        "{field} is required for Grafana [agent.ops].logs[{idx}]"
+        "{field} is required for Grafana [agent.ops].{section}[{idx}]"
     );
     Ok(())
 }
 
 impl GrafanaLogSourceSettings {
     pub(super) fn validate(&self, idx: usize) -> Result<()> {
-        validate_nonempty(&self.url, "url", idx)?;
+        validate_nonempty(&self.url, "url", "logs", idx)?;
         let url = Url::parse(self.url.trim())
             .with_context(|| format!("invalid url for Grafana [agent.ops].logs[{idx}]"))?;
         ensure!(
@@ -90,16 +90,16 @@ impl GrafanaLogSourceSettings {
             url.username().is_empty() && url.password().is_none(),
             "url must not embed credentials for Grafana [agent.ops].logs[{idx}]"
         );
-        validate_nonempty(&self.datasource_uid, "datasource_uid", idx)?;
+        validate_nonempty(&self.datasource_uid, "datasource_uid", "logs", idx)?;
         ensure!(
             self.datasource_uid
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')),
             "datasource_uid contains unsupported characters for Grafana [agent.ops].logs[{idx}]"
         );
-        validate_nonempty(&self.index, "index", idx)?;
-        validate_nonempty(&self.username, "username", idx)?;
-        validate_nonempty(&self.password, "password", idx)?;
+        validate_nonempty(&self.index, "index", "logs", idx)?;
+        validate_nonempty(&self.username, "username", "logs", idx)?;
+        validate_nonempty(&self.password, "password", "logs", idx)?;
         Ok(())
     }
 
@@ -742,5 +742,442 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("query_shard_exception"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metrics queries (`grafana_query`)
+// ---------------------------------------------------------------------------
+
+/// The configured Grafana metrics datasource: everything one
+/// `grafana_query` call needs to reach Grafana and one datasource.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct GrafanaMetricsSource {
+    /// The short name the model selects this datasource by.
+    pub(super) name: String,
+    /// What the datasource holds — published in the tool schema.
+    pub(super) description: String,
+    base_url: Url,
+    pub(super) datasource_uid: String,
+    datasource_type: String,
+    org_id: u64,
+    username: String,
+    password: String,
+}
+
+impl fmt::Debug for GrafanaMetricsSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GrafanaMetricsSource")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("base_url", &self.base_url)
+            .field("datasource_uid", &self.datasource_uid)
+            .field("datasource_type", &self.datasource_type)
+            .field("org_id", &self.org_id)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GrafanaMetricsSettings {
+    /// The short name the model selects the datasource by in `grafana_query`.
+    pub(super) name: String,
+    /// What the datasource holds — published in the tool schema.
+    pub(super) description: String,
+    pub(super) url: String,
+    pub(super) datasource_uid: String,
+    #[serde(default = "default_datasource_type")]
+    pub(super) datasource_type: String,
+    #[serde(default = "default_org_id")]
+    pub(super) org_id: u64,
+    pub(super) username: String,
+    pub(super) password: String,
+}
+
+impl fmt::Debug for GrafanaMetricsSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GrafanaMetricsSettings")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("url", &self.url)
+            .field("datasource_uid", &self.datasource_uid)
+            .field("datasource_type", &self.datasource_type)
+            .field("org_id", &self.org_id)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn default_datasource_type() -> String {
+    "prometheus".to_string()
+}
+
+impl GrafanaMetricsSettings {
+    pub(super) fn validate(&self, idx: usize) -> Result<()> {
+        validate_nonempty(&self.name, "name", "grafana", idx)?;
+        validate_nonempty(&self.description, "description", "grafana", idx)?;
+        validate_nonempty(&self.url, "url", "grafana", idx)?;
+        Url::parse(self.url.trim())
+            .with_context(|| format!("invalid url for Grafana [agent.ops].grafana[{idx}]"))?;
+        validate_nonempty(&self.datasource_uid, "datasource_uid", "grafana", idx)?;
+        validate_nonempty(&self.username, "username", "grafana", idx)?;
+        Ok(())
+    }
+
+    pub(super) fn into_source(self) -> Result<GrafanaMetricsSource> {
+        Ok(GrafanaMetricsSource {
+            name: self.name.trim().to_string(),
+            description: self.description.trim().to_string(),
+            base_url: Url::parse(self.url.trim())?,
+            datasource_uid: self.datasource_uid.trim().to_string(),
+            datasource_type: self.datasource_type.trim().to_string(),
+            org_id: self.org_id,
+            username: self.username.trim().to_string(),
+            password: self.password,
+        })
+    }
+}
+
+/// The `grafana_query` arguments the calling agent passes.
+pub(super) struct MetricsQuery {
+    /// The configured datasource's `name`; empty selects the first one.
+    pub(super) datasource: String,
+    pub(super) expr: String,
+    pub(super) from: String,
+    pub(super) to: String,
+    pub(super) max_data_points: u32,
+}
+
+/// Run one metrics query against the Grafana datasource proxy
+/// (`POST /api/ds/query`) and render the returned series as compact text.
+/// Metrics only: the tool intentionally has no log or dashboard surface.
+pub(super) fn query_metrics(source: &GrafanaMetricsSource, query: &MetricsQuery) -> Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("build Grafana HTTP client")?;
+
+    let endpoint = {
+        let mut endpoint = source.base_url.clone();
+        endpoint.set_path("api/ds/query");
+        endpoint
+    };
+    let body = json!({
+        "from": query.from,
+        "to": query.to,
+        "queries": [{
+            "refId": "A",
+            "datasource": {
+                "type": source.datasource_type,
+                "uid": source.datasource_uid,
+            },
+            "expr": query.expr,
+            "instant": false,
+            "maxDataPoints": query.max_data_points,
+        }],
+    });
+
+    let response = client
+        .post(endpoint)
+        .basic_auth(&source.username, Some(&source.password))
+        .header("X-Grafana-Org-Id", source.org_id)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .context("send Grafana metrics query")?;
+
+    let status = response.status();
+    let text = response.text().context("read Grafana metrics response")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "Grafana metrics query returned HTTP {status}: {}",
+            first_lines(&text)
+        );
+    }
+
+    let parsed: Value =
+        serde_json::from_str(&text).context("parse Grafana metrics response as JSON")?;
+    render_metrics_response(&parsed)
+}
+
+/// Render the `/api/ds/query` response: one line per series with the frame's
+/// label/name and up to [`MAX_RENDERED_SAMPLES`] `time=value` samples.
+fn render_metrics_response(response: &Value) -> Result<String> {
+    const MAX_RENDERED_SAMPLES: usize = 24;
+
+    let frames = response
+        .pointer("/results/A/frames")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Grafana metrics response has no results.A.frames"))?;
+
+    if let Some(error) = response.pointer("/results/A/error").and_then(Value::as_str) {
+        anyhow::bail!("Grafana metrics query failed: {error}");
+    }
+
+    let mut lines = Vec::new();
+    for frame in frames {
+        let fields = frame
+            .pointer("/schema/fields")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Grafana metrics frame has no schema.fields"))?;
+        let values = frame
+            .pointer("/data/values")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Grafana metrics frame has no data.values"))?;
+
+        // Column 0 is the time axis; the remaining columns are series.
+        let mut series: Vec<(String, &Value)> = Vec::new();
+        let mut time_column: Option<&Value> = None;
+        for (idx, field) in fields.iter().enumerate() {
+            let field_type = field.get("type").and_then(Value::as_str).unwrap_or("");
+            let column = values.get(idx);
+            if field_type == "time" {
+                time_column = column;
+            } else if let Some(column) = column {
+                let labels = field
+                    .get("labels")
+                    .and_then(Value::as_object)
+                    .map(|labels| {
+                        labels
+                            .iter()
+                            .map(|(k, v)| {
+                                let rendered = v
+                                    .as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| v.to_string());
+                                format!("{k}={rendered}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                let name = field.get("name").and_then(Value::as_str).unwrap_or("");
+                let title = if labels.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{{{labels}}}")
+                };
+                series.push((title, column));
+            }
+        }
+
+        let times: Vec<Value> = time_column
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        for (title, column) in series {
+            let points: Vec<Value> = column.as_array().cloned().unwrap_or_default();
+            let samples: Vec<String> = points
+                .iter()
+                .zip(times.iter())
+                .enumerate()
+                .take(MAX_RENDERED_SAMPLES)
+                .map(|(idx, (value, time))| {
+                    format!("{}={}", render_time(time), render_value(value, idx))
+                })
+                .collect();
+            let suffix = if points.len() > MAX_RENDERED_SAMPLES {
+                format!(" (+{} more)", points.len() - MAX_RENDERED_SAMPLES)
+            } else {
+                String::new()
+            };
+            lines.push(format!("{title}: {}{suffix}", samples.join(" ")));
+        }
+    }
+
+    if lines.is_empty() {
+        return Ok("(no series returned)".to_string());
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_time(time: &Value) -> String {
+    let millis = time.as_i64().unwrap_or(0);
+    DateTime::<Utc>::from_timestamp_millis(millis)
+        .map(|t| t.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| time.to_string())
+}
+
+fn render_value(value: &Value, idx: usize) -> String {
+    if value.is_null() {
+        return format!("#{idx}");
+    }
+    value.to_string()
+}
+
+fn first_lines(body: &str) -> String {
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .chars()
+        .take(300)
+        .collect()
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    #[test]
+    fn metrics_response_renders_labeled_series() {
+        let response = json!({
+            "results": {
+                "A": {
+                    "status": 200,
+                    "frames": [{
+                        "schema": {
+                            "fields": [
+                                {"name": "Time", "type": "time", "labels": serde_json::Value::Null},
+                                {"name": "value", "type": "number",
+                                 "labels": {"instance": "host-1", "handler": "/search"}}
+                            ]
+                        },
+                        "data": {"values": [[1700000000000_i64, 1700000060000_i64], [12.5, 9.0]]}
+                    }]
+                }
+            }
+        });
+        let rendered = render_metrics_response(&response).unwrap();
+        assert!(
+            rendered.contains("{handler=/search,instance=host-1}:"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("=12.5"), "{rendered}");
+        assert!(rendered.contains("=9.0"), "{rendered}");
+    }
+
+    #[test]
+    fn metrics_response_surfaces_query_errors() {
+        let response = json!({
+            "results": {"A": {"error": "parse error at char 5", "frames": []}}
+        });
+        let error = render_metrics_response(&response).unwrap_err();
+        assert!(
+            error.to_string().contains("parse error at char 5"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn metrics_response_without_frames_is_an_error() {
+        let response = json!({"results": {}});
+        let error = render_metrics_response(&response).unwrap_err();
+        assert!(error.to_string().contains("results.A.frames"), "{error}");
+    }
+
+    #[test]
+    fn metrics_settings_validate_required_fields() {
+        let valid = GrafanaMetricsSettings {
+            name: "metrics".into(),
+            description: "Primary metrics datasource.".into(),
+            url: "https://grafana.example.com".into(),
+            datasource_uid: "uid-1".into(),
+            datasource_type: "prometheus".into(),
+            org_id: 1,
+            username: "ops".into(),
+            password: "secret".into(),
+        };
+        assert!(valid.validate(0).is_ok());
+
+        let missing_uid = GrafanaMetricsSettings {
+            datasource_uid: "  ".into(),
+            ..valid.clone()
+        };
+        let error = missing_uid.validate(0).unwrap_err();
+        assert!(error.to_string().contains("datasource_uid"), "{error}");
+    }
+
+    #[test]
+    fn metrics_settings_debug_redacts_the_password() {
+        let settings = GrafanaMetricsSettings {
+            name: "metrics".into(),
+            description: "Primary metrics datasource.".into(),
+            url: "https://grafana.example.com".into(),
+            datasource_uid: "uid-1".into(),
+            datasource_type: "prometheus".into(),
+            org_id: 1,
+            username: "ops".into(),
+            password: "secret".into(),
+        };
+        let rendered = format!("{settings:?}");
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    #[test]
+    fn metrics_source_debug_redacts_the_password() {
+        let source = GrafanaMetricsSettings {
+            name: "metrics".into(),
+            description: "Primary metrics datasource.".into(),
+            url: "https://grafana.example.com".into(),
+            datasource_uid: "uid-1".into(),
+            datasource_type: "prometheus".into(),
+            org_id: 1,
+            username: "ops".into(),
+            password: "secret".into(),
+        }
+        .into_source()
+        .unwrap();
+        let rendered = format!("{source:?}");
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod tool_definition_tests {
+    use super::*;
+
+    #[test]
+    fn tool_definition_lists_the_configured_datasources() {
+        let sources = vec![
+            GrafanaMetricsSource {
+                name: "metrics".into(),
+                description: "Primary metrics datasource.".into(),
+                base_url: Url::parse("https://grafana.example.com").unwrap(),
+                datasource_uid: "prom-uid".into(),
+                datasource_type: "prometheus".into(),
+                org_id: 1,
+                username: "ops".into(),
+                password: "secret".into(),
+            },
+            GrafanaMetricsSource {
+                name: "edge".into(),
+                description: "Edge node metrics.".into(),
+                base_url: Url::parse("https://grafana.example.com").unwrap(),
+                datasource_uid: "edge-uid".into(),
+                datasource_type: "prometheus".into(),
+                org_id: 1,
+                username: "ops".into(),
+                password: "secret".into(),
+            },
+        ];
+        let tool = crate::agents::ops::grafana_query_tool_definition(&sources);
+        assert!(
+            tool.description
+                .contains("- metrics — Primary metrics datasource.")
+        );
+        assert!(tool.description.contains("- edge — Edge node metrics."));
+        assert_eq!(tool.name, "grafana_query");
+        assert_eq!(tool.operation, "grafana_query");
+        // The datasource names form an enum in the schema: the model sees the
+        // valid values, and a wrong one is rejected by schema validation.
+        let datasource = &tool.parameters["properties"]["datasource"];
+        assert_eq!(datasource["enum"], serde_json::json!(["metrics", "edge"]));
+        // With multiple datasources the selection is required.
+        assert!(
+            tool.parameters["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("datasource")))
+        );
     }
 }
