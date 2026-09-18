@@ -18,11 +18,12 @@ use crate::core::workflow::AgentSpawnContext;
 
 use super::InvokeOptions;
 
-/// How many times a role's structured output may be repaired inside the task's
-/// own session before the task fails. Each repair is one extra prompt asking
-/// the model to fix its tool call — the task itself is never restated and the
-/// session is never rotated.
-const MAX_STRUCTURED_OUTPUT_REPAIRS: u32 = 10;
+/// How many times a model may be nudged before the run gives up. One budget
+/// covers every nudge kind: in-session structured-output repairs (each repair
+/// is one extra prompt asking the model to fix its tool call — the task
+/// itself is never restated and the session is never rotated) and the worker
+/// cycle's session nudges for a result that cannot produce an MR.
+pub(crate) const MAX_MODEL_NUDGES: u32 = 10;
 
 /// Model preferences selected by callers without exposing engine construction.
 /// Structured-output contracts are *not* here: they belong to a single
@@ -126,7 +127,7 @@ impl AgentModel {
     /// When the model's answer does not satisfy that contract — it never
     /// called the tool, called a different one, broke the schema, or produced
     /// something the Rust type rejects — the model is asked to correct itself
-    /// inside the same session, up to [`MAX_STRUCTURED_OUTPUT_REPAIRS`] times,
+    /// inside the same session, up to [`MAX_MODEL_NUDGES`] times,
     /// and the task is never restated. Transport-level retries (the ACP child
     /// dying mid-prompt) are handled below this layer and are not counted as
     /// repairs.
@@ -353,12 +354,12 @@ fn resolve_structured_output<T: StructuredOutput>(
             Err(error) => error,
         };
 
-        if attempt >= MAX_STRUCTURED_OUTPUT_REPAIRS {
+        if attempt >= MAX_MODEL_NUDGES {
             let preview: String = handoff.response.chars().take(800).collect();
             return Err(anyhow::Error::new(StructuredOutputRetriesExhausted {
                 message: format!(
                     "{agent_id}: `{tool_name}` structured output still invalid after \
-                     {MAX_STRUCTURED_OUTPUT_REPAIRS} correction attempt(s) — {correction}; \
+                     {MAX_MODEL_NUDGES} correction attempt(s) — {correction}; \
                      last response preview: {preview:?}",
                     correction = error.correction(tool_name),
                 ),
@@ -367,14 +368,14 @@ fn resolve_structured_output<T: StructuredOutput>(
 
         attempt += 1;
         warn!(
-            "{agent_id}: {correction}. Repair {attempt}/{MAX_STRUCTURED_OUTPUT_REPAIRS} in the same session",
+            "{agent_id}: {correction}. Repair {attempt}/{MAX_MODEL_NUDGES} in the same session",
             correction = error.correction(tool_name),
         );
         handoff = send_repair(&structured_output_repair_prompt(
             tool_name,
             &error,
             attempt,
-            MAX_STRUCTURED_OUTPUT_REPAIRS,
+            MAX_MODEL_NUDGES,
         ))?;
     }
 }
@@ -588,17 +589,17 @@ acp_command = ["agent", "acp"]"#
     fn every_repair_attempt_is_actually_sent_before_giving_up() {
         let bad = || handoff_with_tool("sample_tool", json!({"decision": "maybe"}));
         let script = std::iter::repeat_with(bad)
-            .take(MAX_STRUCTURED_OUTPUT_REPAIRS as usize)
+            .take(MAX_MODEL_NUDGES as usize)
             .collect();
         let (result, prompts) = resolve_with_script(bad(), script);
         let error = result.unwrap_err();
         assert!(AgentModel::structured_output_retries_exhausted(&error));
-        assert_eq!(prompts.len(), MAX_STRUCTURED_OUTPUT_REPAIRS as usize);
+        assert_eq!(prompts.len(), MAX_MODEL_NUDGES as usize);
     }
 
     #[test]
     fn exhaustion_reports_the_last_failure_not_the_first() {
-        let mut script: Vec<_> = (0..MAX_STRUCTURED_OUTPUT_REPAIRS - 1)
+        let mut script: Vec<_> = (0..MAX_MODEL_NUDGES - 1)
             .map(|_| handoff_with_tool("sample_tool", json!({"decision": "maybe"})))
             .collect();
         // The final failure must survive lenient wire parsing (unknown tags

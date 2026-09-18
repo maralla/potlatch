@@ -20,8 +20,8 @@ use crate::agents::git::GitRepo;
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::schema::tagged;
 use crate::core::agent::{
-    AgentModel, CoreAgent, InvokeOptions, ModelPreferences, ObjectSchema, Schema, compat,
-    structured_output,
+    AgentModel, CoreAgent, InvokeOptions, MAX_MODEL_NUDGES, ModelPreferences, ObjectSchema, Schema,
+    compat, structured_output,
 };
 use crate::core::banner::Banner;
 use crate::core::config::{AgentSection, Config};
@@ -53,6 +53,13 @@ const WORKER_NO_CHANGES_NUDGE: &str = "Continue this implementation in the curre
 Your previous result claimed completion, but the repository has no code changes for this issue. \
 Inspect the current workspace, make the required implementation and tests, then submit an updated \
 structured result. Do not merely repeat the previous answer.";
+const WORKER_DEPENDENCY_CLOSED_NUDGE: &str = "Continue this implementation in the current session. \
+The dependency you declared is already closed, so the work can proceed. Finish the implementation \
+and submit an updated structured result with the required merge request title and description.";
+const WORKER_UNUSABLE_EXISTING_MR_NUDGE: &str = "Continue this implementation in the current session. \
+The merge request you identified cannot be adopted (it is not open or could not be fetched). \
+Implement the change yourself if you have not, then submit an updated structured result with the \
+required merge request title and description.";
 
 /// The name of the structured-output tool both worker contracts use. An
 /// implementation run and a feedback run are different tasks with different
@@ -60,15 +67,15 @@ structured result. Do not merely repeat the previous answer.";
 /// run's result back to Potlatch.
 const HANDOFF_TOOL: &str = "handoff";
 
-/// Metadata for a merge request the worker actually produced. Every field is
-/// optional because the worker's fallbacks (issue title, placeholder
-/// description) are better defaults than forcing the model to invent text.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+/// Metadata for a merge request the worker actually produced. The title and
+/// description are REQUIRED — the worker opens the MR right after the run and
+/// has no better default than a placeholder, so the model authors both: the
+/// schema marks them required and the branch decoder rejects empty values,
+/// which feeds the schema repair loop instead of publishing junk.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct ImplementedMetadata {
-    #[serde(default)]
-    mr_title: Option<String>,
-    #[serde(default)]
-    mr_description: Option<String>,
+    mr_title: String,
+    mr_description: String,
     #[serde(default)]
     changes_summary: Option<String>,
 }
@@ -156,7 +163,24 @@ impl<'de> Deserialize<'de> for WorkerImplementationOutput {
     {
         let (outcome, fields) = tagged::parts(deserializer, "outcome")?;
         match outcome.as_str() {
-            "implemented" => tagged::branch(fields).map(Self::Implemented),
+            "implemented" => tagged::branch(fields).and_then(|metadata: ImplementedMetadata| {
+                // The worker publishes the MR immediately, so a missing or
+                // markdown-only title / empty description is exactly what the
+                // repair loop should fix — never a fallback to placeholders.
+                if strip_markdown_formatting(metadata.mr_title.trim()).is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "mr_title is required: write a short merge request title \
+                             (max 8-10 words) describing what the change does, with no markdown",
+                    ));
+                }
+                if metadata.mr_description.trim().is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "mr_description is required: write the merge request description \
+                             in markdown with ## Goal, ## Implementation, ## Testing sections",
+                    ));
+                }
+                Ok(Self::Implemented(metadata))
+            }),
             "existing_mr" => tagged::branch(fields).map(|wire: ExistingMrWire| Self::ExistingMr {
                 existing_mr_iid: wire.existing_mr_iid,
             }),
@@ -223,8 +247,9 @@ struct WaitDependencyWire {
     depends_on_issue: u64,
 }
 
-/// The MR metadata properties shared by the implementation contract's
-/// `implemented` branch and the feedback contract's `addressed` branch.
+/// The MR metadata properties of the feedback contract's `addressed` branch,
+/// where the MR already exists: both fields are optional and omitting one
+/// keeps its current value.
 fn mr_metadata_properties(schema: ObjectSchema) -> ObjectSchema {
     schema
         .property(
@@ -241,8 +266,28 @@ fn mr_metadata_properties(schema: ObjectSchema) -> ObjectSchema {
         )
 }
 
+/// The MR metadata properties of the implementation contract's `implemented`
+/// branch, where the worker opens the MR right after the run: both fields are
+/// REQUIRED because a placeholder title or description is worse than a repair
+/// turn — there is no core-side fallback.
+fn required_mr_metadata_properties(schema: ObjectSchema) -> ObjectSchema {
+    schema
+        .required_property(
+            "mr_title",
+            Schema::string(
+                "REQUIRED. Short MR title (max 8-10 words). Focus on WHAT, not HOW. No markdown.",
+            ),
+        )
+        .required_property(
+            "mr_description",
+            Schema::string(
+                "REQUIRED. Full MR description in markdown with ## Goal, ## Implementation, ## Testing sections.",
+            ),
+        )
+}
+
 /// The `changes_summary` field: optional for the implementation contract
-/// (core falls back to the issue title for the commit message), REQUIRED for
+/// (the commit message comes from the required MR title), REQUIRED for
 /// the feedback contract — without it the tail would have no commit message,
 /// and a missing field is exactly what the schema repair loop can fix.
 fn changes_summary_property() -> (&'static str, Schema) {
@@ -275,8 +320,13 @@ structured_output! {
             "How the implementation run ended. Pick exactly one and send only that outcome's fields.",
             {
                 "implemented" => (
-                    format!("You made the code changes; {} commits, pushes, and opens the merge request.", display_name()),
-                    fields(mr_metadata_properties(ObjectSchema::new()).property(
+                    format!(
+                        "You made the code changes; {} commits, pushes, and opens the merge \
+                         request. Author the required MR title and description yourself — never \
+                         placeholders or the issue title.",
+                        display_name()
+                    ),
+                    fields(required_mr_metadata_properties(ObjectSchema::new()).property(
                         changes_summary_property().0,
                         changes_summary_property().1,
                     ))
@@ -1980,7 +2030,9 @@ trait ImplementationPort {
     fn issue_comments(&self) -> String;
     fn build_prompt(&mut self, continuation: bool, comments: &str) -> Result<String>;
     fn invoke_implementation_model(&mut self, prompt: &str) -> Result<ImplModelResult>;
-    fn nudge_implementation_model(&mut self) -> Result<ImplModelResult>;
+    /// Continue the session with a nudge explaining what the previous result
+    /// was missing (no code changes, a closed dependency, …).
+    fn nudge_implementation_model(&mut self, nudge: &str) -> Result<ImplModelResult>;
     fn stage_all(&mut self) -> Result<()>;
     fn commit(&mut self, message: &str) -> Result<()>;
     fn push_branch(&mut self, branch: &str) -> Result<()>;
@@ -2097,7 +2149,7 @@ fn run_implementation_cycle(
     let comments = port.issue_comments();
     let prompt = port.build_prompt(branch_existed, &comments)?;
     let mut model_result = port.invoke_implementation_model(&prompt)?;
-    let mut metadata = ImplementedMetadata::default();
+    let mut nudges_used = 0u32;
 
     loop {
         let output = match model_result {
@@ -2113,10 +2165,12 @@ fn run_implementation_cycle(
             }
         };
 
-        match *output {
-            WorkerImplementationOutput::Implemented(output_metadata) => {
-                metadata = output_metadata;
-            }
+        // Only `Implemented` falls through to the MR-creation tail, and it
+        // always carries the now-required MR metadata. Every other outcome
+        // either terminates the run or cannot produce an MR on its own —
+        // those nudge the session instead of falling back to placeholders.
+        let metadata = match *output {
+            WorkerImplementationOutput::Implemented(metadata) => metadata,
             WorkerImplementationOutput::ExistingMr { existing_mr_iid } => {
                 match port.merge_request_state(existing_mr_iid).as_deref() {
                     Some("opened") => {
@@ -2135,14 +2189,25 @@ fn run_implementation_cycle(
                         return Ok(());
                     }
                     Some(state) => warn!(
-                        "Issue #{}: model identified MR !{} but it is not open (state={}); proceeding with new MR",
+                        "Issue #{}: model identified MR !{} but it is not open (state={}); nudging the model to finish the implementation itself",
                         issue.iid, existing_mr_iid, state
                     ),
                     None => warn!(
-                        "Issue #{}: model identified MR !{} but it could not be fetched; proceeding with new MR",
+                        "Issue #{}: model identified MR !{} but it could not be fetched; nudging the model to finish the implementation itself",
                         issue.iid, existing_mr_iid
                     ),
                 }
+                model_result = nudge_or_fail(
+                    port,
+                    &mut nudges_used,
+                    WORKER_UNUSABLE_EXISTING_MR_NUDGE,
+                    format!(
+                        "Issue #{}: model keeps pointing at MR !{}, which cannot be adopted, \
+                         and never handed off usable MR metadata",
+                        issue.iid, existing_mr_iid
+                    ),
+                )?;
+                continue;
             }
             WorkerImplementationOutput::NeedsSplit(blocked) => {
                 warn!("Issue #{} is too broad, needs splitting", issue.iid);
@@ -2191,12 +2256,27 @@ fn run_implementation_cycle(
                     result.left_branch = None;
                     return Ok(());
                 }
+                info!(
+                    "Issue #{}: dependency #{} is already closed; nudging the model to finish the implementation and hand off MR metadata",
+                    issue.iid, depends_on_issue
+                );
+                model_result = nudge_or_fail(
+                    port,
+                    &mut nudges_used,
+                    WORKER_DEPENDENCY_CLOSED_NUDGE,
+                    format!(
+                        "Issue #{}: model keeps deferring to dependency #{}, which is already \
+                         closed, and never handed off usable MR metadata",
+                        issue.iid, depends_on_issue
+                    ),
+                )?;
+                continue;
             }
-        }
+        };
 
         port.stage_all()?;
         if port.has_staged_changes()? {
-            let title = extract_mr_title(metadata.mr_title.as_deref(), &issue.title);
+            let title = extract_mr_title(&metadata.mr_title);
             port.commit(&build_commit_message(&title, issue.iid))?;
         }
         if !port.has_diff_against(&default_branch)? {
@@ -2204,12 +2284,20 @@ fn run_implementation_cycle(
                 "Issue #{}: agent produced no code changes, nudging the current session",
                 issue.iid
             );
-            model_result = port.nudge_implementation_model()?;
+            model_result = nudge_or_fail(
+                port,
+                &mut nudges_used,
+                WORKER_NO_CHANGES_NUDGE,
+                format!(
+                    "Issue #{}: agent repeatedly produced no code changes for the issue",
+                    issue.iid
+                ),
+            )?;
             continue;
         }
 
-        let title = extract_mr_title(metadata.mr_title.as_deref(), &issue.title);
-        let summary = extract_mr_description(metadata.mr_description.as_deref());
+        let title = extract_mr_title(&metadata.mr_title);
+        let summary = metadata.mr_description.trim();
         port.push_branch(&branch_name)?;
         let mr_iid = port.create_merge_request(
             &branch_name,
@@ -2223,7 +2311,7 @@ fn run_implementation_cycle(
         if scope_label.is_some() {
             port.add_mr_scope_label(mr_iid);
         }
-        port.require_save_session_with_summary(mr_iid, &summary)?;
+        port.require_save_session_with_summary(mr_iid, summary)?;
         return Ok(());
     }
 }
@@ -2237,7 +2325,13 @@ struct LiveImplementationPort<'a> {
 }
 
 impl LiveImplementationPort<'_> {
-    fn invoke_implementation_model(&self, initial_prompt: Option<&str>) -> Result<ImplModelResult> {
+    /// Run one implementation-model turn: `initial_prompt` starts a fresh
+    /// task session, `None` continues the existing session with `nudge`.
+    fn run_implementation_model(
+        &self,
+        initial_prompt: Option<&str>,
+        nudge: &str,
+    ) -> Result<ImplModelResult> {
         let issue_iid = self.issue.iid;
         let options = InvokeOptions {
             cancel_check: Some(worker_issue_cancel_check(
@@ -2256,7 +2350,7 @@ impl LiveImplementationPort<'_> {
                 .complete_typed::<WorkerImplementationOutput>(prompt, &options),
             None => self
                 .model
-                .continue_typed::<WorkerImplementationOutput>(WORKER_NO_CHANGES_NUDGE, &options),
+                .continue_typed::<WorkerImplementationOutput>(nudge, &options),
         };
 
         loop {
@@ -2439,11 +2533,11 @@ impl ImplementationPort for LiveImplementationPort<'_> {
     }
 
     fn invoke_implementation_model(&mut self, prompt: &str) -> Result<ImplModelResult> {
-        LiveImplementationPort::invoke_implementation_model(self, Some(prompt))
+        self.run_implementation_model(Some(prompt), "")
     }
 
-    fn nudge_implementation_model(&mut self) -> Result<ImplModelResult> {
-        LiveImplementationPort::invoke_implementation_model(self, None)
+    fn nudge_implementation_model(&mut self, nudge: &str) -> Result<ImplModelResult> {
+        self.run_implementation_model(None, nudge)
     }
 
     fn stage_all(&mut self) -> Result<()> {
@@ -2484,6 +2578,22 @@ impl ImplementationPort for LiveImplementationPort<'_> {
     fn hand_issue_back_to_humans(&mut self, branch: &str, reason: &str) -> Result<()> {
         hand_issue_back_to_humans(self.state, self.issue.iid, branch, reason)
     }
+}
+
+/// Nudge the implementation session, or fail the cycle once the unified
+/// [`MAX_MODEL_NUDGES`] budget is exhausted — re-nudging an unchanged result
+/// would loop forever, so the issue is retried on a later poll instead.
+fn nudge_or_fail(
+    port: &mut dyn ImplementationPort,
+    nudges_used: &mut u32,
+    nudge: &str,
+    failure: String,
+) -> Result<ImplModelResult> {
+    if *nudges_used >= MAX_MODEL_NUDGES {
+        return Err(anyhow::anyhow!(failure));
+    }
+    *nudges_used += 1;
+    port.nudge_implementation_model(nudge)
 }
 
 /// Implement one issue: adopt an existing merge request if the issue
@@ -4629,36 +4739,22 @@ fn extract_waiting_on_issue_iid(labels: &[String]) -> Option<u64> {
     })
 }
 
-/// Extract the MR title the agent emitted, falling back to the issue title
-/// (not a generic placeholder like "Implementation changes") when the agent
-/// didn't provide one. The issue title is always meaningful and specific to
-/// the work, so it's a far better default than a placeholder that produces
-/// a stream of indistinguishable MRs.
-fn extract_mr_title(mr_title: Option<&str>, issue_title: &str) -> String {
-    if let Some(s) = mr_title {
-        let cleaned = strip_markdown_formatting(s.trim());
-        if !cleaned.is_empty() {
-            return cleaned;
-        }
-    }
-    // No title provided by the agent — fall back to the issue title, which
-    // is always specific to the work. Never use a generic placeholder.
-    issue_title.to_string()
+/// Clean the MR title the agent emitted: trim, and strip the markdown
+/// wrapping models habitually add around titles. The implementation contract
+/// requires the field (schema + branch decoder), so there is no fallback —
+/// an MR is never published with a placeholder or the issue title.
+fn extract_mr_title(mr_title: &str) -> String {
+    strip_markdown_formatting(mr_title.trim())
 }
 
 /// Extract an explicit MR title the agent emitted (for metadata updates on
 /// follow-up turns). Returns `None` when the agent didn't provide one, so the
-/// caller can distinguish "no title provided" from "title provided". Unlike
-/// [`extract_mr_title`], this does NOT fall back to the issue title — a
+/// caller can distinguish "no title provided" from "title provided". A
 /// metadata update should only overwrite the title when the agent explicitly
 /// said to.
 fn extract_explicit_mr_title(mr_title: Option<&str>) -> Option<String> {
-    let cleaned = strip_markdown_formatting(mr_title?.trim());
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
+    let cleaned = extract_mr_title(mr_title?);
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 fn strip_markdown_formatting(s: &str) -> String {
@@ -5033,11 +5129,38 @@ mod tests {
         assert_eq!(
             output,
             WorkerImplementationOutput::Implemented(ImplementedMetadata {
-                mr_title: Some("Add feature".to_string()),
-                mr_description: Some("## Goal\nDo it".to_string()),
+                mr_title: "Add feature".to_string(),
+                mr_description: "## Goal\nDo it".to_string(),
                 changes_summary: Some("Added the feature".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn implementation_output_nudges_a_usable_mr_title_and_description() {
+        // Missing → the schema's required-property error names the field;
+        // empty, whitespace-only, or markdown-only values pass the schema but
+        // are rejected by the branch decoder, so the repair loop makes the
+        // model author both: the worker publishes the MR as-is, with no
+        // fallback to the issue title or a placeholder.
+        let error = conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+            "outcome": "implemented"
+        }));
+        assert_eq!(error, "$.mr_title: required property is missing");
+
+        let error = conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+            "outcome": "implemented",
+            "mr_title": "**",
+            "mr_description": "## Goal\nDo it"
+        }));
+        assert!(error.contains("mr_title is required"), "{error}");
+
+        let error = conformance::assert_rejects::<WorkerImplementationOutput>(serde_json::json!({
+            "outcome": "implemented",
+            "mr_title": "Add feature",
+            "mr_description": "   "
+        }));
+        assert!(error.contains("mr_description is required"), "{error}");
     }
 
     #[test]
@@ -5058,12 +5181,13 @@ mod tests {
         let output = conformance::assert_accepts::<WorkerImplementationOutput>(serde_json::json!({
             "outcome": "implemented",
             "mr_title": "Add feature",
+            "mr_description": "## Goal\nDo it",
             "depends_on_issue": 7
         }));
         let WorkerImplementationOutput::Implemented(metadata) = output else {
             panic!("expected the implemented branch, got {output:?}");
         };
-        assert_eq!(metadata.mr_title.as_deref(), Some("Add feature"));
+        assert_eq!(metadata.mr_title, "Add feature");
     }
 
     #[test]
@@ -5460,11 +5584,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_mr_title_falls_back_to_issue_title_when_absent() {
-        // When the agent doesn't set mr_title, the MR title falls back to
-        // the issue title — never a generic placeholder.
+    fn extract_mr_title_strips_markdown_wrapping_without_falling_back() {
+        // The implementation contract requires the title, so the extractor
+        // only cleans it — it never substitutes the issue title.
         assert_eq!(
-            extract_mr_title(None, "Add login rate limiting"),
+            extract_mr_title("  **Add login rate limiting** "),
             "Add login rate limiting"
         );
     }
@@ -5535,10 +5659,7 @@ mod tests {
 
     #[test]
     fn extract_mr_title_reads_structured_field() {
-        assert_eq!(
-            extract_mr_title(Some("Stable title"), "Issue title"),
-            "Stable title"
-        );
+        assert_eq!(extract_mr_title("Stable title"), "Stable title");
         assert_eq!(
             extract_explicit_mr_title(Some("Stable title")),
             Some("Stable title".into())
@@ -5635,12 +5756,13 @@ mod tests {
         let output = conformance::assert_accepts::<WorkerImplementationOutput>(serde_json::json!({
             "outcome": "implemented",
             "mr_title": "Fix bug",
+            "mr_description": "## Goal\nDo it",
             "existing_mr_iid": 42
         }));
         let WorkerImplementationOutput::Implemented(metadata) = output else {
             panic!("expected the implemented branch, got {output:?}");
         };
-        assert_eq!(metadata.mr_title.as_deref(), Some("Fix bug"));
+        assert_eq!(metadata.mr_title, "Fix bug");
     }
 
     // -----------------------------------------------------------------
@@ -6461,6 +6583,7 @@ mod tests {
         dependency_closed: bool,
         model_cancelled: bool,
         model_output: WorkerImplementationOutput,
+        nudge_output: Option<WorkerImplementationOutput>,
         created_mr_iid: u64,
         stop_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
         failing_operations: Vec<&'static str>,
@@ -6481,10 +6604,11 @@ mod tests {
                 dependency_closed: false,
                 model_cancelled: false,
                 model_output: WorkerImplementationOutput::Implemented(ImplementedMetadata {
-                    mr_title: Some("Reduce the retry delay".to_string()),
-                    mr_description: Some("Reduced the retry delay at 30s.".to_string()),
+                    mr_title: "Reduce the retry delay".to_string(),
+                    mr_description: "Reduced the retry delay at 30s.".to_string(),
                     changes_summary: None,
                 }),
+                nudge_output: None,
                 created_mr_iid: 12,
                 stop_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
                 failing_operations: Vec::new(),
@@ -6523,6 +6647,13 @@ mod tests {
 
         fn deciding(mut self, output: WorkerImplementationOutput) -> Self {
             self.model_output = output;
+            self
+        }
+
+        /// The structured result the next nudge answers with (once; later
+        /// nudges repeat `model_output`).
+        fn answering_nudge(mut self, output: WorkerImplementationOutput) -> Self {
+            self.nudge_output = Some(output);
             self
         }
 
@@ -6715,9 +6846,13 @@ mod tests {
             })
         }
 
-        fn nudge_implementation_model(&mut self) -> Result<ImplModelResult> {
+        fn nudge_implementation_model(&mut self, _nudge: &str) -> Result<ImplModelResult> {
             self.required("nudge_implementation_model", "")?;
-            Ok(ImplModelResult::Output(Box::new(self.model_output.clone())))
+            let output = self
+                .nudge_output
+                .take()
+                .unwrap_or_else(|| self.model_output.clone());
+            Ok(ImplModelResult::Output(Box::new(output)))
         }
 
         fn stage_all(&mut self) -> Result<()> {
@@ -7044,7 +7179,40 @@ mod tests {
     }
 
     #[test]
-    fn implementation_proceeds_normally_when_the_declared_dependency_is_already_closed() {
+    fn implementation_nudges_the_model_when_the_declared_dependency_is_already_closed() {
+        // The model declared a dependency that has since closed, so its
+        // result carries no MR metadata. Instead of creating an MR from the
+        // issue title and a placeholder description, the session is nudged
+        // until the model hands off the required metadata itself.
+        let mut port = FakeImplPort::new()
+            .deciding(WorkerImplementationOutput::WaitDependency {
+                depends_on_issue: 4,
+            })
+            .answering_nudge(WorkerImplementationOutput::Implemented(
+                ImplementedMetadata {
+                    mr_title: "Reduce the retry delay".to_string(),
+                    mr_description: "Capped the backoff at 30s.".to_string(),
+                    changes_summary: None,
+                },
+            ))
+            .with_closed_dependency();
+        let run = run_implementation(&mut port, None);
+
+        assert_eq!(run.result.unwrap(), Some(12));
+        assert!(run.trace.contains(&"dependency_closed(4)".to_string()));
+        assert!(
+            run.trace
+                .contains(&"nudge_implementation_model()".to_string())
+        );
+        assert!(run.trace.contains(
+            &"create_merge_request(issue-7,main,Reduce the retry delay,Closes #7\n\nCapped the backoff at 30s.)"
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn implementation_fails_when_nudges_are_exhausted_and_the_model_keeps_deferring_to_a_closed_dependency()
+     {
         let mut port = FakeImplPort::new()
             .deciding(WorkerImplementationOutput::WaitDependency {
                 depends_on_issue: 4,
@@ -7052,11 +7220,15 @@ mod tests {
             .with_closed_dependency();
         let run = run_implementation(&mut port, None);
 
-        assert_eq!(run.result.unwrap(), Some(12));
-        assert!(run.trace.contains(
-            &"create_merge_request(issue-7,main,Reduce the retry delay for issue 7,Closes #7\n\nImplementation completed.)"
-                .to_string()
-        ));
+        assert!(run.result.is_err());
+        assert_eq!(
+            run.trace
+                .iter()
+                .filter(|step| step.starts_with("nudge_implementation_model"))
+                .count(),
+            MAX_MODEL_NUDGES as usize
+        );
+        assert!(!run.mr_created);
     }
 
     #[test]
@@ -7086,11 +7258,47 @@ mod tests {
         for state in [Some("merged"), None] {
             let mut port = FakeImplPort::new()
                 .deciding(WorkerImplementationOutput::ExistingMr { existing_mr_iid: 9 })
+                // The nudge lets the model finish the handoff with the
+                // required MR metadata instead of the run falling back to
+                // placeholders.
+                .answering_nudge(WorkerImplementationOutput::Implemented(
+                    ImplementedMetadata {
+                        mr_title: "Reduce the retry delay".to_string(),
+                        mr_description: "Capped the backoff at 30s.".to_string(),
+                        changes_summary: None,
+                    },
+                ))
                 .with_existing_mr_state(state);
             let run = run_implementation(&mut port, None);
 
             assert_eq!(run.result.unwrap(), Some(12));
+            assert!(
+                run.trace
+                    .contains(&"nudge_implementation_model()".to_string())
+            );
             assert!(run.trace.contains(&"push_branch(issue-7)".to_string()));
+        }
+    }
+
+    #[test]
+    fn implementation_fails_when_nudges_are_exhausted_and_the_pointed_at_mr_stays_unusable() {
+        for state in [Some("merged"), None] {
+            let mut port = FakeImplPort::new()
+                .deciding(WorkerImplementationOutput::ExistingMr { existing_mr_iid: 9 })
+                .with_existing_mr_state(state);
+            let run = run_implementation(&mut port, None);
+
+            // Repeating the same unusable answer fails the cycle once the
+            // unified nudge budget is spent instead of looping forever.
+            assert!(run.result.is_err());
+            assert_eq!(
+                run.trace
+                    .iter()
+                    .filter(|step| step.starts_with("nudge_implementation_model"))
+                    .count(),
+                MAX_MODEL_NUDGES as usize
+            );
+            assert!(!run.mr_created);
         }
     }
 

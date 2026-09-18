@@ -3,6 +3,7 @@ mod model;
 pub mod schema;
 
 pub use handoff::AgentHandoff;
+pub(crate) use model::MAX_MODEL_NUDGES;
 pub use model::{AgentModel, ModelPreferences};
 pub(crate) use schema::structured_output;
 pub use schema::{ObjectSchema, OneOfSchema, Schema, StructuredOutput, compat};
