@@ -2740,7 +2740,7 @@ fn plan_mr_metadata_update(
 /// Returns `Ok(true)` if the agent decided the issue cannot be resolved and
 /// the MR was closed + issue rejected.
 /// Durable per-MR feedback bookkeeping: what the last feedback run already
-/// saw and answered. Without it a worker cycle re-runs the feedback flow on
+/// answered. Without it a worker cycle re-runs the feedback flow on
 /// every poll for any comment that cannot be resolved away (plain comments
 /// never clear), and each run posts a fresh "already done" reply — observed
 /// as a same-meaning reply loop with dozens of comments on one MR.
@@ -2749,9 +2749,14 @@ struct MrFeedbackState {
     /// The newest note id present when the run started (the run's own
     /// replies get higher ids; re-fetching after the run captures them).
     last_comment_id: u64,
-    /// Discussion ids present at run time — the threads the run already
-    /// had a chance to answer.
-    seen_discussions: Vec<String>,
+    /// Discussion ids the run actually replied to. A run that withheld its
+    /// replies (branch not merging cleanly) must not record them: the
+    /// threads would be orphaned — never answered, never retried.
+    /// Renamed from `seen_discussions`, whose entries were recorded even
+    /// for reply-less runs; old files deserialize as "nothing answered"
+    /// so the owed replies happen on the next cycle.
+    #[serde(default)]
+    answered_discussions: Vec<String>,
 }
 
 fn mr_feedback_state_path(sessions_dir: &str, agent_id: &str, mr_iid: u64) -> PathBuf {
@@ -2785,7 +2790,7 @@ fn feedback_run_needed(
     }
     if unresolved_ids
         .iter()
-        .any(|id| !prior.seen_discussions.contains(id))
+        .any(|id| !prior.answered_discussions.contains(id))
     {
         return true;
     }
@@ -3125,11 +3130,19 @@ INSTRUCTIONS:
         source_branch: latest_mr.source_branch.clone(),
         target_branch: latest_mr.target_branch.clone(),
     };
-    run_feedback_tail(&mut port, &input)?;
+    let tail_outcome = run_feedback_tail(&mut port, &input)?;
 
     // Record what the run saw INCLUDING its own replies (re-fetch: the
     // replies are new notes with higher ids) so the next cycle cannot
-    // re-trigger on them.
+    // re-trigger on them. A run that withheld its replies records nothing:
+    // its discussions are still owed an answer, and re-running the flow is
+    // the retry — marking them answered here would orphan the threads
+    // forever (observed on MR !334: conflicts were pushed but GitLab still
+    // reported the stale conflict state, the replies were skipped, and the
+    // recorded state silenced every later cycle).
+    if tail_outcome == FeedbackTailOutcome::RepliesWithheld {
+        return Ok(false);
+    }
     let seen_comment_id = state
         .forge
         .get_mr_comments(mr_iid)
@@ -3140,7 +3153,7 @@ INSTRUCTIONS:
         &state_path,
         &MrFeedbackState {
             last_comment_id: seen_comment_id,
-            seen_discussions: input.unresolved_ids.clone(),
+            answered_discussions: input.unresolved_ids.clone(),
         },
     )?;
 
@@ -3234,9 +3247,25 @@ trait FeedbackTailPort {
     fn resolve_discussion(&mut self, discussion_id: &str);
 }
 
+/// What the feedback tail did with the model's replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedbackTailOutcome {
+    /// Replies were posted (or there was nothing to reply to): the run
+    /// completed its duty, so its observations can be recorded.
+    Completed,
+    /// Replies were withheld because the branch still does not merge
+    /// cleanly — answering the reviews now would describe code that is not
+    /// pushed. The caller must not record the discussions as answered; the
+    /// next cycle retries the whole flow.
+    RepliesWithheld,
+}
+
 /// Finish a feedback run directly: metadata first, required git operations,
 /// conflict gates, then best-effort GitLab replies.
-fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput) -> Result<()> {
+fn run_feedback_tail(
+    port: &mut dyn FeedbackTailPort,
+    input: &FeedbackTailInput,
+) -> Result<FeedbackTailOutcome> {
     if let Some(update) = plan_mr_metadata_update(
         &input.surface_before.title,
         &input.surface_before.description,
@@ -3339,7 +3368,7 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
             "MR !{}: merge conflicts with origin/{} remain; skipping replies until the branch merges cleanly",
             input.mr_iid, input.target_branch
         );
-        return Ok(());
+        return Ok(FeedbackTailOutcome::RepliesWithheld);
     }
 
     // One reply per addressed comment: each comment in the prompt carries
@@ -3394,7 +3423,7 @@ fn run_feedback_tail(port: &mut dyn FeedbackTailPort, input: &FeedbackTailInput)
         }
         port.reply_to_discussion(id, &body);
     }
-    Ok(())
+    Ok(FeedbackTailOutcome::Completed)
 }
 
 struct LiveFeedbackTailPort<'a> {
@@ -7579,7 +7608,7 @@ mod tests {
     fn run_feedback(
         port: &mut FakeFeedbackPort,
         input: FeedbackTailInput,
-    ) -> (Result<()>, Vec<String>) {
+    ) -> (Result<FeedbackTailOutcome>, Vec<String>) {
         let result = run_feedback_tail(port, &input);
         let trace = port.trace.borrow().clone();
         (result, trace)
@@ -7606,7 +7635,7 @@ mod tests {
         let mut port = FakeFeedbackPort::new().with_changes(&[true]);
         let (result, trace) = run_feedback(&mut port, feedback_input(&["d1", "d2"], resolution));
 
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), FeedbackTailOutcome::Completed);
         let commit = format!(
             "commit({})",
             build_commit_message("Reduced the retry delay", 7)
@@ -7701,7 +7730,7 @@ mod tests {
             .behind_target();
         let (result, trace) = run_feedback(&mut port, input);
 
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), FeedbackTailOutcome::RepliesWithheld);
         assert!(!trace.contains(&"push_source_branch".to_string()));
         assert!(port.replies.is_empty());
         assert!(port.resolutions.is_empty());
@@ -7717,7 +7746,10 @@ mod tests {
             .with_surface_after(feedback_surface("Reduce the retry delay", true));
         let (result, trace) = run_feedback(&mut port, input);
 
-        assert!(result.is_ok());
+        // The push already happened, but the withheld replies are the
+        // caller's signal to leave the feedback state untouched so the
+        // owed replies are retried once GitLab's status catches up.
+        assert_eq!(result.unwrap(), FeedbackTailOutcome::RepliesWithheld);
         assert!(trace.contains(&"push_source_branch".to_string()));
         assert!(port.replies.is_empty());
         assert!(port.resolutions.is_empty());
@@ -7813,7 +7845,7 @@ mod tests {
         use super::Comment as ForgeComment;
         let prior = MrFeedbackState {
             last_comment_id: 10,
-            seen_discussions: vec!["d1".into()],
+            answered_discussions: vec!["d1".into()],
         };
         let comments = vec![ForgeComment {
             id: 10,
