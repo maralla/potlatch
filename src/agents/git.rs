@@ -617,6 +617,75 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Paths with uncommitted changes (staged, unstaged, or untracked),
+    /// relative to the repo root. Parsed from `-z` porcelain so paths with
+    /// special characters survive round-tripping into pathspecs.
+    pub fn dirty_files(&self) -> Result<Vec<String>> {
+        let output = Command::new("git")
+            .args(["status", "--porcelain", "-z"])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to read git status")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Git status failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let mut paths = Vec::new();
+        let mut fields = raw.split('\0');
+        while let Some(entry) = fields.next() {
+            if entry.len() < 4 {
+                continue;
+            }
+            let path = &entry[3..];
+            if path.is_empty() {
+                continue;
+            }
+            paths.push(path.to_string());
+            // Rename/copy entries carry a second, NUL-separated path.
+            if entry.as_bytes()[0] == b'R' || entry.as_bytes()[0] == b'C' {
+                fields.next();
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// Stage everything except `exclude` (plus the Potlatch-generated task
+    /// context dirs). Used to commit only what the current model turn
+    /// changed: files that were already dirty before the turn started stay
+    /// out of the commit instead of being swept in.
+    pub fn add_all_excluding(&self, exclude: &[String]) -> Result<()> {
+        let mut args = vec![
+            "add".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+            ":(exclude).potlatch-context".to_string(),
+            ":(exclude).potlatch".to_string(),
+        ];
+        for path in exclude {
+            args.push(format!(":(exclude){path}"));
+        }
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to git add")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Git add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn commit(&self, message: &str) -> Result<()> {
         let output = Command::new("git")
             .args(["commit", "-m", message])
@@ -723,6 +792,57 @@ mod tests {
             args.join(" "),
             GitRepo::command_error(&output)
         );
+    }
+
+    #[test]
+    fn dirty_files_and_excluding_add_stage_only_the_delta() {
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch-git-dirty-delta-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        run_git(&dir, &["init", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "test@example.com"]);
+        run_git(&dir, &["config", "user.name", "test"]);
+        fs::write(dir.join("committed.txt"), "base\n").unwrap();
+        run_git(&dir, &["add", "committed.txt"]);
+        run_git(&dir, &["commit", "-m", "base"]);
+
+        let repo = GitRepo::new(
+            dir.to_string_lossy().into_owned(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(repo.dirty_files().unwrap().is_empty());
+
+        // Pre-turn dirt: a modification left by an earlier task.
+        fs::write(dir.join("committed.txt"), "stale edit\n").unwrap();
+        assert_eq!(repo.dirty_files().unwrap(), vec!["committed.txt"]);
+
+        // The turn's own changes: a new file plus a staged new file.
+        fs::write(dir.join("turn_output.txt"), "made this turn\n").unwrap();
+        fs::write(dir.join("other.txt"), "new\n").unwrap();
+        run_git(&dir, &["add", "other.txt"]);
+        assert_eq!(
+            repo.dirty_files().unwrap(),
+            vec!["committed.txt", "other.txt", "turn_output.txt"]
+        );
+
+        // Delta staging leaves the pre-turn dirt out of the index.
+        repo.add_all_excluding(&["committed.txt".to_string()])
+            .unwrap();
+        let staged_only = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let staged_names = String::from_utf8_lossy(&staged_only.stdout);
+        assert!(staged_names.contains("other.txt"));
+        assert!(staged_names.contains("turn_output.txt"));
+        assert!(!staged_names.contains("committed.txt"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

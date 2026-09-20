@@ -106,6 +106,17 @@ pub struct NewSessionParams {
         rename = "write_roots"
     )]
     pub write_roots: Option<Vec<String>>,
+    /// The task scope this session was started for (e.g. `issue-365`). The
+    /// harness records it next to the agent's current-session marker and
+    /// refuses to resume a session whose scope differs, so one task's
+    /// conversation can never leak into another's. Potlatch extension —
+    /// ignored by non-potlatch backends.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "task_scope"
+    )]
+    pub task_scope: Option<String>,
 }
 
 /// One allowed value in a `select` session config option ([`SessionConfigOptionBrief`]).
@@ -256,6 +267,7 @@ mod tests {
             agent_tools: None,
             context_channels: None,
             write_roots: None,
+            task_scope: None,
         };
         let v = serde_json::to_value(&params).unwrap();
         assert_eq!(v["agent_id"], "worker-7");
@@ -270,9 +282,40 @@ mod tests {
             agent_tools: None,
             context_channels: None,
             write_roots: None,
+            task_scope: None,
         };
         let v = serde_json::to_value(&params).unwrap();
         assert!(v.get("agent_id").is_none());
+    }
+
+    #[test]
+    fn new_session_params_serialize_the_task_scope_extension() {
+        let params = NewSessionParams {
+            cwd: "/tmp/repo".into(),
+            agent_id: Some("worker-14".into()),
+            mcp_servers: vec![],
+            structured_output_tools: None,
+            agent_tools: None,
+            context_channels: None,
+            write_roots: None,
+            task_scope: Some("issue-365".into()),
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(v["task_scope"], "issue-365");
+
+        // Absent task_scope stays off the wire.
+        let params = NewSessionParams {
+            cwd: "/tmp/repo".into(),
+            agent_id: Some("worker-14".into()),
+            mcp_servers: vec![],
+            structured_output_tools: None,
+            agent_tools: None,
+            context_channels: None,
+            write_roots: None,
+            task_scope: None,
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert!(v.get("task_scope").is_none());
     }
 
     #[test]

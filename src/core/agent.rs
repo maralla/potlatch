@@ -25,6 +25,10 @@ pub struct InvokeOptions {
     pub cancel_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub follow_up_poll: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
     pub activity_label: Option<String>,
+    /// Identifies the task this invocation belongs to (e.g. `issue-365`). A
+    /// session recovered from disk is only resumed when its recorded scope
+    /// matches, so a new task never inherits another task's conversation.
+    pub task_scope: Option<String>,
 }
 
 #[derive(Debug, Clone)]

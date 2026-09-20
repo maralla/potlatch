@@ -1308,6 +1308,7 @@ impl PmoPort for LivePmoPort<'_> {
                     "{} triaging issue #{}",
                     self.state.agent_id, issue.iid
                 )),
+                task_scope: Some(format!("issue-{}", issue.iid)),
             },
         );
         self.model.set_capability_provider(None);

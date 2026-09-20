@@ -264,6 +264,8 @@ impl ModelEngine {
 
     /// Start a new task: the structured-output contract for *this* task is
     /// converted to generic JSON and handed to the selected ACP backend.
+    /// The task scope (e.g. `issue-365`) travels with the session so crash
+    /// recovery never resumes another task's conversation.
     pub fn invoke(
         &self,
         prompt: &str,
@@ -272,9 +274,13 @@ impl ModelEngine {
     ) -> Result<ModelResponse> {
         let contracts = structured_output_contracts_json(tools);
         let (cancel_check, follow_up_poll) = live_callbacks(options);
-        let handoff = self
-            .inner
-            .run_task(prompt, contracts, cancel_check, follow_up_poll)?;
+        let handoff = self.inner.run_task(
+            prompt,
+            contracts,
+            options.task_scope.as_deref(),
+            cancel_check,
+            follow_up_poll,
+        )?;
         Ok(ModelResponse { handoff })
     }
 
@@ -420,6 +426,7 @@ acp_command = ["agent", "acp"]"#
             cancel_check: Some(Arc::new(|| true)),
             follow_up_poll: Some(Arc::new(|| vec!["new comment".to_string()])),
             activity_label: None,
+            task_scope: None,
         };
         let (cancel, poll) = live_callbacks(&options);
         assert!(cancel.expect("cancel check")());

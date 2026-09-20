@@ -26,7 +26,7 @@ use super::client::{ChatClient, ChatResponse, StreamCallback, TurnCallback};
 use super::parent::SharedOutput;
 use super::session_store::{
     SessionRoots, agent_current_marker, clear_current_session, read_current_session,
-    session_context_file, write_current_session,
+    read_current_session_scope, session_context_file, write_current_session,
 };
 use super::tools::ToolRegistry;
 use super::tools::agent_bus::AgentToolCaller;
@@ -117,6 +117,11 @@ struct Session {
     /// session has no sessions-directory identity (agent_id empty): a fresh
     /// context, never persisted, never resumed.
     context_path: Option<PathBuf>,
+    /// The task scope this session was started for (e.g. `issue-365`), from
+    /// the `task_scope` extension of `session/new`. Recorded next to the
+    /// agent's current-session marker; a session is only ever resumed for a
+    /// task of the same scope.
+    task_scope: Option<String>,
 }
 
 impl Session {
@@ -135,6 +140,7 @@ impl Session {
             transcript_path: None,
             agent_id: String::new(),
             context_path: None,
+            task_scope: None,
         }
     }
 }
@@ -336,6 +342,12 @@ impl AcpServer {
             .map(str::to_string)
             .unwrap_or_default();
 
+        session.task_scope = params
+            .get("task_scope")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
         // A previous run of this agent may have crashed mid-task: its marker
         // still names the session it never finished. Adopt that session's id —
         // and with it the run.log/context directory — so this run resumes it;
@@ -345,19 +357,36 @@ impl AcpServer {
         let sessions_root = self.roots.sessions.clone();
         if !session.agent_id.is_empty() {
             let marker = agent_current_marker(&self.roots.agents, &session.agent_id);
+            // A recovered session is adopted only when it was working the
+            // same task scope as the incoming one. Without this check a
+            // stale marker makes a new task resume a finished (or
+            // abandoned) session from an entirely different issue — the
+            // model then answers the old task instead of the new prompt.
+            let prev_scope = read_current_session_scope(&marker);
+            let scope_matches = prev_scope.as_deref() == session.task_scope.as_deref();
             if let Some(prev_id) = read_current_session(&marker)
                 && prev_id != session.id
+                && scope_matches
                 && session_context_file(&sessions_root, &prev_id).is_file()
             {
                 info!(
                     "harness ACP: agent {} resuming interrupted session {prev_id} \
-                     (context recovered from disk)",
-                    session.agent_id
+                     (context recovered from disk, scope {:?})",
+                    session.agent_id, session.task_scope
                 );
                 session.id = prev_id;
+            } else if let Some(prev_id) = read_current_session(&marker)
+                && prev_id != session.id
+                && !scope_matches
+            {
+                info!(
+                    "harness ACP: agent {} starting a fresh session — marker names {prev_id} \
+                     from another task scope ({:?} vs {:?})",
+                    session.agent_id, prev_scope, session.task_scope
+                );
             }
             session.context_path = Some(session_context_file(&sessions_root, &session.id));
-            write_current_session(&marker, &session.id);
+            write_current_session(&marker, &session.id, session.task_scope.as_deref());
         }
 
         // Optional `write_roots` extension: directories the write/edit tools
@@ -2136,11 +2165,25 @@ mod tests {
         id: Value,
         agent_id: &str,
     ) -> String {
+        session_new_scoped(server, buffer, id, agent_id, None)
+    }
+
+    fn session_new_scoped(
+        server: &mut AcpServer,
+        buffer: &Arc<Mutex<Vec<u8>>>,
+        id: Value,
+        agent_id: &str,
+        task_scope: Option<&str>,
+    ) -> String {
+        let mut params = json!({ "cwd": "/tmp", "agent_id": agent_id });
+        if let Some(scope) = task_scope {
+            params["task_scope"] = json!(scope);
+        }
         let msg = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "session/new",
-            "params": { "cwd": "/tmp", "agent_id": agent_id }
+            "params": params
         });
         let response = collect_output(server, buffer, &msg);
         match response {
@@ -2271,6 +2314,77 @@ mod tests {
         assert!(
             all_text.contains("halfway through the task"),
             "resumed context must carry the previous run's prompt: {all_text}"
+        );
+    }
+
+    #[test]
+    fn a_session_from_another_task_scope_is_not_adopted() {
+        let dir = test_util::unique_test_dir();
+        let llm: Arc<dyn ChatClient> = Arc::new(StubClient);
+
+        // First run: a scoped session for one task that never closed (the
+        // marker still names it, crash-recovery style).
+        let (mut first, buffer) = buffered_server_with_roots(llm.clone(), test_roots(dir.path()));
+        let stale_sid =
+            session_new_scoped(&mut first, &buffer, json!(1), "worker-7", Some("issue-334"));
+        let prompt = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": stale_sid,
+                "prompt": [{ "type": "text", "text": "address MR feedback" }]
+            }
+        });
+        let _ = collect_output(&mut first, &buffer, &prompt);
+        drop(first);
+
+        // Second run: a NEW task for the same agent, different scope. The
+        // marker session belongs to another task, so it must NOT be adopted
+        // — adopting it would answer the old task instead of the new one.
+        let (mut second, buffer) = buffered_server_with_roots(llm.clone(), test_roots(dir.path()));
+        let fresh_sid = session_new_scoped(
+            &mut second,
+            &buffer,
+            json!(1),
+            "worker-7",
+            Some("issue-365"),
+        );
+        assert_ne!(
+            fresh_sid, stale_sid,
+            "a session from another task scope must not be adopted"
+        );
+        // The marker now names the new session with the new scope.
+        let marker = dir.path().join("agents").join("worker-7").join("current");
+        assert_eq!(
+            read_current_session(&marker).as_deref(),
+            Some(fresh_sid.as_str())
+        );
+        assert_eq!(
+            read_current_session_scope(&marker).as_deref(),
+            Some("issue-365")
+        );
+
+        // The same scope resuming after a crash still adopts: that is the
+        // crash-recovery contract. The fresh session first runs a prompt so
+        // its context exists on disk.
+        let prompt = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": fresh_sid,
+                "prompt": [{ "type": "text", "text": "implement the issue" }]
+            }
+        });
+        let _ = collect_output(&mut second, &buffer, &prompt);
+        drop(second);
+        let (mut third, buffer) = buffered_server_with_roots(llm, test_roots(dir.path()));
+        let resumed_sid =
+            session_new_scoped(&mut third, &buffer, json!(1), "worker-7", Some("issue-365"));
+        assert_eq!(
+            resumed_sid, fresh_sid,
+            "same-scope crash recovery adopts the interrupted session"
         );
     }
 

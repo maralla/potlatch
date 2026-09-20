@@ -71,15 +71,35 @@ pub(crate) fn agent_current_marker(root: &Path, agent_id: &str) -> PathBuf {
 pub(crate) fn read_current_session(marker: &Path) -> Option<String> {
     fs::read_to_string(marker)
         .ok()
-        .map(|raw| raw.trim().to_string())
+        .and_then(|raw| raw.lines().next().map(str::to_string))
+        .map(|sid| sid.trim().to_string())
         .filter(|sid| !sid.is_empty())
 }
 
-pub(crate) fn write_current_session(marker: &Path, session_id: &str) {
+/// The task scope the marker's session was started for, if any. A marker
+/// without a scope line names a legacy session — treated as an unknown scope
+/// that matches nothing scoped.
+pub(crate) fn read_current_session_scope(marker: &Path) -> Option<String> {
+    fs::read_to_string(marker)
+        .ok()
+        .and_then(|raw| raw.lines().nth(1).map(str::to_string))
+        .map(|scope| scope.trim().to_string())
+        .filter(|scope| !scope.is_empty())
+}
+
+/// Record the session in flight for an agent, together with the task scope
+/// it was started for. Resumption adopts the session only when the new
+/// task's scope matches, so one agent's session never carries another
+/// task's conversation (see `AcpServer::session_new`).
+pub(crate) fn write_current_session(marker: &Path, session_id: &str, scope: Option<&str>) {
     if let Some(parent) = marker.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(marker, session_id);
+    let contents = match scope {
+        Some(scope) => format!("{session_id}\n{scope}"),
+        None => session_id.to_string(),
+    };
+    let _ = fs::write(marker, contents);
 }
 
 /// Empty the marker when it still names this session. A marker naming a
@@ -126,8 +146,9 @@ mod tests {
 
         assert_eq!(read_current_session(&marker), None);
 
-        write_current_session(&marker, "session-1");
+        write_current_session(&marker, "session-1", None);
         assert_eq!(read_current_session(&marker).as_deref(), Some("session-1"));
+        assert_eq!(read_current_session_scope(&marker), None);
 
         // Clearing a marker that names a different session is a no-op.
         clear_current_session(&marker, "session-2");
@@ -137,6 +158,39 @@ mod tests {
         assert_eq!(read_current_session(&marker), None);
         // The file exists but is empty, not deleted.
         assert!(marker.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scoped_marker_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "potlatch_marker_scope_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("current");
+
+        write_current_session(&marker, "session-1", Some("issue-365"));
+        assert_eq!(read_current_session(&marker).as_deref(), Some("session-1"));
+        assert_eq!(
+            read_current_session_scope(&marker).as_deref(),
+            Some("issue-365")
+        );
+
+        // Rewriting with a new scope replaces the old one.
+        write_current_session(&marker, "session-2", Some("mr-feedback-334"));
+        assert_eq!(read_current_session(&marker).as_deref(), Some("session-2"));
+        assert_eq!(
+            read_current_session_scope(&marker).as_deref(),
+            Some("mr-feedback-334")
+        );
+
+        // A session id containing no scope line still reads as unscoped.
+        fs::write(&marker, "session-3").unwrap();
+        assert_eq!(read_current_session(&marker).as_deref(), Some("session-3"));
+        assert_eq!(read_current_session_scope(&marker), None);
 
         let _ = fs::remove_dir_all(&dir);
     }

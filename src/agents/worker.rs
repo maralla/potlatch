@@ -2026,6 +2026,7 @@ trait ImplementationPort {
     fn has_diff_against(&self, base: &str) -> Result<bool>;
     fn has_staged_changes(&self) -> Result<bool>;
     fn merge_request_state(&self, mr_iid: u64) -> Option<String>;
+    fn merge_request_source_branch(&self, mr_iid: u64) -> Option<String>;
     fn dependency_closed(&self, issue_iid: u64) -> bool;
     fn issue_comments(&self) -> String;
     fn build_prompt(&mut self, continuation: bool, comments: &str) -> Result<String>;
@@ -2033,7 +2034,12 @@ trait ImplementationPort {
     /// Continue the session with a nudge explaining what the previous result
     /// was missing (no code changes, a closed dependency, …).
     fn nudge_implementation_model(&mut self, nudge: &str) -> Result<ImplModelResult>;
-    fn stage_all(&mut self) -> Result<()>;
+    fn dirty_files(&self) -> Result<Vec<String>>;
+    /// Stage only the files the model turn changed: everything except the
+    /// paths that were already dirty before the turn started. Pre-existing
+    /// dirt (leftover work from an interrupted earlier task) must never be
+    /// swept into this issue's commit.
+    fn stage_turn_changes(&mut self, pre_turn_dirty: &[String]) -> Result<()>;
     fn commit(&mut self, message: &str) -> Result<()>;
     fn push_branch(&mut self, branch: &str) -> Result<()>;
     fn create_merge_request(
@@ -2146,6 +2152,20 @@ fn run_implementation_cycle(
         return Ok(());
     }
     port.require_working_on_label()?;
+    // The worktree must be clean before the model turn starts. Dirt here is
+    // leftover work from an interrupted earlier task on this clone — it is
+    // not this issue's input, and letting the turn run on top of it risks
+    // sweeping that work into this issue's commit (or losing it to a reset).
+    let pre_turn_dirty = port.dirty_files()?;
+    if !pre_turn_dirty.is_empty() {
+        anyhow::bail!(
+            "Issue #{}: worktree has {} uncommitted file(s) before the model turn \
+             ({}); refusing to run on a contaminated worktree",
+            issue.iid,
+            pre_turn_dirty.len(),
+            pre_turn_dirty.join(", ")
+        );
+    }
     let comments = port.issue_comments();
     let prompt = port.build_prompt(branch_existed, &comments)?;
     let mut model_result = port.invoke_implementation_model(&prompt)?;
@@ -2172,6 +2192,26 @@ fn run_implementation_cycle(
         let metadata = match *output {
             WorkerImplementationOutput::Implemented(metadata) => metadata,
             WorkerImplementationOutput::ExistingMr { existing_mr_iid } => {
+                // An existing_mr answer naming another issue's MR is a
+                // stale-context symptom: the model is answering a previous
+                // task carried in the session, not this issue. Nudging it to
+                // "implement yourself" here produced an MR for the wrong
+                // issue (issue-365 branch published as the !334 follow-up);
+                // failing the run lets a fresh session retry this issue.
+                if let Some(branch) = port.merge_request_source_branch(existing_mr_iid)
+                    && let Ok(other_iid) = extract_issue_number_from_branch(&branch)
+                    && other_iid != issue.iid
+                {
+                    anyhow::bail!(
+                        "Issue #{}: model pointed at MR !{}, which belongs to issue #{} \
+                         (branch {}), not to this issue — treating the result as unusable \
+                         instead of implementing an unrelated task on this branch",
+                        issue.iid,
+                        existing_mr_iid,
+                        other_iid,
+                        branch
+                    );
+                }
                 match port.merge_request_state(existing_mr_iid).as_deref() {
                     Some("opened") => {
                         info!(
@@ -2274,7 +2314,7 @@ fn run_implementation_cycle(
             }
         };
 
-        port.stage_all()?;
+        port.stage_turn_changes(&pre_turn_dirty)?;
         if port.has_staged_changes()? {
             let title = extract_mr_title(&metadata.mr_title);
             port.commit(&build_commit_message(&title, issue.iid))?;
@@ -2343,6 +2383,7 @@ impl LiveImplementationPort<'_> {
                 "{} implementing issue #{}",
                 self.state.agent_id, issue_iid
             )),
+            task_scope: Some(format!("issue-{issue_iid}")),
         };
         let mut completion = match initial_prompt {
             Some(prompt) => self
@@ -2417,6 +2458,14 @@ impl ImplementationPort for LiveImplementationPort<'_> {
             .get_merge_request(mr_iid)
             .ok()
             .map(|mr| mr.state)
+    }
+
+    fn merge_request_source_branch(&self, mr_iid: u64) -> Option<String> {
+        self.state
+            .forge
+            .get_merge_request(mr_iid)
+            .ok()
+            .map(|mr| mr.source_branch)
     }
 
     fn dependency_closed(&self, issue_iid: u64) -> bool {
@@ -2540,8 +2589,22 @@ impl ImplementationPort for LiveImplementationPort<'_> {
         self.run_implementation_model(None, nudge)
     }
 
-    fn stage_all(&mut self) -> Result<()> {
-        self.state.git_repo.add_all()
+    fn dirty_files(&self) -> Result<Vec<String>> {
+        self.state.git_repo.dirty_files()
+    }
+
+    fn stage_turn_changes(&mut self, pre_turn_dirty: &[String]) -> Result<()> {
+        if pre_turn_dirty.is_empty() {
+            self.state.git_repo.add_all()
+        } else {
+            warn!(
+                "{}: staging excludes {} file(s) already dirty before the turn: {}",
+                self.state.agent_id,
+                pre_turn_dirty.len(),
+                pre_turn_dirty.join(", ")
+            );
+            self.state.git_repo.add_all_excluding(pre_turn_dirty)
+        }
     }
 
     fn commit(&mut self, message: &str) -> Result<()> {
@@ -2878,6 +2941,20 @@ fn handle_mr_comments(
         .git_repo
         .checkout_remote_branch(&latest_mr.source_branch)?;
 
+    // Same contamination gate as the implementation cycle: dirt here is
+    // leftover work from another task on this clone. It must not be swept
+    // into this MR's feedback commit, and a reset must not destroy it.
+    let pre_turn_dirty = state.git_repo.dirty_files()?;
+    if !pre_turn_dirty.is_empty() {
+        anyhow::bail!(
+            "MR !{}: worktree has {} uncommitted file(s) before the model turn \
+             ({}); refusing to run on a contaminated worktree",
+            latest_mr.iid,
+            pre_turn_dirty.len(),
+            pre_turn_dirty.join(", ")
+        );
+    }
+
     // Remember the remote HEAD so we can detect changes after the agent runs,
     // even if the agent disobeys and commits/pushes itself.
     let pre_agent_sha = latest_mr
@@ -3046,6 +3123,7 @@ INSTRUCTIONS:
                     "{} addressing MR !{} feedback",
                     &state.agent_id, latest_mr.iid
                 )),
+                task_scope: Some(format!("issue-{issue_iid}")),
             },
         ) {
             Ok(output) => output,
@@ -3075,6 +3153,7 @@ INSTRUCTIONS:
                     "{} addressing MR !{} feedback",
                     &state.agent_id, latest_mr.iid
                 )),
+                task_scope: Some(format!("mr-feedback-{}", latest_mr.iid)),
             },
         )?;
         info!(
@@ -3122,6 +3201,7 @@ INSTRUCTIONS:
         issue_iid: issue_number,
         surface_before: MrSurfaceObservation::from_mr(&latest_mr),
         resolution,
+        pre_turn_dirty,
     };
     let mut port = LiveFeedbackTailPort {
         git_repo: state.git_repo,
@@ -3199,6 +3279,10 @@ struct FeedbackTailInput {
     issue_iid: Option<u64>,
     surface_before: MrSurfaceObservation,
     resolution: FeedbackResolution,
+    /// Paths already dirty before the model turn started. They are excluded
+    /// from every staging call in the tail so leftover work from another
+    /// task is never swept into this MR's commit.
+    pre_turn_dirty: Vec<String>,
 }
 
 impl FeedbackTailInput {
@@ -3234,7 +3318,7 @@ trait FeedbackTailPort {
     fn has_changes_since(&self, base_ref: &str) -> Result<bool>;
     fn merge_in_progress(&self) -> Result<bool>;
     fn stage_resolved_conflicts(&mut self) -> Result<bool>;
-    fn stage_all(&mut self) -> Result<()>;
+    fn stage_turn_changes(&mut self, pre_turn_dirty: &[String]) -> Result<()>;
     fn has_staged_changes(&self) -> Result<bool>;
     fn commit(&mut self, message: &str) -> Result<()>;
     fn complete_merge_if_ready(&mut self, message: &str) -> Result<bool>;
@@ -3284,10 +3368,10 @@ fn run_feedback_tail(
                 input.mr_iid
             );
         }
-        port.stage_all()?;
+        port.stage_turn_changes(&input.pre_turn_dirty)?;
         has_new_changes = port.has_changes_since(&input.pre_agent_sha)?;
     } else if has_new_changes {
-        port.stage_all()?;
+        port.stage_turn_changes(&input.pre_turn_dirty)?;
         if port.has_staged_changes()? {
             port.commit(&input.commit_message())?;
         }
@@ -3307,7 +3391,7 @@ fn run_feedback_tail(
         if port.up_to_date_with_target(&input.target_branch)? {
             if port.has_changes_since(&input.pre_agent_sha)? {
                 has_new_changes = true;
-                port.stage_all()?;
+                port.stage_turn_changes(&input.pre_turn_dirty)?;
                 if port.has_staged_changes()? {
                     port.commit(&input.merge_commit_message())?;
                 }
@@ -3466,8 +3550,18 @@ impl FeedbackTailPort for LiveFeedbackTailPort<'_> {
         self.git_repo.stage_resolved_unmerged_paths()
     }
 
-    fn stage_all(&mut self) -> Result<()> {
-        self.git_repo.add_all()
+    fn stage_turn_changes(&mut self, pre_turn_dirty: &[String]) -> Result<()> {
+        if pre_turn_dirty.is_empty() {
+            self.git_repo.add_all()
+        } else {
+            warn!(
+                "MR !{}: staging excludes {} file(s) already dirty before the turn: {}",
+                self.mr_iid,
+                pre_turn_dirty.len(),
+                pre_turn_dirty.join(", ")
+            );
+            self.git_repo.add_all_excluding(pre_turn_dirty)
+        }
     }
 
     fn has_staged_changes(&self) -> Result<bool> {
@@ -6609,6 +6703,7 @@ mod tests {
         staged: bool,
         merge_clean: bool,
         existing_mr_state: Option<String>,
+        existing_mr_branch: Option<String>,
         dependency_closed: bool,
         model_cancelled: bool,
         model_output: WorkerImplementationOutput,
@@ -6630,6 +6725,7 @@ mod tests {
                 staged: true,
                 merge_clean: true,
                 existing_mr_state: Some("opened".to_string()),
+                existing_mr_branch: Some("issue-7".to_string()),
                 dependency_closed: false,
                 model_cancelled: false,
                 model_output: WorkerImplementationOutput::Implemented(ImplementedMetadata {
@@ -6693,6 +6789,11 @@ mod tests {
 
         fn with_existing_mr_state(mut self, state: Option<&str>) -> Self {
             self.existing_mr_state = state.map(str::to_string);
+            self
+        }
+
+        fn with_existing_mr_branch(mut self, branch: Option<&str>) -> Self {
+            self.existing_mr_branch = branch.map(str::to_string);
             self
         }
 
@@ -6851,6 +6952,11 @@ mod tests {
             self.existing_mr_state.clone()
         }
 
+        fn merge_request_source_branch(&self, mr_iid: u64) -> Option<String> {
+            self.record(format!("merge_request_source_branch({mr_iid})"));
+            self.existing_mr_branch.clone()
+        }
+
         fn dependency_closed(&self, issue_iid: u64) -> bool {
             self.record(format!("dependency_closed({issue_iid})"));
             self.dependency_closed
@@ -6884,7 +6990,11 @@ mod tests {
             Ok(ImplModelResult::Output(Box::new(output)))
         }
 
-        fn stage_all(&mut self) -> Result<()> {
+        fn dirty_files(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn stage_turn_changes(&mut self, _pre_turn_dirty: &[String]) -> Result<()> {
             self.required("stage_all", "")
         }
 
@@ -7408,6 +7518,7 @@ mod tests {
             issue_iid: Some(7),
             surface_before: feedback_surface("Reduce the retry delay", false),
             resolution,
+            pre_turn_dirty: Vec::new(),
         }
     }
 
@@ -7551,7 +7662,7 @@ mod tests {
             Ok(self.staged_conflicts)
         }
 
-        fn stage_all(&mut self) -> Result<()> {
+        fn stage_turn_changes(&mut self, _pre_turn_dirty: &[String]) -> Result<()> {
             self.required("stage_all")
         }
 

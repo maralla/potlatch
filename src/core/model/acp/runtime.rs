@@ -120,6 +120,9 @@ pub(crate) struct AcpRuntime {
     /// renders them into the marker prompt. Set per task by
     /// [`AcpRuntime::run_task`] and retained across transport retries.
     structured_output_tools: Mutex<Vec<Value>>,
+    /// The task scope of the task currently in flight, retained across
+    /// transport retries alongside the structured-output contract.
+    current_task_scope: Mutex<Option<String>>,
     shutdown: Arc<AtomicBool>,
     agent_id: String,
     acp: Mutex<Option<AcpSession>>,
@@ -152,6 +155,7 @@ impl AcpRuntime {
             acp_command,
             acp_env,
             structured_output_tools: Mutex::new(Vec::new()),
+            current_task_scope: Mutex::new(None),
             shutdown,
             agent_id,
             acp: Mutex::new(None),
@@ -184,10 +188,12 @@ impl AcpRuntime {
         &self,
         prompt: &str,
         structured_output_tools: Vec<Value>,
+        task_scope: Option<&str>,
         cancel_check: Option<&dyn Fn() -> bool>,
         follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
     ) -> Result<AgentHandoff> {
         self.register_task_contract(structured_output_tools);
+        *self.current_task_scope.lock().unwrap() = task_scope.map(str::to_string);
         let prompt = self.prompt_with_structured_output(prompt);
         let prompt = prepare_task_prompt(&prompt);
 
@@ -605,6 +611,7 @@ impl AcpRuntime {
                 agent_tools: self.session_agent_tools(),
                 context_channels: self.session_context_channels(),
                 write_roots: (!self.write_roots.is_empty()).then(|| self.write_roots.clone()),
+                task_scope: self.current_task_scope.lock().unwrap().clone(),
             })
             .context("ACP session/new")?;
 
