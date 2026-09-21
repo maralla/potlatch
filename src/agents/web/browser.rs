@@ -87,10 +87,15 @@ impl std::error::Error for GoogleVerificationRequired {}
 pub(super) struct ChromeBrowser {
     _browser: Browser,
     tab: Arc<Tab>,
+    /// The owning agent's id, used for log attribution. Browser operations
+    /// run on an envelope thread (see `run_browser_enveloped`), so the agent
+    /// prefix must travel with the object rather than rely on ambient
+    /// thread-local state.
+    agent_id: String,
 }
 
 impl ChromeBrowser {
-    pub(super) fn launch() -> Result<Self> {
+    pub(super) fn launch(agent_id: &str) -> Result<Self> {
         let executable = detect_browser_executable()?;
         let profile = resolve_search_profile_dir(
             std::env::var_os(SEARCH_PROFILE_ENV).map(PathBuf::from),
@@ -145,11 +150,12 @@ impl ChromeBrowser {
         Ok(Self {
             _browser: browser,
             tab,
+            agent_id: agent_id.to_string(),
         })
     }
 
     pub(super) fn navigate_to(&self, url: &str) -> Result<String> {
-        info!("opening {url}");
+        info!("{}: opening {url}", self.agent_id);
         self.tab
             .navigate_to(url)
             .with_context(|| format!("navigate search browser to {url}"))?

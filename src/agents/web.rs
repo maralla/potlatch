@@ -56,6 +56,10 @@ trait WebBackend: Send {
 }
 
 struct ChromeWebBackend {
+    /// The web agent's id, stamped into every browser it launches so
+    /// browser-operation logs carry the message-prefix badge like every
+    /// other agent's logs.
+    agent_id: String,
     browser: Option<ChromeBrowser>,
 }
 
@@ -67,8 +71,11 @@ pub struct WebAgent {
 }
 
 impl ChromeWebBackend {
-    fn new() -> Self {
-        Self { browser: None }
+    fn new(agent_id: &str) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            browser: None,
+        }
     }
 }
 
@@ -78,7 +85,7 @@ impl ChromeWebBackend {
     fn take_or_launch_browser(&mut self) -> Result<ChromeBrowser> {
         match self.browser.take() {
             Some(browser) => Ok(browser),
-            None => ChromeBrowser::launch(),
+            None => ChromeBrowser::launch(&self.agent_id),
         }
     }
 }
@@ -267,7 +274,7 @@ impl CoreAgent for WebAgent {
         Ok(Self {
             runtime: ctx.runtime.clone(),
             inbox,
-            backend: Box::new(ChromeWebBackend::new()),
+            backend: Box::new(ChromeWebBackend::new(ctx.runtime.agent_id())),
             max_results: ctx.settings.max_results,
         })
     }
@@ -583,7 +590,7 @@ mod tests {
         if std::env::var("POTLATCH_GOOGLE_SEARCH_SMOKE").as_deref() != Ok("1") {
             return;
         }
-        let mut backend = ChromeWebBackend::new();
+        let mut backend = ChromeWebBackend::new("web-0");
         let markdown = backend
             .search("Rust programming language", 3)
             .expect("Google Search through Chrome");
@@ -598,7 +605,7 @@ mod tests {
         }
         let target = std::env::var("POTLATCH_WEB_FETCH_SMOKE_URL")
             .unwrap_or_else(|_| "https://example.com/".to_string());
-        let mut backend = ChromeWebBackend::new();
+        let mut backend = ChromeWebBackend::new("web-0");
         let response = handle_agent_request(
             &mut backend,
             DEFAULT_MAX_RESULTS,
