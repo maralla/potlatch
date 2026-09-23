@@ -950,7 +950,10 @@ trait WorkerRoutingPort {
         mr_iid: u64,
         linked_issue_iid: Option<u64>,
         comments_only: bool,
-    ) -> Result<bool>;
+    ) -> Result<FeedbackFlowOutcome>;
+    /// All of this worker's own sessions that still validate (claims held,
+    /// issues open, MRs open): the MR feedback watch list.
+    fn own_resumable_sessions(&mut self) -> Vec<ActiveIssue>;
     fn resolve_cancelled_issue(&mut self, issue_iid: u64) -> bool;
     fn issue_trackable(&mut self, issue_iid: u64) -> bool;
 }
@@ -1136,6 +1139,34 @@ fn cleanup_finished_mr(port: &mut dyn WorkerRoutingPort, issue_iid: u64, merged:
     true
 }
 
+/// Rotate the MR feedback watch past `finished`: set `active` to the next
+/// own MR session so every own MR is gate-checked in turn (wrapping back
+/// to the first), and None once they are all gone. A worker whose current
+/// MR is in steady state must not park on it: the watch rotates and the
+/// worker looks for new work in the same cycle. The re-validated watch
+/// list comes from the port: sessions that no longer validate (merged,
+/// closed, released) are already cleaned up inside it.
+fn rotate_watch_past(
+    port: &mut dyn WorkerRoutingPort,
+    active: &mut Option<ActiveIssue>,
+    finished: &ActiveIssue,
+) {
+    let mut watch: Vec<ActiveIssue> = port
+        .own_resumable_sessions()
+        .into_iter()
+        .filter(|candidate| candidate.mr_iid.is_some())
+        .collect();
+    watch.sort_by_key(|candidate| candidate.issue_iid);
+    // Wrap to the first entry when `finished` is the last (or only) one:
+    // a single steady-state MR stays the watch target and is re-checked
+    // every cycle (the gate check is cheap), never parked on.
+    let next = watch
+        .iter()
+        .position(|candidate| candidate.issue_iid > finished.issue_iid)
+        .unwrap_or(0);
+    *active = watch.get(next).cloned();
+}
+
 fn cleanup_implementation(
     port: &mut dyn WorkerRoutingPort,
     issue_iid: u64,
@@ -1193,19 +1224,32 @@ fn handle_active_mr(
     }
 
     match port.run_feedback(mr_iid, Some(tracked.issue_iid), false) {
-        Ok(false) => Ok(false),
-        Ok(true) => {
+        Ok(FeedbackFlowOutcome::Abandon) => {
             info!(
                 "{}: Issue #{} abandoned, MR !{} closed",
                 agent_id, tracked.issue_iid, mr_iid
             );
             if port.release_issue_claim(tracked.issue_iid) {
                 port.cleanup_session(tracked.issue_iid);
+                // No rotation here: the abandoned session no longer
+                // validates, so it is gone from the watch list. The next
+                // cycle's entry recovers whatever watch remains.
                 *active = None;
                 Ok(true)
             } else {
                 Ok(false)
             }
+        }
+        // Merge conflicts still unresolved: the whole flow is retried next
+        // cycle, so keep holding this MR and do not look for other work.
+        Ok(FeedbackFlowOutcome::HoldForRetry) => Ok(false),
+        // Steady state: nothing actionable on this MR this cycle. A worker
+        // must not park here (observed: workers pinned for hours on a
+        // steady-state MR while the pool idled) — rotate the watch to the
+        // next own MR and look for new work in the same cycle.
+        Ok(FeedbackFlowOutcome::Idle) => {
+            rotate_watch_past(port, active, &tracked);
+            Ok(true)
         }
         Err(e) => {
             let message = format!("{e:#}");
@@ -1462,7 +1506,34 @@ fn run_worker_routing_cycle(
         Some(active_issue) if !active_issue.mr_created => {
             handle_active_reattempt(port, agent_id, scope_label, active)
         }
-        _ => true,
+        _ => {
+            // A worker with no active issue must first recover its own MR
+            // watch. Sessions that no longer validate are cleaned up inside
+            // the port; a recovered watch is gate-checked on the next
+            // cycle instead of the worker skipping straight to new work and
+            // silently dropping it (observed: workers parked on startup
+            // resume, and the watch never recovered once displaced).
+            if port.shutdown_requested() {
+                return Ok(());
+            }
+            let mut watch: Vec<ActiveIssue> = port
+                .own_resumable_sessions()
+                .into_iter()
+                .filter(|candidate| candidate.mr_iid.is_some())
+                .collect();
+            watch.sort_by_key(|candidate| candidate.issue_iid);
+            if let Some(first) = watch.first() {
+                *active = Some(first.clone());
+                info!(
+                    "{}: Recovered own MR watch ({} session(s)); gate check comes first",
+                    agent_id,
+                    watch.len()
+                );
+                false
+            } else {
+                true
+            }
+        }
     };
     if continue_polling {
         poll_for_work(port, agent_id, scope_label, active)?;
@@ -1636,7 +1707,7 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
         mr_iid: u64,
         linked_issue_iid: Option<u64>,
         comments_only: bool,
-    ) -> Result<bool> {
+    ) -> Result<FeedbackFlowOutcome> {
         handle_mr_comments(
             self.state,
             self.model,
@@ -1644,6 +1715,9 @@ impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
             linked_issue_iid,
             comments_only,
         )
+    }
+    fn own_resumable_sessions(&mut self) -> Vec<ActiveIssue> {
+        collect_resumable_sessions(self.state, self.scope_label)
     }
     fn resolve_cancelled_issue(&mut self, issue_iid: u64) -> bool {
         handle_worker_issue_processing_cancelled(
@@ -2802,24 +2876,18 @@ fn plan_mr_metadata_update(
 
 /// Returns `Ok(true)` if the agent decided the issue cannot be resolved and
 /// the MR was closed + issue rejected.
-/// Durable per-MR feedback bookkeeping: what the last feedback run already
-/// answered. Without it a worker cycle re-runs the feedback flow on
-/// every poll for any comment that cannot be resolved away (plain comments
-/// never clear), and each run posts a fresh "already done" reply — observed
-/// as a same-meaning reply loop with dozens of comments on one MR.
+/// Durable per-MR feedback bookkeeping: the newest note id the last run
+/// already handled. Unresolved threads are deliberately NOT recorded: an
+/// unresolved thread re-triggers the flow every cycle by design — the
+/// worker always handles them — so there is nothing to remember about
+/// them. Only handled plain comments are gated: a comment the run already
+/// handled must not re-trigger it, and the run's own replies re-fetch
+/// into `last_comment_id` so they cannot re-trigger it either.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct MrFeedbackState {
     /// The newest note id present when the run started (the run's own
     /// replies get higher ids; re-fetching after the run captures them).
     last_comment_id: u64,
-    /// Discussion ids the run actually replied to. A run that withheld its
-    /// replies (branch not merging cleanly) must not record them: the
-    /// threads would be orphaned — never answered, never retried.
-    /// Renamed from `seen_discussions`, whose entries were recorded even
-    /// for reply-less runs; old files deserialize as "nothing answered"
-    /// so the owed replies happen on the next cycle.
-    #[serde(default)]
-    answered_discussions: Vec<String>,
 }
 
 fn mr_feedback_state_path(sessions_dir: &str, agent_id: &str, mr_iid: u64) -> PathBuf {
@@ -2838,28 +2906,36 @@ fn save_mr_feedback_state(path: &Path, state: &MrFeedbackState) -> Result<()> {
         .with_context(|| format!("save MR feedback state {}", path.display()))
 }
 
-/// Whether a feedback run is warranted: something the last run did not see
-/// or answer must have changed — a merge-conflict state, an unresolved
-/// thread the run never replied, or a comment newer than the run's newest
-/// seen note. Otherwise the run would repeat its previous no-op reply.
+/// Whether a feedback run is warranted: the worker always handles
+/// unresolved threads, and a plain comment is handled once — a comment
+/// the last run already handled (including its own replies) must not
+/// re-trigger it.
 fn feedback_run_needed(
     prior: &MrFeedbackState,
     unresolved_ids: &[String],
     comments: &[Comment],
     has_conflicts: bool,
 ) -> bool {
-    if has_conflicts {
-        return true;
-    }
-    if unresolved_ids
-        .iter()
-        .any(|id| !prior.answered_discussions.contains(id))
-    {
-        return true;
-    }
-    comments
-        .iter()
-        .any(|comment| comment.id > prior.last_comment_id)
+    has_conflicts
+        || !unresolved_ids.is_empty()
+        || comments
+            .iter()
+            .any(|comment| comment.id > prior.last_comment_id)
+}
+
+/// How a feedback cycle ended for the owning worker: what the routing
+/// should do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedbackFlowOutcome {
+    /// The feedback cannot be resolved autonomously: the linked issue
+    /// must be abandoned and the MR closed.
+    Abandon,
+    /// The run must be retried next cycle (merge conflicts still
+    /// unresolved): keep holding the MR.
+    HoldForRetry,
+    /// Nothing actionable this cycle. The worker must NOT park on the
+    /// MR: rotate the watch and look for new work.
+    Idle,
 }
 
 fn handle_mr_comments(
@@ -2868,7 +2944,7 @@ fn handle_mr_comments(
     mr_iid: u64,
     linked_issue_iid: Option<u64>,
     comments_only_mode: bool,
-) -> Result<bool> {
+) -> Result<FeedbackFlowOutcome> {
     let work = crate::ui::WorkTimer::start();
     let latest_mr = state.forge.get_merge_request(mr_iid)?;
     let unresolved_ids = state.forge.get_unresolved_discussion_ids(latest_mr.iid)?;
@@ -2883,13 +2959,13 @@ fn handle_mr_comments(
         && plain_comments.is_empty()
         && (comments_only_mode || !latest_mr.has_conflicts)
     {
-        return Ok(false);
+        return Ok(FeedbackFlowOutcome::Idle);
     }
 
-    // A run needs something NEW to address: an unseen unresolved thread, a
-    // comment posted after the last run, or a conflict state. Without this
-    // gate a plain comment that can never be resolved re-triggers the flow
-    // every cycle, and each run posts another same-meaning reply.
+    // A run needs something to handle: an unresolved thread, an unhandled
+    // plain comment, or a conflict state. Unresolved threads re-trigger
+    // every cycle by design — the worker always handles them — so only the
+    // handled plain comments are gated here.
     let state_path = mr_feedback_state_path(state.sessions_dir, state.agent_id, mr_iid);
     let prior_state = load_mr_feedback_state(&state_path);
     if !feedback_run_needed(
@@ -2898,14 +2974,14 @@ fn handle_mr_comments(
         &all_comments,
         latest_mr.has_conflicts,
     ) {
-        // Steady-state for any MR with unresolvable comments: expected on
+        // Steady-state for any MR without unresolved threads: expected on
         // every cycle, so debug-only — an info line here floods the UI.
         debug!(
-            "MR !{}: no new feedback since the last run ({} comment(s) seen); skipping",
+            "MR !{}: no unresolved thread and no unhandled comment ({} comment(s) seen); skipping",
             mr_iid,
             all_comments.len()
         );
-        return Ok(false);
+        return Ok(FeedbackFlowOutcome::Idle);
     }
 
     if !unresolved_ids.is_empty() {
@@ -2999,7 +3075,7 @@ fn handle_mr_comments(
     if let Some(issue_iid) = issue_number
         && stop_worker_issue_if_review_only(state, issue_iid)
     {
-        return Ok(false);
+        return Ok(FeedbackFlowOutcome::Idle);
     }
     let issue_context = issue_number
         .map(|n| load_issue_context(state.forge.as_ref(), n))
@@ -3128,7 +3204,7 @@ INSTRUCTIONS:
         ) {
             Ok(output) => output,
             Err(e) if handle_worker_issue_processing_cancelled(state, issue_iid, &e) => {
-                return Ok(false);
+                return Ok(FeedbackFlowOutcome::Idle);
             }
             Err(e) => return Err(e),
         };
@@ -3187,7 +3263,7 @@ INSTRUCTIONS:
                 let _ = state.forge.close_mr(latest_mr.iid);
             }
 
-            return Ok(true);
+            return Ok(FeedbackFlowOutcome::Abandon);
         }
     };
 
@@ -3213,16 +3289,17 @@ INSTRUCTIONS:
     let tail_outcome = run_feedback_tail(&mut port, &input)?;
 
     // Record what the run saw INCLUDING its own replies (re-fetch: the
-    // replies are new notes with higher ids) so the next cycle cannot
-    // re-trigger on them. A run that withheld its replies records nothing:
-    // its discussions are still owed an answer, and re-running the flow is
-    // the retry — marking them answered here would orphan the threads
-    // forever (observed on MR !334: conflicts were pushed but GitLab still
-    // reported the stale conflict state, the replies were skipped, and the
-    // recorded state silenced every later cycle).
+    // replies are new notes with higher ids) so a handled plain comment
+    // cannot re-trigger the flow. A run that withheld its replies records
+    // nothing: the unresolved threads re-trigger the flow again next cycle
+    // — that retry IS the disposition (observed on MR !334: conflicts
+    // were pushed but GitLab still reported the stale conflict state, the
+    // replies were skipped, and the recorded state silenced every later
+    // cycle).
     if tail_outcome == FeedbackTailOutcome::RepliesWithheld {
-        return Ok(false);
+        return Ok(FeedbackFlowOutcome::HoldForRetry);
     }
+
     let seen_comment_id = state
         .forge
         .get_mr_comments(mr_iid)
@@ -3233,11 +3310,10 @@ INSTRUCTIONS:
         &state_path,
         &MrFeedbackState {
             last_comment_id: seen_comment_id,
-            answered_discussions: input.unresolved_ids.clone(),
         },
     )?;
 
-    Ok(false)
+    Ok(FeedbackFlowOutcome::Idle)
 }
 
 /// The MR fields the feedback tail compares before and after the model run:
@@ -3461,11 +3537,11 @@ fn run_feedback_tail(
     // paragraph under a specific question answers nothing.
     //
     // Whether a reply repeats an earlier one is NOT decided here by
-    // comparing text: paraphrases make that unreliable. Repetition is
-    // prevented upstream by the run gate — this flow only executes when a
-    // note newer than the last run's newest note exists, and the state
-    // saved after this run records those notes, so an unanswered cycle
-    // cannot re-trigger itself.
+    // comparing text: paraphrases make that unreliable. Repetition is the
+    // model's per-run behavior to get right, not this flow's — an
+    // unresolved thread re-triggers the flow every cycle by design, so a
+    // thread that never gets its per-thread reply is retried, not silenced
+    // (the run state only gates handled plain comments).
     let per_discussion: std::collections::HashMap<&str, &DiscussionReply> = input
         .resolution
         .discussion_replies
@@ -3476,8 +3552,8 @@ fn run_feedback_tail(
 
     for discussion_id in &ids_to_resolve {
         let Some(reply) = per_discussion.get(discussion_id.as_str()) else {
-            info!(
-                "MR !{}: discussion {discussion_id} got no per-thread reply; it stays open",
+            warn!(
+                "MR !{}: discussion {discussion_id} got no per-thread reply; it stays open and is retried next cycle",
                 input.mr_iid
             );
             continue;
@@ -3633,14 +3709,27 @@ struct SessionFile {
 /// On startup, try to resume a session this worker previously owned.
 /// A stored agent_id is only valid while the issue still has this worker's claim.
 fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<ActiveIssue> {
+    collect_resumable_sessions(state, scope_label)
+        .into_iter()
+        .next()
+}
+
+/// All of this worker's own sessions that still validate: the claim label
+/// must still be held live, the issue must still be open and in scope, and
+/// a tracked MR must still be open. Sessions that fail validation are
+/// cleaned up or released as a side effect, exactly as on startup — this
+/// runs every cycle so the MR feedback watch survives a worker picking up
+/// other work.
+fn collect_resumable_sessions(state: &AgentState, scope_label: Option<&str>) -> Vec<ActiveIssue> {
     let claim_label = format!("claimed:{}", &state.agent_id);
     let issue_prefix = format!("{}_issue_", &state.agent_id);
+    let mut resumable: Vec<ActiveIssue> = Vec::new();
 
     let entries = match fs::read_dir(state.sessions_dir) {
         Ok(e) => e,
         Err(e) => {
             warn!("Failed to read sessions directory: {}", e);
-            return None;
+            return resumable;
         }
     };
 
@@ -3751,12 +3840,12 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                         continue;
                     }
                     ResolvedTrackedMr::Track(mr_iid) => {
-                        info!(
-                            "{}: Found session file for issue #{} (MR: !{}), resuming",
+                        debug!(
+                            "{}: Own session for issue #{} still validates (MR: !{})",
                             &state.agent_id, issue_iid, mr_iid
                         );
 
-                        return Some(ActiveIssue {
+                        resumable.push(ActiveIssue {
                             issue_iid,
                             mr_iid: Some(mr_iid),
                             branch_name: Some(format!("issue-{}", issue_iid)),
@@ -3764,12 +3853,12 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                         });
                     }
                     ResolvedTrackedMr::None => {
-                        info!(
-                            "{}: Found session file for issue #{} (no MR yet), resuming",
+                        debug!(
+                            "{}: Own session for issue #{} still validates (no MR yet)",
                             &state.agent_id, issue_iid
                         );
 
-                        return Some(ActiveIssue {
+                        resumable.push(ActiveIssue {
                             issue_iid,
                             mr_iid: None,
                             branch_name: Some(format!("issue-{}", issue_iid)),
@@ -3820,12 +3909,12 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                         continue;
                     }
                     ResolvedTrackedMr::Track(mr_iid) => {
-                        info!(
-                            "{}: Found unclaimed session for issue #{} with matching label, resuming (MR !{})",
+                        debug!(
+                            "{}: Own unlabelled session for issue #{} still validates (MR: !{})",
                             &state.agent_id, issue_iid, mr_iid
                         );
 
-                        return Some(ActiveIssue {
+                        resumable.push(ActiveIssue {
                             issue_iid,
                             mr_iid: Some(mr_iid),
                             branch_name: Some(format!("issue-{}", issue_iid)),
@@ -3833,12 +3922,12 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
                         });
                     }
                     ResolvedTrackedMr::None => {
-                        info!(
-                            "{}: Found unclaimed session for issue #{} with matching label, resuming",
+                        debug!(
+                            "{}: Own unlabelled session for issue #{} still validates (no MR yet)",
                             &state.agent_id, issue_iid
                         );
 
-                        return Some(ActiveIssue {
+                        resumable.push(ActiveIssue {
                             issue_iid,
                             mr_iid: None,
                             branch_name: Some(format!("issue-{}", issue_iid)),
@@ -3872,7 +3961,7 @@ fn try_resume_session(state: &AgentState, scope_label: Option<&str>) -> Option<A
         }
     }
 
-    None
+    resumable
 }
 
 /// Scan all open GitLab issues for this worker's claim label.
@@ -5952,6 +6041,7 @@ mod tests {
         default_branch: String,
         claim_attempts: std::cell::RefCell<std::collections::VecDeque<IssueClaimAttempt>>,
         adopted: Option<ActiveIssue>,
+        resumable: Vec<ActiveIssue>,
         handled_labeled_mr: bool,
         implementation: std::cell::RefCell<std::collections::VecDeque<ImplementationScript>>,
         feedback_abandoned: bool,
@@ -5976,6 +6066,7 @@ mod tests {
                 default_branch: "main".to_string(),
                 claim_attempts: Default::default(),
                 adopted: None,
+                resumable: vec![],
                 handled_labeled_mr: false,
                 implementation: Default::default(),
                 feedback_abandoned: false,
@@ -6017,6 +6108,10 @@ mod tests {
         }
         fn adopting(mut self, active: ActiveIssue) -> Self {
             self.adopted = Some(active);
+            self
+        }
+        fn with_resumable(mut self, sessions: &[ActiveIssue]) -> Self {
+            self.resumable = sessions.to_vec();
             self
         }
         fn handling_labeled_mr(mut self) -> Self {
@@ -6164,6 +6259,10 @@ mod tests {
             self.record("adopt_orphan");
             self.adopted.clone()
         }
+        fn own_resumable_sessions(&mut self) -> Vec<ActiveIssue> {
+            self.record("own_sessions");
+            self.resumable.clone()
+        }
         fn handle_need_ai_worker_mr(&mut self) -> Result<bool> {
             self.required("handle_labeled_mr")?;
             Ok(self.handled_labeled_mr)
@@ -6196,14 +6295,18 @@ mod tests {
             mr: u64,
             issue: Option<u64>,
             comments_only: bool,
-        ) -> Result<bool> {
+        ) -> Result<FeedbackFlowOutcome> {
             self.record(format!("run_feedback:{mr}:{issue:?}:{comments_only}"));
             self.feedback_payloads
                 .borrow_mut()
                 .push((mr, issue, comments_only));
             match &self.feedback_error {
                 Some(e) => Err(anyhow::anyhow!(e.clone())),
-                None => Ok(self.feedback_abandoned),
+                None => Ok(if self.feedback_abandoned {
+                    FeedbackFlowOutcome::Abandon
+                } else {
+                    FeedbackFlowOutcome::Idle
+                }),
             }
         }
         fn resolve_cancelled_issue(&mut self, iid: u64) -> bool {
@@ -6252,6 +6355,8 @@ mod tests {
     }
     fn polling_steps() -> Vec<String> {
         [
+            "shutdown",
+            "own_sessions",
             "shutdown",
             "adopt_orphan",
             "handle_labeled_mr",
@@ -6354,7 +6459,7 @@ mod tests {
         let mut shutdown = FakeWorkerPort::new()
             .listing(&[candidate])
             .implementing(&[ImplementationScript::failed(Some("issue-7"), "interrupted")])
-            .with_shutdown_answers(&[false, false, false, false, true]);
+            .with_shutdown_answers(&[false, false, false, false, false, true]);
         let run = run_worker_routing(&mut shutdown, None);
         assert_eq!(run.trace.last().map(String::as_str), Some("shutdown"));
         assert_eq!(run.active.unwrap().branch_name.as_deref(), Some("issue-7"));
@@ -6391,7 +6496,7 @@ mod tests {
 
         let mut shutdown = FakeWorkerPort::new()
             .listing(std::slice::from_ref(&candidate))
-            .with_shutdown_answers(&[false, false, false, true]);
+            .with_shutdown_answers(&[false, false, false, false, true]);
         let run = run_worker_routing(&mut shutdown, None);
         assert_eq!(
             &run.trace[run.trace.len() - 2..],
@@ -6470,14 +6575,23 @@ mod tests {
     fn worker_cycle_adopts_or_handles_labeled_mr_before_listing() {
         let mut adopting = FakeWorkerPort::new().adopting(active_with_mr(7, 12));
         let run = run_worker_routing(&mut adopting, None);
-        assert_eq!(run.trace, strings(&["shutdown", "adopt_orphan"]));
+        assert_eq!(
+            run.trace,
+            strings(&["shutdown", "own_sessions", "shutdown", "adopt_orphan"])
+        );
         assert_eq!(run.active, Some(active_with_mr(7, 12)));
 
         let mut labeled = FakeWorkerPort::new().handling_labeled_mr();
         let run = run_worker_routing(&mut labeled, None);
         assert_eq!(
             run.trace,
-            strings(&["shutdown", "adopt_orphan", "handle_labeled_mr"])
+            strings(&[
+                "shutdown",
+                "own_sessions",
+                "shutdown",
+                "adopt_orphan",
+                "handle_labeled_mr"
+            ])
         );
     }
 
@@ -6544,19 +6658,89 @@ mod tests {
     }
 
     #[test]
-    fn worker_cycle_runs_feedback_and_preserves_transient_failures() {
+    fn worker_cycle_moves_on_from_steady_state_feedback_instead_of_parking() {
+        // Steady state (nothing new to address) must not park the worker.
+        // With no watch left to recover, the worker drops the MR and looks
+        // for new work in the same cycle (observed pre-fix: a worker pinned
+        // for hours on a steady-state MR while the pool idled).
         let issue = issue_observation(7, &[WORKING_ON_LABEL]);
-        let mut open = FakeWorkerPort::new().knowing(std::slice::from_ref(&issue));
-        let run = run_worker_routing(&mut open, Some(active_with_mr(7, 12)));
+        let mut port = FakeWorkerPort::new().knowing(std::slice::from_ref(&issue));
+        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
         assert_eq!(
             run.trace,
-            strings(&["issue:7", "mr_status:12", "run_feedback:12:Some(7):false"])
+            strings(&[
+                "issue:7",
+                "mr_status:12",
+                "run_feedback:12:Some(7):false",
+                "own_sessions",
+                "shutdown",
+                "adopt_orphan",
+                "handle_labeled_mr",
+                "issues",
+                "shutdown",
+            ])
         );
         assert_eq!(
-            open.feedback_payloads.borrow().as_slice(),
+            port.feedback_payloads.borrow().as_slice(),
             &[(12, Some(7), false)]
         );
+        assert!(run.active.is_none());
+    }
+
+    #[test]
+    fn worker_cycle_rotates_the_watch_instead_of_dropping_it() {
+        // With the MR still open the watch rotates — wrapping back to the
+        // only entry — so the worker keeps the gate check every cycle,
+        // never adopts another worker's session, and still looks for new
+        // work instead of parking.
+        let issues = [
+            issue_observation(7, &[WORKING_ON_LABEL]),
+            issue_observation(9, &[WORKING_ON_LABEL]),
+        ];
+        let mut port = FakeWorkerPort::new()
+            .knowing(&issues)
+            .with_resumable(&[active_with_mr(7, 12), active_with_mr(9, 13)]);
+        let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
+        assert_eq!(
+            &run.trace[..8],
+            &strings(&[
+                "issue:7",
+                "mr_status:12",
+                "run_feedback:12:Some(7):false",
+                "own_sessions",
+                "shutdown",
+                "handle_labeled_mr",
+                "issues",
+                "shutdown",
+            ])
+        );
+        assert!(!run.trace.contains(&"adopt_orphan".to_string()));
+        // The watch rotated to the next own MR.
+        assert_eq!(run.active, Some(active_with_mr(9, 13)));
+
+        // The next cycle re-checks that MR, then wraps back to the first.
+        let run = run_worker_routing(&mut port, Some(active_with_mr(9, 13)));
+        let trace = run.trace.clone();
+        assert_eq!(
+            &trace[trace.len() - 8..],
+            &strings(&[
+                "issue:9",
+                "mr_status:13",
+                "run_feedback:13:Some(9):false",
+                "own_sessions",
+                "shutdown",
+                "handle_labeled_mr",
+                "issues",
+                "shutdown",
+            ])
+        );
+        assert!(!trace.contains(&"adopt_orphan".to_string()));
         assert_eq!(run.active, Some(active_with_mr(7, 12)));
+    }
+
+    #[test]
+    fn worker_cycle_runs_feedback_and_preserves_transient_failures() {
+        let issue = issue_observation(7, &[WORKING_ON_LABEL]);
 
         let mut abandoned = FakeWorkerPort::new()
             .knowing(std::slice::from_ref(&issue))
@@ -6789,11 +6973,6 @@ mod tests {
 
         fn with_existing_mr_state(mut self, state: Option<&str>) -> Self {
             self.existing_mr_state = state.map(str::to_string);
-            self
-        }
-
-        fn with_existing_mr_branch(mut self, branch: Option<&str>) -> Self {
-            self.existing_mr_branch = branch.map(str::to_string);
             self
         }
 
@@ -7876,6 +8055,10 @@ mod tests {
 
         assert!(result.is_ok());
         // No per-thread reply for the thread: it gets none and stays open.
+        // The flow returns Completed anyway: the unresolved thread
+        // re-triggers the whole flow next cycle, so nothing about it is
+        // recorded here.
+        assert_eq!(result.unwrap(), FeedbackTailOutcome::Completed);
         assert_eq!(
             trace.last().map(String::as_str),
             Some("unresolved_discussion_ids(12)")
@@ -7952,11 +8135,10 @@ mod tests {
     }
 
     #[test]
-    fn feedback_run_needed_when_a_comment_is_newer_than_the_last_run() {
+    fn feedback_run_needed_while_a_thread_is_unresolved_or_a_comment_is_unhandled() {
         use super::Comment as ForgeComment;
         let prior = MrFeedbackState {
             last_comment_id: 10,
-            answered_discussions: vec!["d1".into()],
         };
         let comments = vec![ForgeComment {
             id: 10,
@@ -7967,8 +8149,12 @@ mod tests {
             location: None,
             location_details: None,
         }];
-        // Nothing new: the only comment was already seen, and d1 answered.
-        assert!(!feedback_run_needed(
+        // Nothing to handle: no unresolved thread, no unhandled comment,
+        // no conflicts.
+        assert!(!feedback_run_needed(&prior, &[], &comments, false));
+        // An unresolved thread always warrants a run — including one a
+        // previous run already replied to: the worker always handles them.
+        assert!(feedback_run_needed(
             &prior,
             &[String::from("d1")],
             &comments,
@@ -7985,26 +8171,9 @@ mod tests {
             location: None,
             location_details: None,
         });
-        assert!(feedback_run_needed(
-            &prior,
-            &[String::from("d1")],
-            &with_new,
-            false
-        ));
-        // An unseen unresolved thread warrants a run.
-        assert!(feedback_run_needed(
-            &prior,
-            &[String::from("d1"), String::from("d2")],
-            &comments,
-            false
-        ));
+        assert!(feedback_run_needed(&prior, &[], &with_new, false));
         // A conflict state warrants a run regardless.
-        assert!(feedback_run_needed(
-            &prior,
-            &[String::from("d1")],
-            &comments,
-            true
-        ));
+        assert!(feedback_run_needed(&prior, &[], &comments, true));
     }
 
     #[test]
@@ -8200,7 +8369,7 @@ mod tests {
     fn worker_cycle_stops_between_the_listing_and_the_first_candidate() {
         let mut port = FakeWorkerPort::new()
             .listing(&[issue_observation(7, &[])])
-            .with_shutdown_answers(&[false, true]);
+            .with_shutdown_answers(&[false, false, true]);
         let run = run_worker_routing(&mut port, None);
 
         assert!(run.result.is_ok());
