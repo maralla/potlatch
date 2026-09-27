@@ -1,3 +1,0 @@
-- A file edit that reports success can still be gone a minute later when another process owns the checkout; re-read the file just before building instead of trusting the confirmation.
-- A name matcher that strips the wildcard on one side only compiles cleanly and silently matches nothing for patterns written the other way round, turning a deny-list into a no-op.
-- Reusing an existing predicate that is deliberately permissive on empty input inside a deny-by-default check reads well and quietly permits exactly what the new policy exists to forbid.
