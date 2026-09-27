@@ -49,6 +49,8 @@ pub const SENSITIVE_NAMES: &[&str] = &[
     "*.keystore",
     // A nested path that cannot be named by a single component.
     ".docker/config.json",
+    // Project configuration: names endpoints, credentials, and environment.
+    "potlatch.toml",
 ];
 
 /// Whether `path` is sensitive: a dot-prefixed component, a known credential
@@ -160,6 +162,8 @@ mod tests {
             "/home/user/.docker/config.json"
         )));
         assert!(is_sensitive_path(Path::new("/repo/secrets")));
+        assert!(is_sensitive_path(Path::new("/repo/potlatch.toml")));
+        assert!(is_sensitive_path(Path::new("/repo/sub/dir/potlatch.toml")));
     }
 
     #[test]
@@ -184,6 +188,15 @@ mod tests {
         let dir = unique_test_dir();
         write_file(dir.path(), ".ssh/id_rsa");
         let target = dir.path().join(".ssh/id_rsa");
+        let err = ensure_workspace_read(&target, dir.path(), &WriteRoots::default()).unwrap_err();
+        assert!(err.contains("sensitive"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_project_config_anywhere_in_the_workspace() {
+        let dir = unique_test_dir();
+        write_file(dir.path(), "nested/potlatch.toml");
+        let target = dir.path().join("nested/potlatch.toml");
         let err = ensure_workspace_read(&target, dir.path(), &WriteRoots::default()).unwrap_err();
         assert!(err.contains("sensitive"), "unexpected error: {err}");
     }
