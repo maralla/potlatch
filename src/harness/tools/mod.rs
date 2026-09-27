@@ -2,6 +2,7 @@
 
 pub mod agent_bus;
 pub mod edit;
+pub mod guard;
 pub mod http;
 pub mod lsp;
 pub mod read;
@@ -20,6 +21,8 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::core::bus::RemoteAgentToolDefinition;
+
+pub use guard::{ensure_workspace_read, is_sensitive_path};
 
 /// Resolve a path relative to the workspace (cwd), enforcing sandboxing.
 ///
@@ -110,8 +113,27 @@ impl WriteRoots {
     /// Whether `path` (already resolved to an absolute path) falls inside the
     /// working directory `cwd` or one of the configured roots. Empty roots
     /// are permissive: the historical behavior allowed any absolute path.
-    fn permits(&self, path: &Path, cwd: &Path) -> bool {
-        self.0.is_empty() || path.starts_with(cwd) || self.0.iter().any(|r| path.starts_with(r))
+    pub(crate) fn permits(&self, path: &Path, cwd: &Path) -> bool {
+        self.0.is_empty() || path.starts_with(cwd) || self.contains(path)
+    }
+
+    /// Whether `path` (already resolved to an absolute path) falls under one of
+    /// the configured roots. Unlike [`Self::permits`] this ignores `cwd` and the
+    /// empty-roots blanket bypass, so read confinement still rejects paths
+    /// outside the workspace when no roots are configured. The path and the
+    /// roots are also compared in canonical form, so a root reached through a
+    /// symlink still matches a canonical target.
+    pub(crate) fn contains(&self, path: &Path) -> bool {
+        let canonical = path.canonicalize().ok();
+        self.0.iter().any(|root| {
+            if path.starts_with(root) {
+                return true;
+            }
+            match (&canonical, root.canonicalize()) {
+                (Some(path), Ok(root)) => path.starts_with(root),
+                _ => false,
+            }
+        })
     }
 }
 
