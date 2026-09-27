@@ -17,9 +17,15 @@ All roles operate without requiring any user input, making autonomous decisions 
 
 1. **Rust toolchain** (`cargo`, stable) — to build Potlatch from source
 2. **ACP server** — An [Agent Client Protocol](https://agentclientprotocol.com/) server. Potlatch communicates with model backends over ACP (JSON-RPC over stdio). Configure the server command and environment under `[acp.*]` in `potlatch.toml`. The built-in harness (`potlatch harness`) is a self-hosted ACP server that talks directly to an OpenAI-compatible LLM endpoint — set `POTLATCH_BASE_URL` and `POTLATCH_API_KEY` via the `env` array in the `[acp.*]` section.
-3. **GitLab CLI** (`glab`) - For GitLab operations
+3. **Forge CLI** — `glab` for GitLab repositories or `gh` for GitHub repositories. Authenticate the CLI for the account that can read and update the configured repository.
 4. **Git** - For repository operations
 5. **Chrome or Chromium** - The web agent exposes `web_search` and `web_fetch`, opens the system browser visibly
+
+For GitHub, set `repo_url` to an HTTPS or SSH GitHub repository URL (for example,
+`https://github.com/owner/project`). Potlatch uses `gh` for issues, pull requests,
+labels, and review threads. Run `gh auth login` before starting agents. The
+account needs permission to manage issues, pull requests, and repository labels.
+For GitLab, continue using `glab` and a GitLab `repo_url`.
 
 ## Security Note
 
@@ -84,7 +90,7 @@ merge_when_approved = true                   # auto-merge approved MRs (default:
 
 ### Scope label
 
-Optional top-level `scope_label` (default **empty** = no scoping; all open issues and MRs are eligible). When non-empty, worker, reviewer, and PMO only consider items that carry that GitLab label (trimmed, exact match). The worker and PMO filter **issues**; the reviewer filters **merge requests**.
+Optional top-level `scope_label` (default **empty** = no scoping; all open issues and MRs are eligible). When non-empty, worker, reviewer, and PMO only consider items that carry that label (trimmed, exact match). The worker and PMO filter **issues**; the reviewer filters **merge requests**.
 
 When scoping is enabled, merge requests created by the worker and sub-issues created by the PMO automatically receive `scope_label`.
 

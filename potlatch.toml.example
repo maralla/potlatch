@@ -5,6 +5,7 @@
 # Supports GitLab and GitHub. Auto-detected from the URL hostname.
 # Accepted config keys: `repo_url` (preferred) or `gitlab_repo` (legacy alias).
 repo_url = "https://gitlab.com/group/project"
+# For GitHub instead: repo_url = "https://github.com/owner/project"
 
 # Optional: only process issues/MRs that include this label (exact name).
 # scope_label = "potlatch"
