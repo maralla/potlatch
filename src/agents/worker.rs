@@ -951,8 +951,9 @@ trait WorkerRoutingPort {
         linked_issue_iid: Option<u64>,
         comments_only: bool,
     ) -> Result<FeedbackFlowOutcome>;
-    /// All of this worker's own sessions that still validate (claims held,
-    /// issues open, MRs open): the MR feedback watch list.
+    /// All of this worker's own sessions that still validate (claims
+    /// held, issues open, tracked MRs open where one exists): every
+    /// session the worker must keep gate-checking, with or without an MR.
     fn own_resumable_sessions(&mut self) -> Vec<ActiveIssue>;
     fn resolve_cancelled_issue(&mut self, issue_iid: u64) -> bool;
     fn issue_trackable(&mut self, issue_iid: u64) -> bool;
@@ -1139,23 +1140,20 @@ fn cleanup_finished_mr(port: &mut dyn WorkerRoutingPort, issue_iid: u64, merged:
     true
 }
 
-/// Rotate the MR feedback watch past `finished`: set `active` to the next
-/// own MR session so every own MR is gate-checked in turn (wrapping back
-/// to the first), and None once they are all gone. A worker whose current
-/// MR is in steady state must not park on it: the watch rotates and the
-/// worker looks for new work in the same cycle. The re-validated watch
-/// list comes from the port: sessions that no longer validate (merged,
-/// closed, released) are already cleaned up inside it.
+/// Rotate the watch past `finished`: set `active` to the next own
+/// claimed session — with or without an MR — so every own session is
+/// gate-checked in turn (wrapping back to the first), and None once they
+/// are all gone. A worker whose current session is in steady state must
+/// not park on it: the watch rotates and the worker looks for new work
+/// in the same cycle. The re-validated watch list comes from the port:
+/// sessions that no longer validate (merged, closed, released) are
+/// already cleaned up inside it.
 fn rotate_watch_past(
     port: &mut dyn WorkerRoutingPort,
     active: &mut Option<ActiveIssue>,
     finished: &ActiveIssue,
 ) {
-    let mut watch: Vec<ActiveIssue> = port
-        .own_resumable_sessions()
-        .into_iter()
-        .filter(|candidate| candidate.mr_iid.is_some())
-        .collect();
+    let mut watch: Vec<ActiveIssue> = port.own_resumable_sessions();
     watch.sort_by_key(|candidate| candidate.issue_iid);
     // Wrap to the first entry when `finished` is the last (or only) one:
     // a single steady-state MR stays the watch target and is re-checked
@@ -1507,25 +1505,24 @@ fn run_worker_routing_cycle(
             handle_active_reattempt(port, agent_id, scope_label, active)
         }
         _ => {
-            // A worker with no active issue must first recover its own MR
-            // watch. Sessions that no longer validate are cleaned up inside
-            // the port; a recovered watch is gate-checked on the next
-            // cycle instead of the worker skipping straight to new work and
-            // silently dropping it (observed: workers parked on startup
-            // resume, and the watch never recovered once displaced).
+            // A worker with no active issue must first recover its own
+            // claimed work — with or without an MR. Sessions that no
+            // longer validate are cleaned up inside the port; a recovered
+            // session is gate-checked on the next cycle instead of the
+            // worker skipping straight to new work and silently dropping
+            // it (observed: workers parked on startup resume, and the
+            // watch never recovered once displaced; claimed issues with
+            // no MR yet were dropped entirely and orphaned behind their
+            // claim label).
             if port.shutdown_requested() {
                 return Ok(());
             }
-            let mut watch: Vec<ActiveIssue> = port
-                .own_resumable_sessions()
-                .into_iter()
-                .filter(|candidate| candidate.mr_iid.is_some())
-                .collect();
+            let mut watch: Vec<ActiveIssue> = port.own_resumable_sessions();
             watch.sort_by_key(|candidate| candidate.issue_iid);
             if let Some(first) = watch.first() {
                 *active = Some(first.clone());
                 info!(
-                    "{}: Recovered own MR watch ({} session(s)); gate check comes first",
+                    "{}: Recovered own claimed work ({} session(s)); gate check comes first",
                     agent_id,
                     watch.len()
                 );
@@ -6736,6 +6733,21 @@ mod tests {
         );
         assert!(!trace.contains(&"adopt_orphan".to_string()));
         assert_eq!(run.active, Some(active_with_mr(7, 12)));
+    }
+
+    #[test]
+    fn worker_cycle_recovers_claimed_work_without_an_mr() {
+        // A claimed issue whose agent died before an MR existed must be
+        // recovered like any other claimed work (observed: the claim label
+        // and the session file both survived a kill, the MR-only recovery
+        // filter dropped the session, and the claim label then blocked
+        // fresh assignment — the issue was orphaned for good). The gate
+        // check and the re-attempt itself are covered by
+        // worker_cycle_retries_active_issue_and_deletes_reattempt_session.
+        let mut port = FakeWorkerPort::new().with_resumable(&[active_without_mr(7)]);
+        let run = run_worker_routing(&mut port, None);
+        assert_eq!(run.trace, strings(&["shutdown", "own_sessions"]));
+        assert_eq!(run.active, Some(active_without_mr(7)));
     }
 
     #[test]
