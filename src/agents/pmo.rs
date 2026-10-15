@@ -967,6 +967,16 @@ fn handle_processing_failure(
     Ok(())
 }
 
+/// Drop a held claim whose issue is no longer workable (closed, out of
+/// scope, or unfetchable) and forget the persisted claim state. A failed
+/// release leaves the state in place; the restart path
+/// (`try_resume_pmo_state`) re-verifies the issue and discards it.
+fn drop_unworkable_pmo_claim(port: &mut dyn PmoPort) {
+    if port.release_claim().is_ok() {
+        port.clear_claim_state();
+    }
+}
+
 fn run_pmo_cycle(
     agent_id: &str,
     scope_label: Option<&str>,
@@ -996,7 +1006,10 @@ fn run_pmo_cycle(
 
     if let Some(iid) = held_issue_iid {
         match port.issue(iid) {
-            Some(issue) if issue_in_pmo_scope(&issue, scope_label) => {
+            // Only an open, in-scope issue justifies another triage cycle.
+            // A closed issue ends the triage immediately, whatever labels it
+            // still carries — never re-triage it or keep holding the claim.
+            Some(issue) if issue_in_pmo_scope(&issue, scope_label) && issue.state == "opened" => {
                 let in_planning = issue
                     .labels
                     .iter()
@@ -1022,14 +1035,12 @@ fn run_pmo_cycle(
                         return Ok(());
                     }
                     Err(PmoDecisionError::Recoverable(error)) if is_pmo_agent_cancelled(&error) => {
-                        // A label the cancel check watches was removed
-                        // mid-session. Release the claim and let the next
-                        // cycle re-claim and re-run with full context — the
-                        // model then decides how to follow up (approve-and-
-                        // hand-off, takeover, or a fresh triage).
-                        if port.release_claim().is_ok() {
-                            port.clear_claim_state();
-                        }
+                        // The cancel check fired mid-session: the issue was
+                        // closed or a watched label was removed. Release the
+                        // claim and clear the state; the next cycle
+                        // re-evaluates from scratch — a closed issue is
+                        // dropped, never re-triaged.
+                        drop_unworkable_pmo_claim(port);
                         return Ok(());
                     }
                     Err(PmoDecisionError::Recoverable(error)) => {
@@ -1045,11 +1056,18 @@ fn run_pmo_cycle(
                     Err(PmoDecisionError::Immediate(error)) => return Err(error),
                 }
             }
-            _ => {
-                if port.release_claim().is_ok() {
-                    port.clear_claim_state();
-                }
+            // The issue is closed or has left the PMO's scope: the held
+            // claim is no longer workable. Drop it instead of re-triaging
+            // closed or out-of-scope work.
+            Some(issue) => {
+                info!(
+                    "{agent_id}: Dropping the claim on issue #{iid} — no longer workable (state: {}, in scope: {})",
+                    issue.state,
+                    issue_in_pmo_scope(&issue, scope_label)
+                );
+                drop_unworkable_pmo_claim(port);
             }
+            None => drop_unworkable_pmo_claim(port),
         }
     }
 
@@ -1297,7 +1315,7 @@ impl PmoPort for LivePmoPort<'_> {
         let result = self.model.complete_typed::<PmoOutput>(
             &prompt,
             &InvokeOptions {
-                cancel_check: Some(pmo_planning_label_cancel_check(
+                cancel_check: Some(pmo_issue_cancel_check(
                     Arc::clone(&self.forge),
                     issue.iid,
                     self.state.agent_id.to_string(),
@@ -1441,6 +1459,12 @@ fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
 }
 
 fn should_process_issue(issue: &Issue, scope_label: Option<&str>) -> bool {
+    // Never triage a closed issue, whatever labels it still carries — a
+    // human closing the issue cancels the PMO's work on it.
+    if issue.state != "opened" {
+        return false;
+    }
+
     if !issue_in_scope(issue, scope_label) {
         return false;
     }
@@ -1929,14 +1953,34 @@ fn is_pmo_agent_cancelled(err: &anyhow::Error) -> bool {
 
 type FollowUpCursor = Arc<std::sync::Mutex<u64>>;
 
-/// Build a cancel check that closes the PMO's model session when a label the
-/// session depends on is removed from the issue. When the session started on
-/// an issue already in `pmo-planning`, a human removing that label signals the
-/// plan is approved — the session should stop so the next cycle hands off to
-/// the worker. A human removing the claim label means the issue was taken over
-/// — the session should stop silently, with no handoff comment. For a fresh
-/// issue that never had `pmo-planning`, only the claim label is watched.
-fn pmo_planning_label_cancel_check(
+/// Whether the PMO must stop in-flight work on an issue: the issue was
+/// closed, the `pmo-planning` label a planning session depends on was removed
+/// (a human approved the plan), or the claim label was removed (a human took
+/// the issue over). Pure so the cancel check and its tests share one
+/// predicate, mirroring the worker's
+/// `worker_should_cancel_issue_processing`.
+fn pmo_should_cancel_issue_processing(
+    issue: &Issue,
+    was_planning: bool,
+    claim_label: &str,
+) -> bool {
+    issue.state != "opened"
+        || (was_planning
+            && !issue
+                .labels
+                .iter()
+                .any(|label| label == labels::PMO_PLANNING))
+        || !issue.labels.iter().any(|label| label == claim_label)
+}
+
+/// Build a cancel check that closes the PMO's model session the moment the
+/// issue stops being workable. A human closing the issue ends the triage
+/// immediately. When the session started on an issue already in
+/// `pmo-planning`, a human removing that label signals the plan is approved —
+/// the session should stop so the next cycle hands off to the worker. A human
+/// removing the claim label means the issue was taken over — the session
+/// should stop silently, with no handoff comment.
+fn pmo_issue_cancel_check(
     forge: Arc<dyn ForgeClient>,
     issue_iid: u64,
     agent_id: String,
@@ -1945,13 +1989,7 @@ fn pmo_planning_label_cancel_check(
     let claim_label = super::claim::claim_label(&agent_id);
     Arc::new(move || {
         forge.get_issue(issue_iid).ok().is_some_and(|issue| {
-            let lost_planning = was_planning
-                && !issue
-                    .labels
-                    .iter()
-                    .any(|label| label == labels::PMO_PLANNING);
-            let lost_claim = !issue.labels.iter().any(|label| label == &claim_label);
-            lost_planning || lost_claim
+            pmo_should_cancel_issue_processing(&issue, was_planning, &claim_label)
         })
     })
 }
@@ -2446,6 +2484,23 @@ impl CapabilityProvider for GitLabIssueAskHandler {
                 warn!(
                     target: "potlatch::pmo_ask",
                     "shutdown during ask wait; using automatic answer"
+                );
+                clear_pmo_pending_label(self.forge.as_ref(), self.issue_iid);
+                return AskAnswer::Auto;
+            }
+
+            // A human closing the issue cancels the wait immediately: the
+            // answer is no longer needed. The session's cancel check then
+            // stops the rest of the triage on the closed issue.
+            if self
+                .forge
+                .get_issue(self.issue_iid)
+                .is_ok_and(|issue| issue.state != "opened")
+            {
+                warn!(
+                    target: "potlatch::pmo_ask",
+                    issue_iid = self.issue_iid,
+                    "issue closed while waiting for an ask reply; stopping the wait"
                 );
                 clear_pmo_pending_label(self.forge.as_ref(), self.issue_iid);
                 return AskAnswer::Auto;
@@ -3255,6 +3310,84 @@ mod tests {
             event.starts_with("act:remove:") || event.starts_with("act:comment:")
         }));
         drop(trace);
+        assert!(port.comments.is_empty());
+    }
+
+    #[test]
+    fn pmo_should_cancel_issue_processing_for_blocking_changes() {
+        let claim_label = claim::claim_label("pmo-0");
+        let issue = |state: &str, labels: Vec<String>| Issue {
+            iid: 9,
+            title: "Test".into(),
+            description: String::new(),
+            labels,
+            state: state.into(),
+            created_at: None,
+            updated_at: None,
+        };
+
+        // Open, claimed, and still in pmo-planning (or never planning) → the
+        // session keeps working.
+        assert!(!pmo_should_cancel_issue_processing(
+            &issue(
+                "opened",
+                vec![claim_label.clone(), labels::PMO_PLANNING.to_string()],
+            ),
+            true,
+            &claim_label,
+        ));
+        assert!(!pmo_should_cancel_issue_processing(
+            &issue("opened", vec![claim_label.clone()]),
+            false,
+            &claim_label,
+        ));
+
+        // A human closed the issue: cancel immediately, claim label intact.
+        assert!(pmo_should_cancel_issue_processing(
+            &issue(
+                "closed",
+                vec![claim_label.clone(), labels::PMO_PLANNING.to_string()],
+            ),
+            true,
+            &claim_label,
+        ));
+        // A planning session whose pmo-planning label was removed (approved).
+        assert!(pmo_should_cancel_issue_processing(
+            &issue("opened", vec![claim_label.clone()]),
+            true,
+            &claim_label,
+        ));
+        // The claim label was removed (the issue was taken over).
+        assert!(pmo_should_cancel_issue_processing(
+            &issue("opened", Vec::new()),
+            false,
+            &claim_label,
+        ));
+    }
+
+    #[test]
+    fn closed_held_issue_drops_the_claim_without_re_triage() {
+        // A human closed the issue the PMO still holds: the claim is dropped
+        // immediately and the closed issue is never re-triaged or re-claimed.
+        let mut port = FakePmoPort::successful();
+        port.issues[0].state = "closed".into();
+        port.new_comments = true;
+        port.plan = PmoOutput::ProposePlan {
+            plan_text: "Must not run.".into(),
+            update_description: true,
+        };
+
+        run_fake(&mut port, Some(10)).unwrap();
+
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"act:release".to_string()));
+        assert!(trace.contains(&"act:clear_claim".to_string()));
+        assert!(!trace.contains(&"act:context:10".to_string()));
+        assert!(!trace.contains(&"observe:comments:10".to_string()));
+        assert!(!trace.contains(&"act:model:10".to_string()));
+        assert!(!trace.contains(&"act:claim:10".to_string()));
+        drop(trace);
+        assert!(port.descriptions.is_empty());
         assert!(port.comments.is_empty());
     }
 
@@ -4274,6 +4407,11 @@ mod tests {
             updated_at: None,
         };
         assert!(should_process_issue(&issue, None));
+
+        // A closed issue is never processed, whatever labels it still carries.
+        issue.state = "closed".into();
+        assert!(!should_process_issue(&issue, None));
+        issue.state = "opened".into();
 
         issue.labels = vec![
             ACTION_REQUIRED_LABEL.to_string(),
