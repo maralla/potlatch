@@ -24,6 +24,12 @@ use crate::core::workflow::AgentBuildContext;
 
 const REVIEWER_APPROVED_LABEL: &str = "reviewer-approved";
 const NEED_AI_WORKER_LABEL: &str = "need-ai-worker";
+/// MR label: hard exclusion from AI review. A reviewer never picks up an MR
+/// carrying it, and a claim already held on such an MR is released instead
+/// of resumed, so no reviewer keeps tracking the MR. Unlike
+/// [`REVIEWER_APPROVED_LABEL`], which only records that a review already
+/// ran, this label also blocks resuming an interrupted review.
+const NOT_FOR_AI_LABEL: &str = "not-for-ai";
 const MISSING_ISSUE_LINK_BODY: &str = "This MR does not reference an issue. Please link it to the relevant issue by using a branch name like `issue-N` or adding `Closes #N` in the MR description.";
 const GENERIC_TITLES: &[&str] = &[
     "implementation changes",
@@ -430,6 +436,7 @@ fn decide_candidate(
     if mr.state != "opened"
         || !mr.in_scope(scope_label)
         || mr.has_label(REVIEWER_APPROVED_LABEL)
+        || mr.has_label(NOT_FOR_AI_LABEL)
         || mr.title.starts_with("Draft:")
     {
         return CandidateDecision::Skip;
@@ -456,7 +463,12 @@ enum ResumedClaimDecision {
 /// A held claim is resumed only while the MR is still open and in scope.
 /// `reviewer-approved` is not a resume blocker: an approve-then-merge cycle
 /// interrupted between those two steps must finish the merge, not release.
+/// `not-for-ai` always releases, even on an otherwise reviewable MR: no
+/// reviewer may keep tracking an MR carrying it.
 fn decide_resumed_claim(mr: &MrObservation, scope_label: Option<&str>) -> ResumedClaimDecision {
+    if mr.has_label(NOT_FOR_AI_LABEL) {
+        return ResumedClaimDecision::Release;
+    }
     if mr.state == "opened" && mr.in_scope(scope_label) {
         ResumedClaimDecision::Resume
     } else {
@@ -702,10 +714,17 @@ fn resume_held_claim(
 
     match decide_resumed_claim(&mr, scope_label) {
         ResumedClaimDecision::Release => {
-            info!(
-                "{agent_id}: Held MR !{} is no longer reviewable (state: {}), releasing claim",
-                mr.iid, mr.state
-            );
+            if mr.has_label(NOT_FOR_AI_LABEL) {
+                info!(
+                    "{agent_id}: Held MR !{} is labeled `{NOT_FOR_AI_LABEL}`, releasing claim",
+                    mr.iid
+                );
+            } else {
+                info!(
+                    "{agent_id}: Held MR !{} is no longer reviewable (state: {}), releasing claim",
+                    mr.iid, mr.state
+                );
+            }
             port.release_held_claim();
             Ok(ResumedClaimOutcome::Released)
         }
@@ -2047,6 +2066,34 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_cycle_never_claims_a_not_for_ai_mr() {
+        let mut port = FakeReviewerPort::new(vec![
+            observation(7, Some(vec![NOT_FOR_AI_LABEL])),
+            observation(9, None),
+        ]);
+        assert_eq!(run(&mut port, true).unwrap(), Some(9));
+        let trace = port.trace.borrow();
+        assert!(!trace.contains(&"discussions:7".to_string()));
+        assert!(!trace.contains(&"claim:7".to_string()));
+        assert!(!trace.contains(&"model:7".to_string()));
+        assert!(trace.contains(&"claim:9".to_string()));
+    }
+
+    #[test]
+    fn reviewer_cycle_releases_resumable_claim_on_a_not_for_ai_mr() {
+        // A `not-for-ai` label appearing on a held MR releases the claim
+        // instead of resuming it: no reviewer keeps tracking the MR.
+        let mut port = FakeReviewerPort::new(vec![observation(4, Some(vec![NOT_FOR_AI_LABEL]))]);
+        port.recoverable_claim = Some(4);
+        assert_eq!(run(&mut port, true).unwrap(), None);
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"release_final".to_string()));
+        assert!(!trace.contains(&"model:4".to_string()));
+        assert!(trace.contains(&"merge_requests".to_string()));
+        assert_eq!(port.held_claim, None);
+    }
+
+    #[test]
     fn reviewer_cycle_releases_resumable_claim_when_mr_is_not_found() {
         let mut port = FakeReviewerPort::new(vec![observation(7, None)]);
         port.recoverable_claim = Some(4); // MR !4 is not in the listing
@@ -2222,6 +2269,24 @@ mod tests {
         );
         assert_eq!(
             decide_candidate(
+                &observation(7, Some(vec![NOT_FOR_AI_LABEL])),
+                TEST_AGENT,
+                None
+            ),
+            CandidateDecision::Skip
+        );
+        // `not-for-ai` excludes the MR even where `need-ai-worker` would
+        // otherwise bypass the scope filter.
+        assert_eq!(
+            decide_candidate(
+                &observation(7, Some(vec![NEED_AI_WORKER_LABEL, NOT_FOR_AI_LABEL])),
+                TEST_AGENT,
+                Some("potlatch")
+            ),
+            CandidateDecision::Skip
+        );
+        assert_eq!(
+            decide_candidate(
                 &observation(7, Some(vec!["claimed:other"])),
                 TEST_AGENT,
                 None
@@ -2252,6 +2317,22 @@ mod tests {
         assert_eq!(
             decide_resumed_claim(&observation(7, Some(vec!["potlatch"])), Some("potlatch")),
             ResumedClaimDecision::Resume
+        );
+        // `not-for-ai` releases even an otherwise reviewable MR and beats the
+        // `need-ai-worker` scope bypass.
+        assert_eq!(
+            decide_resumed_claim(
+                &observation(7, Some(vec![NOT_FOR_AI_LABEL, "potlatch"])),
+                Some("potlatch")
+            ),
+            ResumedClaimDecision::Release
+        );
+        assert_eq!(
+            decide_resumed_claim(
+                &observation(7, Some(vec![NEED_AI_WORKER_LABEL, NOT_FOR_AI_LABEL])),
+                Some("potlatch")
+            ),
+            ResumedClaimDecision::Release
         );
 
         let mut closed = observation(7, None);
