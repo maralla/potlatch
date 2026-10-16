@@ -1044,16 +1044,24 @@ impl GitLabClient {
     pub fn update_mr_title_description(
         &self,
         iid: u64,
-        title: &str,
-        description: &str,
+        title: Option<&str>,
+        description: Option<&str>,
     ) -> Result<()> {
-        debug!("Updating MR !{} title and description", iid);
+        // Only the provided fields are sent: GitLab leaves omitted fields
+        // unchanged, so a description-only update must not wipe the title.
+        let mut fields: Vec<(&str, &str)> = Vec::new();
+        if let Some(title) = title {
+            fields.push(("title", title));
+        }
+        if let Some(description) = description {
+            fields.push(("description", description));
+        }
+        if fields.is_empty() {
+            return Ok(());
+        }
+        debug!("Updating MR !{} title/description", iid);
 
-        let output = self.run_api_method(
-            &format!("merge_requests/{iid}"),
-            "PUT",
-            &[("title", title), ("description", description)],
-        )?;
+        let output = self.run_api_method(&format!("merge_requests/{iid}"), "PUT", &fields)?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -1063,7 +1071,7 @@ impl GitLabClient {
             );
         }
 
-        info!("Updated MR !{} title and description", iid);
+        info!("Updated MR !{} title/description", iid);
         Ok(())
     }
 
@@ -1241,12 +1249,7 @@ impl super::ForgeClient for GitLabClient {
         title: Option<&str>,
         description: Option<&str>,
     ) -> Result<()> {
-        GitLabClient::update_mr_title_description(
-            self,
-            iid,
-            title.unwrap_or(""),
-            description.unwrap_or(""),
-        )
+        GitLabClient::update_mr_title_description(self, iid, title, description)
     }
     fn add_mr_label_with_retries(&self, iid: u64, label: &str) -> Result<()> {
         GitLabClient::add_mr_label_with_retries(self, iid, label)

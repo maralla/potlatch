@@ -403,6 +403,10 @@ trait ReviewerPort {
     fn post_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()>;
     fn post_resolved_discussion(&mut self, mr_iid: u64, body: &str) -> Result<()>;
     fn create_issue(&mut self, title: &str, description: &str) -> Result<u64>;
+    /// Persist the issue [`create_issue`] returned for an MR with no linked
+    /// issue: reference the issue from the MR description so a later review
+    /// round finds it instead of creating a duplicate.
+    fn link_created_issue(&mut self, mr: &MrObservation, issue_iid: u64) -> Result<()>;
     fn generate_issue_brief(
         &mut self,
         mr: &MrObservation,
@@ -506,6 +510,20 @@ fn linked_issue_iid(mr: &MrObservation) -> Option<u64> {
             .and_then(|c| c.get(1)?.as_str().parse().ok())
     })
     .or_else(|| forge::issue_iid_from_branch(&mr.source_branch))
+}
+
+/// The MR description rewritten to reference the issue the reviewer created
+/// for it, so [`linked_issue_iid`] finds that issue on a later review round
+/// instead of creating a duplicate. Uses the same `Closes #N` reference the
+/// [`MISSING_ISSUE_LINK_BODY`] guidance asks authors to add; merging the MR
+/// then also closes the issue, whose content is a brief of the MR's own work.
+fn mr_description_with_issue_reference(description: &str, issue_iid: u64) -> String {
+    let trimmed = description.trim_end();
+    if trimmed.is_empty() {
+        format!("Closes #{issue_iid}")
+    } else {
+        format!("{trimmed}\n\nCloses #{issue_iid}")
+    }
 }
 
 /// Whether the MR can be reviewed at all, or must be handed straight back
@@ -842,6 +860,14 @@ fn review_claimed_merge_request(
                         mr.iid, issue_iid
                     );
                     subject.issue_iid = Some(issue_iid);
+                    // Persist the link on the MR so the next review round
+                    // finds this issue instead of creating a duplicate.
+                    if let Err(error) = port.link_created_issue(mr, issue_iid) {
+                        warn!(
+                            "MR !{}: created issue #{} but could not reference it from the MR description: {error}",
+                            mr.iid, issue_iid
+                        );
+                    }
                 }
                 Err(error) => {
                     warn!(
@@ -1133,6 +1159,11 @@ Inspect the actual code changes in the repository (the source branch is checked 
     }
     fn create_issue(&mut self, title: &str, description: &str) -> Result<u64> {
         self.forge.create_issue(title, description)
+    }
+    fn link_created_issue(&mut self, mr: &MrObservation, issue_iid: u64) -> Result<()> {
+        let description = mr_description_with_issue_reference(&mr.description, issue_iid);
+        self.forge
+            .update_mr_title_description(mr.iid, None, Some(&description))
     }
     fn add_approved_label(&mut self, mr_iid: u64) -> Result<()> {
         self.forge
@@ -1634,6 +1665,7 @@ mod tests {
         resolved_discussions: Vec<(u64, String)>,
         reviewed_subjects: Vec<ReviewSubject>,
         created_issues: RefCell<Vec<(String, String)>>,
+        linked_issues: Vec<(u64, u64)>,
     }
 
     impl FakeReviewerPort {
@@ -1654,6 +1686,7 @@ mod tests {
                 resolved_discussions: Vec::new(),
                 reviewed_subjects: Vec::new(),
                 created_issues: RefCell::new(Vec::new()),
+                linked_issues: Vec::new(),
             }
         }
 
@@ -1820,6 +1853,12 @@ mod tests {
                 .borrow_mut()
                 .push((title.to_string(), description.to_string()));
             Ok(self.merge_requests.len() as u64 + 1000)
+        }
+        fn link_created_issue(&mut self, mr: &MrObservation, issue_iid: u64) -> Result<()> {
+            self.trace(format!("link_issue:{}:{}", mr.iid, issue_iid));
+            self.fails("link_issue")?;
+            self.linked_issues.push((mr.iid, issue_iid));
+            Ok(())
         }
         fn generate_issue_brief(
             &mut self,
@@ -2241,6 +2280,50 @@ mod tests {
         assert!(port.reviewed_subjects.is_empty());
     }
 
+    #[test]
+    fn reviewer_cycle_links_the_issue_created_for_a_non_issue_mr() {
+        // A non-issue MR (no `Closes #N`, no `issue-N` branch): the reviewer
+        // creates an issue from a model-generated brief, then references it
+        // from the MR description so the next review round reuses it.
+        let mut mr = observation(7, None);
+        mr.source_branch = "feature".to_string();
+        mr.description = "Add the streaming tokenizer.".to_string();
+        let mut port = FakeReviewerPort::new(vec![mr]);
+
+        assert_eq!(run(&mut port, true).unwrap(), Some(7));
+
+        let created_iid = port.merge_requests.len() as u64 + 1000;
+        assert_eq!(port.linked_issues, vec![(7, created_iid)]);
+        assert_eq!(port.reviewed_subjects[0].issue_iid, Some(created_iid));
+        let trace = port.trace.borrow();
+        assert!(trace.contains(&"brief:7".to_string()));
+        assert!(trace.contains(&format!("link_issue:7:{created_iid}")));
+        drop(trace);
+        // The reference reads back as the created issue, so round 2 links
+        // instead of creating a duplicate.
+        let mut round2 = observation(7, None);
+        round2.source_branch = "feature".to_string();
+        round2.description =
+            mr_description_with_issue_reference("Add the streaming tokenizer.", created_iid);
+        assert_eq!(linked_issue_iid(&round2), Some(created_iid));
+    }
+
+    #[test]
+    fn reviewer_cycle_continues_the_review_when_the_issue_link_fails() {
+        // The link is persistence for later rounds: a failure is warned about,
+        // not fatal — this round still reviews against the created issue.
+        let mut mr = observation(7, None);
+        mr.source_branch = "feature".to_string();
+        mr.description = "Add the streaming tokenizer.".to_string();
+        let mut port = FakeReviewerPort::new(vec![mr]).failing("link_issue");
+
+        assert_eq!(run(&mut port, true).unwrap(), Some(7));
+
+        let created_iid = port.merge_requests.len() as u64 + 1000;
+        assert!(port.linked_issues.is_empty());
+        assert_eq!(port.reviewed_subjects[0].issue_iid, Some(created_iid));
+    }
+
     // -----------------------------------------------------------------
     // Pure reviewer decisions
     // -----------------------------------------------------------------
@@ -2386,6 +2469,19 @@ mod tests {
 
         mr.source_branch = "feature".to_string();
         assert_eq!(linked_issue_iid(&mr), None);
+    }
+
+    #[test]
+    fn mr_description_with_issue_reference_keeps_content_and_adds_the_reference() {
+        // A blank description becomes just the reference; a non-blank one
+        // keeps its content — the reference is appended, never a replacement.
+        assert_eq!(
+            mr_description_with_issue_reference("   \n", 42),
+            "Closes #42"
+        );
+        let rewritten = mr_description_with_issue_reference("Ship the parser.", 42);
+        assert!(rewritten.starts_with("Ship the parser."));
+        assert!(rewritten.ends_with("\n\nCloses #42"));
     }
 
     #[test]
