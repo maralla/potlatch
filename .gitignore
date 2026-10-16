@@ -6,5 +6,6 @@ issue_*.md
 potlatch.toml
 .potlatch.toml
 todo.md
+notes.md
 test-repo
 .potlatch/
