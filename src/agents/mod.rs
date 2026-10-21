@@ -14,6 +14,7 @@ mod settings;
 mod ssh_util;
 mod state;
 mod subagent;
+mod sandal;
 mod web;
 mod worker;
 mod workspace;
@@ -27,6 +28,7 @@ pub(crate) fn register(workflow: &mut Workflow) {
     workflow.register_agent::<web::WebAgent>();
     workflow.register_agent::<clerk::ClerkAgent>();
     workflow.register_agent::<subagent::SubagentAgent>();
+    workflow.register_agent::<sandal::SandalAgent>();
 }
 
 #[cfg(test)]
@@ -45,7 +47,7 @@ mod scope_tests {
         assert_eq!(
             names,
             vec![
-                "clerk", "ops", "pmo", "qa", "reviewer", "subagent", "web", "worker"
+                "clerk", "ops", "pmo", "qa", "reviewer", "sandal", "subagent", "web", "worker"
             ]
         );
     }

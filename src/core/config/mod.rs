@@ -132,6 +132,13 @@ impl Config {
         self.agents.get(name)
     }
 
+    /// Directory containing the loaded config file; `None` for synthetic
+    /// configs. Agents resolve their configured paths against this — never
+    /// against a working directory, which differs from the config's.
+    pub fn config_dir(&self) -> Option<&Path> {
+        self.config_dir.as_deref()
+    }
+
     /// Deserialize configuration from the already-parsed top-level TOML value.
     pub fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
         self.raw

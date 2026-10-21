@@ -359,9 +359,14 @@ impl ToolRegistry {
                 .unwrap_or(true)
         };
         for definition in definitions {
-            if !allowed(&definition.name) || self.tools.contains_key(&definition.name) {
+            if !allowed(&definition.name) {
                 continue;
             }
+            // Bus tools OVERRIDE same-named built-ins: the sandal agent's
+            // `shell` replaces the built-in host shell while `[agent.sandal]`
+            // is configured, and nothing else in the fleet publishes a
+            // built-in name. A later definition of the same name wins
+            // (last registration wins); nothing registers twice today.
             self.register(Arc::new(agent_bus::RemoteAgentTool::new(
                 Arc::clone(&caller),
                 definition,

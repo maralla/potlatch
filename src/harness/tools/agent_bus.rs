@@ -56,11 +56,19 @@ impl Tool for RemoteAgentTool {
         })
     }
 
-    fn execute(&self, args: &Value, _cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
+        // The session's working directory rides the call as request
+        // metadata (like the session id): bus-served tools that need it
+        // (the sandal agent's shell tool boots the session's VM with it)
+        // read it from `_session_cwd`; every other handler ignores it.
+        let mut arguments = args.clone();
+        if let Some(map) = arguments.as_object_mut() {
+            map.insert("_session_cwd".into(), Value::String(cwd.to_string()));
+        }
         let result = self.caller.call(
             &self.definition.target,
             &self.definition.operation,
-            args.clone(),
+            arguments,
             &self.session_id,
         )?;
         match result {
@@ -147,8 +155,15 @@ mod tests {
             received.lock().unwrap().as_deref(),
             Some("caller-session-1")
         );
-        // The arguments stay pure — no reserved fields.
-        assert_eq!(result, "{\n  \"value\": \"hello\"\n}");
+        // The session's working directory rides the call as request
+        // metadata too (like the session id): bus-served tools that need
+        // it (the sandal agent's shell tool boots the session's VM with
+        // it) read it from `_session_cwd`; every other handler ignores
+        // it. Key order is the pretty-printer's (alphabetical).
+        assert_eq!(
+            result,
+            "{\n  \"_session_cwd\": \"/tmp\",\n  \"value\": \"hello\"\n}"
+        );
     }
 
     fn tool() -> RemoteAgentTool {

@@ -7,6 +7,48 @@
 repo_url = "https://gitlab.com/group/project"
 # For GitHub instead: repo_url = "https://github.com/owner/project"
 
+# Sandbox (sandal) settings. With an [agent.sandal] section the sandal
+# agent maintains one sandbox VM per agent session and reuses it across
+# that session's shell calls; its `shell` tool OVERRIDES the built-in
+# host shell tool for every session, so the sandbox is the only shell
+# there is. A VM nobody calls on for the idle timeout is closed with its
+# whole overlay. Omit the section entirely to keep the built-in host
+# shell tool.
+#[agent.sandal]
+# Layer files loaded into the session VMs (see the sandal project:
+# toolchain images built with `sandal-export` inside a sandbox VM).
+# Paths are relative to this config file's directory — the directory
+# that holds potlatch.toml — because the agents run from a different
+# working directory (their worktrees) that must never influence how a
+# configured relative path resolves.
+#layers = ["go.layer"]
+# Persistent host directories mapped into the session VMs, as `host:guest`
+# specs. Each VM boots fresh, so without a host-backed cache every build
+# starts cold; the go module/build caches are the ones that matter:
+# `~` expands per side — the host home on the host side, /root (the
+# sandbox guest always runs as root) on the guest side — so the specs
+# below put the guest's default cache paths on the host's caches.
+#shared = [
+#  "~/go/pkg:~/go/pkg",
+#  "~/.cache/go-build:~/.cache/go-build",
+#]
+# VM memory cap in MB. Defaults to 2048 when layers are configured. The
+# cap no longer sizes the footprint: the sandbox boots a small RAM floor
+# and hot-adds memory on demand, so idle cost is flat regardless of this
+# value and a workload only brings online what it actually touches. The
+# cap bounds runaway allocations; set `memory` explicitly for a heavier
+# toolchain (rustc, CGO, large links).
+#memory = 2048
+# Writable overlay disk in MB. Defaults to 16384 when layers are
+# configured: package downloads land on the overlay, whose size without
+# this is the layer data plus 16 MB — real dependency fetches fill that
+# within minutes.
+#disk = 16384
+# Idle timeout in seconds for a session VM nobody has called the shell
+# tool on; the VM is closed with its whole overlay when it passes.
+# Defaults to 1800 (30 minutes).
+#idle_timeout_secs = 1800
+
 # Optional: only process issues/MRs that include this label (exact name).
 # scope_label = "potlatch"
 
