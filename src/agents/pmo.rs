@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use super::claim::{self, ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::labels;
 use super::state::StateStore;
+use crate::agents::artifact::task_context_section;
 use crate::agents::forge::{
     self, ForgeClient, Issue, IssueThreadNote, is_not_found, issue_in_scope, scope_label_filter,
     with_split_parent,
@@ -1758,10 +1759,15 @@ fn build_split_prompt(
     {
         "This issue is already in pmo-planning. The PMO holds the claim and refines the plan whenever new human comments arrive. Treat new comments as refinement feedback: prefer producing the requested plan update. You may still ask for clarification when a human reply surfaces a genuinely blocking question you cannot answer from the repository — restate your current plan briefly and ask that specific question, rather than restating the whole plan or taking an unapproved final action."
     } else if plan_previously_proposed {
-        "A PMO plan was already proposed for this issue (see the task context file) and the issue is no longer in pmo-planning — the human approved that plan by removing the label. Hand it off for implementation: use GUIDE_WORKER to direct the worker to the existing plan — point at the plan comment or the updated description instead of restating it. Only propose a new plan when comments newer than the plan genuinely invalidate it; in that case say what changed and why the old plan no longer holds."
+        "A PMO plan was already proposed for this issue (see the task context) and the issue is no longer in pmo-planning — the human approved that plan by removing the label. Hand it off for implementation: use GUIDE_WORKER to direct the worker to the existing plan — point at the plan comment or the updated description instead of restating it. Only propose a new plan when comments newer than the plan genuinely invalidate it; in that case say what changed and why the old plan no longer holds."
     } else {
-        "This issue is not currently in pmo-planning. If the task context file shows a complete implementation plan was already proposed for this issue (a PMO plan comment or a plan written into the issue description) and no newer comment invalidates it, treat that plan as approved by the human and hand it off via GUIDE_WORKER, pointing the worker at the existing plan instead of restating it. Only propose a new plan when newer feedback genuinely invalidates the plan."
+        "This issue is not currently in pmo-planning. If the task context shows a complete implementation plan was already proposed for this issue (a PMO plan comment or a plan written into the issue description) and no newer comment invalidates it, treat that plan as approved by the human and hand it off via GUIDE_WORKER, pointing the worker at the existing plan instead of restating it. Only propose a new plan when newer feedback genuinely invalidates the plan."
     };
+    // The context file was just written by prepare_issue_context; embed its
+    // content in the prompt when it fits the cap so the triage works from the
+    // brief directly instead of re-reading the file across turns.
+    let context_content = fs::read_to_string(context_path).ok();
+    let task_context = task_context_section(context_path, context_content.as_deref());
     let plan_destination = match bound_mr_iid {
         Some(mr_iid) => format!(
             "This issue is already bound to merge request !{mr_iid}. Factor this into your plan: the worker already has an MR open, so a full description rewrite may lose context the worker has already built. Prefer posting refinements as a comment unless the description itself is the problem."
@@ -1779,16 +1785,16 @@ PMO PLANNING STATE:
 {planning_state}
 {plan_destination}
 
-TASK CONTEXT FILE (you MUST open and read this path on disk — it has the full picture):
-{context_path}
+TASK CONTEXT:
+{task_context}
 
 CONTEXT:
 An automated worker agent attempted to implement this issue but was unable to complete it.
-{system} wrote the path above as a markdown file: **full issue description**, **every issue comment** (including worker rejection / PMO notes), **closed merge request context** (MR comments, reviewer feedback, and diff from the worker's closed MR, when one exists), and **the list of other open issues**. That file is the authoritative written context for this triage.
-- Use your **file-reading** capability on the absolute path and read it **end-to-end** before you decide the situation is unclear.
-- The single line `ISSUE #…: title` in this prompt is **not** a substitute for the file; do not claim "no context" merely because you did not read the task context file.
+The task context above carries: **full issue description**, **every issue comment** (including worker rejection / PMO notes), **closed merge request context** (MR comments, reviewer feedback, and diff from the worker's closed MR, when one exists), and **the list of other open issues**. It is the authoritative written context for this triage.
+- Read the task context **end-to-end** before you decide the situation is unclear.
+- The single line `ISSUE #…: title` in this prompt is **not** a substitute for the full task context; do not claim "no context" merely because you did not review it.
 - The **Closed merge request context** section is especially important when the worker closed an MR after failing to resolve reviewer feedback — the MR comments and diff show what the reviewer asked for and what the worker tried.
-Your job is to analyze the failure reason (from the file + repo when needed) and take the appropriate action.
+Your job is to analyze the failure reason (from the task context + repo when needed) and take the appropriate action.
 
 TRIAGE POLICY:
 - Give focused worker guidance only for a single focused task blocked by one specific misunderstanding, wrong command, or simple technical obstacle. The guidance should be one clear action.
@@ -1824,9 +1830,9 @@ CLARIFICATION POLICY:
 - Clarification sets the `pmo-pending` label: the PMO is blocked and will not re-grab the issue until a human replies and removes the label. During active planning (`pmo-planning`), state your recommendation and questions rather than taking an unapproved final action.
 
 INSTRUCTIONS:
-1. Open and read the **entire** TASK CONTEXT FILE at the absolute path above (description, comments, closed MR context, existing issues). Do this first.
-2. From that file, read the issue description and **all** comments — especially the worker's rejection reason. If there is a **Closed merge request context** section, read the MR comments and diff to understand what the reviewer asked for and what the worker tried.
-3. Review the EXISTING OPEN ISSUES section in that same file to see what is already tracked.
+1. Review the **entire** TASK CONTEXT above (description, comments, closed MR context, existing issues). Do this first.
+2. From the task context, read the issue description and **all** comments — especially the worker's rejection reason. If there is a **Closed merge request context** section, read the MR comments and diff to understand what the reviewer asked for and what the worker tried.
+3. Review the EXISTING OPEN ISSUES section in the task context to see what is already tracked.
 4. Verify whether the repository already satisfies the issue.
 5. Apply the triage, decomposition, dependency, duplicate, and clarification policies above.
 "#,
@@ -1835,7 +1841,7 @@ INSTRUCTIONS:
         title = issue.title,
         planning_state = planning_state,
         plan_destination = plan_destination,
-        context_path = context_path,
+        task_context = task_context,
         parent_priority = parent_priority,
         system = display_name(),
     );

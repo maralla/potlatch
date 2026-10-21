@@ -67,6 +67,30 @@ pub(crate) fn write_task_context_file(
         .into_owned())
 }
 
+/// Task context embedded inline in a task prompt is capped: the embedded copy
+/// becomes part of the never-evicted user prompt, so an oversized brief would
+/// sit in every turn for the whole task. Above the cap the prompt falls back
+/// to referencing the on-disk file (the pre-embedding behavior).
+const MAX_EMBEDDED_TASK_CONTEXT_CHARS: usize = 40_000;
+
+/// Build the TASK CONTEXT section of a task prompt. The context is always
+/// written to disk (reference, debugging, recovery); when it fits under the
+/// embed cap it is also carried verbatim in the prompt, so the model works
+/// from the brief directly instead of spending turns re-reading the file and
+/// risking the brief being compacted away mid-task. `content` is `None` when
+/// the caller could not read the file back — the section then references the
+/// path.
+pub(crate) fn task_context_section(path: &str, content: Option<&str>) -> String {
+    match content {
+        Some(content) if content.len() <= MAX_EMBEDDED_TASK_CONTEXT_CHARS => {
+            format!("TASK CONTEXT (embedded in full below; also saved at {path}):\n\n{content}")
+        }
+        _ => {
+            format!("TASK CONTEXT FILE (open and read it first — it has the full picture):\n{path}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +126,27 @@ mod tests {
         ] {
             assert!(store.path(name).is_err(), "{name:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn small_task_context_is_embedded_with_the_path() {
+        let section = task_context_section("/tmp/task.md", Some("## Brief\nbody"));
+        assert!(section.contains("/tmp/task.md"));
+        assert!(section.contains("## Brief\nbody"));
+    }
+
+    #[test]
+    fn oversized_task_context_falls_back_to_the_path() {
+        let big = "x".repeat(MAX_EMBEDDED_TASK_CONTEXT_CHARS + 1);
+        let section = task_context_section("/tmp/task.md", Some(&big));
+        assert!(section.contains("/tmp/task.md"));
+        // The oversized body is not embedded.
+        assert!(!section.contains("xxxxx"));
+    }
+
+    #[test]
+    fn unreadable_task_context_falls_back_to_the_path() {
+        let section = task_context_section("/tmp/task.md", None);
+        assert!(section.contains("/tmp/task.md"));
     }
 }

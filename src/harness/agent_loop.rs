@@ -18,10 +18,17 @@ use super::prompt;
 use super::tools::ToolRegistry;
 use super::tools::structured_output::COMPLETION_NOTICE;
 
-/// Maximum character length for a tool result stored in context. Larger results
-/// are truncated with a marker, keeping the first portion (most relevant for
-/// file reads and search results) and a note about the truncation.
+/// Maximum character length for a generic tool result stored in context.
+/// Larger results are truncated with a marker, keeping the first portion (most
+/// relevant for file reads and search results) and a note about the truncation.
 const MAX_TOOL_RESULT_CHARS: usize = 4_000;
+
+/// `read` results get a larger allowance: ~16k chars is roughly 250 lines of
+/// code, so a targeted read comes back in one piece instead of being cut into
+/// follow-up read turns. The read tool itself truncates at the same cap on a
+/// line boundary with a source-line resume marker; this allowance keeps the
+/// safety net here from re-cutting what the tool already sized.
+const MAX_READ_RESULT_CHARS: usize = 16_000;
 
 /// Per-entry and total caps for context content replayed into compaction /
 /// collapse prompts. Uncapped, the compaction request approaches the very
@@ -672,7 +679,7 @@ impl AgentLoop {
             let kind = classify_tool_result(&name, &result);
             // Truncate large tool results before pushing to context to avoid
             // context bloat and the BPE encoding cost on oversized outputs.
-            let truncated = truncate_tool_result(&result);
+            let truncated = truncate_tool_result(&name, &result);
             self.context.push_tool_result(kind, truncated, &tc_id);
         }
 
@@ -929,23 +936,45 @@ fn build_collapse_transcript(entries: &[ContextEntry]) -> String {
     transcript
 }
 
-/// Truncate a tool result to `MAX_TOOL_RESULT_CHARS`, preserving the beginning
-/// (which typically contains the most useful output) and appending a marker.
-fn truncate_tool_result(result: &str) -> String {
-    if result.len() <= MAX_TOOL_RESULT_CHARS {
+/// Per-tool result cap: reads get the larger read allowance so a targeted
+/// read is not re-cut by the generic limit; everything else is generic.
+fn max_result_chars(tool_name: &str) -> usize {
+    if tool_name == "read" {
+        MAX_READ_RESULT_CHARS
+    } else {
+        MAX_TOOL_RESULT_CHARS
+    }
+}
+
+/// Truncate a tool result to the tool's cap, preserving the beginning (which
+/// typically contains the most useful output) and appending a marker. The cut
+/// lands on a line boundary and the marker reports the shown line range plus
+/// how to fetch the rest, so the model resumes precisely instead of re-running
+/// the command with guessed overlaps.
+fn truncate_tool_result(tool_name: &str, result: &str) -> String {
+    let max_chars = max_result_chars(tool_name);
+    if result.len() <= max_chars {
         return result.to_string();
     }
-    // Find a char boundary at or before the limit
-    let mut end = MAX_TOOL_RESULT_CHARS;
+    // Find a char boundary at or before the limit, then back up to the end of
+    // the last complete line so no partial line is shown.
+    let mut end = max_chars;
     while !result.is_char_boundary(end) && end > 0 {
         end -= 1;
     }
+    let shown = match result[..end].rfind('\n') {
+        Some(pos) => &result[..pos + 1],
+        None => &result[..end],
+    };
+    let shown_lines = shown.lines().count();
+    let total_lines = result.lines().count();
+    let resume_line = shown_lines + 1;
     format!(
-        "{}\n[...output truncated at {} chars, {}/{} bytes shown...]",
-        &result[..end],
-        MAX_TOOL_RESULT_CHARS,
-        end,
-        result.len()
+        "{shown}[...output truncated: showing lines 1-{shown_lines} of {total_lines} \
+         ({}/{}) bytes. Re-run with a narrower range, or pipe through \
+         `tail -n +{resume_line}` for the remainder...]",
+        shown.len(),
+        result.len(),
     )
 }
 
@@ -1713,5 +1742,44 @@ mod tests {
         // when we can't fix the problem.
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("400"));
+    }
+
+    #[test]
+    fn generic_tool_results_cut_at_a_line_boundary_with_a_resume_marker() {
+        let mut result = String::new();
+        for i in 1..=400 {
+            result.push_str(&format!("line {i} of shell output\n"));
+        }
+
+        let truncated = truncate_tool_result("shell", &result);
+
+        assert!(truncated.len() < result.len());
+        // The cut left a complete last line (no partial line before the marker).
+        let marker_pos = truncated.find("[...output truncated").unwrap();
+        assert_eq!(&truncated[marker_pos - 1..marker_pos], "\n");
+        // The marker names the shown line range and the resume line.
+        let shown_lines = truncated[..marker_pos].lines().count();
+        assert!(truncated.contains(&format!("lines 1-{shown_lines} of 400")));
+        assert!(truncated.contains(&format!("tail -n +{}", shown_lines + 1)));
+    }
+
+    #[test]
+    fn read_results_get_a_larger_cap_than_generic_results() {
+        // ~9k chars: under the read allowance, over the generic cap.
+        let result = "x".repeat(9_000);
+
+        assert_eq!(truncate_tool_result("read", &result), result);
+        let truncated = truncate_tool_result("shell", &result);
+        assert!(truncated.len() < result.len());
+    }
+
+    #[test]
+    fn truncation_without_a_trailing_newline_still_shows_whole_lines() {
+        // No trailing newline anywhere: the cut falls back to the char boundary.
+        let result = "x".repeat(5_000);
+        let truncated = truncate_tool_result("shell", &result);
+        assert!(truncated.contains("[...output truncated"));
+        let marker_pos = truncated.find("[...output truncated").unwrap();
+        assert_eq!(marker_pos, MAX_TOOL_RESULT_CHARS);
     }
 }

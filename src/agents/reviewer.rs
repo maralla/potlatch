@@ -7,7 +7,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::claim::{self, ClaimAcquireOutcome, ClaimLease, ClaimResource};
-use crate::agents::artifact::write_task_context_file;
+use crate::agents::artifact::{task_context_section, write_task_context_file};
 use crate::agents::forge::{
     self, ForgeClient, Issue, MergeRequest, mr_in_scope, scope_label_filter,
 };
@@ -1312,27 +1312,31 @@ fn build_review_prompt(input: ReviewPromptInput<'_>) -> Result<String> {
     } else {
         String::new()
     };
+    let context_content = format!(
+        "# Review Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n## MR description\n{mr_description}\n\n## Linked issue context\n{issue_context}\n\n## Diff summary against {target_branch}\n{diff_stat}\n\n## Changed files\n{changed_files}\n\n## Comment history\n{comments}\n",
+        project_name = input.project_name,
+        mr_iid = input.mr.iid,
+        mr_title = input.mr.title,
+        source_branch = input.mr.source_branch,
+        target_branch = input.mr.target_branch,
+        mr_description = input.mr.description,
+        issue_context = if issue_context.is_empty() {
+            "No linked issue context.".to_string()
+        } else {
+            issue_context
+        },
+        diff_stat = diff_stat_text,
+        changed_files = changed_files_text,
+        comments = comments_text
+    );
     let context_path = write_task_context_file(
         input.sessions_dir,
         &format!("reviewer-mr-{}.md", input.mr.iid),
-        &format!(
-            "# Review Context\n\nProject: {project_name}\nMR: !{mr_iid} {mr_title}\nSource branch: {source_branch}\nTarget branch: {target_branch}\n\n## MR description\n{mr_description}\n\n## Linked issue context\n{issue_context}\n\n## Diff summary against {target_branch}\n{diff_stat}\n\n## Changed files\n{changed_files}\n\n## Comment history\n{comments}\n",
-            project_name = input.project_name,
-            mr_iid = input.mr.iid,
-            mr_title = input.mr.title,
-            source_branch = input.mr.source_branch,
-            target_branch = input.mr.target_branch,
-            mr_description = input.mr.description,
-            issue_context = if issue_context.is_empty() {
-                "No linked issue context.".to_string()
-            } else {
-                issue_context
-            },
-            diff_stat = diff_stat_text,
-            changed_files = changed_files_text,
-            comments = comments_text
-        ),
+        &context_content,
     )?;
+    // The brief is embedded in the prompt when it fits the cap, so the review
+    // works from it directly instead of spending turns re-reading the file.
+    let task_context = task_context_section(&context_path, Some(&context_content));
 
     let completeness_line = if input.is_need_ai_worker_mr {
         "9. COMPLETENESS CHECK (STRICT): For `need-ai-worker` MRs, evaluate completeness against the current MR title, MR description, diff, and comment history (do not require linked issue context). Treat later comments as updates to the requested work. If the current scope implied by those sources is missing or partial, list missing items and request changes.".to_string()
@@ -1348,8 +1352,7 @@ MERGE REQUEST !{}: {}
 
 SOURCE BRANCH: {}
 TARGET BRANCH: {}
-TASK CONTEXT FILE:
-{}
+{task_context}
 
 CRITICAL REQUIREMENTS:
 - Provide clear, actionable feedback in comments (do not ask questions)
@@ -1361,14 +1364,14 @@ CRITICAL REQUIREMENTS:
 COMMENT STYLE (STRICT — for requesting changes and any posted feedback):
 - Do NOT start with a long paragraph of hollow praise or thanks that only restates the diff or issue number (e.g. listing routes, files, or "aligns with #N" without adding a review decision). That adds no value and wastes the reader's time.
 - Lead with what matters: **what must change before merge**, or **why you approve**. Use a direct lead-in such as `Request before merge:` or `Blocking:` when the MR must not merge until the item is addressed.
-- Only request MR description updates after you have read the full `## MR description` section in the task context file (including everything after any `Closes #N` line). Do **not** treat an opening `Closes #N` as “description is only the closing line” when the rest of that section documents the work. If it already states goal, implementation approach, and verification, do not ask to expand the description.
+- Only request MR description updates after you have read the full `## MR description` section in the task context (including everything after any `Closes #N` line). Do **not** treat an opening `Closes #N` as “description is only the closing line” when the rest of that section documents the work. If it already states goal, implementation approach, and verification, do not ask to expand the description.
 - Comments must use reader-facing wording only. Do NOT mention internal field names such as `decision`, `feedback`, or `public_comment`. For example, say "Update the MR description to include the actual verification and testing performed", not "Update MR_DESCRIPTION with the actual verification/testing performed."
 - Keep the comment focused: one short optional line of genuine substance is OK, but **never** pad with a multi-sentence "thanks for the thorough coverage" preface that duplicates the diff.
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before starting the review. Treat it as authoritative project policy.
 2. Before inspecting or judging code, perform any repository setup or pre-review steps required by `AGENTS.md` (for example, updating submodules when the project policy says to do so). If a required setup command fails, request changes and include the failure as blocking review feedback.
-3. Read the task context file above before starting the review. For description quality, rely on the full text under `## MR description` there (do not judge from the MR title line alone).
+3. Review the task context above before starting the review. For description quality, rely on the full text under `## MR description` there (do not judge from the MR title line alone).
 4. Review the full comment history to understand previous feedback, worker responses, and scope updates after the original issue was written
 5. The source branch has already been merged with the target branch locally - you are on the merged result
 6. Inspect the actual code changes in the merged local repository state instead of relying only on the summaries above.
@@ -1389,7 +1392,7 @@ CONCURRENCY AND STATE SAFETY (review every change that touches shared state, bac
 
 MR TITLE AND DESCRIPTION (STRICT — reject if violated):
 - The MR title MUST be a concise, meaningful summary of the code changes. Reject if the title is generic (e.g. "Implementation changes", "Update", "Fix"), just an issue number, or contains markdown formatting like ** or backticks.
-- The MR description MUST explain the goal, implementation approach, and testing. Judge using the full `## MR description` text in the task context file (not the MR title line alone). Reject only if that text is empty, a single generic sentence (e.g. "Implementation completed."), or does not describe the actual changes. If it includes substantive detail (sections like Goal / Implementation / Testing, or equivalent prose), it satisfies this requirement even when the first line is only `Closes #N` or similar.
+- The MR description MUST explain the goal, implementation approach, and testing. Judge using the full `## MR description` text in the task context (not the MR title line alone). Reject only if that text is empty, a single generic sentence (e.g. "Implementation completed."), or does not describe the actual changes. If it includes substantive detail (sections like Goal / Implementation / Testing, or equivalent prose), it satisfies this requirement even when the first line is only `Closes #N` or similar.
 - When rejecting for poor title/description, tell the worker exactly what is wrong using public MR terminology, such as "Please update the MR title..." or "Please update the MR description...". Do not ask for internal fields like `MR_TITLE` or `MR_DESCRIPTION`.
 
 CHANGE SIZE LIMITS (reject if exceeded):
@@ -1423,7 +1426,6 @@ FILE HYGIENE (STRICT — reject if violated):
         input.mr.title,
         input.mr.source_branch,
         input.mr.target_branch,
-        context_path,
         completeness_line
     );
 

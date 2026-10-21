@@ -374,7 +374,7 @@ impl Tool for LspTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Language server protocol queries — go-to-definition, find-references, hover, workspace symbols, and diagnostics. More precise and faster than grep for navigating code: use it to find where a symbol is defined, who calls it, its type signature, or compile errors. First, discover the language server for your project: run `which gopls` (Go), `which rust-analyzer` (Rust), `which clangd` (C/C++), `which typescript-language-server` (TypeScript) etc. Then pass the server command and language. The server is spawned once and reused for the session.",
+            "description": "Language server protocol queries — go-to-definition, find-references, hover, workspace symbols, and diagnostics. Pass the server command (discover it with `which <binary>` first) and language; the server is spawned once and reused for the session.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -763,8 +763,7 @@ mod tests {
         let tool = LspTool::new(&mut states, "/tmp");
         let schema = tool.schema();
         let desc = schema["description"].as_str().unwrap();
-        assert!(desc.contains("which gopls"));
-        assert!(desc.contains("rust-analyzer"));
+        assert!(desc.contains("which <binary>"));
     }
 
     #[test]

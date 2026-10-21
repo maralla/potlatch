@@ -25,7 +25,7 @@ impl Tool for ReadTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Read file contents with line numbers. Pass a 'files' array of {path, start_line?, end_line?} objects; reads run concurrently. Per-file errors are reported inline and do not block the other reads. Very large files are truncated with a marker. Always prefer grep to find relevant code before reading entire files.",
+            "description": "Read file contents with line numbers. Pass a 'files' array of {path, start_line?, end_line?} objects; reads run concurrently, and repeated entries for the same path read several ranges in one call. Reads up to ~250 lines come back complete; larger outputs are cut on a line boundary with the resume line marked — request the remainder in the same call instead of paging in small windows. Per-file errors are reported inline and do not block the other reads. Grep to locate code before reading.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -152,43 +152,44 @@ fn read_single_file(
         );
     }
 
-    let selected: Vec<&str> = lines[start - 1..end].to_vec();
-    let mut result = String::new();
+    // Pack whole lines up to the output cap. At least one line always ships,
+    // so a pathologically long line is still returned (the generic tool-result
+    // truncator in the agent loop is the last-resort backstop for that case).
+    const MAX_OUTPUT: usize = 16_000;
+    let mut body = String::new();
+    let mut shown_end = start;
+    for (i, line) in lines[start - 1..end].iter().enumerate() {
+        let piece = format!("{:>6}| {}\n", start + i, line);
+        if !body.is_empty() && body.len() + piece.len() > MAX_OUTPUT {
+            break;
+        }
+        body.push_str(&piece);
+        shown_end = start + i;
+    }
 
-    if start > 1 || end < total_lines {
+    let mut result = String::new();
+    if start > 1 || shown_end < total_lines {
         result.push_str(&format!(
             "File: {} (lines {}-{} of {})\n\n",
-            path, start, end, total_lines
+            path, start, shown_end, total_lines
         ));
     } else {
         result.push_str(&format!("File: {} ({} lines)\n\n", path, total_lines));
     }
+    result.push_str(&body);
 
-    for (i, line) in selected.iter().enumerate() {
-        result.push_str(&format!("{:>6}| {}\n", start + i, line));
-    }
-
-    const MAX_OUTPUT: usize = 50_000;
-    if result.len() > MAX_OUTPUT {
-        let truncated = truncate_at_char_boundary(&result, MAX_OUTPUT);
-        result = format!(
-            "{truncated}\n[...file truncated at {} chars, use start_line/end_line to read specific sections...]",
-            MAX_OUTPUT
-        );
+    // The requested range did not fit: tell the model exactly where the shown
+    // range ends and how to resume, so the next read starts at the right line
+    // instead of re-guessing an overlapping window.
+    if shown_end < end {
+        result.push_str(&format!(
+            "\n[...read truncated at line {shown_end} of {total_lines}: \
+             re-read with start_line={} to continue...]\n",
+            shown_end + 1
+        ));
     }
 
     result
-}
-
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while !s.is_char_boundary(end) && end > 0 {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 #[cfg(test)]
@@ -350,5 +351,53 @@ mod tests {
         let args = json!({});
         let result = tool.execute(&args, dir.as_str());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn oversized_range_is_cut_on_a_line_boundary_with_a_resume_marker() {
+        let dir = test_util::unique_test_dir();
+        let p = dir.path().join("big.txt");
+        let mut f = std::fs::File::create(&p).unwrap();
+        // 600 lines x ~101 bytes > the 16k output cap.
+        for i in 1..=600 {
+            writeln!(f, "{:06}{}|", i, "x".repeat(93)).unwrap();
+        }
+        drop(f);
+
+        let tool = ReadTool;
+        let args = json!({"files": [{"path": "big.txt", "start_line": 1}]});
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+
+        // Header reports the range actually shown, not the requested one.
+        assert!(result.contains("lines 1-"));
+        assert!(!result.contains("lines 1-600 of 600"));
+        // The cut left a complete final line (every shown line is intact).
+        let body_lines: Vec<&str> = result.lines().filter(|l| l.contains("xxxxx")).collect();
+        assert!(!body_lines.is_empty());
+        for l in &body_lines {
+            assert!(l.trim_end().ends_with('|'), "partial line shown: {l:?}");
+        }
+        // The resume marker names the next line to read.
+        let last_shown: usize = body_lines
+            .last()
+            .and_then(|l| l.trim().split('|').next())
+            .and_then(|n| n.parse().ok())
+            .expect("numbered line");
+        assert!(result.contains(&format!("start_line={}", last_shown + 1)));
+        // Whole output stays under the cap (header + marker included).
+        assert!(result.len() < 17_000);
+    }
+
+    #[test]
+    fn in_range_read_is_not_marked_truncated() {
+        let dir = test_util::unique_test_dir();
+        let p = dir.path().join("small.txt");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+
+        let tool = ReadTool;
+        let args = json!({"files": [{"path": "small.txt"}]});
+        let result = tool.execute(&args, dir.as_str()).unwrap();
+        assert!(!result.contains("truncated"));
+        assert!(result.contains("3 lines"));
     }
 }

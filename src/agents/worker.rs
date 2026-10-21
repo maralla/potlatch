@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use super::claim::{self, ClaimAcquireOutcome, ClaimLease, ClaimResource};
 use super::labels::DO_NOT_IMPLEMENT;
 use super::state::StateStore;
-use crate::agents::artifact::write_task_context_file;
+use crate::agents::artifact::{task_context_section, write_task_context_file};
 use crate::agents::forge::{
     self, Comment, ForgeClient, Issue, MergeRequest, is_not_found, issue_in_scope,
     mr_description_closes_issue, scope_label_filter, split_parent_iid,
@@ -748,8 +748,10 @@ impl CoreAgent for WorkerAgent {
         let scope = scope_label_filter(&runtime.scope_label);
         let active = {
             let state = AgentState::from_runtime(&runtime);
-            let mut active =
-                try_resume_session(&state, scope).or_else(|| find_claimed_issue(&state, scope));
+            // Session-file resumption and the orphaned-claim sweep (claim
+            // label without a session file, e.g. a crash mid-claim) are one
+            // union in collect_resumable_sessions — no fallback chain.
+            let mut active = try_resume_session(&state, scope);
             active = clear_resumed_issue_if_ignored(&state, active, scope);
             if let Some(ref a) = active {
                 if let Some(mr_iid) = a.mr_iid {
@@ -1443,19 +1445,32 @@ fn poll_for_work(
             CandidateScreening::Claimable => {}
         }
 
+        // Reserve the session locally BEFORE applying the remote claim label.
+        // Claiming spans several GitLab calls; a crash after the label but
+        // before the session file used to orphan the claim — invisible to
+        // this worker (nothing to resume) and unclaimable by the others. In
+        // this order a crash leaves either (session, no label) — stale-file
+        // cleanup on the next sweep — or (session, label) — resumable. Never
+        // (label, no session).
+        port.save_session(issue.iid, 0);
         match port.acquire_issue_claim(issue.iid)? {
             IssueClaimAttempt::Lost => {
                 info!(
                     "{}: Failed to claim issue #{}, skipping",
                     agent_id, issue.iid
                 );
+                port.cleanup_session(issue.iid);
                 continue;
             }
-            IssueClaimAttempt::Interrupted => return Ok(()),
+            IssueClaimAttempt::Interrupted => {
+                port.cleanup_session(issue.iid);
+                return Ok(());
+            }
             IssueClaimAttempt::Won => {}
         }
         if port.shutdown_requested() {
             port.release_acquired_claim(issue.iid);
+            port.cleanup_session(issue.iid);
             return Ok(());
         }
         let claimed_issue = match port.issue(issue.iid) {
@@ -1468,6 +1483,7 @@ fn poll_for_work(
                     agent_id, issue.iid
                 );
                 port.release_acquired_claim(issue.iid);
+                port.cleanup_session(issue.iid);
                 continue;
             }
             Err(error) => {
@@ -1476,11 +1492,11 @@ fn poll_for_work(
                     agent_id, issue.iid, error
                 );
                 port.release_acquired_claim(issue.iid);
+                port.cleanup_session(issue.iid);
                 continue;
             }
         };
         port.preserve_issue_claim(issue.iid);
-        port.save_session(issue.iid, 0);
         info!(
             "{}: Implementing issue #{}: {}",
             agent_id, claimed_issue.iid, claimed_issue.title
@@ -3098,8 +3114,10 @@ fn handle_mr_comments(
             all_comments_text: &all_comments_text,
             diff_context: &diff_context_content,
         });
-    // The task context (issue, summary, comments, full diff) goes to disk;
-    // the prompt references it by path — the model reads what it needs.
+    // The task context (issue, summary, comments, full diff) goes to disk for
+    // reference; when it fits the embed cap it is also carried verbatim in the
+    // prompt, so the model works from the brief instead of re-reading the file
+    // across turns (and losing it to compaction mid-task).
     let combined_context_path = write_task_context_file(
         state.sessions_dir,
         &format!(
@@ -3108,6 +3126,8 @@ fn handle_mr_comments(
         ),
         &combined_context_content,
     )?;
+    let task_context =
+        task_context_section(&combined_context_path, Some(&combined_context_content));
 
     let feedback_scope_rules = get_feedback_scope_rules();
     let prompt = format!(
@@ -3117,25 +3137,24 @@ PROJECT: {}
 
 MERGE REQUEST !{}: {}
 
-TASK CONTEXT FILE (open and read it first — it has the full picture):
-{}
+{task_context}
 
 CRITICAL REQUIREMENTS:
 - Leave staging, committing, pushing, and merge request creation to the system
-- The task context file includes all comments and the diff — read it, then act directly
+- The task context above includes all comments and the diff — work from it directly
 - Address all unresolved thread feedback and actionable plain MR comments autonomously
 - Make all necessary code changes to resolve the comments
 - CONCURRENCY AND STATE SAFETY: feedback that touches shared state, status transitions, or concurrent paths must be fixed with proper synchronization (locks/atomics/transactions), atomic or idempotent state updates, and no check-then-act windows — a fix that introduces a data race or an inconsistent intermediate status is not a fix
 - Keep the original issue requirements in mind while addressing feedback
 - If the workspace has merge conflict markers (<<<<<<< / ======= / >>>>>>>), resolve ALL of them before doing anything else. Edit each conflicted file to keep the correct version.
-- The **Merge conflict status** section in the task context file is verified by {system}. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
+- The **Merge conflict status** section in the task context above is verified by {system}. Do NOT claim conflicts are fixed unless that section would be clean after your edits and you commit/push the resolution.
 - `origin/{}` already fetched and merged it into your workspace when conflicts were reported. Edit the listed conflicted files, remove all conflict markers, and leave committing/pushing to {system}. Do not claim the conflict is fixed until the **Merge conflict status** section shows a clean merge with the fetched target tip.
 
 {}
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly.
-2. Open and read the ENTIRE task context file at the path above before anything else. Review the "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context" sections in it.
+2. Review the ENTIRE task context above before anything else — the "Unresolved MR comments to address", "Plain MR comments to consider", and "Full MR comment history for context" sections in it.
 3. Use inline comment locations (`path:line` or `path:start-end`) from the comments to find the corresponding code and make targeted fixes. Grep for the relevant symbol, read only the surrounding lines, then edit.
 4. First, check for merge conflicts using the **Merge conflict status** section and your workspace. If any exist, resolve ALL conflicts in every file, commit the resolution, and verify the target branch merges cleanly before claiming completion.
 5. Focus on the **content** of each comment. Comments are always made by a reviewer (a user) — do not investigate who the author is, cross-reference their git history, or research their past commits or other MRs. The comment text is the instruction; act on it directly.
@@ -3155,7 +3174,6 @@ INSTRUCTIONS:
         &state.project_name,
         latest_mr.iid,
         latest_mr.title,
-        combined_context_path,
         latest_mr.target_branch,
         feedback_scope_rules,
         system = display_name(),
@@ -3958,49 +3976,43 @@ fn collect_resumable_sessions(state: &AgentState, scope_label: Option<&str>) -> 
         }
     }
 
-    resumable
-}
-
-/// Scan all open GitLab issues for this worker's claim label.
-/// Used as a fallback when the session file is missing (e.g. hard kill / crash).
-fn find_claimed_issue(state: &AgentState, scope_label: Option<&str>) -> Option<ActiveIssue> {
-    let claim_label = format!("claimed:{}", &state.agent_id);
-
-    let issues = match state.forge.list_issues() {
+    // GitLab-side sweep: claims this agent still holds on GitLab but that
+    // have no session file — a crash between applying the claim label and
+    // writing the session file leaves exactly that state. Without this sweep
+    // the claim is invisible to this worker (nothing to resume) and
+    // unclaimable by every other worker (the label reads as taken), so the
+    // issue freezes until a human intervenes. Runs every cycle so an
+    // orphaned claim is adopted or released immediately, not only when the
+    // worker happens to start with no resumable sessions at all.
+    let own_issues = match state.forge.list_issues() {
         Ok(i) => i,
         Err(e) => {
             warn!(
                 "{}: Failed to scan issues for orphaned claims: {}",
                 &state.agent_id, e
             );
-
-            return None;
+            return resumable;
         }
     };
-
-    for issue in &issues {
-        if issue.state != "opened" {
+    for issue in &own_issues {
+        if issue.state != "opened" || !issue.labels.contains(&claim_label) {
             continue;
         }
-
-        if !issue.labels.contains(&claim_label) {
+        // Already covered by a validated session file above.
+        if resumable.iter().any(|r| r.issue_iid == issue.iid) {
             continue;
         }
-
         if !issue_in_scope(issue, scope_label) {
             continue;
         }
-
         if issue_has_worker_pending_label(&issue.labels) {
             state.release_worker_hold_pending_gitlab_only(issue.iid);
             continue;
         }
-
         if issue_has_worker_review_only_label(&issue.labels) {
             state.release_worker_hold_review_only(issue.iid);
             continue;
         }
-
         match resolve_tracked_mr_for_worker_issue(state.forge.as_ref(), issue.iid, 0) {
             ResolvedTrackedMr::MergedCloseIssue => {
                 close_issue_best_effort(state.forge.as_ref(), issue.iid);
@@ -4013,15 +4025,14 @@ fn find_claimed_issue(state: &AgentState, scope_label: Option<&str>) -> Option<A
                 let _ = state.forge.remove_issue_label(issue.iid, WORKING_ON_LABEL);
 
                 state.cleanup_session(issue.iid);
-                continue;
             }
             ResolvedTrackedMr::Track(mr_iid) => {
                 info!(
-                    "{}: Found orphaned claim on issue #{} (MR: !{}), adopting it",
+                    "{}: Found orphaned claim on issue #{} (MR: !{}, no session file), adopting it",
                     &state.agent_id, issue.iid, mr_iid
                 );
 
-                return Some(ActiveIssue {
+                resumable.push(ActiveIssue {
                     issue_iid: issue.iid,
                     mr_iid: Some(mr_iid),
                     branch_name: Some(format!("issue-{}", issue.iid)),
@@ -4030,11 +4041,11 @@ fn find_claimed_issue(state: &AgentState, scope_label: Option<&str>) -> Option<A
             }
             ResolvedTrackedMr::None => {
                 info!(
-                    "{}: Found orphaned claim on issue #{} (no MR), adopting it",
+                    "{}: Found orphaned claim on issue #{} (no MR, no session file), adopting it",
                     &state.agent_id, issue.iid
                 );
 
-                return Some(ActiveIssue {
+                resumable.push(ActiveIssue {
                     issue_iid: issue.iid,
                     mr_iid: None,
                     branch_name: Some(format!("issue-{}", issue.iid)),
@@ -4044,7 +4055,7 @@ fn find_claimed_issue(state: &AgentState, scope_label: Option<&str>) -> Option<A
         }
     }
 
-    None
+    resumable
 }
 
 /// Try to adopt an orphaned session file (issue has no claim label from any worker).
@@ -4649,13 +4660,16 @@ fn build_implementation_prompt(
     let parent_context = split_parent_context(state.forge.as_ref(), issue)?;
     let context_content =
         worker_issue_context_markdown(issue, comments_text, parent_context.as_deref());
-    // The task context (issue description + comments) goes to disk; the
-    // prompt references it by path — the model reads what it needs.
+    // The task context (issue description + comments) goes to disk for
+    // reference; when it fits the embed cap it is also carried verbatim in the
+    // prompt so the model works from the brief instead of re-reading the file
+    // across turns.
     let context_path = write_task_context_file(
         state.sessions_dir,
         &format!("{}-issue-{}.md", state.agent_id, issue.iid),
         &context_content,
     )?;
+    let task_context = task_context_section(&context_path, Some(&context_content));
 
     let common_requirements = get_common_requirements();
     let scope_rules = get_scope_rules(false);
@@ -4668,12 +4682,11 @@ PROJECT: {}
 
 ISSUE #{}: {}
 
-TASK CONTEXT FILE (open and read it first — it has the full picture):
-{}
+{task_context}
 
 CONTEXT:
-- The task context file contains this issue's **description** and **every issue comment** at the time the task started. That is your primary written spec.
-- Labels on the issue (e.g. priority) are visible in the task context file; infer scope from description + comments + `AGENTS.md`.
+- The task context above contains this issue's **description** and **every issue comment** at the time the task started. That is your primary written spec.
+- Labels on the issue (e.g. priority) are visible in the task context above; infer scope from description + comments + `AGENTS.md`.
 
 {}
 
@@ -4681,7 +4694,7 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly for implementation, tests, linting, and documentation rules.
-2. Open and read the ENTIRE task context file at the path above (description and every issue comment) before anything else.
+2. Review the ENTIRE task context above (description and every issue comment) before anything else.
 3. Analyze the issue and comments carefully
 4. Before writing any new code, investigate the codebase for existing mechanisms that already do what you need (see REUSE FIRST above). Grep for the shape of what you need; read what you find; reuse or extend it. Only create something new when the search genuinely comes up empty — and say what you searched.
 5. Estimate the number of changed lines:
@@ -4708,13 +4721,7 @@ IMPORTANT — When in doubt, REJECT:
 
 Proceed with the implementation autonomously. Do not ask for any user input.
 "#,
-        &state.project_name,
-        issue.iid,
-        issue.title,
-        context_path,
-        common_requirements,
-        scope_rules,
-        notes_rules
+        &state.project_name, issue.iid, issue.title, common_requirements, scope_rules, notes_rules
     );
 
     Ok(prompt)
@@ -4728,13 +4735,14 @@ fn build_continuation_prompt(
     let parent_context = split_parent_context(state.forge.as_ref(), issue)?;
     let context_content =
         worker_issue_context_markdown(issue, comments_text, parent_context.as_deref());
-    // The task context (issue description + comments) goes to disk; the
-    // prompt references it by path — the model reads what it needs.
+    // Same as the implementation prompt: the brief goes to disk for reference
+    // and is embedded in the prompt when it fits the cap.
     let context_path = write_task_context_file(
         state.sessions_dir,
         &format!("{}-issue-{}.md", &state.agent_id, issue.iid),
         &context_content,
     )?;
+    let task_context = task_context_section(&context_path, Some(&context_content));
 
     let common_requirements = get_common_requirements();
     let scope_rules = get_scope_rules(true);
@@ -4747,11 +4755,10 @@ PROJECT: {}
 
 ISSUE #{}: {}
 
-TASK CONTEXT FILE (open and read it first — it has the full picture):
-{}
+{task_context}
 
 CONTEXT:
-- The task context file contains this issue's **description** and **every issue comment** at task start.
+- The task context above contains this issue's **description** and **every issue comment** at task start.
 - A branch for this issue already exists with previous work
 - You are continuing the implementation from where it was left off
 - Review the existing code changes in this branch
@@ -4763,7 +4770,7 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Read `AGENTS.md` from the repository root before making any changes. Follow it strictly for implementation, tests, linting, and documentation rules.
-2. Open and read the ENTIRE task context file at the path above (description and every issue comment) before anything else.
+2. Review the ENTIRE task context above (description and every issue comment) before anything else.
 3. Review the existing changes in the current branch
 4. Analyze what has been done and what remains
 5. Before writing any new code, investigate the codebase for existing mechanisms that already do what you need (see REUSE FIRST above) — including the work already on this branch. Reuse or extend what exists; only create something new when the search genuinely comes up empty, and say what you searched.
@@ -4792,13 +4799,7 @@ IMPORTANT — When in doubt, REJECT:
 
 Proceed with continuing the implementation autonomously. Do not ask for any user input.
 "#,
-        &state.project_name,
-        issue.iid,
-        issue.title,
-        context_path,
-        common_requirements,
-        scope_rules,
-        notes_rules
+        &state.project_name, issue.iid, issue.title, common_requirements, scope_rules, notes_rules
     );
 
     Ok(prompt)
@@ -6376,11 +6377,11 @@ mod tests {
         expected.extend(
             [
                 "shutdown",
+                "save_session:7:0",
                 "acquire_claim:7",
                 "shutdown",
                 "issue:7",
                 "preserve_claim:7",
-                "save_session:7:0",
                 "run_implementation:7",
                 "trackable:7",
             ]
@@ -6410,10 +6411,12 @@ mod tests {
         assert!(run.active.is_none());
         assert!(run.trace.ends_with(&strings(&[
             "shutdown",
+            "save_session:7:0",
             "acquire_claim:7",
             "shutdown",
             "issue:7",
             "release_acquired:7",
+            "cleanup_session:7",
         ])));
         assert!(
             !run.trace
@@ -6496,8 +6499,8 @@ mod tests {
             .with_shutdown_answers(&[false, false, false, false, true]);
         let run = run_worker_routing(&mut shutdown, None);
         assert_eq!(
-            &run.trace[run.trace.len() - 2..],
-            &strings(&["shutdown", "release_acquired:7"])
+            &run.trace[run.trace.len() - 3..],
+            &strings(&["shutdown", "release_acquired:7", "cleanup_session:7"])
         );
 
         let mut lost = FakeWorkerPort::new()
@@ -6513,9 +6516,11 @@ mod tests {
             .listing(&[issue_observation(7, &[]), issue_observation(9, &[])])
             .with_claim_attempts(&[IssueClaimAttempt::Interrupted]);
         let run = run_worker_routing(&mut interrupted, None);
+        // The interrupted claim stops the poll and removes the session file
+        // that was reserved before the remote label was applied.
         assert_eq!(
-            run.trace.last().map(String::as_str),
-            Some("acquire_claim:7")
+            &run.trace[run.trace.len() - 2..],
+            &strings(&["acquire_claim:7", "cleanup_session:7"])
         );
     }
 
@@ -6539,10 +6544,11 @@ mod tests {
             .knowing(&[closed_dep])
             .implementing(&[ImplementationScript::succeeded(7)]);
         let run = run_worker_routing(&mut resumed, None);
-        assert!(run.trace.windows(3).any(|w| w
+        assert!(run.trace.windows(4).any(|w| w
             == strings(&[
                 "issue:4",
                 "remove_label:7:waiting-on-issue:#4",
+                "save_session:7:0",
                 "acquire_claim:7"
             ])));
 
