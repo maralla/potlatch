@@ -51,6 +51,14 @@ const INBOX_WAIT: Duration = Duration::from_millis(200);
 /// Default per-command timeout (seconds): the same default the built-in
 /// shell tool carries.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Maximum per-command timeout (seconds): the request's own deadline
+/// (30 minutes — the bus deadline that carries the response). A request
+/// past it is capped, not honored: on the cap the whole VM closes (the
+/// timeout path) and the session's next call boots a fresh one, so the
+/// session recovers — an uncapped hour-long command would block every
+/// retry behind it while its own response was already dropped at the
+/// deadline.
+const MAX_TIMEOUT_SECS: u64 = 30 * 60;
 /// Output kept per command (the head); the rest is counted, not stored.
 /// The same cap the built-in shell tool carries.
 const MAX_OUTPUT: usize = 50_000;
@@ -65,14 +73,38 @@ const READ_SLICE_MS: i32 = 200;
 /// written at spawn would be lost silently.
 const READY_MARKER: &str = "__POTLATCH_VM_SESSION_READY__";
 /// How long a booting VM may take to reach the ready marker (the guest
-/// boots in well under a second; a layer-carrying VM takes a few).
+/// boots in well under a second; a layerchain VM takes a few).
 const READY_DEADLINE: Duration = Duration::from_secs(30);
 /// The session shell wrapper: print the ready marker, then eval one
 /// protocol line per input line for the VM's whole life. Spawned as `sh
 /// -c` (never `sh -i`): no interactive prompt ever lands in the stream,
 /// and the wrapper is the only thing the guest shell ever runs directly.
+/// Each eval merges its command's stderr into the stream (`2>&1`): the
+/// model sees its own command's stderr (the host shell tool's contract
+/// — stdout, stderr, exit code), and nothing streams to the inherited
+/// ssh stderr (the platform log) but ssh's own connection errors.
+/// Runs inside the VM over the SSH channel (see [`VmState::ssh`]): the
+/// console wrapper below only bootstraps sshd and keeps the VM's console
+/// session alive; every protocol line rides SSH.
 const SESSION_WRAPPER: &str = "echo __POTLATCH_VM_SESSION_READY__; \
-while IFS= read -r line; do eval \"$line\"; done";
+while IFS= read -r line; do eval \"$line\" 2>&1; done";
+/// The marker the console's bootstrap line prints once the guest's sshd
+/// is up and the session key is in place: the agent waits for it once
+/// per VM, then never touches the console again (the console pipes are
+/// held for the VM's life — dropping them closes the console session,
+/// and sandal tears the VM down with it).
+const BOOTSTRAP_MARKER: &str = "__POTLATCH_VM_BOOTSTRAP_READY__";
+/// How long a booting VM may take to reach the bootstrap marker (the
+/// guest boots in well under a second; a layerchain VM takes a few).
+const BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(60);
+/// The console command: one sshd-setup line (the session key in, sshd
+/// started on the guest's own loopback — the vsock channel the VMM's
+/// --ssh-port listener bridges to), the marker, then a keepalive. The
+/// keepalive holds the console session open for the VM's life — sandal
+/// tears the VM down when the console session dies, so the keepalive IS
+/// the VM's life from the console side; it produces nothing, so the held
+/// pipes never fill. Everything after the marker rides the SSH channel.
+const CONSOLE_KEEPALIVE: &str = "tail -f /dev/null";
 
 /// Default VM memory cap (MB) when layers are configured without
 /// `memory`. The cap no longer sizes the footprint: the sandbox boots a
@@ -97,7 +129,7 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// The `shell` tool this agent publishes — the override for the built-in
 /// shell tool while `[agent.sandal]` is configured.
-const SHELL_DESCRIPTION: &str = "Run a shell command inside the session's sandbox VM. You are already in the working directory (cwd) — no need to `cd` into it. The VM is reused across this session's calls: packages installed by an earlier call are still installed, and files written by an earlier call are still there. Returns the command's output and exit code. Foreground commands have a timeout (default 120s); on timeout the whole VM is closed and the session's next call boots a fresh one — anything longer than a minute or two belongs in the background: set background: true, get a job id back immediately, and poll it with job_id (or kill it with job_id + kill: true). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `write` or `edit` instead.";
+const SHELL_DESCRIPTION: &str = "Run a shell command inside the session's sandbox VM. You are already in the working directory (cwd) — no need to `cd` into it. The VM is reused across this session's calls: packages installed by an earlier call are still installed, and files written by an earlier call are still there. Returns the command's output and exit code. Foreground commands have a timeout (default 120s, maximum 30 minutes); on timeout the whole VM is closed and the session's next call boots a fresh one — anything longer than a minute or two belongs in the background: set background: true, get a job id back immediately, and poll it with job_id (or kill it with job_id + kill: true). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `write` or `edit` instead.";
 
 /// `[agent.sandal]` settings as configured: paths still relative to the
 /// config file, share specs unresolved, sizing unset where absent.
@@ -115,6 +147,19 @@ pub struct SandalAgentSettings {
     pub shared: Vec<String>,
     pub memory: Option<u64>,
     pub disk: Option<u64>,
+    /// Path to the SSH private key the session shells authenticate with.
+    /// The public key is read from `<ssh_key>.pub` (or derived with
+    /// `ssh-keygen -y`) and injected into the guest's sshd at boot —
+    /// the session's shell rides the SSH channel, never the console.
+    /// Paths resolve like layers: `~` expands, relative paths resolve
+    /// against the config directory.
+    pub ssh_key: Option<String>,
+    /// Path to the SSH server layer (sshd + sshd-setup + one host key)
+    /// every session VM boots with — required: the session's shell rides
+    /// the SSH channel this layer's sshd opens. Resolves like the
+    /// toolchain layers: relative paths resolve against the config
+    /// directory.
+    pub ssh_server_layer: Option<String>,
     /// Idle timeout (seconds) for a session VM whose last shell call is
     /// older than this; see [`DEFAULT_IDLE_TIMEOUT_SECS`].
     pub idle_timeout_secs: Option<u64>,
@@ -128,8 +173,21 @@ pub struct ResolvedSettings {
     /// `host:guest` share specs, resolved on both sides (see
     /// [`SandalAgentSettings::shared`]).
     pub shares: Vec<String>,
-    pub memory_mb: Option<u64>,
-    pub disk_mb: Option<u64>,
+    /// The SSH private key the session shells authenticate with, and the
+    /// public key material injected into the guest's sshd at boot.
+    pub ssh_key: PathBuf,
+    pub ssh_public: String,
+    /// The SSH server layer (sshd + sshd-setup + one host key):
+    /// configured like the toolchain layers (required) and always
+    /// carried — every session VM boots with it, and the session's
+    /// shell rides the SSH channel its sshd opens.
+    pub ssh_server_layer: PathBuf,
+    /// The session VM's memory cap (MB). Always resolved: every session
+    /// VM carries the SSH server layer (sized for it alone), so the
+    /// `layers`-gated sizing of the console era is gone.
+    pub memory_mb: u64,
+    /// The session VM's writable overlay disk (MB). Always resolved.
+    pub disk_mb: u64,
     pub idle_timeout: Duration,
 }
 
@@ -149,32 +207,133 @@ impl SandalAgentSettings {
     /// defaults, and a toolchain VM gets `memory`/`disk` defaults sized
     /// for real builds (see [`DEFAULT_MEMORY_MB`]/[`DEFAULT_DISK_MB`]).
     pub fn resolve(&self, config_dir: Option<&Path>) -> Result<ResolvedSettings> {
-        let config_dir = config_dir
-            .context("cannot resolve [agent.sandal] paths: no config directory (synthetic config)")?;
+        let config_dir = config_dir.context(
+            "cannot resolve [agent.sandal] paths: no config directory (synthetic config)",
+        )?;
         let mut layers = Vec::with_capacity(self.layers.len());
         for configured in &self.layers {
             let path = config_dir.join(configured);
             let path = path
                 .canonicalize()
-                .with_context(|| format!("[agent.sandal] layer not found: {configured}"))?;
-            ensure!(path.is_file(), "[agent.sandal] layer is not a file: {configured}");
+                .with_context(|| format!("[agent.sodal] layer not found: {configured}"))?;
+            ensure!(
+                path.is_file(),
+                "[agent.sandal] layer is not a file: {configured}"
+            );
             layers.push(path);
         }
         let mut shares = Vec::with_capacity(self.shared.len());
         for spec in &self.shared {
             shares.push(resolve_share(spec, config_dir)?);
         }
-        let sized = !layers.is_empty();
+        // The SSH channel: the session's shell rides it (never the
+        // console), so the key and the server layer are resolved here,
+        // once, the same way the sandbox binary is resolved once.
+        let ssh_key = resolve_ssh_key(self.ssh_key.as_deref(), config_dir)?;
+        let ssh_public = derive_public_key(&ssh_key)?;
+        let ssh_server_layer =
+            resolve_ssh_server_layer(self.ssh_server_layer.as_deref(), config_dir)?;
+        // Sizing is always on: every session VM carries the SSH server
+        // layer, so the `layers`-gated sizing of the console era is
+        // gone — the defaults exist for it alone, and a toolchain VM
+        // gets the same floor.
         Ok(ResolvedSettings {
             layers,
             shares,
-            memory_mb: sized.then(|| self.memory.unwrap_or(DEFAULT_MEMORY_MB)),
-            disk_mb: sized.then(|| self.disk.unwrap_or(DEFAULT_DISK_MB)),
+            ssh_key,
+            ssh_public,
+            ssh_server_layer,
+            memory_mb: self.memory.unwrap_or(DEFAULT_MEMORY_MB),
+            disk_mb: self.disk.unwrap_or(DEFAULT_DISK_MB),
             idle_timeout: Duration::from_secs(
                 self.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
             ),
         })
     }
+}
+
+/// Resolve the configured SSH key path: `~` expands, relative paths
+/// resolve against the config directory (like layers), and a missing
+/// key is an error, not a warning — without it no session VM can boot.
+fn resolve_ssh_key(configured: Option<&str>, config_dir: &Path) -> Result<PathBuf> {
+    let configured = configured.context(
+        "[agent.sandal] ssh_key is required: the session's shell rides the \
+         SSH channel, and the session key is what sshd authenticates",
+    )?;
+    let home = crate::paths::home_dir();
+    let path = expand_home(configured, &home);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        config_dir.join(path)
+    };
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("[agent.sandal] ssh_key not found: {configured}"))?;
+    ensure!(
+        path.is_file(),
+        "[agent.sandal] ssh_key is not a file: {configured}"
+    );
+    Ok(path)
+}
+
+/// Derive the public key material from the private key: read
+/// `<key>.pub` when it exists (the standard pairing), else derive it
+/// with `ssh-keygen -y` (a passphrase-less key). One line, exactly what
+/// sshd-setup injects.
+fn derive_public_key(key: &Path) -> Result<String> {
+    // <key>.pub: the sibling file (id_ed25519 -> id_ed25519.pub), the
+    // standard pairing.
+    let mut s = key.as_os_str().to_os_string();
+    s.push(".pub");
+    let pub_path = PathBuf::from(s);
+    if pub_path.is_file() {
+        let public = std::fs::read_to_string(&pub_path)
+            .with_context(|| format!("failed to read {}", pub_path.display()))?;
+        let public = public.trim().to_string();
+        ensure!(
+            !public.is_empty(),
+            "[agent.sandal] ssh_key's .pub file is empty"
+        );
+        return Ok(public);
+    }
+    let output = Command::new("ssh-keygen")
+        .arg("-y")
+        .arg("-f")
+        .arg(key)
+        .output()
+        .context("failed to run ssh-keygen (is it installed?)")?;
+    ensure!(
+        output.status.success(),
+        "ssh-keygen -y failed (passphrase-protected key?): {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let public = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    ensure!(!public.is_empty(), "ssh-keygen -y produced no public key");
+    Ok(public)
+}
+
+/// Resolve the configured SSH server layer path: relative paths resolve
+/// against the config directory — it is a layer (the SSH server one),
+/// resolved exactly like the toolchain layers — and a missing or
+/// non-file layer is an error, not a warning: without it no session VM
+/// can boot, and the session's shell rides the SSH channel its sshd
+/// opens.
+fn resolve_ssh_server_layer(configured: Option<&str>, config_dir: &Path) -> Result<PathBuf> {
+    let configured = configured.context(
+        "[agent.sandal] ssh_server_layer is required: every session VM \
+         boots with the SSH server (sshd + sshd-setup), and the session's \
+         shell rides the SSH channel it opens",
+    )?;
+    let path = config_dir.join(configured);
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("[agent.sandal] ssh_server_layer not found: {configured}"))?;
+    ensure!(
+        path.is_file(),
+        "[agent.sandal] ssh_server_layer is not a file: {configured}"
+    );
+    Ok(path)
 }
 
 /// Resolve one `host:guest` share spec. `~` expands per side — the host
@@ -264,15 +423,10 @@ impl CoreAgent for SandalAgent {
             // whole timeout, so it runs on its own thread below —
             // same-session calls serialize on the VM's own state lock,
             // cross-session calls run concurrently.
-            let cwd = request
-                .payload
-                .get("_session_cwd")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            if let Err(error) = self.pool.ensure(session_id, &cwd) {
-                request
-                    .respond(Err(error.context("the session's sandbox VM cannot boot")));
+            let boot = session_context(&request.payload)
+                .and_then(|(cwd, roots)| self.pool.ensure(session_id, &cwd, &roots));
+            if let Err(error) = boot {
+                request.respond(Err(error.context("the session's sandbox VM cannot boot")));
                 return Ok(());
             }
             let pool = Arc::clone(&self.pool);
@@ -297,9 +451,10 @@ impl CoreAgent for SandalAgent {
             .settings
             .resolve(ctx.workflow.config.config_dir())
             .context("[agent.sandal] settings are not usable")?;
-        let bin = resolve_sandal_bin()
-            .context("[agent.sandal] requires the sandal sandbox binary")?;
-        let pool = Arc::new(VmPool::new(settings, bin));
+        let bin =
+            resolve_sandal_bin().context("[agent.sandal] requires the sandal sandbox binary")?;
+        let ssh_bin = resolve_ssh_bin().context("[agent.sandal] requires the ssh binary")?;
+        let pool = Arc::new(VmPool::new(settings, bin, ssh_bin));
         let inbox = bus.register(
             AGENT_NAME,
             vec![AgentToolDefinition {
@@ -314,7 +469,7 @@ impl CoreAgent for SandalAgent {
                         },
                         "timeout_secs": {
                             "type": "integer",
-                            "description": "Timeout in seconds for foreground commands. Default: 120. On timeout the whole VM is closed and the session's next call boots a fresh one. Ignored for background jobs (they run until exit or kill)."
+                            "description": "Timeout in seconds for foreground commands. Default: 120, maximum: 1800 (30 minutes) — a request past the maximum is capped to it. On timeout the whole VM is closed and the session's next call boots a fresh one. Ignored for background jobs (they run until exit or kill)."
                         },
                         "background": {
                             "type": "boolean",
@@ -356,6 +511,37 @@ impl Drop for SandalAgent {
     }
 }
 
+/// Resolve the ssh binary: `POTLATCH_SSH_BIN` overrides, else `ssh`
+/// on PATH. Resolved once at build so a missing binary is a startup
+/// error, not a per-call one.
+fn resolve_ssh_bin() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("POTLATCH_SSH_BIN") {
+        let path = PathBuf::from(path);
+        ensure!(
+            path.is_file(),
+            "POTLATCH_SSH_BIN is not a file: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+    Ok(PathBuf::from("ssh"))
+}
+
+/// Allocate one SSH channel port: bind 127.0.0.1:0, take the port,
+/// drop the listener. The window between the drop and the sandbox's own
+/// bind is microseconds; a collision in it fails the sandbox's bind
+/// loudly (the process exits with the error), never silently.
+fn allocate_ssh_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .context("failed to allocate an SSH channel port")?;
+    let port = listener
+        .local_addr()
+        .context("failed to read the allocated SSH channel port")?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
 /// Resolve the sandbox binary: `POTLATCH_SANDBOX_BIN` overrides, else a
 /// `sandal` on PATH. Resolved once at build so a missing binary is a
 /// startup error, not a per-call one.
@@ -382,15 +568,47 @@ fn resolve_sandal_bin() -> Result<PathBuf> {
     )
 }
 
-/// One live session VM. `cwd` is pinned at spawn and readable without
-/// the state lock; everything mutable lives behind one state lock that a
-/// command holds for its whole run.
+/// The session's shell-call context: the working directory and the
+/// declared write roots (the same per-agent list the harness's write/edit
+/// tools permit outside the cwd — e.g. the QA agent's session directory,
+/// where its test scripts live). Both are pinned on the session's first
+/// call: a later call presenting a different pair is an error, not a
+/// renegotiation and not a second VM.
+fn session_context(payload: &Value) -> Result<(String, Vec<String>)> {
+    let cwd = payload
+        .get("_session_cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .context("the shell call carries no session working directory")?;
+    let roots = payload
+        .get("_session_write_roots")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok((cwd, roots))
+}
+
+/// One live session VM. `cwd`/`roots` are pinned at spawn and readable
+/// without the state lock; everything mutable lives behind one state lock
+/// that a command holds for its whole run.
 struct VmEntry {
     /// The working directory this VM was booted with — pinned on the
     /// session's first call and never renegotiated: every later call
     /// lands in the same VM, so a session that somehow presents a
     /// different directory gets an error, not a second VM.
     cwd: String,
+    /// The declared write roots this VM was booted with — pinned like
+    /// [`Self::cwd`]: the session's out-of-cwd work must resolve the
+    /// same way on every call, so a later call presenting a different
+    /// list gets the same error, not a reshare.
+    roots: Vec<String>,
     /// The whole mutable state behind one lock: held for an entire
     /// command, so same-session commands serialize while cross-session
     /// commands run concurrently; only ever `try_lock`ed by the idle
@@ -399,15 +617,26 @@ struct VmEntry {
     state: Mutex<VmState>,
 }
 
-/// The mutable state of one live session VM.
+/// The mutable state of one live session VM: the VM process, the
+/// console (held after the bootstrap, never used again), and the SSH
+/// session that carries every protocol line.
 struct VmState {
-    child: Child,
+    /// The sandbox process — the VM itself. Lives for the entry's whole
+    /// life; killed in [`close_state`].
+    vm: Child,
+    /// The console pipes, held for the VM's life: dropping them closes
+    /// the console session (sandal tears the VM down with it), and the
+    /// bootstrap's keepalive holds it open. Taken and dropped in
+    /// [`close_state`] — the console session dies first, sandal's own
+    /// teardown runs, and the kills below are the belt. Everything
+    /// between rides the SSH channel.
+    console: Option<(ChildStdin, ChildStdout)>,
+    /// The SSH session process: the session shell (the wrapper inside
+    /// it) and its pipes. Its death is the session's death — the entry
+    /// is removed and the VM is closed with it.
+    ssh: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
-    /// Set once the session shell printed the ready marker. Input written
-    /// before the guest finished booting is dropped, so the first call
-    /// waits for the marker; later calls skip the wait.
-    ready: bool,
     /// Last shell call on this VM — updated at each command's start AND
     /// end: a long-running command is neither reaped mid-run (the reaper
     /// skips a held lock anyway) nor left stale the moment it finishes.
@@ -422,14 +651,19 @@ struct VmState {
 struct VmPool {
     settings: ResolvedSettings,
     bin: PathBuf,
+    /// The ssh binary (the session channel's client): resolved once at
+    /// build (see [`resolve_ssh_bin`]), held here so the spawn never
+    /// resolves and the tests inject a fake.
+    ssh_bin: PathBuf,
     entries: Mutex<HashMap<String, Arc<VmEntry>>>,
 }
 
 impl VmPool {
-    fn new(settings: ResolvedSettings, bin: PathBuf) -> Self {
+    fn new(settings: ResolvedSettings, bin: PathBuf, ssh_bin: PathBuf) -> Self {
         Self {
             settings,
             bin,
+            ssh_bin,
             entries: Mutex::new(HashMap::new()),
         }
     }
@@ -438,21 +672,49 @@ impl VmPool {
     /// working directory, and the configured persistent shares whose host
     /// side exists (a share for a cache directory that has not been
     /// created yet is dropped with a warning, and appears once it has).
-    fn spawn(&self, cwd: &str) -> Result<VmEntry> {
+    fn spawn(&self, cwd: &str, roots: &[String]) -> Result<VmEntry> {
+        // (a) The sandbox process: --ssh-port (the listener the session's
+        // ssh connects to, bridged through vsock to the guest's own
+        // loopback where the bootstrap's sshd listens), the layers (the
+        // configured toolchains plus the SSH server layer), the shares,
+        // the sizing, and the console bootstrap command. Take the console
+        // pipes: the bootstrap waits on them, then holds them for the
+        // VM's life.
+        let port = allocate_ssh_port()?;
         let mut cmd = Command::new(&self.bin);
-        cmd.arg("run");
-        if let Some(memory_mb) = self.settings.memory_mb {
-            cmd.arg("-m").arg(memory_mb.to_string());
-        }
-        if let Some(disk_mb) = self.settings.disk_mb {
-            cmd.arg("--disk-size").arg(disk_mb.to_string());
-        }
+        cmd.arg("run")
+            .arg("--ssh-port")
+            .arg(port.to_string())
+            .arg("-m")
+            .arg(self.settings.memory_mb.to_string())
+            .arg("--disk-size")
+            .arg(self.settings.disk_mb.to_string());
         for layer in &self.settings.layers {
             cmd.arg("--layer").arg(layer);
         }
+        // The SSH server layer: configured like the toolchain layers
+        // (required) and appended after them — sshd and sshd-setup ride
+        // with every session VM, and the session's shell rides the SSH
+        // channel it opens.
+        cmd.arg("--layer").arg(&self.settings.ssh_server_layer);
         // The working directory rides the same path on both sides so
         // guest paths resolve exactly as the session's paths do.
         cmd.arg("--share").arg(format!("{cwd}:{cwd}"));
+        // The declared write roots ride the same path on both sides for the
+        // same reason: the session's out-of-cwd work — its test scripts,
+        // its scratch files — must resolve inside the sandbox exactly as it
+        // does outside. A root that is not a directory fails the boot, not a
+        // silently dropped share: the declaration is the calling agent's
+        // own, and a dropped root would surface later as a confusing path
+        // error inside the sandbox.
+        for root in roots {
+            ensure!(
+                Path::new(root).is_dir(),
+                "[agent.sandal] the session's declared write root is not \
+                 a directory: {root}"
+            );
+            cmd.arg("--share").arg(format!("{root}:{root}"));
+        }
         for spec in &self.settings.shares {
             let (host, _) = spec
                 .split_once(':')
@@ -467,26 +729,134 @@ impl VmPool {
                 );
             }
         }
-        cmd.arg("--").arg("sh").arg("-c").arg(SESSION_WRAPPER);
+        // The console command: the session key into sshd, sshd started,
+        // the marker, then the keepalive that holds the console session
+        // (the VM's life from the console side) for the entry's whole
+        // life.
+        let public = self.settings.ssh_public.replace('\'', "'\\''");
+        let console = format!(
+            "/usr/sbin/sshd-setup '{public}' && echo {BOOTSTRAP_MARKER}; \
+             exec {CONSOLE_KEEPALIVE}"
+        );
+        cmd.arg("--").arg("sh").arg("-c").arg(&console);
         // stderr is inherited, never piped: the boot log lands in this
         // process's own log (where it is greppable), and an unread pipe
         // could never fill and stall the VM mid-boot.
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
         dies_with_parent(&mut cmd);
-        let mut child = cmd
+        let entry = Self::spawn_vm(
+            cmd,
+            self.bin.clone(),
+            self.ssh_bin.clone(),
+            cwd,
+            roots,
+            port,
+            &self.settings,
+        )?;
+        Ok(entry)
+    }
+
+    /// The rest of one session VM's spawn: the VM process and its console
+    /// pipes, the console bootstrap wait, the ssh session spawn and its
+    /// ready wait. One place so a failure anywhere closes everything —
+    /// a half-spawned session VM (a VM whose sshd never came up, an ssh
+    /// process that never connected) must never be left standing.
+    fn spawn_vm(
+        mut cmd: Command,
+        bin: PathBuf,
+        ssh_bin: PathBuf,
+        cwd: &str,
+        roots: &[String],
+        port: u16,
+        settings: &ResolvedSettings,
+    ) -> Result<VmEntry> {
+        let mut vm = cmd
             .spawn()
-            .with_context(|| format!("failed to spawn {}", self.bin.display()))?;
-        // Safety: take() leaves the pipes Some-less in `child`; the entry
-        // owns them for the VM's life and closes them by dropping.
-        let stdin = child.stdin.take().context("sandbox stdin not piped")?;
-        let stdout = child.stdout.take().context("sandbox stdout not piped")?;
+            .with_context(|| format!("failed to spawn {}", bin.display()))?;
+        let (console_in, mut console_out) = (
+            vm.stdin.take().context("sandbox stdin not piped")?,
+            vm.stdout.take().context("sandbox stdout not piped")?,
+        );
+        // (b) The console bootstrap wait: the BOOTSTRAP_MARKER is the
+        // last thing the console ever prints (the keepalive after it
+        // prints nothing), so this read drains the boot noise and ends
+        // at the marker — nothing after it can ever fill the held pipe.
+        if let Err(error) = wait_marker(
+            &mut console_out,
+            &mut vm,
+            BOOTSTRAP_MARKER,
+            BOOTSTRAP_DEADLINE,
+            "the session VM's sshd never came up (no bootstrap marker); \
+             see the platform log for the sandbox's own output",
+        ) {
+            let _ = vm.kill();
+            let _ = vm.wait();
+            return Err(error);
+        }
+        // (c) The SSH session: the session key against the --ssh-port
+        // listener, the session wrapper inside. stderr is inherited: the
+        // session's own errors land in the platform log, greppable like
+        // the boot log.
+        let mut ssh_cmd = Command::new(&ssh_bin);
+        ssh_cmd
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-i")
+            .arg(&settings.ssh_key)
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("root@127.0.0.1")
+            // The wrapper as ONE remote command: ssh flattens its command
+            // argv into a single line the guest's login shell re-parses —
+            // `sh -c <wrapper>` as separate argv splits into `sh -c echo`
+            // (an empty line) with the read loop in the login shell, and
+            // the ready marker never prints. One argument, one command.
+            .arg(SESSION_WRAPPER);
+        ssh_cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        dies_with_parent(&mut ssh_cmd);
+        let mut ssh = ssh_cmd
+            .spawn()
+            .context("failed to spawn the session's ssh channel")?;
+        let (ssh_in, mut ssh_out) = (
+            ssh.stdin
+                .take()
+                .context("the ssh session's stdin not piped")?,
+            ssh.stdout
+                .take()
+                .context("the ssh session's stdout not piped")?,
+        );
+        // (d) The ssh session's ready wait: the session shell is up and
+        // reading. A failure here closes everything — a session VM whose
+        // shell never came up must never be left standing.
+        if let Err(error) = wait_marker(
+            &mut ssh_out,
+            &mut ssh,
+            READY_MARKER,
+            READY_DEADLINE,
+            "the session VM's ssh channel never became ready; \
+             see the platform log for the session's own output",
+        ) {
+            let _ = ssh.kill();
+            let _ = ssh.wait();
+            let _ = vm.kill();
+            let _ = vm.wait();
+            return Err(error);
+        }
         Ok(VmEntry {
             cwd: cwd.to_string(),
+            roots: roots.to_vec(),
             state: Mutex::new(VmState {
-                child,
-                stdin,
-                stdout,
-                ready: false,
+                vm,
+                console: Some((console_in, console_out)),
+                ssh,
+                stdin: ssh_in,
+                stdout: ssh_out,
                 last_used: Instant::now(),
             }),
         })
@@ -499,15 +869,40 @@ impl VmPool {
     /// Boot a session's VM if it has none. Run-loop only: the spawn must
     /// happen on a long-lived thread (see the run loop), never on a
     /// per-call thread.
-    fn ensure(&self, session_id: &str, cwd: &str) -> Result<()> {
+    fn ensure(&self, session_id: &str, cwd: &str, roots: &[String]) -> Result<()> {
         let mut entries = lock(&self.entries);
         match entries.get(session_id) {
             Some(_) => Ok(()),
             None => {
-                let entry = Arc::new(self.spawn(cwd)?);
+                let entry = Arc::new(self.spawn(cwd, roots)?);
                 entries.insert(session_id.to_string(), entry);
                 Ok(())
             }
+        }
+    }
+
+    /// The live entry for a session's already-booted VM, checked against
+    /// this call's context: the cwd and the declared write roots are pinned
+    /// at boot, so a call presenting a different pair is an error, not a
+    /// renegotiation and not a second VM. A missing entry was reaped (or
+    /// died) between the run loop's boot and this call: the caller retries,
+    /// and the run loop boots it.
+    fn entry_for(&self, session_id: &str, payload: &Value) -> Result<Arc<VmEntry>> {
+        let (cwd, roots) = session_context(payload)?;
+        let entries = lock(&self.entries);
+        match entries.get(session_id) {
+            Some(entry) => {
+                if entry.cwd != cwd || entry.roots != roots {
+                    return Err(anyhow::anyhow!(
+                        "the session's sandbox VM is bound to its first call's \
+                         working directory and write roots"
+                    ));
+                }
+                Ok(Arc::clone(entry))
+            }
+            None => Err(anyhow::anyhow!(
+                "the session's sandbox VM is not running; retry"
+            )),
         }
     }
 
@@ -528,50 +923,24 @@ impl VmPool {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .context("missing 'command' argument")?;
-        // The harness proxy pins the session's working directory as call
-        // metadata (like the session id itself): the first call's is what
-        // the VM boots with, and a later call presenting a different one
-        // is an error, not a second VM.
-        let cwd = payload
-            .get("_session_cwd")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .context("the shell call carries no session working directory")?;
         let timeout_secs = payload
             .get("timeout_secs")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .min(MAX_TIMEOUT_SECS);
         let timeout = Duration::from_secs(timeout_secs.max(1));
         // At most one VM per session: reuse the live one, or boot the
         // first. The map lock covers only the lookup and the insert —
         // never a command — so one session's boot never blocks another
         // session's lookup.
-        let entry = {
-            let mut entries = lock(&self.entries);
-            match entries.get(session_id) {
-                Some(entry) => {
-                    if entry.cwd != cwd {
-                        return Err(anyhow::anyhow!(
-                            "the session's sandbox VM is bound to its first \
-                             working directory"
-                        ));
-                    }
-                    Arc::clone(entry)
-                }
-                // The run loop boots session VMs; a missing one here was
-                // reaped (or died) between the run loop's check and this
-                // call. The caller retries, and the run loop boots it.
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "the session's sandbox VM is not running; retry"
-                    ));
-                }
-            }
-        };
+        let entry = self.entry_for(session_id, payload)?;
         // This session's commands serialize on the VM's own state lock;
         // the Arc keeps the entry alive for the command even if the map
         // drops it concurrently (a reap or a close-all).
-        let background = payload.get("background").and_then(Value::as_bool).unwrap_or(false);
+        let background = payload
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let job = background.then(job_tag);
         let mut state = lock_state(&entry.state);
         state.last_used = Instant::now();
@@ -607,43 +976,19 @@ impl VmPool {
 
     /// Poll or kill one background job. The job's state is the VM's (its
     /// output file and its own exit code); this only reads what it left.
-    fn execute_job_control(
-        &self,
-        session_id: &str,
-        payload: &Value,
-        job: &str,
-    ) -> Result<String> {
+    fn execute_job_control(&self, session_id: &str, payload: &Value, job: &str) -> Result<String> {
         // The job tag is ours (hex from run_job_start); never let a caller
         // inject one into a shell line.
         ensure!(
             job.len() <= 64 && job.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "invalid job id {job:?}"
         );
-        let kill = payload.get("kill").and_then(Value::as_bool).unwrap_or(false);
-        let cwd = payload
-            .get("_session_cwd")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .context("the shell call carries no session working directory")?;
+        let kill = payload
+            .get("kill")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS.max(1));
-        let entry = {
-            let mut entries = lock(&self.entries);
-            match entries.get(session_id) {
-                Some(entry) => {
-                    if entry.cwd != cwd {
-                        return Err(anyhow::anyhow!(
-                            "the session's sandbox VM is bound to its first working directory"
-                        ));
-                    }
-                    Arc::clone(entry)
-                }
-                None => {
-                return Err(anyhow::anyhow!(
-                    "the session's sandbox VM is not running; retry"
-                ));
-            }
-            }
-        };
+        let entry = self.entry_for(session_id, payload)?;
         let mut state = lock_state(&entry.state);
         state.last_used = Instant::now();
         let (sentinel, line) = if kill {
@@ -657,35 +1002,39 @@ impl VmPool {
         if outcome.vm_dead() {
             lock(&self.entries).remove(session_id);
         }
-    let raw = outcome.into_result()?;
-    if kill {
-        return Ok(format!("Job {job} killed (best-effort: its own shell only)"));
+        let raw = outcome.into_result()?;
+        if kill {
+            return Ok(format!(
+                "Job {job} killed (best-effort: its own shell only)"
+            ));
+        }
+        // The job's own exit code rides its output file.
+        let output = &raw.out[..];
+        let marker = b"JOB-EXIT:";
+        let exit = find_subslice(output, marker, 0).and_then(|at| {
+            let rest = &output[at + marker.len()..];
+            let end = rest
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .unwrap_or(rest.len());
+            std::str::from_utf8(&rest[..end])
+                .ok()
+                .and_then(|digits| digits.parse::<i32>().ok())
+        });
+        let mut result = match exit {
+            Some(code) => format!("exit code: {code}\n\n"),
+            None => "exit code: (still running)\n\n".to_string(),
+        };
+        // Strip the JOB-EXIT line: the status is the header, not output.
+        let head_end = find_subslice(output, b"\nJOB-EXIT:", 0).unwrap_or(output.len());
+        let output_part = String::from_utf8_lossy(&output[..head_end]);
+        if output_part.trim().is_empty() {
+            result.push_str("(no output yet)");
+        } else {
+            result.push_str(&output_part);
+        }
+        Ok(result)
     }
-    // The job's own exit code rides its output file.
-    let output = &raw.out[..];
-    let marker = b"JOB-EXIT:";
-    let exit = find_subslice(output, marker, 0).and_then(|at| {
-        let rest = &output[at + marker.len()..];
-        let end = rest.iter().position(|b| !b.is_ascii_digit()).unwrap_or(rest.len());
-        std::str::from_utf8(&rest[..end])
-            .ok()
-            .and_then(|digits| digits.parse::<i32>().ok())
-    });
-    let mut result = match exit {
-        Some(code) => format!("exit code: {code}\n\n"),
-        None => "exit code: (still running)\n\n".to_string(),
-    };
-    // Strip the JOB-EXIT line: the status is the header, not output.
-    let head_end = find_subslice(output, b"\nJOB-EXIT:", 0).unwrap_or(output.len());
-    let output_part = String::from_utf8_lossy(&output[..head_end]);
-    if output_part.trim().is_empty() {
-        result.push_str("(no output yet)");
-    } else {
-        result.push_str(&output_part);
-    }
-    Ok(result)
-    }
-
 
     /// Close VMs whose last shell call is older than the configured idle
     /// timeout. Each close kills the VM with its whole overlay — nothing
@@ -747,8 +1096,14 @@ fn job_tag() -> String {
 /// Close one VM: kill the child and drop its pipes. The overlay dies with
 /// the process; nothing is persisted.
 fn close_state(state: &mut VmState) {
-    let _ = state.child.kill();
-    let _ = state.child.wait();
+    // The console pipes first: dropping them closes the console session,
+    // and sandal tears the VM down from the inside — its own teardown,
+    // the guest cleaning up after itself. The kills below are the belt.
+    drop(state.console.take());
+    let _ = state.ssh.kill();
+    let _ = state.ssh.wait();
+    let _ = state.vm.kill();
+    let _ = state.vm.wait();
 }
 
 /// Lock the pool map, poisoning and all: a panicked command thread must
@@ -764,7 +1119,9 @@ fn lock(
 /// read EOFs into the dead-VM path — a fresh boot, not a bricked
 /// session.
 fn lock_state(state: &Mutex<VmState>) -> std::sync::MutexGuard<'_, VmState> {
-    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// One command's outcome inside a VM: the formatted result, or the
@@ -799,8 +1156,6 @@ impl Outcome {
 /// until the per-call sentinel, and report the exit code it carries.
 /// EOF before the sentinel means the VM died; a deadline passing means
 /// the command hung — the VM is closed either way.
-
-
 /// The per-call sentinel: a fresh marker each call, so output echoed by an
 /// earlier command can never terminate a later one.
 fn fresh_sentinel() -> String {
@@ -849,9 +1204,7 @@ fn job_start_line(cwd: &str, command: &str, job: &str) -> (String, String) {
 fn job_poll_line(job: &str) -> (String, String) {
     let sentinel = fresh_sentinel();
     let out = job_output_path(job);
-    let line = format!(
-        "tail -c 50000 {out} 2>/dev/null; printf '\\n{sentinel}:0\\n'\n"
-    );
+    let line = format!("tail -c 50000 {out} 2>/dev/null; printf '\\n{sentinel}:0\\n'\n");
     (sentinel, line)
 }
 
@@ -879,12 +1232,9 @@ fn job_output_path(job: &str) -> String {
 /// sentinel means the VM died; a deadline passing means the line hung —
 /// the VM is closed either way.
 fn run_line(state: &mut VmState, line: &str, sentinel: &str, timeout: Duration) -> Outcome {
-    if !state.ready {
-        match wait_ready(state) {
-            Ok(()) => state.ready = true,
-            Err(error) => return Outcome::Closed(Err(error)),
-        }
-    }
+    // The session shell is up (the spawn completed the whole bootstrap —
+    // the console's sshd and the ssh channel's ready marker): the
+    // protocol starts here, first line to last.
     let deadline = Instant::now() + timeout;
     // The write retries refusals — but a refusal that persists is almost
     // always a dead VM (the memory cap OOM-killed the guest, the wrapper
@@ -892,7 +1242,7 @@ fn run_line(state: &mut VmState, line: &str, sentinel: &str, timeout: Duration) 
     // transport. Detect the death fast: the entry is removed and the
     // session's next call boots a fresh VM in about a second, instead of
     // burning the whole timeout against a corpse.
-    match write_line_retrying(&mut state.stdin, &mut state.child, &line, deadline) {
+    match write_line_retrying(&mut state.stdin, &mut state.ssh, &line, deadline) {
         Ok(()) => {}
         Err(WriteError::Dead(status)) => {
             close_state(state);
@@ -934,7 +1284,9 @@ fn run_line(state: &mut VmState, line: &str, sentinel: &str, timeout: Duration) 
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, READ_SLICE_MS) };
         if ready < 0 {
             close_state(state);
-            return Outcome::Closed(Err(anyhow::anyhow!("failed to poll the sandbox VM's output")));
+            return Outcome::Closed(Err(anyhow::anyhow!(
+                "failed to poll the sandbox VM's output"
+            )));
         }
         if ready == 0 {
             continue;
@@ -943,13 +1295,15 @@ fn run_line(state: &mut VmState, line: &str, sentinel: &str, timeout: Duration) 
         let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
         if n < 0 {
             close_state(state);
-            return Outcome::Closed(Err(anyhow::anyhow!("failed to read the sandbox VM's output")));
+            return Outcome::Closed(Err(anyhow::anyhow!(
+                "failed to read the sandbox VM's output"
+            )));
         }
         if n == 0 {
             // EOF: the VM died mid-command. Report the status; the why is
             // in this process's own log (the child's stderr is inherited).
             let status = state
-                .child
+                .ssh
                 .wait()
                 .ok()
                 .and_then(|status| status.code())
@@ -998,19 +1352,27 @@ fn run_line(state: &mut VmState, line: &str, sentinel: &str, timeout: Duration) 
     }
 }
 
-/// Wait for the session shell's ready marker. Everything before it is
-/// boot noise — read past, never kept. EOF means the VM died before its
-/// session shell came up; a deadline passing means it never did.
-fn wait_ready(state: &mut VmState) -> Result<()> {
-    let deadline = Instant::now() + READY_DEADLINE;
+/// Wait for one process's marker: the console's bootstrap marker (sshd
+/// is up) or the ssh session's ready marker (the session shell is up).
+/// Everything before the marker is boot noise — read past, never kept.
+/// EOF means the process died before the marker; a deadline passing
+/// means it never printed one. Either way the caller closes everything.
+fn wait_marker(
+    stdout: &mut ChildStdout,
+    child: &mut Child,
+    marker: &str,
+    deadline: Duration,
+    never: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + deadline;
     // The rolling tail: only the bytes that could hold the marker are
     // kept, never the noise before them.
     let mut tail: Vec<u8> = Vec::new();
-    let fd = state.stdout.as_raw_fd();
+    let fd = stdout.as_raw_fd();
     let mut chunk = [0u8; 8192];
     loop {
         if Instant::now() >= deadline {
-            bail!("the session's sandbox VM never became ready; see the platform log for the sandbox's own output");
+            bail!("{never}");
         }
         let mut fds = [libc::pollfd {
             fd,
@@ -1031,23 +1393,22 @@ fn wait_ready(state: &mut VmState) -> Result<()> {
             bail!("failed to read the sandbox VM's output");
         }
         if n == 0 {
-            let status = state
-                .child
+            let status = child
                 .wait()
                 .ok()
                 .and_then(|status| status.code())
                 .unwrap_or(-1);
             bail!(
-                "the session's sandbox VM exited before its session shell was ready \
+                "the session's sandbox VM exited before its channel was ready \
                  (status {status}); see the platform log for the sandbox's own output"
             );
         }
         let data = &chunk[..n as usize];
         tail.extend_from_slice(data);
-        if find_subslice(&tail, READY_MARKER.as_bytes(), 0).is_some() {
+        if find_subslice(&tail, marker.as_bytes(), 0).is_some() {
             return Ok(());
         }
-        let keep = tail.len().saturating_sub(READY_MARKER.len() + 16);
+        let keep = tail.len().saturating_sub(marker.len() + 16);
         tail.drain(..keep);
     }
 }
@@ -1164,47 +1525,95 @@ mod tests {
     use crate::harness::tools::test_util::unique_test_dir;
     use std::fs;
 
-    /// A fake sandbox binary: a shell script that evals the protocol lines
-    /// verbatim, so the whole protocol round-trips without a VM. The
-    /// commands run host-side in one long-lived process — exactly what the
-    /// reuse tests need to observe.
+    /// A fake sandbox binary: prints the bootstrap marker (sshd "came
+    /// up"), then the keepalive — the console half of the SSH split. It
+    /// also dumps its own argv: the spawn args (the layers, the shares,
+    /// the sizing) are the only fake-level observation of what the pool
+    /// asked the sandbox for.
     fn fake_sandal(dir: &Path) -> PathBuf {
         let path = dir.join("fake-sandal");
         fs::write(
             &path,
-            format!("#!/bin/sh\necho {READY_MARKER}\nwhile IFS= read -r line; do eval \"$line\"; done\n"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{dump}'\necho {BOOTSTRAP_MARKER}\nexec {CONSOLE_KEEPALIVE}\n",
+                dump = dir.join("sandal.args").display()
+            ),
         )
         .unwrap();
-        fs::set_permissions(
-            &path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         path
     }
 
-    /// A pool with a fake binary, no layers (no sizing flags), and the
-    /// given idle timeout.
+    /// A fake ssh binary: prints the ready marker, then evals the
+    /// protocol lines verbatim — the session half of the SSH split. The
+    /// commands run host-side in one long-lived process, exactly what the
+    /// reuse tests need to observe.
+    fn fake_ssh(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-ssh");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho {READY_MARKER}\nwhile IFS= read -r line; do eval \"$line\" 2>&1; done\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A fake session key pair (a private key file and its .pub), the
+    /// fake SSH server layer, and the wiring the resolve path needs: the
+    /// key path is configured, the .pub sits next to it, the layer sits
+    /// in the config directory. Nothing real — the fakes never
+    /// authenticate anything.
+    fn fake_ssh_wiring(dir: &Path) -> (String, String, String) {
+        let key = dir.join("session-key");
+        fs::write(&key, "FAKE PRIVATE KEY").unwrap();
+        let pub_path = dir.join("session-key.pub");
+        let public = "FAKE PUBLIC KEY";
+        fs::write(&pub_path, public).unwrap();
+        let layer = dir.join("ssh-server.layer");
+        fs::write(&layer, "FAKE LAYER").unwrap();
+        (
+            key.display().to_string(),
+            public.to_string(),
+            layer.display().to_string(),
+        )
+    }
+
+    /// A pool with both fakes (the sandbox and its ssh), the fake
+    /// wiring, and the given idle timeout. The settings resolve through
+    /// the real path (the fake key/layer in the test directory), so the
+    /// resolve path is under test too.
     fn pool(dir: &Path, idle_timeout_secs: u64) -> Arc<VmPool> {
-        Arc::new(VmPool::new(
-            ResolvedSettings {
-                layers: vec![],
-                shares: vec![],
-                memory_mb: None,
-                disk_mb: None,
-                idle_timeout: Duration::from_secs(idle_timeout_secs),
-            },
-            fake_sandal(dir),
-        ))
+        let (key_path, public, layer_path) = fake_ssh_wiring(dir);
+        let raw = settings(&format!(
+            "[agent.sandal]\nssh_key = '{key_path}'\nssh_server_layer = '{layer_path}'\nidle_timeout_secs = {idle_timeout_secs}\n"
+        ));
+        let resolved = raw.resolve(Some(dir)).unwrap();
+        assert_eq!(resolved.ssh_public, public);
+        Arc::new(VmPool::new(resolved, fake_sandal(dir), fake_ssh(dir)))
     }
 
     fn call(pool: &VmPool, session: &str, command: &str) -> Result<String> {
+        call_with_roots(pool, session, command, &[])
+    }
+
+    /// The run loop's half of the protocol: boot the session's VM with the
+    /// calling agent's declared write roots (empty for an agent that
+    /// declared none — no root shares, and the same empty list on every
+    /// later call), then the command.
+    fn call_with_roots(
+        pool: &VmPool,
+        session: &str,
+        command: &str,
+        roots: &[String],
+    ) -> Result<String> {
         let cwd = std::env::current_dir().unwrap();
-        // The run loop's half of the protocol: boot the session's VM.
-        pool.ensure(session, &cwd.to_string_lossy())?;
+        pool.ensure(session, &cwd.to_string_lossy(), roots)?;
         pool.execute(
             session,
-            &json!({"command": command, "_session_cwd": cwd}),
+            &json!({"command": command, "_session_cwd": cwd, "_session_write_roots": roots}),
         )
     }
 
@@ -1217,12 +1626,25 @@ mod tests {
         root["agent"]["sandal"].clone().try_into().unwrap()
     }
 
+    /// Parse and resolve with the fake session key spliced in: every
+    /// resolve-path test needs the key now (it is required, not
+    /// optional), and this is the one place that wires the fake.
+    fn settings_resolved(dir: &Path, content: &str) -> Result<ResolvedSettings> {
+        let (key_path, _, layer_path) = fake_ssh_wiring(dir);
+        let content = content.replace(
+            "[agent.sandal]\n",
+            &format!("[agent.sandal]\nssh_key = '{key_path}'\nssh_server_layer = '{layer_path}'\n"),
+        );
+        settings(&content).resolve(Some(dir))
+    }
+
     #[test]
     fn settings_parse_all_fields() {
         let raw = settings(
-            "[agent.sandal]\nlayers = ['go.layer']\nshared = ['~/go/pkg:~/go/pkg']\nmemory = 4096\ndisk = 8192\nidle_timeout_secs = 600\n",
+            "[agent.sandal]\nlayers = ['go.layer']\nssh_server_layer = 'ssh-server.layer'\nshared = ['~/go/pkg:~/go/pkg']\nmemory = 4096\ndisk = 8192\nidle_timeout_secs = 600\n",
         );
         assert_eq!(raw.layers, ["go.layer"]);
+        assert_eq!(raw.ssh_server_layer, Some("ssh-server.layer".to_string()));
         assert_eq!(raw.shared, ["~/go/pkg:~/go/pkg"]);
         assert_eq!(raw.memory, Some(4096));
         assert_eq!(raw.disk, Some(8192));
@@ -1239,19 +1661,19 @@ mod tests {
 
     #[test]
     fn empty_layers_keep_default_sizing() {
-        // No layers -> no sizing flags at all, whatever memory/disk say:
-        // sizing exists for toolchain VMs, not bare ones — and shares
-        // alone (a cache mapping without a toolchain) do not turn sizing
-        // on either.
+        // No toolchain layers: sizing is the defaults anyway — every
+        // session VM carries the SSH server layer, so the `layers`
+        // gate of the console era is gone (a toolchain VM gets the
+        // same floor).
         let dir = unique_test_dir();
-        let resolved = settings(
-            "[agent.sandal]\nlayers = []\nshared = ['~/go/pkg:~/go/pkg']\nmemory = 65536\n",
-        )
+        let (key_path, _, layer_path) = fake_ssh_wiring(dir.path());
+        let resolved = settings(&format!(
+            "[agent.sandal]\nlayers = []\nshared = ['~/go/pkg:~/go/pkg']\nssh_key = '{key_path}'\nssh_server_layer = '{layer_path}'\nmemory = 65536\n",
+        ))
         .resolve(Some(dir.path()))
         .unwrap();
         assert!(resolved.layers.is_empty());
-        assert!(resolved.memory_mb.is_none());
-        assert!(resolved.disk_mb.is_none());
+        assert_eq!(resolved.memory_mb, 65536);
     }
 
     #[test]
@@ -1262,10 +1684,10 @@ mod tests {
         // the host's persistent cache.
         let home = crate::paths::home_dir();
         let dir = unique_test_dir();
-        let resolved = settings(
+        let resolved = settings_resolved(
+            dir.path(),
             "[agent.sandal]\nlayers = []\nshared = ['~/go/pkg:~/go/pkg', '~/.cache/go-build:~/.cache/go-build']\n",
         )
-        .resolve(Some(dir.path()))
         .unwrap();
         assert_eq!(
             resolved.shares,
@@ -1283,10 +1705,10 @@ mod tests {
     fn shared_resolves_relative_host_paths_against_the_config_dir() {
         let dir = unique_test_dir();
         std::fs::create_dir_all(dir.path().join("cache")).unwrap();
-        let resolved = settings(
+        let resolved = settings_resolved(
+            dir.path(),
             "[agent.sandal]\nlayers = []\nshared = ['cache:/root/cache']\n",
         )
-        .resolve(Some(dir.path()))
         .unwrap();
         assert_eq!(
             resolved.shares,
@@ -1312,15 +1734,14 @@ mod tests {
         let layer = dir.path().join("go.layer");
         std::fs::write(&layer, "layer").unwrap();
 
-        let resolved = settings("[agent.sandal]\nlayers = ['go.layer']\n")
-            .resolve(Some(dir.path()))
-            .unwrap();
+        let resolved =
+            settings_resolved(dir.path(), "[agent.sandal]\nlayers = ['go.layer']\n").unwrap();
 
         assert_eq!(resolved.layers, vec![layer]);
         // Sizing defaults apply: a toolchain VM must not boot at the
         // sandbox's own 256 MB / layer+16 MB defaults.
-        assert_eq!(resolved.memory_mb, Some(DEFAULT_MEMORY_MB));
-        assert_eq!(resolved.disk_mb, Some(DEFAULT_DISK_MB));
+        assert_eq!(resolved.memory_mb, DEFAULT_MEMORY_MB);
+        assert_eq!(resolved.disk_mb, DEFAULT_DISK_MB);
     }
 
     #[test]
@@ -1328,22 +1749,21 @@ mod tests {
         let dir = unique_test_dir();
         std::fs::write(dir.path().join("go.layer"), "layer").unwrap();
 
-        let resolved = settings(
+        let resolved = settings_resolved(
+            dir.path(),
             "[agent.sandal]\nlayers = ['go.layer']\nmemory = 2048\ndisk = 4096\n",
         )
-        .resolve(Some(dir.path()))
         .unwrap();
 
-        assert_eq!(resolved.memory_mb, Some(2048));
-        assert_eq!(resolved.disk_mb, Some(4096));
+        assert_eq!(resolved.memory_mb, 2048);
+        assert_eq!(resolved.disk_mb, 4096);
     }
 
     #[test]
     fn missing_layer_is_an_error() {
         let dir = unique_test_dir();
-        let error = settings("[agent.sandal]\nlayers = ['go.layer']\n")
-            .resolve(Some(dir.path()))
-            .unwrap_err();
+        let error =
+            settings_resolved(dir.path(), "[agent.sandal]\nlayers = ['go.layer']\n").unwrap_err();
         assert!(error.to_string().contains("layer not found"));
     }
 
@@ -1355,18 +1775,15 @@ mod tests {
         let dir = unique_test_dir();
         std::fs::create_dir_all(dir.path().join("images")).unwrap();
         std::fs::write(dir.path().join("images/go.layer"), "layer").unwrap();
-        let resolved = settings("[agent.sandal]\nlayers = ['images/go.layer']\n")
-            .resolve(Some(dir.path()))
-            .unwrap();
-        assert_eq!(
-            resolved.layers,
-            vec![dir.path().join("images/go.layer")]
-        );
+        let resolved =
+            settings_resolved(dir.path(), "[agent.sandal]\nlayers = ['images/go.layer']\n")
+                .unwrap();
+        assert_eq!(resolved.layers, vec![dir.path().join("images/go.layer")]);
     }
 
     #[test]
     fn synthetic_config_cannot_resolve_layers() {
-        let error = settings("[agent.sandal]\nlayers = ['go.layer']\n")
+        let error = settings("[agent.sandal]\nssh_key = '/nonexistent'\nlayers = ['go.layer']\n")
             .resolve(None)
             .unwrap_err();
         assert!(error.to_string().contains("no config directory"));
@@ -1376,17 +1793,16 @@ mod tests {
     fn idle_timeout_defaults_and_overrides() {
         let dir = unique_test_dir();
         std::fs::write(dir.path().join("go.layer"), "layer").unwrap();
-        let default = settings("[agent.sandal]\nlayers = ['go.layer']\n")
-            .resolve(Some(dir.path()))
-            .unwrap();
+        let default =
+            settings_resolved(dir.path(), "[agent.sandal]\nlayers = ['go.layer']\n").unwrap();
         assert_eq!(
             default.idle_timeout,
             Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
         );
-        let configured = settings(
+        let configured = settings_resolved(
+            dir.path(),
             "[agent.sandal]\nlayers = ['go.layer']\nidle_timeout_secs = 60\n",
         )
-        .resolve(Some(dir.path()))
         .unwrap();
         assert_eq!(configured.idle_timeout, Duration::from_secs(60));
     }
@@ -1420,8 +1836,8 @@ mod tests {
         let entries = lock(&pool.entries);
         let a = entries.get("session-a").unwrap();
         let b = entries.get("session-b").unwrap();
-        let pid_a = lock_state(&a.state).child.id();
-        let pid_b = lock_state(&b.state).child.id();
+        let pid_a = lock_state(&a.state).ssh.id();
+        let pid_b = lock_state(&b.state).ssh.id();
         assert_ne!(pid_a, pid_b, "two sessions share one process");
         drop(entries);
         // And both keep serving their own sessions.
@@ -1450,22 +1866,19 @@ mod tests {
         let pool = pool(dir.path(), 3600);
         let timed_out = {
             let cwd = std::env::current_dir().unwrap();
-            pool.ensure("session-1", &cwd.to_string_lossy()).unwrap();
-            pool
-                .execute(
-                    "session-1",
-                    &json!({
-                        "command": "sleep 30",
-                        "timeout_secs": 1,
-                        "_session_cwd": cwd,
-                    }),
-                )
-                .unwrap_err()
+            pool.ensure("session-1", &cwd.to_string_lossy(), &[])
+                .unwrap();
+            pool.execute(
+                "session-1",
+                &json!({
+                    "command": "sleep 30",
+                    "timeout_secs": 1,
+                    "_session_cwd": cwd,
+                }),
+            )
+            .unwrap_err()
         };
-        assert!(
-            timed_out.to_string().contains("timed out"),
-            "{timed_out}"
-        );
+        assert!(timed_out.to_string().contains("timed out"), "{timed_out}");
         // The VM was closed: the next call boots a fresh one, and the
         // sleep from the timed-out call is gone with it.
         let fresh = call(&pool, "session-1", "echo fresh-vm").unwrap();
@@ -1521,6 +1934,95 @@ mod tests {
         assert!(error.to_string().contains("no session working directory"));
     }
 
+    /// The per-agent session-directory share: the roots an agent declared
+    /// for its session ride the call (the same list its write tools
+    /// permit) and into the session's own VM — every root, same path on
+    /// both sides, exactly like the working directory.
+    #[test]
+    fn declared_write_roots_are_shared_into_the_session_vm() {
+        let dir = unique_test_dir();
+        let pool = pool(dir.path(), 3600);
+        let root_a = dir.path().join("session-root-a");
+        let root_b = dir.path().join("session-root-b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        let roots = [root_a.display().to_string(), root_b.display().to_string()];
+        // A fine command first: the VM boots with the declared roots.
+        let ok = call_with_roots(&pool, "session-1", "echo booted", &roots).unwrap();
+        assert!(ok.contains("booted"));
+        // The spawn asked for every declared root, same path on both sides.
+        let args = fs::read_to_string(dir.path().join("sandal.args")).unwrap();
+        for root in &roots {
+            assert!(
+                args.contains(&format!("--share\n{root}:{root}")),
+                "the spawn never asked to share declared root {root}: {args}"
+            );
+        }
+    }
+
+    /// The roots are pinned at boot like the working directory: a later
+    /// call presenting a different list is an error, not a reshare — and
+    /// the VM keeps serving the list it booted with.
+    #[test]
+    fn a_changed_write_root_list_is_an_error_not_a_reshare() {
+        let dir = unique_test_dir();
+        let pool = pool(dir.path(), 3600);
+        let root = dir.path().join("session-root");
+        fs::create_dir_all(&root).unwrap();
+        let roots = [root.display().to_string()];
+        let first = call_with_roots(&pool, "session-1", "echo first", &roots).unwrap();
+        assert!(first.contains("first"));
+        // A different root, the same root dropped, a root added — every
+        // shape is a mismatch, never a renegotiation.
+        let other = dir.path().join("other-root");
+        fs::create_dir_all(&other).unwrap();
+        for changed in [
+            vec![other.display().to_string()],
+            vec![],
+            vec![roots[0].clone(), other.display().to_string()],
+        ] {
+            let error = call_with_roots(&pool, "session-1", "echo changed", &changed).unwrap_err();
+            assert!(
+                error.to_string().contains("bound to its first call's"),
+                "a changed root list was not an error: {error}"
+            );
+        }
+        // And the reverse: a session that declared none cannot add one.
+        let none = call(&pool, "session-2", "echo none").unwrap();
+        assert!(none.contains("none"));
+        let error = call_with_roots(&pool, "session-2", "echo added", &roots).unwrap_err();
+        assert!(
+            error.to_string().contains("bound to its first call's"),
+            "adding a root to a rootless session was not an error: {error}"
+        );
+        // The pinned VM still serves its own list.
+        let still = call_with_roots(&pool, "session-1", "echo still", &roots).unwrap();
+        assert!(still.contains("still"));
+    }
+
+    /// A declared root that is not a directory fails the boot, loudly:
+    /// the declaration is the calling agent's own, and a silently dropped
+    /// root would surface later as a confusing path error inside the VM.
+    #[test]
+    fn a_missing_declared_root_fails_the_boot() {
+        let dir = unique_test_dir();
+        let pool = pool(dir.path(), 3600);
+        let missing = dir.path().join("no-such-root").display().to_string();
+        let error = call_with_roots(
+            &pool,
+            "session-1",
+            "echo boot",
+            std::slice::from_ref(&missing),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("not a directory") && error.to_string().contains(&missing),
+            "a missing declared root did not fail the boot: {error}"
+        );
+        // Nothing was booted: the session has no VM.
+        assert!(lock(&pool.entries).get("session-1").is_none());
+    }
+
     #[test]
     fn output_is_capped_and_counted() {
         let dir = unique_test_dir();
@@ -1541,107 +2043,19 @@ mod tests {
         assert!(result.contains("exit code: 42"), "{result}");
     }
 
-    /// The real-sandbox end-to-end: one VM per session, reused across the
-    /// session's calls, and isolated from every other session's VM. Skips
-    /// when the real sandbox binary is not installed — the pool behavior
-    /// above is already covered by the fake.
+    /// A command's stderr rides the protocol, merged into its own output:
+    /// the host shell tool's contract (stdout, stderr, exit code) — the
+    /// model sees its own command's diagnostics instead of them streaming
+    /// to the inherited ssh stderr (the platform log, the operator's UI).
     #[test]
-    fn real_sandbox_reuse_and_isolation() {
-        let Ok(bin) = resolve_sandal_bin() else {
-            return;
-        };
+    fn a_commands_stderr_rides_the_protocol() {
         let dir = unique_test_dir();
-        let pool = VmPool::new(
-            ResolvedSettings {
-                layers: vec![],
-                shares: vec![],
-                memory_mb: None,
-                disk_mb: None,
-                idle_timeout: Duration::from_secs(3600),
-            },
-            bin,
-        );
-        let marker = "__reuse_marker__";
-        // Reuse: a file the session wrote is still there on its next call.
-        // A per-command VM would lose it.
-        let wrote = call(&pool, "session-1", &format!("echo {marker} > /tmp/reuse.txt"))
-            .unwrap();
-        assert!(wrote.starts_with("exit code: 0"), "{wrote}");
-        let read_back = call(&pool, "session-1", "cat /tmp/reuse.txt").unwrap();
-        assert!(read_back.contains(marker), "the session VM did not survive: {read_back}");
-        // Isolation: another session's VM boots fresh — the file is
-        // invisible to it.
-        let other = call(&pool, "session-2", "cat /tmp/reuse.txt 2>/dev/null").unwrap();
+        let pool = pool(dir.path(), 3600);
+        let result = call(&pool, "session-1", "echo err-text 1>&2").unwrap();
         assert!(
-            other.starts_with("exit code: 1"),
-            "another session saw the first session's file: {other}"
+            result.contains("err-text"),
+            "the command's stderr did not ride the protocol: {result}"
         );
-    }
-
-    /// The real toolchain e2e: a layer-carrying VM builds and runs a go
-    /// program, and the session VM persists what the build left. Skips
-    /// without the real binary or the real deployment's layer — the pool
-    /// and protocol behavior above is already covered without them.
-    #[test]
-    fn real_sandbox_toolchain_build() {
-        let Ok(bin) = resolve_sandal_bin() else {
-            return;
-        };
-        let layer = crate::paths::home_dir().join("projects/kmcrawler-agent/go.layer");
-        if !layer.is_file() {
-            return;
-        }
-        let dir = unique_test_dir();
-        // A dependency-free go project: no module fetches, so nothing
-        // touches a host cache — the build cache stays inside the VM.
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).unwrap();
-        fs::write(project.join("go.mod"), "module probe\n\ngo 1.21\n").unwrap();
-        fs::write(
-            project.join("main.go"),
-            "package main\n\nfunc main() { println(\"__TOOLCHAIN_OK__\") }\n",
-        )
-        .unwrap();
-        let pool = VmPool::new(
-            ResolvedSettings {
-                layers: vec![layer],
-                shares: vec![],
-                // The toolchain sizing defaults — a toolchain VM must not
-                // boot at the sandbox's own 256 MB default.
-                memory_mb: Some(DEFAULT_MEMORY_MB),
-                disk_mb: Some(DEFAULT_DISK_MB),
-                idle_timeout: Duration::from_secs(3600),
-            },
-            bin,
-        );
-        // The session VM binds to this test directory (the project's
-        // parent), so the project is visible inside it — the same pinning
-        // every session's working directory gets.
-        let session_cwd = dir.path().to_string_lossy().to_string();
-        pool.ensure("session-1", &session_cwd).unwrap();
-        let run = |command: &str| {
-            pool.execute(
-                "session-1",
-                &json!({"command": command, "_session_cwd": session_cwd}),
-            )
-            .unwrap()
-        };
-        let guest_project = "/tmp/project";
-        let copy = format!(
-            "mkdir -p {guest_project} && cp {}/* {guest_project}/",
-            project.display()
-        );
-        let built = run(&copy);
-        assert!(built.starts_with("exit code: 0"), "{built}");
-        let built = run(&format!(
-            "cd {guest_project} && go build -o probe . && ./probe"
-        ));
-        assert!(built.contains("__TOOLCHAIN_OK__"), "{built}");
-        // The session VM persisted the build: a later call still sees it.
-        let persisted = run(&format!(
-            "test -x {guest_project}/probe && echo persisted"
-        ));
-        assert!(persisted.contains("persisted"), "{persisted}");
     }
 
     /// The guarantee the dispatch exists for: one session's long-running
@@ -1657,7 +2071,7 @@ mod tests {
         let a = std::thread::spawn(move || {
             let cwd = std::env::current_dir().unwrap();
             pool_a
-                .ensure("session-a", &cwd.to_string_lossy())
+                .ensure("session-a", &cwd.to_string_lossy(), &[])
                 .unwrap();
             pool_a
                 .execute(
@@ -1694,7 +2108,7 @@ mod tests {
         let a = std::thread::spawn(move || {
             let cwd = std::env::current_dir().unwrap();
             pool_a
-                .ensure("session-1", &cwd.to_string_lossy())
+                .ensure("session-1", &cwd.to_string_lossy(), &[])
                 .unwrap();
             pool_a
                 .execute(
@@ -1729,7 +2143,11 @@ mod tests {
         let dir = unique_test_dir();
         let pool = pool(dir.path(), 3600);
         // A fine first command — the VM looks healthy.
-        assert!(call(&pool, "session-1", "echo healthy").unwrap().contains("healthy"));
+        assert!(
+            call(&pool, "session-1", "echo healthy")
+                .unwrap()
+                .contains("healthy")
+        );
         // The VM dies out-of-band (the memory cap OOM-killed the guest).
         {
             let entries = lock(&pool.entries);
@@ -1750,7 +2168,11 @@ mod tests {
         );
         // The entry is gone: the next call boots a fresh VM.
         assert!(lock(&pool.entries).get("session-1").is_none());
-        assert!(call(&pool, "session-1", "echo fresh-vm").unwrap().contains("fresh-vm"));
+        assert!(
+            call(&pool, "session-1", "echo fresh-vm")
+                .unwrap()
+                .contains("fresh-vm")
+        );
     }
 
     /// The background-job path: a job that outlives any transport starts
@@ -1760,8 +2182,11 @@ mod tests {
     fn background_jobs_start_poll_and_finish() {
         let dir = unique_test_dir();
         let pool = pool(dir.path(), 3600);
-        let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
-        pool.ensure("session-1", &cwd).unwrap();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        pool.ensure("session-1", &cwd, &[]).unwrap();
         let start = pool
             .execute(
                 "session-1",
@@ -1772,7 +2197,10 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(start.starts_with("Background job started: potlatch-job-"), "{start}");
+        assert!(
+            start.starts_with("Background job started: potlatch-job-"),
+            "{start}"
+        );
         let job = start
             .lines()
             .find_map(|l| l.strip_prefix("Background job started: "))
@@ -1780,19 +2208,13 @@ mod tests {
             .to_string();
         // Poll while it runs: no exit code, no output.
         let running = pool
-            .execute(
-                "session-1",
-                &json!({"job_id": job, "_session_cwd": cwd}),
-            )
+            .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
             .unwrap();
         assert!(running.contains("(still running)"), "{running}");
         // Wait for the job, then poll: its own exit code and output.
         std::thread::sleep(Duration::from_secs(2));
         let finished = pool
-            .execute(
-                "session-1",
-                &json!({"job_id": job, "_session_cwd": cwd}),
-            )
+            .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
             .unwrap();
         assert!(finished.contains("exit code: 0"), "{finished}");
         assert!(finished.contains("job-done"), "{finished}");
@@ -1804,8 +2226,11 @@ mod tests {
     fn background_jobs_kill_best_effort() {
         let dir = unique_test_dir();
         let pool = pool(dir.path(), 3600);
-        let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
-        pool.ensure("session-1", &cwd).unwrap();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        pool.ensure("session-1", &cwd, &[]).unwrap();
         let start = pool
             .execute(
                 "session-1",
@@ -1829,10 +2254,7 @@ mod tests {
             .unwrap();
         assert!(killed.contains("killed"), "{killed}");
         let after = pool
-            .execute(
-                "session-1",
-                &json!({"job_id": job, "_session_cwd": cwd}),
-            )
+            .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
             .unwrap();
         assert!(after.contains("(no output yet)"), "{after}");
     }
@@ -1851,8 +2273,11 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
         let worker = std::thread::spawn(move || {
-            let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
-            pool.ensure("session-1", &cwd).unwrap();
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            pool.ensure("session-1", &cwd, &[]).unwrap();
             while let Ok(command) = rx.recv() {
                 let result = pool
                     .execute(
@@ -1890,8 +2315,11 @@ mod tests {
     fn a_foreground_command_runs_while_a_background_job_is_running() {
         let dir = unique_test_dir();
         let pool = pool(dir.path(), 3600);
-        let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
-        pool.ensure("session-1", &cwd).unwrap();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        pool.ensure("session-1", &cwd, &[]).unwrap();
         // Start a long-running background job.
         let start = pool
             .execute(
@@ -1921,10 +2349,7 @@ mod tests {
         );
         // The job is still running, untouched by the foreground command.
         let running = pool
-            .execute(
-                "session-1",
-                &json!({"job_id": job, "_session_cwd": cwd}),
-            )
+            .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
             .unwrap();
         assert!(running.contains("(still running)"), "{running}");
         // Kill the job; the poll finds nothing after.
@@ -1936,10 +2361,7 @@ mod tests {
             .unwrap();
         assert!(killed.contains("killed"), "{killed}");
         let after = pool
-            .execute(
-                "session-1",
-                &json!({"job_id": job, "_session_cwd": cwd}),
-            )
+            .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
             .unwrap();
         assert!(after.contains("(no output yet)"), "{after}");
     }
@@ -1952,8 +2374,11 @@ mod tests {
     fn multiple_background_jobs_run_concurrently() {
         let dir = unique_test_dir();
         let pool = pool(dir.path(), 3600);
-        let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
-        pool.ensure("session-1", &cwd).unwrap();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        pool.ensure("session-1", &cwd, &[]).unwrap();
         let started = Instant::now();
         let starts: Vec<String> = (0..3)
             .map(|i| {
@@ -1984,10 +2409,7 @@ mod tests {
         // And all three jobs are running at the same time.
         for job in &jobs {
             let running = pool
-                .execute(
-                    "session-1",
-                    &json!({"job_id": job, "_session_cwd": cwd}),
-                )
+                .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
                 .unwrap();
             assert!(running.contains("(still running)"), "{running}");
         }
@@ -1996,10 +2418,7 @@ mod tests {
         std::thread::sleep(Duration::from_secs(9));
         for (i, job) in jobs.iter().enumerate() {
             let finished = pool
-                .execute(
-                    "session-1",
-                    &json!({"job_id": job, "_session_cwd": cwd}),
-                )
+                .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
                 .unwrap();
             assert!(
                 finished.contains(&format!("job-{i}-done")),

@@ -56,7 +56,12 @@ impl AcpVendorState for PotlatchVendorState {
                 operation.to_string(),
                 arguments,
                 session_id,
-                Duration::from_secs(45),
+                // Far beyond the legitimate envelope: a deployment's boot
+                // queue (serialized boots at startup) and the commands'
+                // own timeouts. A deadline inside that envelope drops the
+                // response — the work's result lost, the caller's retries
+                // poisoned behind it.
+                Duration::from_secs(30 * 60),
             )
         })();
         Some(match result {

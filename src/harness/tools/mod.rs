@@ -352,12 +352,20 @@ impl ToolRegistry {
         definitions: Vec<RemoteAgentToolDefinition>,
         allowed_tools: Option<&[String]>,
         session_id: &str,
+        write_roots: &[PathBuf],
     ) {
         let allowed = |name: &str| {
             allowed_tools
                 .map(|names| names.iter().any(|allowed| allowed == name))
                 .unwrap_or(true)
         };
+        // The session's declared write roots (see [`agent_bus::RemoteAgentTool`]):
+        // what the calling agent passed for this session, forwarded with every
+        // call so a sandboxing handler can share the list into the sandbox.
+        let write_roots: Vec<String> = write_roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect();
         for definition in definitions {
             if !allowed(&definition.name) {
                 continue;
@@ -371,6 +379,7 @@ impl ToolRegistry {
                 Arc::clone(&caller),
                 definition,
                 session_id,
+                write_roots.clone(),
             )));
         }
     }

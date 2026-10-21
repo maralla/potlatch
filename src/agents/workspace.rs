@@ -78,6 +78,14 @@ impl<'a> AgentBootstrap<'a> {
                 .display()
                 .to_string(),
         );
+        // The project's session directory, declared HERE — at this agent's
+        // own model connection, never in a config: every forge-backed
+        // agent's session state lives there (its session files, its
+        // analysis/history — one directory per project), so its model's
+        // own commands reference it. One declaration, two effects: the
+        // write tools permit it outside the cwd, and the sandbox shares
+        // it into this agent's own session VM.
+        model_preferences.write_roots.push(sessions_dir.clone());
         let model = AgentModel::connect(self.ctx, working_dir.clone(), model_preferences)?;
 
         Ok(AgentWorkspace {

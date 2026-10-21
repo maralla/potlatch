@@ -196,6 +196,13 @@ impl AgentBus {
         })
     }
 
+    /// Send one cross-agent request and wait for its response. The
+    /// deadline covers the whole request — the route wait (a target
+    /// still building at startup) and the response — and it is set far
+    /// beyond the legitimate envelope (a deployment's boot queue, the
+    /// commands' own timeouts): a response that takes as long as the
+    /// work takes is delivered, not dropped — a dropped response loses
+    /// the work's result and poisons the caller's retries behind it.
     pub fn request(
         &self,
         target: &str,

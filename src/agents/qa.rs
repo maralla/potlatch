@@ -246,30 +246,6 @@ impl QaAgentSettings {
     }
 }
 
-/// Model preferences that confine the harness's `write`/`edit` tools to the
-/// QA agent's own sessions directory. Everything the model legitimately
-/// writes — its knowledge files, the function index, its test scripts —
-/// lives under `<base_dir>/<project>-sessions/`; the checked-out repo is
-/// covered separately by the tools' default (relative-path) mode.
-fn qa_model_preferences(ctx: &AgentBuildContext<QaAgentSettings>) -> ModelPreferences {
-    let Ok(settings) = super::settings::AgentSettings::from_config(&ctx.workflow.config) else {
-        return ModelPreferences::default();
-    };
-    let Some(repo_url) = settings.repo_url() else {
-        return ModelPreferences::default();
-    };
-    let Ok(project_name) = super::workspace::extract_project_name(repo_url) else {
-        return ModelPreferences::default();
-    };
-    ModelPreferences {
-        write_roots: vec![super::workspace::sessions_dir(
-            &ctx.workflow.base_dir,
-            &project_name,
-        )],
-        ..ModelPreferences::default()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Agent state
 // ---------------------------------------------------------------------------
@@ -415,7 +391,7 @@ impl CoreAgent for QaAgent {
     }
 
     fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
-        let runtime = AgentBootstrap::new(&ctx, qa_model_preferences(&ctx)).build()?;
+        let runtime = AgentBootstrap::new(&ctx, ModelPreferences::default()).build()?;
         let agent_settings = ctx.settings;
         let config = QaConfig {
             poll_interval: agent_settings.poll_interval,

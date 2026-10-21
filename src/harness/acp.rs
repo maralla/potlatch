@@ -392,7 +392,7 @@ impl AcpServer {
         // Optional `write_roots` extension: directories the write/edit tools
         // may touch outside the cwd (via `outside_cwd: true`). Empty/absent
         // keeps the historical permissive behavior.
-        let write_roots = params
+        let declared_write_roots = params
             .get("write_roots")
             .and_then(Value::as_array)
             .map(|arr| {
@@ -403,7 +403,7 @@ impl AcpServer {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let write_roots = super::tools::WriteRoots::from_paths(write_roots);
+        let write_roots = super::tools::WriteRoots::from_paths(declared_write_roots.clone());
 
         // Build the tool registry with built-in tools + caller-defined
         // structured-output tools. The tool set is fixed for the session
@@ -420,6 +420,7 @@ impl AcpServer {
                 session.agent_tools.clone(),
                 session.allowed_tools.as_deref(),
                 &session.id,
+                &declared_write_roots,
             );
         }
         if let Some(defs) = &session.structured_output_tools {
