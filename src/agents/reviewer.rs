@@ -1102,6 +1102,7 @@ impl ReviewerPort for LiveReviewerPort<'_> {
                         self.model.agent_id(),
                         subject.mr.iid
                     )),
+                    task_scope: Some(format!("mr-review-{}", subject.mr.iid)),
                     ..InvokeOptions::default()
                 },
             )?
@@ -1145,6 +1146,7 @@ Inspect the actual code changes in the repository (the source branch is checked 
                         self.model.agent_id(),
                         mr.iid
                     )),
+                    task_scope: Some(format!("mr-brief-{}", mr.iid)),
                     ..InvokeOptions::default()
                 },
             )?
