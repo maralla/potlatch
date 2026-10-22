@@ -27,7 +27,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
@@ -129,7 +129,7 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// The `shell` tool this agent publishes — the override for the built-in
 /// shell tool while `[agent.sandal]` is configured.
-const SHELL_DESCRIPTION: &str = "Run a shell command inside the session's sandbox VM. You are already in the working directory (cwd) — no need to `cd` into it. The VM is reused across this session's calls: packages installed by an earlier call are still installed, and files written by an earlier call are still there. Returns the command's output and exit code. Foreground commands have a timeout (default 120s, maximum 30 minutes); on timeout the whole VM is closed and the session's next call boots a fresh one — anything longer than a minute or two belongs in the background: set background: true, get a job id back immediately, and poll it with job_id (or kill it with job_id + kill: true). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `write` or `edit` instead.";
+const SHELL_DESCRIPTION: &str = "Run a shell command inside the session's sandbox VM. You are already in the working directory (cwd) — no need to `cd` into it. The VM is reused across this session's calls: packages installed by an earlier call are still installed, and files written by an earlier call are still there. Returns the command's output and exit code. Foreground commands have a timeout (default 120s, maximum 30 minutes); on timeout the whole VM is closed and the session's next call boots a fresh one — anything longer than a minute or two belongs in the background: set background: true, get a job id back immediately, and poll it with job_id (or kill it with job_id + kill: true). Poll a background job a couple of times, not forever: if a job has produced no new output after a few polls over several minutes, kill it (job_id + kill: true) and run a narrower command instead of sleeping and re-polling in a loop. Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `write` or `edit` instead.";
 
 /// `[agent.sandal]` settings as configured: paths still relative to the
 /// config file, share specs unresolved, sizing unset where absent.
@@ -1008,26 +1008,26 @@ impl VmPool {
                 "Job {job} killed (best-effort: its own shell only)"
             ));
         }
-        // The job's own exit code rides its output file.
+        // The job's own exit code and start stamp ride its output file.
         let output = &raw.out[..];
-        let marker = b"JOB-EXIT:";
-        let exit = find_subslice(output, marker, 0).and_then(|at| {
-            let rest = &output[at + marker.len()..];
-            let end = rest
-                .iter()
-                .position(|b| !b.is_ascii_digit())
-                .unwrap_or(rest.len());
-            std::str::from_utf8(&rest[..end])
-                .ok()
-                .and_then(|digits| digits.parse::<i32>().ok())
-        });
+        let exit = digits_after_marker(output, b"JOB-EXIT:");
+        let started_epoch = digits_after_marker(output, b"JOB-START:");
         let mut result = match exit {
             Some(code) => format!("exit code: {code}\n\n"),
-            None => "exit code: (still running)\n\n".to_string(),
+            // The job's age is what tells a waiting model whether to keep
+            // waiting or to kill the job and change course: without it,
+            // "(still running)" reads the same at 5s as at 5h.
+            None => match job_age_seconds(started_epoch) {
+                Some(age) => {
+                    format!("exit code: (still running, {})\n\n", format_job_age(age))
+                }
+                None => "exit code: (still running)\n\n".to_string(),
+            },
         };
-        // Strip the JOB-EXIT line: the status is the header, not output.
+        // Strip the bookkeeping markers: the status is the header, not
+        // output. JOB-EXIT rides the file's tail; JOB-START its head.
         let head_end = find_subslice(output, b"\nJOB-EXIT:", 0).unwrap_or(output.len());
-        let output_part = String::from_utf8_lossy(&output[..head_end]);
+        let output_part = String::from_utf8_lossy(strip_job_start_stamp(&output[..head_end]));
         if output_part.trim().is_empty() {
             result.push_str("(no output yet)");
         } else {
@@ -1181,18 +1181,24 @@ fn foreground_line(cwd: &str, command: &str) -> (String, String) {
 }
 
 /// The background-start protocol line: the job runs detached in the VM
-/// with its whole output (and its own `JOB-EXIT:` code) going to a
-/// job-tagged file, and the sentinel carries only the backgrounding's
-/// own status. The job tag rides the job's command line, so a kill can
-/// find it with pkill.
+/// with its whole output going to a job-tagged file — a `JOB-START:`
+/// epoch first line (a poll reports the job's age from it), the job's
+/// own output, and its own `JOB-EXIT:` code when it finishes — and the
+/// sentinel carries only the backgrounding's own status. The job tag
+/// rides the job's command line, so a kill can find it with pkill.
 fn job_start_line(cwd: &str, command: &str, job: &str) -> (String, String) {
     let sentinel = fresh_sentinel();
     let encoded = base64::engine::general_purpose::STANDARD.encode(command);
     let cwd = cwd.replace('\'', "'\\''");
     let out = job_output_path(job);
+    // The stamp is written synchronously, before the backgrounding: a job
+    // that has not run a single instruction yet still reports its age to
+    // the first poll (the job writing its own stamp would race it). The
+    // job's own output and its JOB-EXIT code append after the stamp.
     let line = format!(
-        "cd '{cwd}' 2>/dev/null && {{ ( eval \": {job}; $(printf %s {encoded} | base64 -d)\"; \
-         printf 'JOB-EXIT:%d\\n' \"$?\" >>{out} ) >{out} 2>&1 & \
+        "cd '{cwd}' 2>/dev/null && {{ printf 'JOB-START:%s\\n' \"$(date +%s)\" >{out}; \
+         ( eval \": {job}; $(printf %s {encoded} | base64 -d)\"; \
+         printf 'JOB-EXIT:%d\\n' \"$?\" >>{out} ) >>{out} 2>&1 & \
          printf '\\n{sentinel}:0\\n'; }} || printf '\\n{sentinel}:127\\n'\n"
     );
     (sentinel, line)
@@ -1225,6 +1231,67 @@ fn job_kill_line(job: &str) -> (String, String) {
 /// never on a share — the job state is the VM's, and it dies with the VM.
 fn job_output_path(job: &str) -> String {
     format!("/tmp/{job}.out")
+}
+
+/// The non-negative integer following a marker's first occurrence in the
+/// job's output file: `JOB-EXIT:` and `JOB-START:` both ride that file
+/// and are read the same way — first marker, digits to the first
+/// non-digit.
+fn digits_after_marker(output: &[u8], marker: &[u8]) -> Option<u64> {
+    let at = find_subslice(output, marker, 0)?;
+    let rest = &output[at + marker.len()..];
+    let end = rest
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(rest.len());
+    std::str::from_utf8(&rest[..end])
+        .ok()
+        .and_then(|digits| digits.parse().ok())
+}
+
+/// Strip the `JOB-START:<epoch>` stamp line job_start_line writes as the
+/// output file's first line: harness bookkeeping, not the job's output.
+/// Only a whole leading line is a stamp — a tail window that cuts the
+/// file mid-stream leaves fragments that belong to the job's output.
+fn strip_job_start_stamp(output: &[u8]) -> &[u8] {
+    let Some(rest) = output.strip_prefix(b"JOB-START:") else {
+        return output;
+    };
+    let digits = rest
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(rest.len());
+    match rest.get(digits) {
+        Some(b'\n') => &rest[digits + 1..],
+        _ => output,
+    }
+}
+
+/// The job's age from its start stamp (the epoch job_start_line writes
+/// into its output file), or None without one. Guest and host clocks are
+/// both UTC epoch seconds; skew only skews the age, and a negative one
+/// clamps to zero rather than underflowing.
+fn job_age_seconds(started_epoch: Option<u64>) -> Option<u64> {
+    let start = started_epoch?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(now.saturating_sub(start))
+}
+
+/// A job's age, compact: `42s`, `5m03s`, `1h02m03s` — readable at a
+/// glance mid-poll, minutes being the unit a wait-or-give-up decision
+/// turns on.
+fn format_job_age(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else {
+        format!("{minutes}m{seconds:02}s")
+    }
 }
 
 /// Run one protocol line in a live VM: write it, read output until the
@@ -1261,8 +1328,11 @@ fn run_line(state: &mut VmState, line: &str, sentinel: &str, timeout: Duration) 
     }
     let mut out: Vec<u8> = Vec::new();
     let mut total = 0usize;
-    // The carry keeps the bytes that could straddle a read boundary of the
-    // sentinel search.
+    // The carry holds the bytes that could still straddle a read boundary
+    // of the sentinel search. `out` and `carry` never overlap: a byte
+    // leaves carry into out only once it can no longer be part of the
+    // sentinel line, so the framing around the sentinel is stripped
+    // exactly once no matter how the reads split.
     let mut carry: Vec<u8> = Vec::new();
     let fd = state.stdout.as_raw_fd();
     let mut chunk = [0u8; 8192];
@@ -1314,41 +1384,55 @@ fn run_line(state: &mut VmState, line: &str, sentinel: &str, timeout: Duration) 
             )));
         }
         let data = &chunk[..n as usize];
+        carry.extend_from_slice(data);
+        total += data.len();
         // Search for the sentinel before the cap decides anything: the
         // sentinel is the last bytes in the stream, but it must be found
-        // wherever it lands.
-        carry.extend_from_slice(data);
-        if let Some((at, code)) = find_sentinel(&carry, sentinel) {
-            // The command finished before this read: its whole output and
-            // the sentinel arrived together. The output is everything
-            // before the marker (the marker's own leading newline
-            // stripped), capped like any other read.
-            let head_end = if at > 0 && carry[at - 1] == b'\n' {
+        // wherever it lands. A sentinel without its trailing newline is
+        // not done yet — the shell writes the line in pieces, and
+        // returning at the code would leave the newline (and everything
+        // after it) in the pipe to leak into the next command's read.
+        let found = find_sentinel(&carry, sentinel);
+        if let Some((at, code, match_end)) = found
+            && carry.get(match_end) == Some(&b'\n')
+        {
+            // The line's own leading newline is framing, not output.
+            let line_start = if at > 0 && carry[at - 1] == b'\n' {
                 at - 1
             } else {
                 at
             };
-            let head = &carry[..head_end];
             let room = MAX_OUTPUT.saturating_sub(out.len());
-            out.extend_from_slice(&head[..room.min(head.len())]);
-            total += head.len();
-            let dropped = total.saturating_sub(out.len());
-            return Outcome::Done(Ok(RawRun {
-                out: std::mem::take(&mut out),
-                code,
-                dropped,
-            }));
+            let take = line_start.min(room);
+            out.extend_from_slice(&carry[..take]);
+            // The sentinel line itself (and anything the child flushed
+            // past it — nothing in the protocol does) is consumed here,
+            // never carried into the next command's read.
+            let dropped = total
+                .saturating_sub(out.len())
+                .saturating_sub(match_end + 1 - line_start);
+            return Outcome::Done(Ok(RawRun { out, code, dropped }));
         }
-        // Keep only the tail that could straddle the next boundary.
-        let keep = carry.len().saturating_sub(sentinel.len() + 16);
-        carry.drain(..keep);
-        // The cap: keep the head, count the rest.
+        // Emit the bytes that can no longer be part of the sentinel line;
+        // keep the rest for the next read. The window holds a partial
+        // sentinel line: the marker, its code, the trailing newline, and
+        // the line's own leading newline. When a sentinel has been seen
+        // but is not complete yet, everything from its line start on is
+        // framing until the newline lands.
+        let keep_from = match found {
+            Some((at, _, _)) => {
+                if at > 0 && carry[at - 1] == b'\n' {
+                    at - 1
+                } else {
+                    at
+                }
+            }
+            None => carry.len().saturating_sub(sentinel.len() + 16),
+        };
         let room = MAX_OUTPUT.saturating_sub(out.len());
-        if room > 0 {
-            let take = room.min(data.len());
-            out.extend_from_slice(&data[..take]);
-        }
-        total += data.len();
+        let emit = keep_from.min(room);
+        out.extend_from_slice(&carry[..emit]);
+        carry.drain(..keep_from);
     }
 }
 
@@ -1473,8 +1557,10 @@ fn write_line_retrying(
 }
 
 /// Find `<sentinel>:<code>` in `data` and return where the marker
-/// starts and the code it carries.
-fn find_sentinel(data: &[u8], sentinel: &str) -> Option<(usize, i32)> {
+/// starts, the code it carries, and where the match ends (just past the
+/// code) — the caller completes the line by checking for the trailing
+/// newline there (see the newline-leak note in [`run_line`]).
+fn find_sentinel(data: &[u8], sentinel: &str) -> Option<(usize, i32, usize)> {
     let marker = format!("{sentinel}:");
     let mut from = 0;
     while let Some(at) = find_subslice(data, marker.as_bytes(), from) {
@@ -1484,10 +1570,14 @@ fn find_sentinel(data: &[u8], sentinel: &str) -> Option<(usize, i32)> {
             .position(|b| !b.is_ascii_digit())
             .unwrap_or(rest.len());
         if end > 0 {
-            return std::str::from_utf8(&rest[..end])
+            let code = std::str::from_utf8(&rest[..end])
                 .ok()
-                .and_then(|digits| digits.parse::<i32>().ok())
-                .map(|code| (at, code));
+                .and_then(|digits| digits.parse::<i32>().ok());
+            if let Some(code) = code {
+                // The match ends just past the code: the caller checks the
+                // trailing newline there (see find_sentinel's doc).
+                return Some((at, code, at + marker.len() + end));
+            }
         }
         from = at + 1;
     }
@@ -2206,18 +2296,58 @@ mod tests {
             .find_map(|l| l.strip_prefix("Background job started: "))
             .unwrap()
             .to_string();
-        // Poll while it runs: no exit code, no output.
+        // Poll while it runs: no exit code, no output, and the job's age
+        // from its start stamp.
         let running = pool
             .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
             .unwrap();
-        assert!(running.contains("(still running)"), "{running}");
-        // Wait for the job, then poll: its own exit code and output.
+        assert!(running.contains("(still running, "), "{running}");
         std::thread::sleep(Duration::from_secs(2));
         let finished = pool
             .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
             .unwrap();
         assert!(finished.contains("exit code: 0"), "{finished}");
         assert!(finished.contains("job-done"), "{finished}");
+    }
+
+    /// A running job's poll carries its age: the stamp job_start_line
+    /// writes into the job's output file is what turns a poll from a
+    /// numberless wait into one a model can give up on. The regression:
+    /// a silent job polled for half an hour read the same at every poll
+    /// — "(still running)", "(no output yet)" — so the model slept in a
+    /// loop forever.
+    #[test]
+    fn a_running_jobs_poll_reports_its_age() {
+        let dir = unique_test_dir();
+        let pool = pool(dir.path(), 3600);
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        pool.ensure("session-1", &cwd, &[]).unwrap();
+        let start = pool
+            .execute(
+                "session-1",
+                &json!({"command": "sleep 5", "background": true, "_session_cwd": cwd}),
+            )
+            .unwrap();
+        let job = start
+            .lines()
+            .find_map(|l| l.strip_prefix("Background job started: "))
+            .unwrap()
+            .to_string();
+        std::thread::sleep(Duration::from_secs(2));
+        let running = pool
+            .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
+            .unwrap();
+        let age = running
+            .strip_prefix("exit code: (still running, ")
+            .and_then(|rest| rest.strip_suffix(")\n\n(no output yet)"))
+            .unwrap_or_else(|| panic!("running poll must carry the job's age: {running}"));
+        // Two seconds waited, one second of format granularity: the age
+        // reflects elapsed time, it is not a constant zero.
+        let secs = age.trim_end_matches('s').parse::<u64>().unwrap_or(0);
+        assert!(secs >= 1, "age must reflect the wait: {running}");
     }
 
     /// A killed job is gone: best-effort kill (its own shell), then the
@@ -2351,7 +2481,7 @@ mod tests {
         let running = pool
             .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
             .unwrap();
-        assert!(running.contains("(still running)"), "{running}");
+        assert!(running.contains("(still running, "), "{running}");
         // Kill the job; the poll finds nothing after.
         let killed = pool
             .execute(
@@ -2411,7 +2541,7 @@ mod tests {
             let running = pool
                 .execute("session-1", &json!({"job_id": job, "_session_cwd": cwd}))
                 .unwrap();
-            assert!(running.contains("(still running)"), "{running}");
+            assert!(running.contains("(still running, "), "{running}");
         }
         // None finished behind another: all three report their own exit
         // within the same window after the sleep.
@@ -2435,11 +2565,65 @@ mod tests {
         let sentinel = "__POTLATCH_VM_EXIT_1__";
         let mut data = b"junkjunkjunk".to_vec();
         data.extend_from_slice(format!("{sentinel}:7\n").as_bytes());
-        let (at, code) = find_sentinel(&data, sentinel).unwrap();
+        let (at, code, match_end) = find_sentinel(&data, sentinel).unwrap();
         assert_eq!(code, 7);
         assert_eq!(&data[at..at + sentinel.len()], sentinel.as_bytes());
+        // The match ends just past the code, on the line's newline.
+        assert_eq!(data[match_end], b'\n');
         // And not find what is not there.
         assert_eq!(find_sentinel(b"junk", sentinel), None);
         assert_eq!(find_sentinel(&data, "__OTHER__"), None);
+    }
+
+    #[test]
+    fn sentinel_without_its_trailing_newline_is_not_complete() {
+        // The session shell writes the sentinel line in separate write()s.
+        // find_sentinel locates the marker and its code whether or not the
+        // line's newline has arrived; run_line's completeness gate is the
+        // newline check at the returned match end — returning at the code
+        // alone would leave the newline in the pipe to leak into the next
+        // command's read.
+        let sentinel = "__POTLATCH_VM_EXIT_1__";
+        let line = format!("junk{sentinel}:7\n");
+        let (at, code, match_end) = find_sentinel(line.as_bytes(), sentinel).unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(
+            &line.as_bytes()[at..at + sentinel.len()],
+            sentinel.as_bytes()
+        );
+        assert_eq!(line.as_bytes()[match_end], b'\n');
+        // Same line, newline not yet arrived: located, but the caller's
+        // completeness gate does not pass.
+        let incomplete = format!("junk{sentinel}:7");
+        let (_, _, match_end) = find_sentinel(incomplete.as_bytes(), sentinel).unwrap();
+        assert_ne!(incomplete.as_bytes().get(match_end), Some(&b'\n'));
+    }
+
+    #[test]
+    fn job_start_stamp_is_stripped_as_a_whole_leading_line() {
+        assert_eq!(
+            strip_job_start_stamp(b"JOB-START:1729584000\njob output\n"),
+            b"job output\n"
+        );
+        // Not a stamp: a different prefix, a non-numeric stamp line, or a
+        // tail window that starts mid-line — the job's own output is kept.
+        assert_eq!(
+            strip_job_start_stamp(b"JOB-STARTX:1729584000\nout\n"),
+            b"JOB-STARTX:1729584000\nout\n"
+        );
+        assert_eq!(
+            strip_job_start_stamp(b"JOB-START:not-a-number\nout\n"),
+            b"JOB-START:not-a-number\nout\n"
+        );
+        assert_eq!(strip_job_start_stamp(b"9584000\nout\n"), b"9584000\nout\n");
+    }
+
+    #[test]
+    fn job_age_formats_in_units_a_wait_turns_on() {
+        assert_eq!(format_job_age(0), "0s");
+        assert_eq!(format_job_age(42), "42s");
+        assert_eq!(format_job_age(65), "1m05s");
+        assert_eq!(format_job_age(27 * 60), "27m00s");
+        assert_eq!(format_job_age(3600 + 125), "1h02m05s");
     }
 }
