@@ -643,7 +643,12 @@ impl AgentState<'_> {
             return false;
         }
 
-        if let Some(mr) = mr_iid {
+        // The caller may not know the bound MR (crash before the session
+        // recorded it, or the call site never tracked one). Resolve it from
+        // the forge so closing the issue always takes its MR down with it.
+        let mr_to_close =
+            mr_iid.or_else(|| find_open_mr_bound_to_issue(self.forge.as_ref(), issue_iid));
+        if let Some(mr) = mr_to_close {
             let _ = self
                 .forge
                 .add_mr_comment(mr, "Closing this MR — the linked issue has been closed.");
@@ -1077,10 +1082,7 @@ fn apply_active_issue_hold(
     match decide_issue_hold(&issue, scope_label) {
         IssueHold::Keep => true,
         IssueHold::AbandonClosed => {
-            if port.abandon_closed_issue(
-                tracked.issue_iid,
-                watching_mr.then_some(tracked.mr_iid).flatten(),
-            ) {
+            if port.abandon_closed_issue(tracked.issue_iid, tracked.mr_iid) {
                 *active = None;
             }
             false
@@ -4194,6 +4196,17 @@ fn find_open_mr_for_issue(forge: &dyn ForgeClient, issue_iid: u64) -> Option<u64
         .flatten()
 }
 
+/// Resolve an open MR bound to an issue when no session MR is recorded: an
+/// MR whose description closes the issue (`Closes #iid`), else the open MR
+/// sourced from the `issue-<iid>` branch. A merged keyword MR yields `None`
+/// — the issue was already delivered, nothing left to close.
+fn find_open_mr_bound_to_issue(forge: &dyn ForgeClient, issue_iid: u64) -> Option<u64> {
+    if let Some(ClosesLinkedMr::Open(mr_iid)) = closes_keyword_mr_status(forge, issue_iid) {
+        return Some(mr_iid);
+    }
+    find_open_mr_for_issue(forge, issue_iid)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -4993,10 +5006,12 @@ fn extract_mr_description(mr_description: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::agents::forge;
+    use crate::agents::forge::{IssueThreadNote, MergeRequestChangesSnapshot};
     use crate::agents::labels::DO_NOT_IMPLEMENT;
     use crate::core::agent::StructuredOutput;
     use crate::core::agent::schema::conformance;
     use crate::core::agent::validate_agent_config;
+    use std::sync::Mutex;
 
     // -----------------------------------------------------------------
     // Session persistence: tolerant policy. Corrupt/unsupported session
@@ -5142,6 +5157,267 @@ mod tests {
         assert!(!path.exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Abandoning a closed issue must close the MR bound to it, even when
+    // the caller has no MR iid recorded (crash before the session file
+    // saved it, or the call site never tracked one).
+    // -----------------------------------------------------------------
+
+    /// Records mutating forge calls and serves scripted MRs, so tests can
+    /// assert exactly which MRs an abandonment flow closed.
+    struct ScriptedForge {
+        mrs: Vec<MergeRequest>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedForge {
+        fn with_mrs(mrs: Vec<MergeRequest>) -> Self {
+            Self {
+                mrs,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn close_mr_calls(&self) -> Vec<u64> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c.strip_prefix("close_mr:").and_then(|s| s.parse().ok()))
+                .collect()
+        }
+    }
+
+    fn scripted_mr(iid: u64, description: &str, source_branch: &str, state: &str) -> MergeRequest {
+        MergeRequest {
+            iid,
+            title: format!("MR !{iid}"),
+            description: description.to_string(),
+            source_branch: source_branch.to_string(),
+            target_branch: "main".to_string(),
+            state: state.to_string(),
+            sha: None,
+            labels: None,
+            has_conflicts: false,
+        }
+    }
+
+    impl ForgeClient for ScriptedForge {
+        fn list_issues(&self) -> Result<Vec<Issue>> {
+            Ok(Vec::new())
+        }
+        fn get_issue(&self, _iid: u64) -> Result<Issue> {
+            anyhow::bail!("get_issue not expected in this test")
+        }
+        fn create_issue(&self, _title: &str, _description: &str) -> Result<u64> {
+            anyhow::bail!("create_issue not expected in this test")
+        }
+        fn close_issue(&self, iid: u64) -> Result<()> {
+            self.record(format!("close_issue:{iid}"));
+            Ok(())
+        }
+        fn update_issue_description(&self, iid: u64, _description: &str) -> Result<()> {
+            self.record(format!("update_issue_description:{iid}"));
+            Ok(())
+        }
+        fn add_issue_label(&self, iid: u64, label: &str) -> Result<()> {
+            self.record(format!("add_issue_label:{iid}:{label}"));
+            Ok(())
+        }
+        fn remove_issue_label(&self, iid: u64, label: &str) -> Result<()> {
+            self.record(format!("remove_issue_label:{iid}:{label}"));
+            Ok(())
+        }
+        fn add_issue_comment(&self, iid: u64, _body: &str) -> Result<()> {
+            self.record(format!("add_issue_comment:{iid}"));
+            Ok(())
+        }
+        fn get_issue_comments(&self, _iid: u64) -> Result<Vec<Comment>> {
+            Ok(Vec::new())
+        }
+        fn get_issue_thread_notes(&self, _iid: u64) -> Result<Vec<IssueThreadNote>> {
+            Ok(Vec::new())
+        }
+        fn list_merge_requests(&self) -> Result<Vec<MergeRequest>> {
+            Ok(self.mrs.clone())
+        }
+        fn get_merge_request(&self, iid: u64) -> Result<MergeRequest> {
+            self.mrs
+                .iter()
+                .find(|mr| mr.iid == iid)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("MR !{iid} not scripted"))
+        }
+        fn find_open_mr_by_source_branch(&self, source_branch: &str) -> Result<Option<u64>> {
+            Ok(self
+                .mrs
+                .iter()
+                .find(|mr| mr.source_branch == source_branch && mr.state == "opened")
+                .map(|mr| mr.iid))
+        }
+        fn find_mrs_by_source_branch(&self, source_branch: &str) -> Result<Vec<u64>> {
+            Ok(self
+                .mrs
+                .iter()
+                .filter(|mr| mr.source_branch == source_branch)
+                .map(|mr| mr.iid)
+                .collect())
+        }
+        fn get_merge_request_changes(&self, _iid: u64) -> Result<MergeRequestChangesSnapshot> {
+            anyhow::bail!("get_merge_request_changes not expected in this test")
+        }
+        fn create_merge_request(
+            &self,
+            _source_branch: &str,
+            _target_branch: &str,
+            _title: &str,
+            _description: &str,
+        ) -> Result<u64> {
+            anyhow::bail!("create_merge_request not expected in this test")
+        }
+        fn merge_mr(&self, iid: u64) -> Result<()> {
+            self.record(format!("merge_mr:{iid}"));
+            Ok(())
+        }
+        fn close_mr(&self, iid: u64) -> Result<()> {
+            self.record(format!("close_mr:{iid}"));
+            Ok(())
+        }
+        fn update_mr_title_description(
+            &self,
+            iid: u64,
+            _title: Option<&str>,
+            _description: Option<&str>,
+        ) -> Result<()> {
+            self.record(format!("update_mr_metadata:{iid}"));
+            Ok(())
+        }
+        fn add_mr_label_with_retries(&self, iid: u64, label: &str) -> Result<()> {
+            self.record(format!("add_mr_label:{iid}:{label}"));
+            Ok(())
+        }
+        fn remove_mr_label(&self, iid: u64, label: &str) -> Result<()> {
+            self.record(format!("remove_mr_label:{iid}:{label}"));
+            Ok(())
+        }
+        fn add_mr_comment(&self, iid: u64, _comment: &str) -> Result<()> {
+            self.record(format!("add_mr_comment:{iid}"));
+            Ok(())
+        }
+        fn add_mr_discussion(&self, iid: u64, _body: &str) -> Result<()> {
+            self.record(format!("add_mr_discussion:{iid}"));
+            Ok(())
+        }
+        fn add_resolved_mr_discussion(&self, iid: u64, _body: &str) -> Result<()> {
+            self.record(format!("add_resolved_mr_discussion:{iid}"));
+            Ok(())
+        }
+        fn get_mr_comments(&self, _iid: u64) -> Result<Vec<Comment>> {
+            Ok(Vec::new())
+        }
+        fn get_unresolved_discussion_ids(&self, _iid: u64) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn get_unresolved_discussion_count(&self, _iid: u64) -> Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+        fn resolve_discussion(&self, mr_iid: u64, _discussion_id: &str) -> Result<()> {
+            self.record(format!("resolve_discussion:{mr_iid}"));
+            Ok(())
+        }
+        fn reply_to_discussion(
+            &self,
+            mr_iid: u64,
+            _discussion_id: &str,
+            _body: &str,
+        ) -> Result<()> {
+            self.record(format!("reply_to_discussion:{mr_iid}"));
+            Ok(())
+        }
+        fn is_not_found(&self, err: &anyhow::Error) -> bool {
+            is_not_found(err)
+        }
+    }
+
+    fn abandon_runtime(name: &str, forge: Arc<dyn ForgeClient>) -> TestRuntime {
+        let dir = worker_session_test_dir(name);
+        fs::create_dir_all(&dir).unwrap();
+        let mut rt = test_runtime(&dir.to_string_lossy(), "worker-0");
+        rt.forge = forge;
+        rt
+    }
+
+    #[test]
+    fn abandon_closed_issue_resolves_the_bound_mr_via_the_closes_keyword() {
+        // No session MR recorded; the forge has an open MR whose description
+        // closes the issue (on an unrelated branch, so only the keyword can
+        // find it) plus an open MR for a different issue that must stay open.
+        let forge = Arc::new(ScriptedForge::with_mrs(vec![
+            scripted_mr(30, "Closes #7", "feature/unrelated", "opened"),
+            scripted_mr(31, "Closes #8", "feature/other", "opened"),
+        ]));
+        let probe = Arc::clone(&forge);
+        let rt = abandon_runtime("abandon-keyword", forge);
+        let state = test_agent_state(&rt);
+
+        assert!(state.abandon_closed_issue(7, None));
+        assert_eq!(probe.close_mr_calls(), vec![30]);
+
+        let _ = fs::remove_dir_all(worker_session_test_dir("abandon-keyword"));
+    }
+
+    #[test]
+    fn abandon_closed_issue_falls_back_to_the_issue_branch_mr() {
+        // No keyword link either: the open MR sourced from `issue-7` is the
+        // bound MR and must be closed.
+        let forge = Arc::new(ScriptedForge::with_mrs(vec![
+            scripted_mr(30, "", "issue-7", "opened"),
+            scripted_mr(31, "", "issue-8", "opened"),
+        ]));
+        let probe = Arc::clone(&forge);
+        let rt = abandon_runtime("abandon-branch", forge);
+        let state = test_agent_state(&rt);
+
+        assert!(state.abandon_closed_issue(7, None));
+        assert_eq!(probe.close_mr_calls(), vec![30]);
+
+        let _ = fs::remove_dir_all(worker_session_test_dir("abandon-branch"));
+    }
+
+    #[test]
+    fn abandon_closed_issue_prefers_the_caller_tracked_mr_and_never_closes_merged_ones() {
+        // A tracked MR wins over the forge-resolved one...
+        let forge = Arc::new(ScriptedForge::with_mrs(vec![
+            scripted_mr(9, "", "issue-7", "opened"),
+            scripted_mr(30, "Closes #7", "feature/unrelated", "opened"),
+        ]));
+        let probe = Arc::clone(&forge);
+        let rt = abandon_runtime("abandon-tracked", forge);
+        let state = test_agent_state(&rt);
+        assert!(state.abandon_closed_issue(7, Some(9)));
+        assert_eq!(probe.close_mr_calls(), vec![9]);
+        let _ = fs::remove_dir_all(worker_session_test_dir("abandon-tracked"));
+
+        // ...and a merged keyword MR means the issue was delivered: nothing
+        // is closed when no open MR remains.
+        let merged = Arc::new(ScriptedForge::with_mrs(vec![scripted_mr(
+            30,
+            "Closes #7",
+            "issue-7",
+            "merged",
+        )]));
+        let merged_probe = Arc::clone(&merged);
+        let rt = abandon_runtime("abandon-merged", merged);
+        let state = test_agent_state(&rt);
+        assert!(state.abandon_closed_issue(7, None));
+        assert!(merged_probe.close_mr_calls().is_empty());
+        let _ = fs::remove_dir_all(worker_session_test_dir("abandon-merged"));
     }
 
     // -----------------------------------------------------------------
