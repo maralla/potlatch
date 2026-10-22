@@ -8,5 +8,6 @@ pub mod periodic;
 pub mod registry;
 pub mod retry;
 pub mod runtime;
+pub mod scope;
 pub(crate) mod supervisor;
 pub mod workflow;

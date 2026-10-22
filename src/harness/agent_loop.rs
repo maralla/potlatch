@@ -17,6 +17,7 @@ use super::context::{Context, ContextEntry, ContextKind, Role};
 use super::prompt;
 use super::tools::ToolRegistry;
 use super::tools::structured_output::COMPLETION_NOTICE;
+use crate::core::scope::SessionScope;
 
 /// Maximum character length for a generic tool result stored in context.
 /// Larger results are truncated with a marker, keeping the first portion (most
@@ -150,9 +151,9 @@ impl AgentLoop {
     /// Restore the context from a previous run's transcript. Returns whether
     /// a transcript was found and restored; a fresh session (or a corrupt
     /// transcript) starts empty and re-runs `init_context`.
-    pub fn restore_context(&mut self, cwd: &str, context_channels: &[(String, String)]) -> bool {
+    pub fn restore_context(&mut self, context_channels: &[(String, String)]) -> bool {
         let Some(path) = self.context_path.clone() else {
-            self.init_context(cwd, context_channels);
+            self.init_context(context_channels);
             return false;
         };
         let restored = fs::read_to_string(&path)
@@ -165,7 +166,7 @@ impl AgentLoop {
                 true
             }
             None => {
-                self.init_context(cwd, context_channels);
+                self.init_context(context_channels);
                 false
             }
         }
@@ -195,7 +196,7 @@ impl AgentLoop {
     /// registered by in-process agents on the bus (e.g. durable project memory
     /// from the memory agent). Called once at session creation. Subsequent
     /// `session/prompt` calls reuse this context — true single long session.
-    pub fn init_context(&mut self, _cwd: &str, context_channels: &[(String, String)]) {
+    pub fn init_context(&mut self, context_channels: &[(String, String)]) {
         let descriptions = self.tools.tool_descriptions();
         let system_prompt = prompt::system_prompt(&descriptions);
         self.context
@@ -220,10 +221,10 @@ impl AgentLoop {
     pub fn run(
         &mut self,
         prompt: &str,
-        cwd: &str,
+        scope: &SessionScope,
         on_chunk: Option<&StreamCallback>,
     ) -> Result<String> {
-        self.run_with_turn_callback(prompt, cwd, on_chunk, None)
+        self.run_with_turn_callback(prompt, scope, on_chunk, None)
     }
 
     /// Run the agentic loop with an optional turn callback invoked after each
@@ -232,7 +233,7 @@ impl AgentLoop {
     pub fn run_with_turn_callback(
         &mut self,
         prompt: &str,
-        cwd: &str,
+        scope: &SessionScope,
         on_chunk: Option<&StreamCallback>,
         on_turn: Option<&super::client::TurnCallback>,
     ) -> Result<String> {
@@ -408,7 +409,7 @@ impl AgentLoop {
                     }
                     let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
                     let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-                    let result = execute_and_log(tools_ref, name, &args, cwd);
+                    let result = execute_and_log(tools_ref, name, &args, scope);
                     early_cache_for_cb.lock().unwrap().insert(idx, result);
                     Some(String::new()) // non-None signals "executed"
                 };
@@ -441,7 +442,7 @@ impl AgentLoop {
                                 if let Some(cached) = cache.get(&idx) {
                                     return cached.clone();
                                 }
-                                execute_and_log(tools_ref, name, args, cwd)
+                                execute_and_log(tools_ref, name, args, scope)
                             })
                             .collect()
                     } else {
@@ -455,7 +456,7 @@ impl AgentLoop {
                                     if let Some(cached) = cache.get(&idx) {
                                         return s.spawn(move || cached.clone());
                                     }
-                                    s.spawn(move || execute_and_log(tools_ref, name, args, cwd))
+                                    s.spawn(move || execute_and_log(tools_ref, name, args, scope))
                                 })
                                 .collect();
                             handles
@@ -552,7 +553,7 @@ impl AgentLoop {
             }
 
             // Check finish reason
-            match self.handle_response(&response, cwd)? {
+            match self.handle_response(&response, scope)? {
                 LoopControl::Stop => {
                     self.persist_context();
                     return Ok(response.content);
@@ -576,7 +577,11 @@ impl AgentLoop {
         }
     }
 
-    fn handle_response(&mut self, response: &ChatResponse, cwd: &str) -> Result<LoopControl> {
+    fn handle_response(
+        &mut self,
+        response: &ChatResponse,
+        scope: &SessionScope,
+    ) -> Result<LoopControl> {
         if response.finish_reason == "stop" || response.tool_calls.is_empty() {
             // Model is done — store the final text
             if !response.content.is_empty() {
@@ -644,7 +649,7 @@ impl AgentLoop {
                 })
                 .collect()
         } else {
-            self.execute_tool_calls_concurrent(&response.tool_calls, cwd)
+            self.execute_tool_calls_concurrent(&response.tool_calls, scope)
         };
 
         for (name, tc_id, result) in tool_results {
@@ -697,7 +702,7 @@ impl AgentLoop {
     fn execute_tool_calls_concurrent(
         &self,
         tool_calls: &[Value],
-        cwd: &str,
+        scope: &SessionScope,
     ) -> Vec<(String, String, String)> {
         if tool_calls.is_empty() {
             return Vec::new();
@@ -722,7 +727,7 @@ impl AgentLoop {
             return parsed
                 .iter()
                 .map(|(name, tc_id, args)| {
-                    let result = self.execute_one(name, args, cwd);
+                    let result = self.execute_one(name, args, scope);
                     (name.clone(), tc_id.clone(), result)
                 })
                 .collect();
@@ -735,7 +740,7 @@ impl AgentLoop {
                 .iter()
                 .map(|(name, tc_id, args)| {
                     s.spawn(move || {
-                        let result = self.execute_one(name, args, cwd);
+                        let result = self.execute_one(name, args, scope);
                         (name.clone(), tc_id.clone(), result)
                     })
                 })
@@ -757,8 +762,8 @@ impl AgentLoop {
     }
 
     /// Execute a single tool call, logging the invocation and result.
-    fn execute_one(&self, name: &str, args: &Value, cwd: &str) -> String {
-        execute_and_log(&self.tools, name, args, cwd)
+    fn execute_one(&self, name: &str, args: &Value, scope: &SessionScope) -> String {
+        execute_and_log(&self.tools, name, args, scope)
     }
 
     /// Detect if the agent is repeating the same tool call.
@@ -843,11 +848,11 @@ fn compact_summary_fallback(content: &str, label: &str) -> String {
 /// Execute a single tool call against the registry, logging the invocation and
 /// result. Used by both the overlap execution callback and the fallback
 /// sequential executor so that tool call details are always logged.
-fn execute_and_log(tools: &ToolRegistry, name: &str, args: &Value, cwd: &str) -> String {
+fn execute_and_log(tools: &ToolRegistry, name: &str, args: &Value, scope: &SessionScope) -> String {
     let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
     info!("harness: executing tool {name} args={args_str}");
 
-    match tools.execute(name, args, cwd) {
+    match tools.execute(name, args, scope) {
         Ok(result) => {
             info!(
                 "harness: tool {name} result: {}",
@@ -1017,6 +1022,11 @@ mod tests {
     use super::super::tools::test_util;
     use super::*;
 
+    /// A cwd-only session scope for loop tests.
+    fn scope(cwd: &str) -> SessionScope {
+        SessionScope::new(cwd, std::iter::empty::<std::path::PathBuf>())
+    }
+
     #[test]
     fn loop_runs_single_tool_call_then_stops() {
         let llm = Arc::new(FakeChatClient::new(vec![
@@ -1044,12 +1054,7 @@ mod tests {
             },
         ]));
 
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut SessionStates::new(),
-            "",
-            &Default::default(),
-            None,
-        );
+        let tools = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), &scope(""), None);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(
             llm,
@@ -1059,9 +1064,9 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context("/tmp", &[]);
+        agent.init_context(&[]);
 
-        let result = agent.run("run echo hi", "/tmp", None).unwrap();
+        let result = agent.run("run echo hi", &scope("/tmp"), None).unwrap();
         assert!(result.contains("Done"));
     }
 
@@ -1131,12 +1136,7 @@ mod tests {
             },
         ]));
 
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut SessionStates::new(),
-            "",
-            &Default::default(),
-            None,
-        );
+        let tools = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), &scope(""), None);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(
             llm,
@@ -1146,9 +1146,11 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context("/tmp", &[]);
+        agent.init_context(&[]);
 
-        let result = agent.run("test error recovery", "/tmp", None).unwrap();
+        let result = agent
+            .run("test error recovery", &scope("/tmp"), None)
+            .unwrap();
         assert!(result.contains("Recovered"));
     }
 
@@ -1179,12 +1181,7 @@ mod tests {
             },
         ]));
 
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut SessionStates::new(),
-            "",
-            &Default::default(),
-            None,
-        );
+        let tools = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), &scope(""), None);
         let cancel = Arc::new(AtomicBool::new(true)); // Pre-cancelled
         let mut agent = AgentLoop::new(
             llm,
@@ -1194,9 +1191,9 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context("/tmp", &[]);
+        agent.init_context(&[]);
 
-        let result = agent.run("test cancel", "/tmp", None).unwrap();
+        let result = agent.run("test cancel", &scope("/tmp"), None).unwrap();
         assert!(result.contains("cancelled"));
     }
 
@@ -1240,12 +1237,7 @@ mod tests {
             },
         ]));
 
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut SessionStates::new(),
-            "",
-            &Default::default(),
-            None,
-        );
+        let tools = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), &scope(""), None);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(
             llm,
@@ -1255,14 +1247,14 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context("/tmp", &[]);
+        agent.init_context(&[]);
 
         // First prompt: a tool-call round plus the final stop round = 2 turns.
-        agent.run("first prompt", "/tmp", None).unwrap();
+        agent.run("first prompt", &scope("/tmp"), None).unwrap();
         assert_eq!(agent.turn, 2);
 
         // The counter spans prompts in the same session — it does not reset.
-        agent.run("second prompt", "/tmp", None).unwrap();
+        agent.run("second prompt", &scope("/tmp"), None).unwrap();
         assert_eq!(agent.turn, 3);
     }
 
@@ -1305,12 +1297,7 @@ mod tests {
             },
         ));
 
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut SessionStates::new(),
-            "",
-            &Default::default(),
-            None,
-        );
+        let tools = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), &scope(""), None);
         let cancel = Arc::new(AtomicBool::new(false));
         let inject_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let mut agent = AgentLoop::new(
@@ -1321,7 +1308,7 @@ mod tests {
             cancel,
             Arc::clone(&inject_queue),
         );
-        agent.init_context("/tmp", &[]);
+        agent.init_context(&[]);
 
         // Push an injected message before running — it will be drained on
         // the first iteration and appear in the first LLM call.
@@ -1330,7 +1317,7 @@ mod tests {
             .unwrap()
             .push_back("injected message".into());
 
-        let result = agent.run("original prompt", "/tmp", None).unwrap();
+        let result = agent.run("original prompt", &scope("/tmp"), None).unwrap();
         assert!(result.contains("Done with injected message"));
 
         // The first LLM call should contain both the original prompt and the
@@ -1481,12 +1468,7 @@ mod tests {
             },
         ]));
 
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut SessionStates::new(),
-            "",
-            &Default::default(),
-            None,
-        );
+        let tools = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), &scope(""), None);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(
             llm,
@@ -1496,9 +1478,11 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context(dir.as_str(), &[]);
+        agent.init_context(&[]);
 
-        let result = agent.run("write then read", dir.as_str(), None).unwrap();
+        let result = agent
+            .run("write then read", &scope(dir.as_str()), None)
+            .unwrap();
         assert!(result.contains("Done"));
         // The read result should contain the content written by write,
         // proving sequential execution preserved the order.
@@ -1602,12 +1586,7 @@ mod tests {
             vec![tool_call],
         ));
 
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut SessionStates::new(),
-            "",
-            &Default::default(),
-            None,
-        );
+        let tools = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), &scope(""), None);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(
             llm,
@@ -1617,9 +1596,11 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context(dir.as_str(), &[]);
+        agent.init_context(&[]);
 
-        let result = agent.run("read target.txt", dir.as_str(), None).unwrap();
+        let result = agent
+            .run("read target.txt", &scope(dir.as_str()), None)
+            .unwrap();
         // The file content should appear in the context (via tool result) even
         // though it was executed speculatively.
         assert!(result.contains("Done"));
@@ -1719,12 +1700,7 @@ mod tests {
             },
         ]));
 
-        let tools = ToolRegistry::with_builtin_tools(
-            &mut SessionStates::new(),
-            "",
-            &Default::default(),
-            None,
-        );
+        let tools = ToolRegistry::with_builtin_tools(&mut SessionStates::new(), &scope(""), None);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = AgentLoop::new(
             llm,
@@ -1734,9 +1710,9 @@ mod tests {
             cancel,
             Arc::new(Mutex::new(VecDeque::new())),
         );
-        agent.init_context("/tmp", &[]);
+        agent.init_context(&[]);
 
-        let result = agent.run("do something", "/tmp", None);
+        let result = agent.run("do something", &scope("/tmp"), None);
         // The 400 propagates because sanitization found nothing to fix
         // (arguments were already valid). This is correct — don't retry
         // when we can't fix the problem.

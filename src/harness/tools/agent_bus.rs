@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::Tool;
 use crate::core::bus::RemoteAgentToolDefinition;
+use crate::core::scope::SessionScope;
 
 pub trait AgentToolCaller: Send + Sync {
     /// Forward a tool call to the owning agent. `session_id` is the
@@ -28,13 +29,6 @@ pub struct RemoteAgentTool {
     /// every call so bus-served agents can scope per-caller state (e.g.
     /// the subagent agent owns each subagent to its caller's task session).
     session_id: String,
-    /// The session's declared write roots: the directories the calling
-    /// agent passed for its session (e.g. the QA agent's session
-    /// directory) — the same list the write/edit tools permit outside the
-    /// cwd. Forwarded with every call so bus-served tools that sandbox the
-    /// session's commands (the sandal agent's shell) can share the list
-    /// into the sandbox; every other handler ignores it.
-    write_roots: Vec<String>,
 }
 
 impl RemoteAgentTool {
@@ -42,13 +36,11 @@ impl RemoteAgentTool {
         caller: Arc<dyn AgentToolCaller>,
         definition: RemoteAgentToolDefinition,
         session_id: &str,
-        write_roots: Vec<String>,
     ) -> Self {
         Self {
             caller,
             definition,
             session_id: session_id.to_string(),
-            write_roots,
         }
     }
 }
@@ -65,26 +57,14 @@ impl Tool for RemoteAgentTool {
         })
     }
 
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
-        // The session's working directory and declared write roots ride the
-        // call as request metadata (like the session id): bus-served tools
-        // that need them (the sandal agent's shell tool boots the session's
-        // VM with the cwd and shares the roots into it) read them from
-        // `_session_cwd`/`_session_write_roots`; every other handler
-        // ignores them.
+    fn execute(&self, args: &Value, scope: &SessionScope) -> Result<String> {
+        // The session's file scope rides the call as request metadata (like
+        // the session id): bus-served tools that need it (the sandal agent's
+        // shell tool boots the session's VM with the scope's cwd and shares
+        // its roots into it) parse it back out; every other handler ignores
+        // the keys.
         let mut arguments = args.clone();
-        if let Some(map) = arguments.as_object_mut() {
-            map.insert("_session_cwd".into(), Value::String(cwd.to_string()));
-            map.insert(
-                "_session_write_roots".into(),
-                Value::Array(
-                    self.write_roots
-                        .iter()
-                        .map(|root| Value::String(root.clone()))
-                        .collect(),
-                ),
-            );
-        }
+        scope.write_metadata(&mut arguments);
         let result = self.caller.call(
             &self.definition.target,
             &self.definition.operation,
@@ -144,8 +124,11 @@ mod tests {
                 operation: "run".to_string(),
             },
             "caller-session-1",
-            vec!["/tmp/project-sessions".to_string()],
         )
+    }
+
+    fn scope() -> SessionScope {
+        SessionScope::new("/tmp", ["/tmp/project-sessions"])
     }
 
     #[test]
@@ -170,7 +153,7 @@ mod tests {
         }
         let tool = tool_with_caller(Arc::new(CapturingCaller(capture)));
         let result = tool
-            .execute(&serde_json::json!({"value": "hello"}), "/tmp")
+            .execute(&serde_json::json!({"value": "hello"}), &scope())
             .unwrap();
         assert_eq!(
             received.lock().unwrap().as_deref(),
@@ -193,7 +176,6 @@ mod tests {
     fn tool() -> RemoteAgentTool {
         tool_with_caller(Arc::new(EchoCaller))
     }
-
     #[test]
     fn proxy_schema_is_owned_by_the_registering_agent() {
         let tool = tool();
@@ -208,7 +190,7 @@ mod tests {
     #[test]
     fn proxy_returns_the_parent_call_result() {
         let result = tool()
-            .execute(&serde_json::json!({"value": "hello"}), "/tmp")
+            .execute(&serde_json::json!({"value": "hello"}), &scope())
             .unwrap();
         assert!(result.contains("hello"));
     }
@@ -216,7 +198,7 @@ mod tests {
     #[test]
     fn proxy_returns_string_results_without_json_encoding() {
         let result = tool_with_caller(Arc::new(TextCaller))
-            .execute(&serde_json::json!({}), "/tmp")
+            .execute(&serde_json::json!({}), &scope())
             .unwrap();
         assert_eq!(result, "# Rendered\n\nContent.");
     }

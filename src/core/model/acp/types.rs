@@ -97,9 +97,9 @@ pub struct NewSessionParams {
         rename = "context_channels"
     )]
     pub context_channels: Option<Vec<Value>>,
-    /// Directories the harness permits `write`/`edit` to touch outside the
-    /// session cwd (via `outside_cwd: true`). Potlatch extension; ignored by
-    /// ACP servers that do not implement it.
+    /// Directories the harness's file tools may touch beyond the session
+    /// cwd — together with the cwd, the session's whole file scope.
+    /// Potlatch extension; ignored by ACP servers that do not implement it.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

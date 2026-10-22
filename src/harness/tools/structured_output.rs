@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::Tool;
+use crate::core::scope::SessionScope;
 
 /// Shared side-channel cell holding the JSON the model emitted via a
 /// structured-output tool call.
@@ -67,7 +68,7 @@ impl Tool for StructuredOutputTool {
         self.schema.clone()
     }
 
-    fn execute(&self, args: &Value, _cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, _scope: &SessionScope) -> Result<String> {
         let mut args = args.clone();
         let decoded = decode_stringified_containers(&self.schema["parameters"], &mut args);
         if decoded > 0 {
@@ -222,6 +223,11 @@ fn branch_matches(branch: &Value, value: &Value) -> bool {
 mod tests {
     use super::*;
 
+    /// A cwd-only session scope for tool tests.
+    fn scope(cwd: &str) -> crate::core::scope::SessionScope {
+        crate::core::scope::SessionScope::new(cwd, std::iter::empty::<std::path::PathBuf>())
+    }
+
     #[test]
     fn terminal_result_tells_the_model_to_stop() {
         let (tool, _cell) = StructuredOutputTool::with_terminal(
@@ -231,7 +237,7 @@ mod tests {
             true,
         );
         let result = tool
-            .execute(&json!({"decision": "approve"}), "/tmp")
+            .execute(&json!({"decision": "approve"}), &scope("/tmp"))
             .unwrap();
         // The completion notice IS the deliverable under test: without it
         // the model re-emits the decision (observed: three identical
@@ -250,7 +256,7 @@ mod tests {
             false,
         );
         let args = json!({"mr_title": "Add tests"});
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         assert_eq!(result, "handoff recorded.");
         let captured = cell.lock().unwrap().clone();
         assert_eq!(captured, Some(json!({"mr_title": "Add tests"})));
@@ -264,7 +270,7 @@ mod tests {
             json!({"type": "object"}),
             false,
         );
-        let result = tool.execute(&Value::Null, "/tmp");
+        let result = tool.execute(&Value::Null, &scope("/tmp"));
         let error = result.unwrap_err().to_string();
         assert!(error.contains("arrived with NO arguments"), "{error}");
         assert!(error.contains("transport"), "{error}");
@@ -280,7 +286,7 @@ mod tests {
             json!({"type": "object"}),
             false,
         );
-        let result = tool.execute(&json!({}), "/tmp");
+        let result = tool.execute(&json!({}), &scope("/tmp"));
         let error = result.unwrap_err().to_string();
         assert!(error.contains("EMPTY arguments"), "{error}");
         assert!(error.contains("transport"), "{error}");
@@ -296,7 +302,7 @@ mod tests {
             json!({"type": "object"}),
             false,
         );
-        let result = tool.execute(&json!([1, 2, 3]), "/tmp");
+        let result = tool.execute(&json!([1, 2, 3]), &scope("/tmp"));
         let error = result.unwrap_err().to_string();
         assert!(error.contains("must be a JSON object"), "{error}");
         assert!(error.contains("received"), "{error}");
@@ -343,7 +349,7 @@ mod tests {
                 "decision": "split",
                 "sub_issues": "[{\"title\":\"First\"},{\"title\":\"Second\"}]"
             }),
-            "/tmp",
+            &scope("/tmp"),
         )
         .unwrap();
 
@@ -381,7 +387,7 @@ mod tests {
 
         tool.execute(
             &json!({"config": "{\"labels\":\"[\\\"one\\\",\\\"two\\\"]\"}"}),
-            "/tmp",
+            &scope("/tmp"),
         )
         .unwrap();
 
@@ -403,8 +409,11 @@ mod tests {
         let (tool, cell) =
             StructuredOutputTool::with_terminal("report".into(), "Report it.", parameters, false);
 
-        tool.execute(&json!({"items": "not json", "metadata": "[1,2]"}), "/tmp")
-            .unwrap();
+        tool.execute(
+            &json!({"items": "not json", "metadata": "[1,2]"}),
+            &scope("/tmp"),
+        )
+        .unwrap();
 
         assert_eq!(
             cell.lock().unwrap().clone(),
@@ -420,8 +429,10 @@ mod tests {
             json!({"type": "object"}),
             false,
         );
-        tool.execute(&json!({"mr_title": "A"}), "/tmp").unwrap();
-        tool.execute(&json!({"mr_title": "B"}), "/tmp").unwrap();
+        tool.execute(&json!({"mr_title": "A"}), &scope("/tmp"))
+            .unwrap();
+        tool.execute(&json!({"mr_title": "B"}), &scope("/tmp"))
+            .unwrap();
         let captured = cell.lock().unwrap().clone();
         assert_eq!(captured, Some(json!({"mr_title": "B"})));
     }
@@ -434,7 +445,7 @@ mod tests {
             json!({"type": "object"}),
             false,
         );
-        let result = tool.execute(&json!("not an object"), "/tmp");
+        let result = tool.execute(&json!("not an object"), &scope("/tmp"));
         assert!(result.is_err());
     }
 

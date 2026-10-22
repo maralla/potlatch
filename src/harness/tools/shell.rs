@@ -6,7 +6,6 @@ use std::io::Read;
 use std::io::{Error, ErrorKind};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +18,7 @@ use serde_json::{Value, json};
 use crate::util::dies_with_parent;
 
 use super::Tool;
+use crate::core::scope::SessionScope;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_OUTPUT: usize = 50_000;
@@ -461,7 +461,7 @@ impl ShellTool {
     /// `SessionStates` if not already present (first prompt), then retrieves
     /// it so background jobs survive across prompts and are killed on
     /// session close.
-    pub fn new(states: &mut super::SessionStates, _cwd: &str) -> Self {
+    pub fn new(states: &mut super::SessionStates) -> Self {
         if states.get::<JobTable>().is_none() {
             states.insert(Arc::new(JobTable::new()));
         }
@@ -486,7 +486,7 @@ impl Tool for ShellTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `write` or `edit` instead. To run a long-running command in the background, set `background: true`; you get a job id back and can poll its output later with `job_id`, or terminate it with `job_id` + `kill: true`. Poll a background job a couple of times, not forever: if a job has produced no new output after a few polls over several minutes, terminate it (`kill: true`) and run a narrower command instead of sleeping and re-polling in a loop. Set `outside_cwd: true` when you legitimately need to `cd` into or operate on a path outside the working directory (e.g. an agent session directory explicitly permitted by the task instructions).",
+            "description": "Run a shell command in the working directory (cwd). You are already in the working directory — no need to `cd` into it. Returns stdout, stderr, and exit code. Commands have a timeout (default 120s). Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `write` or `edit` instead. To run a long-running command in the background, set `background: true`; you get a job id back and can poll its output later with `job_id`, or terminate it with `job_id` + `kill: true`. Poll a background job a couple of times, not forever: if a job has produced no new output after a few polls over several minutes, terminate it (`kill: true`) and run a narrower command instead of sleeping and re-polling in a loop.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -510,18 +510,13 @@ impl Tool for ShellTool {
                         "type": "boolean",
                         "description": "When true with `job_id`, terminate the background job."
                     },
-                    "outside_cwd": {
-                        "type": "boolean",
-                        "description": "When true, suppress the warning about `cd`-ing to a path outside the working directory. Use this when the task instructions explicitly direct you to operate on a path outside the workspace (e.g. running a script from an agent session directory). Default false.",
-                        "default": false
-                    }
                 },
                 "required": []
             }
         })
     }
 
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, scope: &SessionScope) -> Result<String> {
         // An empty `job_id` counts as absent: models sometimes fill every
         // schema property with defaults, and an empty poll target would
         // otherwise shadow the `command` and spin the loop on
@@ -546,20 +541,6 @@ impl Tool for ShellTool {
             .ok_or_else(|| anyhow::anyhow!("missing 'command' argument"))?;
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(self.timeout_secs);
         let background = args["background"].as_bool().unwrap_or(false);
-        let outside_cwd = args["outside_cwd"].as_bool().unwrap_or(false);
-
-        // Detect wrong-directory `cd` prefixes and warn. We don't strip or
-        // modify the command — if the model cd's to the wrong path, the
-        // command fails naturally, which is clearer feedback than silently
-        // fixing it. The warning is prepended to the tool result so the model
-        // sees it. Suppressed when the caller explicitly opted into operating
-        // outside the working directory (e.g. running a script from an agent
-        // session directory).
-        let cd_warning = if outside_cwd {
-            None
-        } else {
-            detect_wrong_cd(command, cwd)
-        };
 
         // Detect file-writing patterns and log a warning. We don't block the
         // command (some legitimate uses exist, e.g. `git commit` writes files),
@@ -572,13 +553,8 @@ impl Tool for ShellTool {
         }
 
         if background {
-            let id = self.jobs.spawn(command, cwd)?;
-            let mut result = format!("Background job started: {id}\ncommand: {command}");
-            if let Some(ref warning) = cd_warning {
-                result.push_str("\n\n");
-                result.push_str(warning);
-            }
-            return Ok(result);
+            let id = self.jobs.spawn(command, scope.cwd())?;
+            return Ok(format!("Background job started: {id}\ncommand: {command}"));
         }
 
         let mut cmd = if cfg!(target_os = "windows") {
@@ -591,7 +567,7 @@ impl Tool for ShellTool {
             c
         };
 
-        cmd.current_dir(cwd);
+        cmd.current_dir(scope.cwd());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.stdin(Stdio::null());
@@ -698,10 +674,6 @@ impl Tool for ShellTool {
                 "Command timed out after {timeout_secs}s and was killed.\n"
             ));
         }
-        if let Some(ref warning) = cd_warning {
-            result.push_str(warning);
-            result.push_str("\n\n");
-        }
         if !stdout_str.is_empty() {
             result.push_str("stdout:\n");
             result.push_str(&stdout_str);
@@ -738,77 +710,6 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// Detect a leading `cd <path> &&` (or `cd <path>;`) prefix that targets a
-/// directory other than the working directory. The shell tool already runs in
-/// the working directory, so such a `cd` sends the command to the wrong place.
-///
-/// We do NOT strip or modify the command — if the model cd's to the wrong
-/// path, the command fails naturally, which is clearer feedback than silently
-/// fixing it. Instead we return a warning string that is prepended to the tool
-/// result so the model sees it. Returns `None` when there is no `cd` prefix,
-/// the `cd` targets the working directory, or the `cd` is a standalone
-/// command with no separator.
-fn detect_wrong_cd(command: &str, cwd: &str) -> Option<String> {
-    let trimmed = command.trim_start();
-
-    // Match `cd <path> && <rest>` or `cd <path>;<rest>`.
-    let after_cd = trimmed.strip_prefix("cd ")?;
-
-    // Find the separator: `&&` or `;`
-    let sep_pos = after_cd.find("&&").or_else(|| after_cd.find(';'))?;
-    let rest = after_cd[sep_pos..]
-        .trim_start_matches("&&")
-        .trim_start_matches(';')
-        .trim_start();
-
-    if rest.is_empty() {
-        return None;
-    }
-
-    let cd_path = after_cd[..sep_pos]
-        .trim()
-        .trim_matches('\'')
-        .trim_matches('"');
-
-    // Canonicalize both paths to compare. If we can't canonicalize (path
-    // doesn't exist), treat the cd as wrong — but only for absolute paths.
-    // Relative paths (e.g. `cd subdir && go build`) are legitimate: the model
-    // is cd-ing into a subdirectory to run a command there, not guessing the
-    // wrong project root.
-    let cwd_canonical = Path::new(cwd)
-        .canonicalize()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| cwd.to_string());
-
-    let cd_path_absolute = Path::new(cd_path).is_absolute();
-
-    if !cd_path_absolute {
-        // Relative cd paths are always legitimate — no warning.
-        return None;
-    }
-
-    let cd_canonical = Path::new(cd_path)
-        .canonicalize()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| cd_path.to_string());
-
-    if cd_canonical == cwd_canonical {
-        // Redundant cd to the same directory — harmless, no warning.
-        None
-    } else {
-        // Wrong directory — warn. The warning is visible in the tool result
-        // so the model learns to stop guessing paths. The command runs as
-        // given so the failure (if any) is honest feedback.
-        let warning = format!(
-            "WARNING: the command begins with `cd {cd_path}`, which is not the working directory. \
-             Commands already run in the working directory. Do not use `cd` with absolute paths; \
-             use relative paths instead. The command ran as given."
-        );
-        tracing::warn!("harness: wrong-directory cd '{cd_path}' (cwd is '{cwd_canonical}')");
-        Some(warning)
-    }
-}
-
 /// Detect shell patterns that create or modify files directly, bypassing the
 /// sandboxed `write`/`edit` tools. Returns true for patterns like
 /// `cat > file`, `echo > file`, `sed -i`, `tee file`, `cp`, `mv` into the
@@ -839,6 +740,11 @@ fn looks_like_file_write(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cwd-only session scope for tool tests.
+    fn scope(cwd: &str) -> crate::core::scope::SessionScope {
+        crate::core::scope::SessionScope::new(cwd, std::iter::empty::<std::path::PathBuf>())
+    }
     use crate::harness::tools::test_util;
     use std::fs;
     use std::io;
@@ -972,7 +878,7 @@ mod tests {
     fn runs_echo_command() {
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "echo hello"});
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         assert!(result.contains("hello"));
         assert!(result.contains("exit code: 0"));
     }
@@ -981,7 +887,7 @@ mod tests {
     fn captures_stderr() {
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "echo err >&2"});
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         assert!(result.contains("err"));
     }
 
@@ -989,7 +895,7 @@ mod tests {
     fn captures_nonzero_exit() {
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "exit 42"});
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         assert!(result.contains("exit code: 42"));
     }
 
@@ -998,7 +904,7 @@ mod tests {
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "sleep 60", "timeout_secs": 2});
         let start = Instant::now();
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
@@ -1025,7 +931,7 @@ mod tests {
             "timeout_secs": 2,
         });
         let start = Instant::now();
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         let elapsed = start.elapsed();
         assert!(result.contains("timed out"));
         assert!(
@@ -1064,11 +970,11 @@ mod tests {
         });
 
         // Warm up: one command settles any lazily-created runtime threads.
-        tool.execute(&args, "/tmp").unwrap();
+        tool.execute(&args, &scope("/tmp")).unwrap();
         let baseline = thread_count();
 
         for _ in 0..3 {
-            tool.execute(&args, "/tmp").unwrap();
+            tool.execute(&args, &scope("/tmp")).unwrap();
         }
         assert!(
             thread_count() <= baseline,
@@ -1257,104 +1163,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_wrong_cd_silent_for_same_directory() {
-        assert!(
-            detect_wrong_cd("cd /tmp && echo hi", "/tmp").is_none(),
-            "no warning for redundant cd to cwd"
-        );
-    }
-
-    #[test]
-    fn detect_wrong_cd_silent_for_relative_dot() {
-        // `cd .` is the same directory — no warning (relative path).
-        assert!(detect_wrong_cd("cd . && go build ./...", "/tmp").is_none());
-    }
-
-    #[test]
-    fn detect_wrong_cd_silent_for_relative_subdirectory() {
-        // Relative cd paths are always legitimate — no warning, even if the
-        // subdirectory doesn't exist (the command will fail naturally).
-        assert!(detect_wrong_cd("cd subdir && go build ./...", "/tmp").is_none());
-        assert!(detect_wrong_cd("cd inventory/pdf && go build ./...", "/tmp").is_none());
-    }
-
-    #[test]
-    fn detect_wrong_cd_warns_for_wrong_directory() {
-        let warning = detect_wrong_cd("cd /home/user/wrong-project && go test ./...", "/tmp")
-            .expect("should warn for wrong-directory cd");
-        assert!(warning.contains("not the working directory"));
-        assert!(!warning.contains("stripped"));
-    }
-
-    #[test]
-    fn detect_wrong_cd_handles_semicolon_separator() {
-        assert!(detect_wrong_cd("cd /tmp; echo hi", "/tmp").is_none());
-    }
-
-    #[test]
-    fn detect_wrong_cd_ignores_commands_without_cd() {
-        assert!(detect_wrong_cd("go test ./...", "/tmp").is_none());
-    }
-
-    #[test]
-    fn detect_wrong_cd_ignores_cd_without_separator() {
-        // `cd /tmp` alone (no && or ;) is a valid standalone command — don't warn.
-        assert!(detect_wrong_cd("cd /tmp", "/tmp").is_none());
-    }
-
-    #[test]
-    fn detect_wrong_cd_handles_quoted_path() {
-        assert!(detect_wrong_cd("cd '/tmp' && echo hi", "/tmp").is_none());
-    }
-
-    #[test]
-    fn detect_wrong_cd_treats_trailing_slash_as_same() {
-        // /tmp and /tmp/ are the same directory.
-        assert!(detect_wrong_cd("cd /tmp/ && echo hi", "/tmp").is_none());
-    }
-
-    #[test]
-    fn execute_suppresses_cd_warning_when_outside_cwd_true() {
-        // The QA agent legitimately `cd`s into its session test-scripts dir to
-        // run scripts. With outside_cwd: true, the wrong-directory cd warning
-        // must not appear in the tool result.
-        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
-        let temp = test_util::unique_test_dir();
-        let outside = temp.path().to_path_buf();
-        let args = json!({
-            "command": format!("cd {} && echo ran", outside.to_string_lossy()),
-            "outside_cwd": true
-        });
-        let result = tool.execute(&args, "/tmp").unwrap();
-        assert!(
-            !result.contains("not the working directory"),
-            "no cd warning expected with outside_cwd, got: {result}"
-        );
-        assert!(result.contains("ran"));
-    }
-
-    #[test]
-    fn execute_warns_on_cd_outside_when_outside_cwd_absent() {
-        // Default (outside_cwd false/absent): a cd to a path that isn't cwd
-        // still produces the warning.
-        let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
-        let temp = test_util::unique_test_dir();
-        let outside = temp.path().to_path_buf();
-        let args = json!({
-            "command": format!("cd {} && echo ran", outside.to_string_lossy())
-        });
-        let result = tool.execute(&args, "/tmp").unwrap();
-        assert!(
-            result.contains("not the working directory"),
-            "expected cd warning without outside_cwd, got: {result}"
-        );
-    }
-
-    #[test]
     fn spawn_background_returns_job_id() {
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "echo hi", "background": true});
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         assert!(result.starts_with("Background job started:"));
         // The job id follows the label.
         let id = result
@@ -1369,7 +1181,7 @@ mod tests {
         let poll_args = json!({"job_id": id});
         let mut found = false;
         for _ in 0..20 {
-            let poll = tool.execute(&poll_args, "/tmp").unwrap();
+            let poll = tool.execute(&poll_args, &scope("/tmp")).unwrap();
             if poll.contains("hi") && poll.contains("exited") {
                 found = true;
                 break;
@@ -1383,7 +1195,7 @@ mod tests {
     fn poll_running_job_returns_running_status() {
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "sleep 2", "background": true});
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         let id = result
             .strip_prefix("Background job started: ")
             .unwrap()
@@ -1392,20 +1204,20 @@ mod tests {
             .unwrap();
 
         let poll_args = json!({"job_id": id});
-        let poll = tool.execute(&poll_args, "/tmp").unwrap();
+        let poll = tool.execute(&poll_args, &scope("/tmp")).unwrap();
         assert!(poll.contains("status: running"));
         assert!(poll.contains("sleep 2"));
 
         // Clean up.
         let kill_args = json!({"job_id": id, "kill": true});
-        tool.execute(&kill_args, "/tmp").unwrap();
+        tool.execute(&kill_args, &scope("/tmp")).unwrap();
     }
 
     #[test]
     fn kill_terminates_background_job() {
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "sleep 60", "background": true});
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         let id = result
             .strip_prefix("Background job started: ")
             .unwrap()
@@ -1414,7 +1226,7 @@ mod tests {
             .unwrap();
 
         let kill_args = json!({"job_id": id, "kill": true});
-        let kill_result = tool.execute(&kill_args, "/tmp").unwrap();
+        let kill_result = tool.execute(&kill_args, &scope("/tmp")).unwrap();
         assert!(
             kill_result.contains("status: killed"),
             "expected killed status, got: {kill_result}"
@@ -1422,7 +1234,7 @@ mod tests {
 
         // Polling again should still report killed.
         let poll_args = json!({"job_id": id});
-        let poll = tool.execute(&poll_args, "/tmp").unwrap();
+        let poll = tool.execute(&poll_args, &scope("/tmp")).unwrap();
         assert!(poll.contains("status: killed"));
     }
 
@@ -1441,7 +1253,7 @@ mod tests {
                     "job_id": "",
                     "kill": false
                 }),
-                "/tmp",
+                &scope("/tmp"),
             )
             .unwrap();
         assert!(
@@ -1451,7 +1263,10 @@ mod tests {
 
         // Whitespace-only ids count as empty too.
         let result = tool
-            .execute(&json!({"job_id": "   ", "command": "echo spaced"}), "/tmp")
+            .execute(
+                &json!({"job_id": "   ", "command": "echo spaced"}),
+                &scope("/tmp"),
+            )
             .unwrap();
         assert!(
             result.contains("spaced"),
@@ -1463,7 +1278,7 @@ mod tests {
     fn poll_unknown_job_id_returns_error() {
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"job_id": "nonexistent-id"});
-        let result = tool.execute(&args, "/tmp");
+        let result = tool.execute(&args, &scope("/tmp"));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("unknown job id"));
@@ -1475,7 +1290,7 @@ mod tests {
         // returns the full output, not a job id.
         let tool = ShellTool::with_job_table(Arc::new(JobTable::new()));
         let args = json!({"command": "echo foreground"});
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         assert!(result.contains("foreground"));
         assert!(result.contains("exit code: 0"));
         assert!(!result.contains("Background job started"));

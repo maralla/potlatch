@@ -23,6 +23,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::Tool;
+use crate::core::scope::SessionScope;
 
 // ---------------------------------------------------------------------------
 // LspClient — raw JSON-RPC over stdio to a language server subprocess
@@ -413,7 +414,7 @@ impl Tool for LspTool {
         })
     }
 
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, scope: &SessionScope) -> Result<String> {
         let operation = args["operation"]
             .as_str()
             .ok_or_else(|| anyhow!("missing 'operation' parameter"))?;
@@ -427,6 +428,7 @@ impl Tool for LspTool {
         let client = self.cache.get_or_spawn(server)?;
         let client = client.lock().unwrap();
         let display_name = server;
+        let cwd = scope.cwd();
 
         match operation {
             "definition" => exec_position_query(

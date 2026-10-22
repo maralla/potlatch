@@ -41,6 +41,7 @@ use crate::core::bus::{AgentInbox, AgentToolDefinition};
 use crate::core::config::Config;
 use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 use crate::core::runtime::AgentRuntime;
+use crate::core::scope::SessionScope;
 use crate::core::workflow::AgentBuildContext;
 use crate::util::dies_with_parent;
 
@@ -405,7 +406,7 @@ impl CoreAgent for SandalAgent {
         // Idle VMs first: a long-idle session VM is dead weight nobody
         // will ever call again — close it with its whole overlay.
         self.pool.reap_idle();
-        if let Some(mut request) = self.inbox.recv_timeout(INBOX_WAIT)? {
+        if let Some(request) = self.inbox.recv_timeout(INBOX_WAIT)? {
             // The harness proxy always sets the calling session's id;
             // without it there is nothing to key the VM on.
             let Some(session_id) = request.session_id.as_deref() else {
@@ -423,8 +424,8 @@ impl CoreAgent for SandalAgent {
             // whole timeout, so it runs on its own thread below —
             // same-session calls serialize on the VM's own state lock,
             // cross-session calls run concurrently.
-            let boot = session_context(&request.payload)
-                .and_then(|(cwd, roots)| self.pool.ensure(session_id, &cwd, &roots));
+            let boot = SessionScope::from_metadata(&request.payload)
+                .and_then(|scope| self.pool.ensure(session_id, &scope));
             if let Err(error) = boot {
                 request.respond(Err(error.context("the session's sandbox VM cannot boot")));
                 return Ok(());
@@ -568,47 +569,16 @@ fn resolve_sandal_bin() -> Result<PathBuf> {
     )
 }
 
-/// The session's shell-call context: the working directory and the
-/// declared write roots (the same per-agent list the harness's write/edit
-/// tools permit outside the cwd — e.g. the QA agent's session directory,
-/// where its test scripts live). Both are pinned on the session's first
-/// call: a later call presenting a different pair is an error, not a
-/// renegotiation and not a second VM.
-fn session_context(payload: &Value) -> Result<(String, Vec<String>)> {
-    let cwd = payload
-        .get("_session_cwd")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .context("the shell call carries no session working directory")?;
-    let roots = payload
-        .get("_session_write_roots")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Ok((cwd, roots))
-}
-
-/// One live session VM. `cwd`/`roots` are pinned at spawn and readable
-/// without the state lock; everything mutable lives behind one state lock
-/// that a command holds for its whole run.
+/// One live session VM. The session's file scope is pinned at spawn and
+/// readable without the state lock; everything mutable lives behind one
+/// state lock that a command holds for its whole run.
 struct VmEntry {
-    /// The working directory this VM was booted with — pinned on the
-    /// session's first call and never renegotiated: every later call
-    /// lands in the same VM, so a session that somehow presents a
-    /// different directory gets an error, not a second VM.
-    cwd: String,
-    /// The declared write roots this VM was booted with — pinned like
-    /// [`Self::cwd`]: the session's out-of-cwd work must resolve the
-    /// same way on every call, so a later call presenting a different
-    /// list gets the same error, not a reshare.
-    roots: Vec<String>,
+    /// The session's file scope this VM was booted with — the calling
+    /// agent's cwd and declared roots, pinned on the session's first call
+    /// and never renegotiated: every later call lands in the same VM, so
+    /// a session that somehow presents a different scope gets an error,
+    /// not a second VM or a reshare.
+    scope: SessionScope,
     /// The whole mutable state behind one lock: held for an entire
     /// command, so same-session commands serialize while cross-session
     /// commands run concurrently; only ever `try_lock`ed by the idle
@@ -672,7 +642,7 @@ impl VmPool {
     /// working directory, and the configured persistent shares whose host
     /// side exists (a share for a cache directory that has not been
     /// created yet is dropped with a warning, and appears once it has).
-    fn spawn(&self, cwd: &str, roots: &[String]) -> Result<VmEntry> {
+    fn spawn(&self, scope: &SessionScope) -> Result<VmEntry> {
         // (a) The sandbox process: --ssh-port (the listener the session's
         // ssh connects to, bridged through vsock to the guest's own
         // loopback where the bootstrap's sshd listens), the layers (the
@@ -699,6 +669,7 @@ impl VmPool {
         cmd.arg("--layer").arg(&self.settings.ssh_server_layer);
         // The working directory rides the same path on both sides so
         // guest paths resolve exactly as the session's paths do.
+        let cwd = scope.cwd();
         cmd.arg("--share").arg(format!("{cwd}:{cwd}"));
         // The declared write roots ride the same path on both sides for the
         // same reason: the session's out-of-cwd work — its test scripts,
@@ -707,9 +678,10 @@ impl VmPool {
         // silently dropped share: the declaration is the calling agent's
         // own, and a dropped root would surface later as a confusing path
         // error inside the sandbox.
-        for root in roots {
+        for root in scope.roots() {
+            let root = root.display().to_string();
             ensure!(
-                Path::new(root).is_dir(),
+                Path::new(&root).is_dir(),
                 "[agent.sandal] the session's declared write root is not \
                  a directory: {root}"
             );
@@ -748,8 +720,7 @@ impl VmPool {
             cmd,
             self.bin.clone(),
             self.ssh_bin.clone(),
-            cwd,
-            roots,
+            scope,
             port,
             &self.settings,
         )?;
@@ -765,8 +736,7 @@ impl VmPool {
         mut cmd: Command,
         bin: PathBuf,
         ssh_bin: PathBuf,
-        cwd: &str,
-        roots: &[String],
+        scope: &SessionScope,
         port: u16,
         settings: &ResolvedSettings,
     ) -> Result<VmEntry> {
@@ -849,8 +819,7 @@ impl VmPool {
             return Err(error);
         }
         Ok(VmEntry {
-            cwd: cwd.to_string(),
-            roots: roots.to_vec(),
+            scope: scope.clone(),
             state: Mutex::new(VmState {
                 vm,
                 console: Some((console_in, console_out)),
@@ -869,12 +838,12 @@ impl VmPool {
     /// Boot a session's VM if it has none. Run-loop only: the spawn must
     /// happen on a long-lived thread (see the run loop), never on a
     /// per-call thread.
-    fn ensure(&self, session_id: &str, cwd: &str, roots: &[String]) -> Result<()> {
+    fn ensure(&self, session_id: &str, scope: &SessionScope) -> Result<()> {
         let mut entries = lock(&self.entries);
         match entries.get(session_id) {
             Some(_) => Ok(()),
             None => {
-                let entry = Arc::new(self.spawn(cwd, roots)?);
+                let entry = Arc::new(self.spawn(scope)?);
                 entries.insert(session_id.to_string(), entry);
                 Ok(())
             }
@@ -888,11 +857,11 @@ impl VmPool {
     /// died) between the run loop's boot and this call: the caller retries,
     /// and the run loop boots it.
     fn entry_for(&self, session_id: &str, payload: &Value) -> Result<Arc<VmEntry>> {
-        let (cwd, roots) = session_context(payload)?;
+        let scope = SessionScope::from_metadata(payload)?;
         let entries = lock(&self.entries);
         match entries.get(session_id) {
             Some(entry) => {
-                if entry.cwd != cwd || entry.roots != roots {
+                if entry.scope != scope {
                     return Err(anyhow::anyhow!(
                         "the session's sandbox VM is bound to its first call's \
                          working directory and write roots"
@@ -945,8 +914,8 @@ impl VmPool {
         let mut state = lock_state(&entry.state);
         state.last_used = Instant::now();
         let (sentinel, line) = match &job {
-            Some(job) => job_start_line(&entry.cwd, command, job),
-            None => foreground_line(&entry.cwd, command),
+            Some(job) => job_start_line(entry.scope.cwd(), command, job),
+            None => foreground_line(entry.scope.cwd(), command),
         };
         let outcome = run_line(&mut state, line.as_str(), sentinel.as_str(), timeout);
         // The command's end is the last use: without this a finished
@@ -1689,6 +1658,15 @@ mod tests {
         call_with_roots(pool, session, command, &[])
     }
 
+    /// A session scope for pool tests: the given cwd, no declared roots
+    /// unless the test passes them.
+    fn test_scope(cwd: &Path, roots: &[String]) -> SessionScope {
+        SessionScope::new(
+            cwd.to_string_lossy().into_owned(),
+            roots.iter().map(|r| PathBuf::from(r)),
+        )
+    }
+
     /// The run loop's half of the protocol: boot the session's VM with the
     /// calling agent's declared write roots (empty for an agent that
     /// declared none — no root shares, and the same empty list on every
@@ -1700,7 +1678,7 @@ mod tests {
         roots: &[String],
     ) -> Result<String> {
         let cwd = std::env::current_dir().unwrap();
-        pool.ensure(session, &cwd.to_string_lossy(), roots)?;
+        pool.ensure(session, &test_scope(&cwd, roots))?;
         pool.execute(
             session,
             &json!({"command": command, "_session_cwd": cwd, "_session_write_roots": roots}),
@@ -1956,8 +1934,7 @@ mod tests {
         let pool = pool(dir.path(), 3600);
         let timed_out = {
             let cwd = std::env::current_dir().unwrap();
-            pool.ensure("session-1", &cwd.to_string_lossy(), &[])
-                .unwrap();
+            pool.ensure("session-1", &test_scope(&cwd, &[])).unwrap();
             pool.execute(
                 "session-1",
                 &json!({
@@ -2160,9 +2137,7 @@ mod tests {
         let pool_a = Arc::clone(&pool);
         let a = std::thread::spawn(move || {
             let cwd = std::env::current_dir().unwrap();
-            pool_a
-                .ensure("session-a", &cwd.to_string_lossy(), &[])
-                .unwrap();
+            pool_a.ensure("session-a", &test_scope(&cwd, &[])).unwrap();
             pool_a
                 .execute(
                     "session-a",
@@ -2197,9 +2172,7 @@ mod tests {
         let pool_a = Arc::clone(&pool);
         let a = std::thread::spawn(move || {
             let cwd = std::env::current_dir().unwrap();
-            pool_a
-                .ensure("session-1", &cwd.to_string_lossy(), &[])
-                .unwrap();
+            pool_a.ensure("session-1", &test_scope(&cwd, &[])).unwrap();
             pool_a
                 .execute(
                     "session-1",
@@ -2276,7 +2249,8 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        pool.ensure("session-1", &cwd, &[]).unwrap();
+        pool.ensure("session-1", &test_scope(Path::new(&cwd), &[]))
+            .unwrap();
         let start = pool
             .execute(
                 "session-1",
@@ -2324,7 +2298,8 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        pool.ensure("session-1", &cwd, &[]).unwrap();
+        pool.ensure("session-1", &test_scope(Path::new(&cwd), &[]))
+            .unwrap();
         let start = pool
             .execute(
                 "session-1",
@@ -2360,7 +2335,8 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        pool.ensure("session-1", &cwd, &[]).unwrap();
+        pool.ensure("session-1", &test_scope(Path::new(&cwd), &[]))
+            .unwrap();
         let start = pool
             .execute(
                 "session-1",
@@ -2407,7 +2383,8 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            pool.ensure("session-1", &cwd, &[]).unwrap();
+            pool.ensure("session-1", &test_scope(Path::new(&cwd), &[]))
+                .unwrap();
             while let Ok(command) = rx.recv() {
                 let result = pool
                     .execute(
@@ -2449,7 +2426,8 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        pool.ensure("session-1", &cwd, &[]).unwrap();
+        pool.ensure("session-1", &test_scope(Path::new(&cwd), &[]))
+            .unwrap();
         // Start a long-running background job.
         let start = pool
             .execute(
@@ -2508,7 +2486,8 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        pool.ensure("session-1", &cwd, &[]).unwrap();
+        pool.ensure("session-1", &test_scope(Path::new(&cwd), &[]))
+            .unwrap();
         let started = Instant::now();
         let starts: Vec<String> = (0..3)
             .map(|i| {

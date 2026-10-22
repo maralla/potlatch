@@ -5,6 +5,10 @@
 //! objects. Edits to the same file apply in order (an earlier edit may shift
 //! text a later edit references); edits to different files run concurrently.
 //! Per-edit errors are reported inline and do not block the other edits.
+//! Every edit path is resolved against the session's file scope
+//! ([`SessionScope`]): the working directory plus the roots the calling
+//! agent declared — the same directory set the sandbox shares into the
+//! session's VM.
 //!
 //! When an exact `old_string` is not found, the error includes the best fuzzy
 //! near-matches (computed via the `dissimilar` crate) with line numbers, so the
@@ -16,6 +20,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::Tool;
+use crate::core::scope::SessionScope;
 
 /// Minimum normalized similarity (0.0..=1.0) for a window to qualify as a
 /// near-match suggestion. Tuned to surface genuine typos and small drift
@@ -33,15 +38,7 @@ const MAX_MULTI_MATCHES: usize = 3;
 /// heuristics only.
 const MIN_FUZZY_NEEDLE_LEN: usize = 8;
 
-pub struct EditTool {
-    roots: super::WriteRoots,
-}
-
-impl EditTool {
-    pub fn new(roots: super::WriteRoots) -> Self {
-        Self { roots }
-    }
-}
+pub struct EditTool;
 
 impl Tool for EditTool {
     fn name(&self) -> &str {
@@ -50,7 +47,7 @@ impl Tool for EditTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Edit files by replacing exact strings. Pass an 'edits' array of objects, each with {path, old_string, new_string}. The 'path' goes INSIDE each edit object, not at the top level. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The old_string must match uniquely within its file. On failure, the error includes line numbers and similarity scores of fuzzy near-matches so you can retry with a more specific match. After editing, the edited region is read back and included in the result so you can verify the change. By default paths must be relative to the working directory; set outside_cwd: true to edit an absolute path outside the workspace (only for agent-managed scratch files explicitly permitted by the task instructions).",
+            "description": "Edit files by replacing exact strings. Pass an 'edits' array of objects, each with {path, old_string, new_string}. The 'path' goes INSIDE each edit object, not at the top level. Edits to the same file apply in order (an earlier edit may shift text a later edit references); edits to different files run concurrently. Per-edit errors are reported inline and do not block the other edits. The old_string must match uniquely within its file. On failure, the error includes line numbers and similarity scores of fuzzy near-matches so you can retry with a more specific match. After editing, the edited region is read back and included in the result so you can verify the change. Paths must be within the working directory or an agent-managed session directory named by the task instructions.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -62,7 +59,7 @@ impl Tool for EditTool {
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Path to the file to edit (relative to the working directory, or an absolute path when outside_cwd is true)."
+                                    "description": "Path to the file to edit (relative to the working directory, or an absolute path within the working directory or an agent-managed session directory named by the task)."
                                 },
                                 "old_string": {
                                     "type": "string",
@@ -77,18 +74,13 @@ impl Tool for EditTool {
                         },
                         "minItems": 1
                     },
-                    "outside_cwd": {
-                        "type": "boolean",
-                        "description": "When true, allow editing files at absolute paths outside the working directory (only for agent-managed scratch files explicitly permitted by the task instructions). Default: false.",
-                        "default": false
-                    }
                 },
                 "required": ["edits"]
             }
         })
     }
 
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, scope: &SessionScope) -> Result<String> {
         let edits = args["edits"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("missing or invalid 'edits' array argument"))?;
@@ -96,8 +88,6 @@ impl Tool for EditTool {
         if edits.is_empty() {
             anyhow::bail!("'edits' array must contain at least one entry");
         }
-
-        let outside_cwd = args["outside_cwd"].as_bool().unwrap_or(false);
 
         // Parse + validate each entry up front (cheap, no I/O). Group by resolved
         // path so we can apply multiple edits to the same file in order, while
@@ -134,7 +124,7 @@ impl Tool for EditTool {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("each edit requires a 'new_string' string"))?;
 
-            let full_path = match super::resolve_write_path(path, cwd, outside_cwd, &self.roots) {
+            let full_path = match super::resolve_write_path(path, scope) {
                 Ok(p) => p,
                 Err(msg) => {
                     // Pre-validation failure: record a synthetic group with a
@@ -651,10 +641,6 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn unrestricted_tool() -> EditTool {
-        EditTool::new(super::super::WriteRoots::default())
-    }
-
     fn make_test_file(dir: &test_util::TestDir, name: &str, content: &str) -> String {
         let path = dir.path().join(name);
         let mut f = std::fs::File::create(&path).unwrap();
@@ -729,13 +715,13 @@ mod tests {
     fn edits_file_successfully() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "hello world\nfoo bar\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "hello world", "new_string": "hello universe"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Successfully edited"));
 
         let content = std::fs::read_to_string(dir.path().join(&name)).unwrap();
@@ -747,13 +733,13 @@ mod tests {
     fn errors_on_no_match() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "hello world\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "nonexistent text", "new_string": "replacement"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("not found"));
 
         let content = std::fs::read_to_string(dir.path().join(&name)).unwrap();
@@ -764,13 +750,13 @@ mod tests {
     fn errors_on_multiple_matches() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "dup\ndup\ndup\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "dup", "new_string": "unique"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("matches 3 times"));
     }
 
@@ -778,28 +764,31 @@ mod tests {
     fn read_after_edit_verification_included() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "fn old_name() {}\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "fn old_name() {}", "new_string": "fn new_name() {\n    // renamed\n}"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Verified"));
         assert!(result.contains("new_name"));
     }
 
     #[test]
-    fn rejects_absolute_path() {
+    fn rejects_a_path_outside_the_scope() {
         let dir = test_util::unique_test_dir();
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": "/etc/passwd", "old_string": "x", "new_string": "y"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
-        assert!(result.contains("absolute paths are not allowed"));
+        let result = tool.execute(&args, &dir.scope()).unwrap();
+        assert!(
+            result.contains("outside the session's writable directories"),
+            "{result}"
+        );
     }
 
     #[test]
@@ -810,14 +799,14 @@ mod tests {
             "test.txt",
             "fn calculate_total() -> i32 {\n    42\n}\n",
         );
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         // Small typo: calculat_total vs calculate_total
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "fn calculat_total() -> i32 {", "new_string": "fn compute_total() -> i32 {"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("not found"));
         assert!(result.contains("Near matches"));
         assert!(result.contains("similarity"));
@@ -827,14 +816,14 @@ mod tests {
     fn edits_single_file_multiple_edits_in_order() {
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "alpha\nbeta\ngamma\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "alpha", "new_string": "ALPHA"},
                 {"path": name, "old_string": "beta", "new_string": "BETA"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Applied 2 edit(s)"));
         assert!(result.contains("ALPHA"));
         assert!(result.contains("BETA"));
@@ -848,14 +837,14 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let a = make_test_file(&dir, "a.txt", "one\ntwo\n");
         let b = make_test_file(&dir, "b.txt", "three\nfour\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": a, "old_string": "one", "new_string": "ONE"},
                 {"path": b, "old_string": "three", "new_string": "THREE"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Applied 2 edit(s)"));
 
         let ca = std::fs::read_to_string(dir.path().join(&a)).unwrap();
@@ -869,14 +858,14 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let ok = make_test_file(&dir, "ok.txt", "good content\n");
         let bad = make_test_file(&dir, "bad.txt", "other content\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": ok, "old_string": "good content", "new_string": "GREAT"},
                 {"path": bad, "old_string": "nonexistent", "new_string": "whatever"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Applied 2 edit(s)"));
         // The successful edit should be reflected in the file.
         let c = std::fs::read_to_string(dir.path().join(&ok)).unwrap();
@@ -894,14 +883,14 @@ mod tests {
         // same in-memory buffer in order.
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "fn old() {}\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": name, "old_string": "fn old() {}", "new_string": "fn renamed() {\n    body\n}"},
                 {"path": name, "old_string": "    body", "new_string": "    new_body"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Applied 2 edit(s)"));
         let content = std::fs::read_to_string(dir.path().join(&name)).unwrap();
         assert!(content.contains("renamed"));
@@ -912,9 +901,9 @@ mod tests {
     #[test]
     fn rejects_empty_edits_array() {
         let dir = test_util::unique_test_dir();
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({"edits": []});
-        let result = tool.execute(&args, dir.as_str());
+        let result = tool.execute(&args, &dir.scope());
         assert!(result.is_err());
     }
 
@@ -922,19 +911,19 @@ mod tests {
     fn rejects_absolute_path_inline() {
         let dir = test_util::unique_test_dir();
         let ok = make_test_file(&dir, "ok.txt", "good\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": ok, "old_string": "good", "new_string": "GREAT"},
                 {"path": "/etc/passwd", "old_string": "x", "new_string": "y"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         // The good edit still applies.
         assert!(result.contains("Applied 2 edit(s)"));
         assert!(result.contains("GREAT"));
-        // The absolute path is rejected inline.
-        assert!(result.contains("absolute paths are not allowed"));
+        // The out-of-scope path is rejected inline.
+        assert!(result.contains("outside the session's writable directories"));
         let c = std::fs::read_to_string(dir.path().join(&ok)).unwrap();
         assert_eq!(c, "GREAT\n");
     }
@@ -945,7 +934,7 @@ mod tests {
         let a = make_test_file(&dir, "a.txt", "1\n");
         let b = make_test_file(&dir, "b.txt", "2\n");
         let c = make_test_file(&dir, "c.txt", "3\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": c, "old_string": "3", "new_string": "C"},
@@ -953,7 +942,7 @@ mod tests {
                 {"path": b, "old_string": "2", "new_string": "B"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         // Output should preserve the original edit order: C, A, B.
         let c_pos = result.find("[edit 0]").unwrap();
         let a_pos = result.find("[edit 1]").unwrap();
@@ -969,7 +958,7 @@ mod tests {
         // rather than failing, so the work proceeds without a retry round-trip.
         let dir = test_util::unique_test_dir();
         let name = make_test_file(&dir, "test.txt", "alpha\nbeta\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "path": name,
             "edits": [
@@ -977,7 +966,7 @@ mod tests {
                 {"old_string": "beta", "new_string": "BETA"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Applied 2 edit(s)"));
         assert!(result.contains("ALPHA"));
         assert!(result.contains("BETA"));
@@ -993,7 +982,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let a = make_test_file(&dir, "a.txt", "one\n");
         let b = make_test_file(&dir, "b.txt", "two\n");
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "path": "a.txt",
             "edits": [
@@ -1001,7 +990,7 @@ mod tests {
                 {"path": b, "old_string": "two", "new_string": "TWO"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Applied 2 edit(s)"));
         let ca = std::fs::read_to_string(dir.path().join(&a)).unwrap();
         let cb = std::fs::read_to_string(dir.path().join(&b)).unwrap();
@@ -1014,13 +1003,13 @@ mod tests {
         // When no edit has a `path` AND there's no top-level `path`, the error
         // must clearly explain that `path` goes inside each edit object.
         let dir = test_util::unique_test_dir();
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"old_string": "alpha", "new_string": "ALPHA"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str());
+        let result = tool.execute(&args, &dir.scope());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("inside the edit object"));
@@ -1028,20 +1017,20 @@ mod tests {
     }
 
     #[test]
-    fn outside_cwd_allows_absolute_path() {
+    fn edit_inside_a_declared_root_is_allowed() {
         let dir = test_util::unique_test_dir();
         let outside = test_util::unique_test_dir();
         let target = outside.path().join("outside.txt");
         std::fs::write(&target, "hello world\n").unwrap();
+        let scope = SessionScope::new(dir.as_str(), [outside.path().to_path_buf()]);
 
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": target.to_string_lossy(), "old_string": "hello world", "new_string": "hello universe"}
-            ],
-            "outside_cwd": true
+            ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &scope).unwrap();
         assert!(result.contains("Successfully edited"), "{result}");
 
         let content = std::fs::read_to_string(&target).unwrap();
@@ -1050,21 +1039,21 @@ mod tests {
     }
 
     #[test]
-    fn outside_cwd_allows_multiple_edits_to_same_external_file() {
+    fn edit_multiple_times_to_same_external_file() {
         let dir = test_util::unique_test_dir();
         let outside = test_util::unique_test_dir();
         let target = outside.path().join("script.py");
         std::fs::write(&target, "alpha\nbeta\n").unwrap();
+        let scope = SessionScope::new(dir.as_str(), [outside.path().to_path_buf()]);
 
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": target.to_string_lossy(), "old_string": "alpha", "new_string": "ALPHA"},
                 {"path": target.to_string_lossy(), "old_string": "beta", "new_string": "BETA"}
-            ],
-            "outside_cwd": true
+            ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &scope).unwrap();
         assert!(result.contains("Applied 2 edit(s)"), "{result}");
 
         let content = std::fs::read_to_string(&target).unwrap();
@@ -1072,22 +1061,23 @@ mod tests {
     }
 
     #[test]
-    fn outside_cwd_defaults_to_false_when_absent() {
-        // Without outside_cwd, an absolute path must still be rejected.
+    fn edit_outside_the_scope_is_rejected() {
+        // A path outside the cwd with no matching declared root is rejected;
+        // there is no flag to opt into it.
         let dir = test_util::unique_test_dir();
         let outside = test_util::unique_test_dir();
         let target = outside.path().join("outside.txt");
         std::fs::write(&target, "hello\n").unwrap();
 
-        let tool = unrestricted_tool();
+        let tool = EditTool;
         let args = json!({
             "edits": [
                 {"path": target.to_string_lossy(), "old_string": "hello", "new_string": "bye"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(
-            result.contains("absolute paths are not allowed"),
+            result.contains("outside the session's writable directories"),
             "expected rejection, got: {result}"
         );
         // File untouched.
@@ -1095,45 +1085,39 @@ mod tests {
     }
 
     #[test]
-    fn outside_cwd_edit_inside_a_configured_root_is_allowed() {
+    fn edit_inside_a_configured_root_is_allowed() {
         let dir = test_util::unique_test_dir();
         let outside = test_util::unique_test_dir();
         let target = outside.path().join("knowledge/notes.md");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, "hello\n").unwrap();
 
-        let tool = EditTool::new(super::super::WriteRoots::from_paths([outside
-            .path()
-            .to_path_buf()]));
+        let scope = SessionScope::new(dir.as_str(), [outside.path().to_path_buf()]);
         let args = json!({
             "edits": [
                 {"path": target.to_string_lossy(), "old_string": "hello", "new_string": "updated"}
-            ],
-            "outside_cwd": true
+            ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = EditTool.execute(&args, &scope).unwrap();
         assert!(result.contains("Successfully edited"), "{result}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "updated\n");
     }
 
     #[test]
-    fn outside_cwd_edit_outside_every_root_is_rejected() {
+    fn edit_outside_every_root_is_rejected() {
         let dir = test_util::unique_test_dir();
         let allowed = test_util::unique_test_dir();
         let forbidden = test_util::unique_test_dir();
         let target = forbidden.path().join("victim.txt");
         std::fs::write(&target, "hello\n").unwrap();
 
-        let tool = EditTool::new(super::super::WriteRoots::from_paths([allowed
-            .path()
-            .to_path_buf()]));
+        let scope = SessionScope::new(dir.as_str(), [allowed.path().to_path_buf()]);
         let args = json!({
             "edits": [
                 {"path": target.to_string_lossy(), "old_string": "hello", "new_string": "pwned"}
-            ],
-            "outside_cwd": true
+            ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = EditTool.execute(&args, &scope).unwrap();
         assert!(
             result.contains("outside the session's writable directories"),
             "expected rejection, got: {result}"

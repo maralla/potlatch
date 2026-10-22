@@ -20,136 +20,62 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::core::bus::RemoteAgentToolDefinition;
+use crate::core::scope::SessionScope;
 
-/// Resolve a path relative to the workspace (cwd), enforcing sandboxing.
+/// Resolve a path for read-only access (the `read`, `grep`, and `glob`
+/// tools) within the session's file scope ([`SessionScope`]: the working
+/// directory plus the roots the calling agent declared). Relative paths
+/// resolve against the scope's cwd; absolute paths are accepted when they
+/// land inside the scope, and anything else is rejected — there is no
+/// separate working-directory rule to satisfy first.
 ///
-/// Rejects:
-/// - Absolute paths (e.g. `/etc/passwd`)
-/// - Paths that escape the workspace via `..` traversal (e.g. `../../secret`)
-///
-/// Returns the resolved absolute path on success, or an error message string
-/// explaining why the path was rejected.
-pub fn resolve_workspace_path(path: &str, cwd: &str) -> Result<PathBuf, String> {
-    if Path::new(path).is_absolute() {
+/// Returns the resolved absolute path (canonicalized when the target — or
+/// its parent — exists, so a path inside the scope that does not exist yet
+/// still resolves and the caller surfaces a clear "not found" error on read).
+pub fn resolve_read_path(path: &str, scope: &SessionScope) -> Result<PathBuf, String> {
+    let resolved = resolve_in_scope(path, scope);
+    if !scope.permits(&resolved) {
         return Err(format!(
-            "absolute paths are not allowed. Use a relative path within the workspace. For example, use 'src/main.rs' instead of '{path}'."
+            "path '{path}' is outside the session's readable directories. \\
+             Read and search paths must be within the working directory or an \\
+             agent-managed session directory named by the task."
         ));
     }
-
-    let cwd_path = Path::new(cwd);
-    let resolved = cwd_path.join(path);
-
-    // Canonicalize both the cwd and the resolved path to detect `..` escapes.
-    // If canonicalization fails (file doesn't exist yet for write), use lexical normalization.
-    let canonical_cwd = cwd_path
-        .canonicalize()
-        .unwrap_or_else(|_| cwd_path.to_path_buf());
-    let canonical_resolved = resolved.canonicalize().or_else(|_| {
-        // For non-existent paths (new files), canonicalize the parent and join
-        if let Some(parent) = resolved.parent() {
-            parent
-                .canonicalize()
-                .map(|p| p.join(resolved.file_name().unwrap_or_default()))
-        } else {
-            Ok(resolved.clone())
-        }
-    });
-
-    match canonical_resolved {
-        Ok(cr) => {
-            if !cr.starts_with(&canonical_cwd) {
-                return Err(format!(
-                    "path '{path}' escapes the workspace. All file operations must be within the working directory."
-                ));
-            }
-            Ok(cr)
-        }
-        Err(_) => {
-            // If we can't canonicalize at all, fall back to lexical check
-            let normalized = resolve_lexical(&resolved, cwd_path);
-            if !normalized.starts_with(&canonical_cwd) {
-                return Err(format!(
-                    "path '{path}' escapes the workspace. All file operations must be within the working directory."
-                ));
-            }
-            Ok(normalized)
-        }
-    }
+    Ok(resolved)
 }
 
-/// Resolve a path for read-only access. Unlike `resolve_workspace_path`, this is
-/// permissive: absolute paths and paths outside the working directory are allowed,
-/// so the agent can read files explicitly referenced in the task context even when
-/// they live elsewhere on the filesystem. Relative paths are resolved against `cwd`.
-///
-/// Returns the resolved absolute path (canonicalized when possible).
-pub fn resolve_read_path(path: &str, cwd: &str) -> Result<PathBuf, String> {
+/// Resolve a write path (the `write` and `edit` tools) within the session's
+/// file scope ([`SessionScope`]): the working directory plus the roots the
+/// calling agent declared — used by agents (e.g. QA) that manage their own
+/// scratch files in a dedicated session directory outside the checked-out
+/// repo. Anything else is rejected. This is no weaker than the `shell` tool,
+/// which can already write anywhere via `bash -c`; the scope guard in
+/// `write` is a footgun guardrail, not a security boundary.
+pub fn resolve_write_path(path: &str, scope: &SessionScope) -> Result<PathBuf, String> {
+    let resolved = resolve_in_scope(path, scope);
+    if !scope.permits(&resolved) {
+        return Err(format!(
+            "path '{path}' is outside the session's writable directories. \\
+             Writes must target the working directory or an agent-managed \\
+             session directory named by the task."
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Resolve `path` for a file-tool operation against the session's cwd:
+/// relative paths join the cwd, absolute paths are kept as-is, and the
+/// result is canonicalized when the target — or its parent — exists (so a
+/// `..` traversal through an existing parent is visible to the scope check,
+/// and a not-yet-existing file inside the scope still resolves).
+fn resolve_in_scope(path: &str, scope: &SessionScope) -> PathBuf {
     let p = Path::new(path);
     let resolved = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        Path::new(cwd).join(path)
+        Path::new(scope.cwd()).join(path)
     };
-    // Canonicalize if the target exists; otherwise return the joined path as-is
-    // (the caller will surface a clear "not found" error on read).
-    Ok(resolved.canonicalize().unwrap_or(resolved))
-}
-
-/// Extra directories the `write` and `edit` tools may touch outside the
-/// working directory (via `outside_cwd: true`). Supplied per ACP session
-/// from its `write_roots` parameter; empty preserves the historical
-/// blanket-bypass behavior for sessions that predate the parameter.
-#[derive(Debug, Clone, Default)]
-pub struct WriteRoots(Vec<PathBuf>);
-
-impl WriteRoots {
-    pub fn from_paths(roots: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
-        Self(roots.into_iter().map(Into::into).collect())
-    }
-
-    /// Whether `path` (already resolved to an absolute path) falls inside the
-    /// working directory `cwd` or one of the configured roots. Empty roots
-    /// are permissive: the historical behavior allowed any absolute path.
-    fn permits(&self, path: &Path, cwd: &Path) -> bool {
-        self.0.is_empty() || path.starts_with(cwd) || self.0.iter().any(|r| path.starts_with(r))
-    }
-}
-
-/// Resolve a write path, optionally allowing locations outside the workspace.
-///
-/// When `outside_cwd` is false (the default for all callers), this is exactly
-/// [`resolve_workspace_path`]: absolute paths and `..` escapes are rejected, so
-/// writes stay inside the working directory. When `outside_cwd` is true and
-/// `roots` is non-empty, the write must land under the cwd or one of the
-/// configured roots — used by agents (e.g. QA) that manage their own scratch
-/// files in a dedicated session directory outside the checked-out repo. When
-/// `roots` is empty, any absolute path is accepted, preserving the historical
-/// behavior. This is no weaker than the `shell` tool, which can already write
-/// anywhere via `bash -c`; the in-workspace guard in `write` is a footgun
-/// guardrail, not a security boundary.
-pub fn resolve_write_path(
-    path: &str,
-    cwd: &str,
-    outside_cwd: bool,
-    roots: &WriteRoots,
-) -> Result<PathBuf, String> {
-    if outside_cwd {
-        let p = Path::new(path);
-        let resolved = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            Path::new(cwd).join(path)
-        };
-        let resolved = resolved.canonicalize().unwrap_or(resolved);
-        if !roots.permits(&resolved, Path::new(cwd)) {
-            return Err(format!(
-                "path '{path}' is outside the session's writable directories. Outside-cwd writes must target the working directory or an agent-managed session directory named by the task."
-            ));
-        }
-        Ok(resolved)
-    } else {
-        resolve_workspace_path(path, cwd)
-    }
+    canonicalize_flexible(&resolved)
 }
 
 /// Format `path` for display in tool output. When `path` is inside `cwd`,
@@ -172,31 +98,22 @@ pub fn display_path(path: &Path, cwd: &str) -> String {
     }
 }
 
-/// Lexically normalize a path (resolve `.` and `..` without filesystem access).
-fn resolve_lexical(path: &Path, base: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        use std::path::Component;
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if result.components().next().is_some() {
-                    result.pop();
-                }
-            }
-            Component::RootDir => {
-                result = PathBuf::from("/");
-            }
-            Component::Normal(c) => {
-                result.push(c);
-            }
-            Component::Prefix(_) => {}
-        }
+/// Canonicalize a path for scope checks: canonicalize the path itself when
+/// it exists, else canonicalize its parent and rejoin the final component
+/// (a file that does not exist yet), else return the path as-is. Keeps a
+/// `..` traversal through an existing parent visible to the `starts_with`
+/// scope check instead of leaving it lexical.
+fn canonicalize_flexible(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
     }
-    if result.is_absolute() {
-        result
-    } else {
-        base.join(result)
+    match path.file_name() {
+        Some(name) => path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .map(|parent| parent.join(name))
+            .unwrap_or_else(|| path.to_path_buf()),
+        None => path.to_path_buf(),
     }
 }
 
@@ -210,8 +127,10 @@ pub trait Tool: Send + Sync {
     /// the system prompt's Tool Usage section.
     fn schema(&self) -> Value;
 
-    /// Execute the tool with parsed arguments. Returns a string result for the model.
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String>;
+    /// Execute the tool with parsed arguments, against the session's file
+    /// scope (the agent-provided cwd + declared roots). Returns a string
+    /// result for the model.
+    fn execute(&self, args: &Value, scope: &SessionScope) -> Result<String>;
 }
 
 /// Session-level state that needs cleanup on `session/close`. Tools that hold
@@ -298,9 +217,10 @@ impl ToolRegistry {
     /// lsp) receive `&mut SessionStates` so they can create/retrieve
     /// their long-lived state. Stateless tools don't take it.
     ///
-    /// `write_roots` limits where `write`/`edit` may touch outside the cwd
-    /// (via `outside_cwd: true`); empty keeps the historical permissive
-    /// behavior.
+    /// `scope` is the session's file scope (the agent-provided cwd plus its
+    /// declared roots): every file tool (`read`, `grep`, `glob`, `write`,
+    /// `edit`) confines paths to it — the same directory set the sandbox
+    /// agent shares into the session's VM.
     ///
     /// `allowed_tools` filters which tools are registered: `None` registers
     /// all; `Some(names)` registers only tools whose name is in the list.
@@ -308,8 +228,7 @@ impl ToolRegistry {
     /// bus-registered proxy tools via [`Self::register_agent_tools`].
     pub fn with_builtin_tools(
         states: &mut SessionStates,
-        cwd: &str,
-        write_roots: &WriteRoots,
+        scope: &SessionScope,
         allowed_tools: Option<&[String]>,
     ) -> Self {
         let mut reg = Self::new();
@@ -320,16 +239,16 @@ impl ToolRegistry {
         };
 
         if allowed("shell") {
-            reg.register(Arc::new(shell::ShellTool::new(states, cwd)));
+            reg.register(Arc::new(shell::ShellTool::new(states)));
         }
         if allowed("read") {
             reg.register(Arc::new(read::ReadTool));
         }
         if allowed("edit") {
-            reg.register(Arc::new(edit::EditTool::new(write_roots.clone())));
+            reg.register(Arc::new(edit::EditTool));
         }
         if allowed("write") {
-            reg.register(Arc::new(write::WriteTool::new(write_roots.clone())));
+            reg.register(Arc::new(write::WriteTool));
         }
         if allowed("grep") {
             reg.register(Arc::new(search::GrepTool));
@@ -341,7 +260,7 @@ impl ToolRegistry {
             reg.register(Arc::new(http::HttpTool::new()));
         }
         if allowed("lsp") {
-            reg.register(Arc::new(lsp::LspTool::new(states, cwd)));
+            reg.register(Arc::new(lsp::LspTool::new(states, scope.cwd())));
         }
         reg
     }
@@ -352,20 +271,12 @@ impl ToolRegistry {
         definitions: Vec<RemoteAgentToolDefinition>,
         allowed_tools: Option<&[String]>,
         session_id: &str,
-        write_roots: &[PathBuf],
     ) {
         let allowed = |name: &str| {
             allowed_tools
                 .map(|names| names.iter().any(|allowed| allowed == name))
                 .unwrap_or(true)
         };
-        // The session's declared write roots (see [`agent_bus::RemoteAgentTool`]):
-        // what the calling agent passed for this session, forwarded with every
-        // call so a sandboxing handler can share the list into the sandbox.
-        let write_roots: Vec<String> = write_roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect();
         for definition in definitions {
             if !allowed(&definition.name) {
                 continue;
@@ -379,7 +290,6 @@ impl ToolRegistry {
                 Arc::clone(&caller),
                 definition,
                 session_id,
-                write_roots.clone(),
             )));
         }
     }
@@ -453,13 +363,13 @@ impl ToolRegistry {
 
     /// Execute a tool call by name. Returns the result string or an error message.
     /// Common aliases (`bash` → `shell`) are resolved to the registered tool.
-    pub fn execute(&self, name: &str, args: &Value, cwd: &str) -> Result<String> {
+    pub fn execute(&self, name: &str, args: &Value, scope: &SessionScope) -> Result<String> {
         let resolved = match name {
             "bash" => "shell",
             other => other,
         };
         match self.tools.get(resolved) {
-            Some(tool) => tool.execute(args, cwd),
+            Some(tool) => tool.execute(args, scope),
             None => anyhow::bail!("unknown tool: {name}"),
         }
     }
@@ -518,6 +428,11 @@ pub(crate) mod test_util {
         pub fn as_str(&self) -> &str {
             self.0.to_str().expect("temp dir is valid utf-8")
         }
+
+        /// A session scope rooted at this directory, with no extra roots.
+        pub fn scope(&self) -> super::SessionScope {
+            super::SessionScope::new(self.as_str(), std::iter::empty::<PathBuf>())
+        }
     }
 
     impl Drop for TestDir {
@@ -532,76 +447,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_absolute_path() {
+    fn read_path_allows_absolute_path_inside_the_cwd() {
         let dir = test_util::unique_test_dir();
-        let result = resolve_workspace_path("/etc/passwd", dir.as_str());
+        let result = resolve_read_path(dir.as_str(), &dir.scope());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn read_path_rejects_absolute_path_outside_the_scope() {
+        let dir = test_util::unique_test_dir();
+        // /tmp itself exists and is outside the scope (no roots declared).
+        let result = resolve_read_path("/tmp", &dir.scope());
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("absolute"));
+        assert!(result.unwrap_err().contains("outside"));
     }
 
     #[test]
-    fn rejects_dotdot_escape() {
+    fn read_path_allows_absolute_path_inside_a_declared_root() {
         let dir = test_util::unique_test_dir();
-        let result = resolve_workspace_path("../../etc/passwd", dir.as_str());
+        let root = test_util::unique_test_dir();
+        let scope = SessionScope::new(dir.as_str(), [root.path().to_path_buf()]);
+        let target = root.path().join("session-state.json");
+        let result = resolve_read_path(target.to_str().unwrap(), &scope);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn read_path_rejects_escape_outside_workspace() {
+        let dir = test_util::unique_test_dir();
+        // A `..` traversal that lands outside the workspace is rejected.
+        let result = resolve_read_path("../../", &dir.scope());
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("escapes"));
-    }
-
-    #[test]
-    fn allows_relative_path() {
-        let dir = test_util::unique_test_dir();
-        let result = resolve_workspace_path("src/main.rs", dir.as_str());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn allows_nested_relative_path() {
-        let dir = test_util::unique_test_dir();
-        let result = resolve_workspace_path("src/deep/nested/file.rs", dir.as_str());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn allows_dot_path() {
-        let dir = test_util::unique_test_dir();
-        let result = resolve_workspace_path(".", dir.as_str());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn rejects_dotdot_within_subdirectory_is_ok() {
-        // a/b/../c should resolve to a/c, which is still inside the workspace
-        let dir = test_util::unique_test_dir();
-        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
-        std::fs::create_dir_all(dir.path().join("a/c")).unwrap();
-        let result = resolve_workspace_path("a/b/../c/file.rs", dir.as_str());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn read_path_allows_absolute_path() {
-        let dir = test_util::unique_test_dir();
-        // /tmp itself exists and is outside the workspace; reads must allow it.
-        let result = resolve_read_path("/tmp", dir.as_str());
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_absolute());
-    }
-
-    #[test]
-    fn read_path_allows_escape_outside_workspace() {
-        let dir = test_util::unique_test_dir();
-        // A `..` traversal that lands outside the workspace is allowed for reads.
-        let result = resolve_read_path("../../", dir.as_str());
-        assert!(result.is_ok());
     }
 
     #[test]
     fn read_path_resolves_relative_against_cwd() {
         let dir = test_util::unique_test_dir();
         std::fs::write(dir.path().join("inside.txt"), "x").unwrap();
-        let result = resolve_read_path("inside.txt", dir.as_str());
+        let result = resolve_read_path("inside.txt", &dir.scope());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), dir.path().join("inside.txt"));
+    }
+
+    #[test]
+    fn write_path_rejects_parent_traversal_through_an_existing_parent() {
+        // `a/../..` resolves through the existing directory `a` and lands
+        // outside the scope — rejected, not lexically smuggled through.
+        let dir = test_util::unique_test_dir();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        let result = resolve_write_path("a/../../escape.txt", &dir.scope());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("outside"));
+    }
+
+    #[test]
+    fn write_path_allows_a_new_file_in_a_new_directory_inside_the_scope() {
+        // The write tool creates parent directories: a path whose own
+        // directory does not exist yet has nothing to canonicalize through,
+        // and the scope check sees a plain in-scope path.
+        let dir = test_util::unique_test_dir();
+        let result = resolve_write_path("newdir/deep/file.txt", &dir.scope());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), dir.path().join("newdir/deep/file.txt"));
     }
 
     #[test]

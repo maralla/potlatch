@@ -4,9 +4,10 @@
 //! objects. Reads run concurrently; per-file errors are reported inline and do
 //! not block the other reads. Very large files are truncated with a marker.
 //!
-//! Reads are not sandboxed: absolute paths and paths outside the working
-//! directory are allowed when a file is explicitly referenced in the task
-//! context.
+//! Reads are scoped to the session's file scope ([`SessionScope`]): the
+//! working directory plus the roots the calling agent declared — the same
+//! directory set the sandbox shares into the session's VM. Absolute paths
+//! and `..` traversals that land outside that scope are rejected.
 
 use std::fs;
 use std::path::PathBuf;
@@ -15,9 +16,9 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::Tool;
+use crate::core::scope::SessionScope;
 
 pub struct ReadTool;
-
 impl Tool for ReadTool {
     fn name(&self) -> &str {
         "read"
@@ -37,7 +38,7 @@ impl Tool for ReadTool {
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Path to the file. May be relative to the working directory, or an absolute path to a file explicitly referenced in the task context."
+                                    "description": "Path to the file. Relative to the working directory, or an absolute path within the working directory or an agent-managed session directory named by the task."
                                 },
                                 "start_line": {
                                     "type": "integer",
@@ -58,7 +59,7 @@ impl Tool for ReadTool {
         })
     }
 
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, scope: &SessionScope) -> Result<String> {
         let files = args["files"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("missing or invalid 'files' array argument"))?;
@@ -85,12 +86,14 @@ impl Tool for ReadTool {
             })
             .collect::<Result<_>>()?;
 
-        // Read concurrently. `thread::scope` borrows `cwd` and the entries by ref,
-        // and joins all spawned threads before returning.
+        // Read concurrently. `thread::scope` borrows `scope` and the entries
+        // by ref, and joins all spawned threads before returning.
         let results: Vec<String> = std::thread::scope(|s| {
             let handles: Vec<_> = entries
                 .iter()
-                .map(|e| s.spawn(move || read_single_file(&e.path, e.start_line, e.end_line, cwd)))
+                .map(|e| {
+                    s.spawn(move || read_single_file(&e.path, e.start_line, e.end_line, scope))
+                })
                 .collect();
             handles
                 .into_iter()
@@ -126,9 +129,9 @@ fn read_single_file(
     path: &str,
     start_line: Option<u64>,
     end_line: Option<u64>,
-    cwd: &str,
+    scope: &SessionScope,
 ) -> String {
-    let full_path: PathBuf = match super::resolve_read_path(path, cwd) {
+    let full_path: PathBuf = match super::resolve_read_path(path, scope) {
         Ok(p) => p,
         Err(msg) => return format!("Error: {msg}"),
     };
@@ -209,7 +212,7 @@ mod tests {
 
         let tool = ReadTool;
         let args = json!({"files": [{"path": "test.txt"}]});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("line one"));
         assert!(result.contains("line two"));
         assert!(result.contains("line three"));
@@ -229,7 +232,7 @@ mod tests {
         let args = json!({
             "files": [{"path": "range.txt", "start_line": 3, "end_line": 5}]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("line 3"));
         assert!(result.contains("line 4"));
         assert!(result.contains("line 5"));
@@ -245,20 +248,36 @@ mod tests {
         let args = json!({"files": [{"path": "nonexistent.txt"}]});
         // The tool itself returns Ok with an inline "Error:" — a missing file
         // is a per-file failure, not a whole-call failure.
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Error"));
     }
 
     #[test]
-    fn reads_absolute_path_outside_workspace() {
+    fn reads_absolute_path_inside_a_declared_root() {
+        let root = test_util::unique_test_dir();
+        std::fs::write(root.path().join("session-notes.md"), "session content\n").unwrap();
+
+        let cwd = test_util::unique_test_dir();
+        let scope = super::super::SessionScope::new(cwd.as_str(), [root.path().to_path_buf()]);
+        let abs = root.path().join("session-notes.md");
+        let args = json!({"files": [{"path": abs.to_str().unwrap()}]});
+        let result = ReadTool.execute(&args, &scope).unwrap();
+        assert!(result.contains("session content"));
+    }
+
+    #[test]
+    fn rejects_absolute_path_outside_the_scope() {
         let external = test_util::unique_test_dir();
         std::fs::write(external.path().join("external.txt"), "external content\n").unwrap();
 
         let cwd = test_util::unique_test_dir();
         let abs = external.path().join("external.txt");
         let args = json!({"files": [{"path": abs.to_str().unwrap()}]});
-        let result = ReadTool.execute(&args, cwd.as_str()).unwrap();
-        assert!(result.contains("external content"));
+        let result = ReadTool.execute(&args, &cwd.scope()).unwrap();
+        // A per-file scope rejection is reported inline like any other
+        // per-file failure.
+        assert!(result.contains("Error"));
+        assert!(result.contains("outside"));
     }
 
     #[test]
@@ -266,7 +285,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let tool = ReadTool;
         let args = json!({"files": [{"path": "/nonexistent/path/file.txt"}]});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Error"));
     }
 
@@ -285,7 +304,7 @@ mod tests {
                 {"path": "c.rs"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Read 3 file(s)"));
         assert!(result.contains("alpha"));
         assert!(result.contains("beta"));
@@ -305,7 +324,7 @@ mod tests {
                 {"path": "missing.txt"}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         // The existing file is still read despite the missing one.
         assert!(result.contains("good"));
         assert!(result.contains("Error"));
@@ -327,7 +346,7 @@ mod tests {
                 {"path": "nums.txt", "start_line": 9, "end_line": 10}
             ]
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("lines 1-2 of 10"));
         assert!(result.contains("lines 9-10 of 10"));
         assert!(result.contains("line 1"));
@@ -340,7 +359,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let tool = ReadTool;
         let args = json!({"files": []});
-        let result = tool.execute(&args, dir.as_str());
+        let result = tool.execute(&args, &dir.scope());
         assert!(result.is_err());
     }
 
@@ -349,7 +368,7 @@ mod tests {
         let dir = test_util::unique_test_dir();
         let tool = ReadTool;
         let args = json!({});
-        let result = tool.execute(&args, dir.as_str());
+        let result = tool.execute(&args, &dir.scope());
         assert!(result.is_err());
     }
 
@@ -366,7 +385,7 @@ mod tests {
 
         let tool = ReadTool;
         let args = json!({"files": [{"path": "big.txt", "start_line": 1}]});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
 
         // Header reports the range actually shown, not the requested one.
         assert!(result.contains("lines 1-"));
@@ -396,7 +415,7 @@ mod tests {
 
         let tool = ReadTool;
         let args = json!({"files": [{"path": "small.txt"}]});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(!result.contains("truncated"));
         assert!(result.contains("3 lines"));
     }

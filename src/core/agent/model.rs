@@ -32,10 +32,12 @@ pub(crate) const MAX_MODEL_NUDGES: u32 = 10;
 #[derive(Debug, Clone, Default)]
 pub struct ModelPreferences {
     pub preferred_session_mode: Option<&'static str>,
-    /// Directories the harness's write/edit tools may touch outside the
-    /// session cwd (via `outside_cwd: true`). Forwarded to the harness in
-    /// `session/new` as the `write_roots` extension; empty keeps the
-    /// harness's historical permissive behavior.
+    /// Directories the harness's file tools (`read`, `grep`, `glob`,
+    /// `write`, `edit`) may touch beyond the session cwd. Forwarded to the
+    /// harness in `session/new` as the `write_roots` extension; together
+    /// with the session cwd they form the session's whole file scope — the
+    /// same directory set the sandbox agent shares into the session's VM.
+    /// Empty leaves the session cwd as the whole scope.
     pub write_roots: Vec<String>,
     /// Root for the harness's agent current-session markers, pinned to the
     /// project working dir (where `potlatch.toml` lives). The harness

@@ -6,16 +6,9 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::Tool;
+use crate::core::scope::SessionScope;
 
-pub struct WriteTool {
-    roots: super::WriteRoots,
-}
-
-impl WriteTool {
-    pub fn new(roots: super::WriteRoots) -> Self {
-        Self { roots }
-    }
-}
+pub struct WriteTool;
 
 impl Tool for WriteTool {
     fn name(&self) -> &str {
@@ -24,39 +17,33 @@ impl Tool for WriteTool {
 
     fn schema(&self) -> Value {
         json!({
-            "description": "Create a new file or overwrite an existing file with the given content. Creates parent directories if needed. Use this for new files; prefer edit for modifying existing files. By default paths must be relative to the working directory; set outside_cwd: true to write to an absolute path outside the workspace (only for agent-managed scratch files explicitly permitted by the task instructions).",
+            "description": "Create a new file or overwrite an existing file with the given content. Creates parent directories if needed. Use this for new files; prefer edit for modifying existing files. Paths must be within the working directory or an agent-managed session directory named by the task instructions.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to write"
+                        "description": "Path to the file to write. Relative to the working directory, or an absolute path within the working directory or an agent-managed session directory named by the task."
                     },
                     "content": {
                         "type": "string",
                         "description": "The full content to write to the file"
                     },
-                    "outside_cwd": {
-                        "type": "boolean",
-                        "description": "When true, allow absolute paths outside the working directory. Default false. Only set this when the task instructions explicitly direct you to write to a specific absolute path (e.g. an agent session directory).",
-                        "default": false
-                    }
                 },
                 "required": ["path", "content"]
             }
         })
     }
 
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, scope: &SessionScope) -> Result<String> {
         let path = args["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'path' argument"))?;
         let content = args["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'content' argument"))?;
-        let outside_cwd = args["outside_cwd"].as_bool().unwrap_or(false);
 
-        let full_path = match super::resolve_write_path(path, cwd, outside_cwd, &self.roots) {
+        let full_path = match super::resolve_write_path(path, scope) {
             Ok(p) => p,
             Err(msg) => return Ok(format!("Error: {msg}")),
         };
@@ -87,20 +74,19 @@ mod tests {
     use super::super::test_util;
     use super::*;
 
-    fn unrestricted_tool() -> WriteTool {
-        WriteTool::new(super::super::WriteRoots::default())
+    fn tool() -> WriteTool {
+        WriteTool
     }
 
     #[test]
     fn creates_new_file() {
         let dir = test_util::unique_test_dir();
 
-        let tool = unrestricted_tool();
         let args = json!({
             "path": "new.txt",
             "content": "line one\nline two\n"
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool().execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Created"));
         assert!(result.contains("2 lines"));
 
@@ -113,12 +99,11 @@ mod tests {
         let dir = test_util::unique_test_dir();
         std::fs::write(dir.path().join("over.txt"), "old content").unwrap();
 
-        let tool = unrestricted_tool();
         let args = json!({
             "path": "over.txt",
             "content": "new content"
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool().execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Overwrote"));
 
         let content = std::fs::read_to_string(dir.path().join("over.txt")).unwrap();
@@ -129,54 +114,58 @@ mod tests {
     fn creates_parent_directories() {
         let dir = test_util::unique_test_dir();
 
-        let tool = unrestricted_tool();
         let args = json!({
             "path": "nested/deep/file.txt",
             "content": "nested"
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool().execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Created"));
 
         assert!(dir.path().join("nested/deep/file.txt").exists());
     }
 
     #[test]
-    fn rejects_absolute_path() {
+    fn rejects_a_path_outside_the_scope() {
+        // Absolute path outside the scope.
         let dir = test_util::unique_test_dir();
-        let tool = unrestricted_tool();
         let args = json!({
             "path": "/tmp/evil.txt",
             "content": "bad"
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
-        assert!(result.contains("absolute paths are not allowed"));
+        let result = tool().execute(&args, &dir.scope()).unwrap();
+        assert!(
+            result.contains("outside the session's writable directories"),
+            "{result}"
+        );
+        assert!(!dir.path().join("evil.txt").exists());
     }
 
     #[test]
     fn rejects_parent_traversal() {
         let dir = test_util::unique_test_dir();
-        let tool = unrestricted_tool();
         let args = json!({
             "path": "../escape.txt",
             "content": "bad"
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
-        assert!(result.contains("escapes the workspace"));
+        let result = tool().execute(&args, &dir.scope()).unwrap();
+        assert!(
+            result.contains("outside the session's writable directories"),
+            "{result}"
+        );
     }
 
     #[test]
-    fn outside_cwd_allows_absolute_path() {
+    fn write_inside_a_declared_root_is_allowed() {
         let dir = test_util::unique_test_dir();
-        let outside = test_util::unique_test_dir();
-        let target = outside.path().join("outside.txt");
+        let root = test_util::unique_test_dir();
+        let target = root.path().join("outside.txt");
+        let scope = super::super::SessionScope::new(dir.as_str(), [root.path().to_path_buf()]);
 
-        let tool = unrestricted_tool();
         let args = json!({
             "path": target.to_string_lossy(),
-            "content": "from outside",
-            "outside_cwd": true
+            "content": "from outside"
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool().execute(&args, &scope).unwrap();
         assert!(result.contains("Created"), "{result}");
 
         let content = std::fs::read_to_string(&target).unwrap();
@@ -184,106 +173,34 @@ mod tests {
     }
 
     #[test]
-    fn outside_cwd_creates_parent_dirs() {
+    fn absolute_path_inside_the_cwd_is_allowed() {
+        // An absolute path that lands inside the working directory is fine —
+        // the cwd is always in scope.
         let dir = test_util::unique_test_dir();
-        let outside = test_util::unique_test_dir();
-        let target = outside.path().join("nested/deep/script.py");
+        let target = dir.path().join("in-cwd.txt");
 
-        let tool = unrestricted_tool();
         let args = json!({
             "path": target.to_string_lossy(),
-            "content": "print('hi')",
-            "outside_cwd": true
+            "content": "in cwd"
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool().execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("Created"), "{result}");
-        assert!(target.exists());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "in cwd");
     }
 
     #[test]
-    fn outside_cwd_overwrites_existing_file() {
+    fn without_roots_the_cwd_is_the_whole_scope() {
+        // An agent that declared no roots has the cwd as its whole scope:
+        // nothing outside it is writable.
         let dir = test_util::unique_test_dir();
         let outside = test_util::unique_test_dir();
-        let target = outside.path().join("existing.txt");
-        std::fs::write(&target, "old").unwrap();
+        let target = outside.path().join("outside.txt");
 
-        let tool = unrestricted_tool();
         let args = json!({
             "path": target.to_string_lossy(),
-            "content": "new",
-            "outside_cwd": true
-        });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
-        assert!(result.contains("Overwrote"), "{result}");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
-    }
-
-    #[test]
-    fn outside_cwd_defaults_to_false_when_absent() {
-        let dir = test_util::unique_test_dir();
-        let tool = unrestricted_tool();
-        // No outside_cwd field — must still reject absolute paths.
-        let args = json!({
-            "path": "/tmp/evil.txt",
             "content": "bad"
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
-        assert!(result.contains("absolute paths are not allowed"));
-    }
-
-    fn rooted_tool(roots: Vec<std::path::PathBuf>) -> WriteTool {
-        WriteTool::new(super::super::WriteRoots::from_paths(roots))
-    }
-
-    #[test]
-    fn outside_cwd_write_inside_a_configured_root_is_allowed() {
-        let dir = test_util::unique_test_dir();
-        let outside = test_util::unique_test_dir();
-        let target = outside.path().join("knowledge/notes.md");
-
-        let tool = rooted_tool(vec![outside.path().to_path_buf()]);
-        let args = json!({
-            "path": target.to_string_lossy(),
-            "content": "notes",
-            "outside_cwd": true
-        });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
-        assert!(result.contains("Created"), "{result}");
-        assert!(target.exists());
-    }
-
-    #[test]
-    fn outside_cwd_write_inside_the_cwd_is_allowed_with_roots() {
-        let dir = test_util::unique_test_dir();
-        let other = test_util::unique_test_dir();
-        let target = dir.path().join("in-workspace.txt");
-
-        // Roots are configured, but the write targets the cwd itself.
-        let tool = rooted_tool(vec![other.path().to_path_buf()]);
-        let args = json!({
-            "path": target.to_string_lossy(),
-            "content": "ws",
-            "outside_cwd": true
-        });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
-        assert!(result.contains("Created"), "{result}");
-        assert!(target.exists());
-    }
-
-    #[test]
-    fn outside_cwd_write_outside_every_root_is_rejected() {
-        let dir = test_util::unique_test_dir();
-        let allowed = test_util::unique_test_dir();
-        let forbidden = test_util::unique_test_dir();
-        let target = forbidden.path().join("evil.txt");
-
-        let tool = rooted_tool(vec![allowed.path().to_path_buf()]);
-        let args = json!({
-            "path": target.to_string_lossy(),
-            "content": "bad",
-            "outside_cwd": true
-        });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool().execute(&args, &dir.scope()).unwrap();
         assert!(
             result.contains("outside the session's writable directories"),
             "{result}"
@@ -292,17 +209,102 @@ mod tests {
     }
 
     #[test]
-    fn outside_cwd_write_to_an_arbitrary_system_path_is_rejected_with_roots() {
+    fn write_to_a_declared_root_creates_parent_dirs() {
+        let dir = test_util::unique_test_dir();
+        let root = test_util::unique_test_dir();
+        let target = root.path().join("nested/deep/script.py");
+        let scope = super::super::SessionScope::new(dir.as_str(), [root.path().to_path_buf()]);
+
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "print('hi')"
+        });
+        let result = tool().execute(&args, &scope).unwrap();
+        assert!(result.contains("Created"), "{result}");
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn write_to_a_declared_root_overwrites_existing_file() {
+        let dir = test_util::unique_test_dir();
+        let root = test_util::unique_test_dir();
+        let target = root.path().join("existing.txt");
+        std::fs::write(&target, "old").unwrap();
+        let scope = super::super::SessionScope::new(dir.as_str(), [root.path().to_path_buf()]);
+
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "new"
+        });
+        let result = tool().execute(&args, &scope).unwrap();
+        assert!(result.contains("Overwrote"), "{result}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_inside_a_configured_root_is_allowed() {
+        let dir = test_util::unique_test_dir();
+        let outside = test_util::unique_test_dir();
+        let target = outside.path().join("knowledge/notes.md");
+        let scope = super::super::SessionScope::new(dir.as_str(), [outside.path().to_path_buf()]);
+
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "notes"
+        });
+        let result = tool().execute(&args, &scope).unwrap();
+        assert!(result.contains("Created"), "{result}");
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn write_inside_the_cwd_is_allowed_with_roots() {
+        let dir = test_util::unique_test_dir();
+        let other = test_util::unique_test_dir();
+        let target = dir.path().join("in-workspace.txt");
+
+        // Roots are configured, but the write targets the cwd itself.
+        let scope = super::super::SessionScope::new(dir.as_str(), [other.path().to_path_buf()]);
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "ws"
+        });
+        let result = tool().execute(&args, &scope).unwrap();
+        assert!(result.contains("Created"), "{result}");
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn write_outside_every_root_is_rejected() {
         let dir = test_util::unique_test_dir();
         let allowed = test_util::unique_test_dir();
+        let forbidden = test_util::unique_test_dir();
+        let target = forbidden.path().join("evil.txt");
+        let scope = super::super::SessionScope::new(dir.as_str(), [allowed.path().to_path_buf()]);
 
-        let tool = rooted_tool(vec![allowed.path().to_path_buf()]);
+        let args = json!({
+            "path": target.to_string_lossy(),
+            "content": "bad"
+        });
+        let result = tool().execute(&args, &scope).unwrap();
+        assert!(
+            result.contains("outside the session's writable directories"),
+            "{result}"
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn write_to_an_arbitrary_system_path_is_rejected_with_roots() {
+        let dir = test_util::unique_test_dir();
+        let allowed = test_util::unique_test_dir();
+        let scope = super::super::SessionScope::new(dir.as_str(), [allowed.path().to_path_buf()]);
+
         let args = json!({
             "path": "/etc/passwd",
-            "content": "bad",
-            "outside_cwd": true
+            "content": "bad"
         });
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool().execute(&args, &scope).unwrap();
         assert!(
             result.contains("outside the session's writable directories"),
             "{result}"

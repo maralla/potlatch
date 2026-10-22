@@ -11,6 +11,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use super::Tool;
+use crate::core::scope::SessionScope;
 
 const MAX_OUTPUT: usize = 50_000;
 const DEFAULT_USER_AGENT: &str = "http-tool/0.1";
@@ -72,7 +73,7 @@ impl Tool for HttpTool {
         })
     }
 
-    fn execute(&self, args: &Value, _cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, _scope: &SessionScope) -> Result<String> {
         let url = args["url"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'url' argument"))?;

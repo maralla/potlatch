@@ -19,9 +19,8 @@ Your workspace is the current working directory. It is the root of the repositor
 
 - The `shell` tool runs commands in the working directory by default.
 - Use `shell` with `ls` or `find .` to discover the workspace structure if needed.
-- **Writes are sandboxed.** `edit` and `write` should only operate on paths within the working directory.
+- **File access is scoped.** `read`, `grep`, `glob`, `write`, and `edit` operate only within the working directory plus any agent-managed session directories the task names — paths outside that scope are rejected. Relative paths from the working directory are preferred; absolute paths are fine when they land inside the scope.
 - **Never use `shell` to create or edit files** (e.g. `cat > file`, `echo > file`, `sed -i`, `tee`). Always use `write` to create files and `edit` to modify them.
-- **Reads are not sandboxed.** `read`, `grep`, and `glob` may follow absolute paths or paths outside the workspace when a file or directory is explicitly referenced in the task context. Use this only to read context provided by the task — never to pull in unrelated files.
 - If a task description references files by absolute path within the repository, prefer stripping the repository prefix and using the relative portion.
 - The workspace may be a clone of a repository at a different location than the original. Always work with files as they exist in your workspace, not at some other path.
 

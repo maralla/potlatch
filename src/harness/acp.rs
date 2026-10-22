@@ -32,6 +32,7 @@ use super::tools::ToolRegistry;
 use super::tools::agent_bus::AgentToolCaller;
 use crate::core::bus::RemoteAgentToolDefinition;
 use crate::core::model::acp::jsonrpc::Outbound;
+use crate::core::scope::SessionScope;
 
 /// Context token budget for the harness ACP agent loop. Compaction triggers at
 /// 60% and targets 30% of this value (see `Context::enforce_budget`).
@@ -72,7 +73,10 @@ pub type SharedSessionChannels = Arc<Mutex<HashMap<String, SessionChannels>>>;
 /// A session in the ACP server.
 struct Session {
     id: String,
-    cwd: String,
+    /// The session's file scope: the agent-provided working directory plus
+    /// the roots the agent declared (`session/new`'s `cwd`/`write_roots`).
+    /// Every file tool confines paths to it.
+    scope: SessionScope,
     model: String,
     /// Current session mode (e.g. "plan", "ask", ""). Empty when no mode was
     /// set. The ACP runtime sends `session/set_config_option` with
@@ -125,10 +129,10 @@ struct Session {
 }
 
 impl Session {
-    fn new(cwd: String) -> Self {
+    fn new(scope: SessionScope) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
-            cwd,
+            scope,
             model: env::var("POTLATCH_MODEL").unwrap_or_default(),
             mode: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -259,6 +263,21 @@ impl AcpServer {
     fn handle_session_new(&mut self, params: &Value) -> Result<Value> {
         let cwd = params["cwd"].as_str().unwrap_or(".").to_string();
         info!("harness ACP: creating session with cwd={cwd}");
+        // The roots ride the same `session/new` (`write_roots` extension):
+        // directories beyond the cwd the calling agent allows its session's
+        // file tools to touch — typically its project's session directory.
+        let declared_roots = params
+            .get("write_roots")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let scope = SessionScope::new(cwd, declared_roots.iter().cloned());
 
         // Guarantee: a session/new on this connection replaces any session
         // that is still registered. The orchestrator closes the previous
@@ -282,7 +301,7 @@ impl AcpServer {
             self.close_all_registered_sessions("superseded by session/new");
         }
 
-        let mut session = Session::new(cwd.clone());
+        let mut session = Session::new(scope);
         // Optional `tools` extension: an allow-list of tool names. When
         // present, only those tools are registered for this session.
         if let Some(arr) = params.get("tools").and_then(|v| v.as_array()) {
@@ -389,29 +408,12 @@ impl AcpServer {
             write_current_session(&marker, &session.id, session.task_scope.as_deref());
         }
 
-        // Optional `write_roots` extension: directories the write/edit tools
-        // may touch outside the cwd (via `outside_cwd: true`). Empty/absent
-        // keeps the historical permissive behavior.
-        let declared_write_roots = params
-            .get("write_roots")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let write_roots = super::tools::WriteRoots::from_paths(declared_write_roots.clone());
-
         // Build the tool registry with built-in tools + caller-defined
         // structured-output tools. The tool set is fixed for the session
-        // lifetime.
+        // lifetime; every file tool confines paths to the session's scope.
         let mut tools = ToolRegistry::with_builtin_tools(
             &mut session.states,
-            &cwd,
-            &write_roots,
+            &session.scope,
             session.allowed_tools.as_deref(),
         );
         if let Some(caller) = &self.agent_tool_caller {
@@ -420,7 +422,6 @@ impl AcpServer {
                 session.agent_tools.clone(),
                 session.allowed_tools.as_deref(),
                 &session.id,
-                &declared_write_roots,
             );
         }
         if let Some(defs) = &session.structured_output_tools {
@@ -482,9 +483,9 @@ impl AcpServer {
             // restore_context falls back to init_context itself when no
             // transcript restores; initing again here would double the
             // system prompt.
-            agent.restore_context(&cwd, &context_channels);
+            agent.restore_context(&context_channels);
         } else {
-            agent.init_context(&cwd, &context_channels);
+            agent.init_context(&context_channels);
         }
         session.agent = Some(Arc::new(Mutex::new(agent)));
 
@@ -640,7 +641,7 @@ impl AcpServer {
                 request_id,
                 agent: Arc::clone(agent),
                 cancel: Arc::clone(&session.cancel),
-                cwd: session.cwd.clone(),
+                scope: session.scope.clone(),
                 transcript_path: session.transcript_path.clone(),
                 output: self.output.clone(),
             }
@@ -730,7 +731,7 @@ struct PromptTurn {
     request_id: Option<Value>,
     agent: Arc<Mutex<AgentLoop>>,
     cancel: Arc<AtomicBool>,
-    cwd: String,
+    scope: SessionScope,
     transcript_path: Option<PathBuf>,
     output: SharedOutput,
 }
@@ -774,8 +775,12 @@ impl PromptTurn {
             }
         };
 
-        let result =
-            agent.run_with_turn_callback(prompt_text, &self.cwd, Some(progress_cb), Some(turn_cb));
+        let result = agent.run_with_turn_callback(
+            prompt_text,
+            &self.scope,
+            Some(progress_cb),
+            Some(turn_cb),
+        );
         // Read all captured structured-output tool calls (e.g. `handoff`, `plan`).
         let structured_outputs = agent.take_structured_outputs();
         drop(agent);

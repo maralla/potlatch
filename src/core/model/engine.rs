@@ -173,9 +173,10 @@ fn live_callbacks(options: &InvokeOptions) -> LiveCallbacks<'_> {
 pub struct ModelSessionOptions {
     pub preferred_session_mode: Option<&'static str>,
     pub(crate) agent_bus: Option<AgentBus>,
-    /// Directories the harness's write/edit tools may touch outside the
-    /// session cwd (via `outside_cwd: true`). Forwarded to the harness in
-    /// `session/new` as the `write_roots` extension.
+    /// Directories the harness's file tools (`read`, `grep`, `glob`,
+    /// `write`, `edit`) may touch beyond the session cwd. Forwarded to the
+    /// harness in `session/new` as the `write_roots` extension; together
+    /// with the session cwd they form the session's whole file scope.
     pub write_roots: Vec<String>,
     /// Root for the harness's agent current-session markers (see
     /// [`ModelPreferences::agents_dir`]).

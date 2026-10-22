@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::sync::Mutex;
 
 use super::Tool;
+use crate::core::scope::SessionScope;
 
 pub struct GrepTool;
 
@@ -28,7 +29,7 @@ impl Tool for GrepTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory or file to search in (default: working directory). May be an absolute path to a location explicitly referenced in the task context."
+                        "description": "Directory or file to search in (default: working directory). Must be within the working directory or an agent-managed session directory named by the task."
                     },
                     "include": {
                         "type": "string",
@@ -48,7 +49,7 @@ impl Tool for GrepTool {
         })
     }
 
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, scope: &SessionScope) -> Result<String> {
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'pattern' argument"))?;
@@ -57,7 +58,7 @@ impl Tool for GrepTool {
         let context_lines = args["context_lines"].as_u64().unwrap_or(0) as usize;
         let max_results = args["max_results"].as_u64().unwrap_or(100) as usize;
 
-        let full_path = match super::resolve_read_path(search_path, cwd) {
+        let full_path = match super::resolve_read_path(search_path, scope) {
             Ok(p) => p,
             Err(msg) => return Ok(format!("Error: {msg}")),
         };
@@ -102,7 +103,7 @@ impl Tool for GrepTool {
             }
 
             let path = entry.path();
-            let display_path = super::display_path(path, cwd);
+            let display_path = super::display_path(path, scope.cwd());
             let mut sink = CollectorSink {
                 path: display_path,
                 collector: &collector,
@@ -181,7 +182,6 @@ impl<'a> Sink for CollectorSink<'a> {
 }
 
 pub struct GlobTool;
-
 impl Tool for GlobTool {
     fn name(&self) -> &str {
         "glob"
@@ -199,7 +199,7 @@ impl Tool for GlobTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory to search in (default: working directory). May be an absolute path to a location explicitly referenced in the task context."
+                        "description": "Directory to search in (default: working directory). Must be within the working directory or an agent-managed session directory named by the task."
                     }
                 },
                 "required": ["pattern"]
@@ -207,13 +207,13 @@ impl Tool for GlobTool {
         })
     }
 
-    fn execute(&self, args: &Value, cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, scope: &SessionScope) -> Result<String> {
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'pattern' argument"))?;
         let search_path = args["path"].as_str().unwrap_or(".");
 
-        let full_path = match super::resolve_read_path(search_path, cwd) {
+        let full_path = match super::resolve_read_path(search_path, scope) {
             Ok(p) => p,
             Err(msg) => return Ok(format!("Error: {msg}")),
         };
@@ -237,7 +237,7 @@ impl Tool for GlobTool {
         let mut results = Vec::new();
         for entry in walker.flatten() {
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                results.push(super::display_path(entry.path(), cwd));
+                results.push(super::display_path(entry.path(), scope.cwd()));
             }
         }
 
@@ -272,7 +272,7 @@ mod tests {
 
         let tool = GrepTool;
         let args = json!({"pattern": "hello"});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("hello"));
         assert!(result.contains("test.rs"));
     }
@@ -284,7 +284,7 @@ mod tests {
 
         let tool = GrepTool;
         let args = json!({"pattern": "nonexistent_function_xyz"});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("No matches"));
     }
 
@@ -297,41 +297,69 @@ mod tests {
 
         let tool = GlobTool;
         let args = json!({"pattern": "*.rs"});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("a.rs"));
         assert!(result.contains("b.rs"));
         assert!(!result.contains("c.txt"));
     }
 
     #[test]
-    fn grep_searches_absolute_path_outside_workspace() {
-        // Searching an absolute path outside the cwd must be allowed when the
-        // location is explicitly provided. Paths outside the cwd stay absolute.
+    fn grep_searches_absolute_path_inside_a_declared_root() {
+        // Searching an absolute path inside a declared session root is
+        // allowed. Paths outside the cwd stay absolute in the output.
+        let root = test_util::unique_test_dir();
+        std::fs::write(root.path().join("target.rs"), "fn needle() {}\n").unwrap();
+
+        let cwd = test_util::unique_test_dir();
+        let scope = super::super::SessionScope::new(cwd.as_str(), [root.path().to_path_buf()]);
+        let tool = GrepTool;
+        let args = json!({"pattern": "needle", "path": root.as_str()});
+        let result = tool.execute(&args, &scope).unwrap();
+        assert!(result.contains("needle"));
+        assert!(result.contains("target.rs"));
+        // External path is shown absolute (not stripped to a relative path).
+        assert!(result.contains(root.as_str()));
+    }
+
+    #[test]
+    fn grep_rejects_a_path_outside_the_scope() {
         let external = test_util::unique_test_dir();
         std::fs::write(external.path().join("target.rs"), "fn needle() {}\n").unwrap();
 
         let cwd = test_util::unique_test_dir();
         let tool = GrepTool;
         let args = json!({"pattern": "needle", "path": external.as_str()});
-        let result = tool.execute(&args, cwd.as_str()).unwrap();
-        assert!(result.contains("needle"));
-        assert!(result.contains("target.rs"));
-        // External path is shown absolute (not stripped to a relative path).
-        assert!(result.contains(external.as_str()));
+        let result = tool.execute(&args, &cwd.scope()).unwrap();
+        assert!(result.contains("Error"));
+        assert!(result.contains("outside"));
     }
 
     #[test]
-    fn glob_searches_absolute_path_outside_workspace() {
+    fn glob_searches_absolute_path_inside_a_declared_root() {
+        let root = test_util::unique_test_dir();
+        std::fs::File::create(root.path().join("match.rs")).unwrap();
+
+        let cwd = test_util::unique_test_dir();
+        let scope = super::super::SessionScope::new(cwd.as_str(), [root.path().to_path_buf()]);
+        let tool = GlobTool;
+        let args = json!({"pattern": "*.rs", "path": root.as_str()});
+        let result = tool.execute(&args, &scope).unwrap();
+        assert!(result.contains("match.rs"));
+        // External path is shown absolute.
+        assert!(result.contains(root.as_str()));
+    }
+
+    #[test]
+    fn glob_rejects_a_path_outside_the_scope() {
         let external = test_util::unique_test_dir();
         std::fs::File::create(external.path().join("match.rs")).unwrap();
 
         let cwd = test_util::unique_test_dir();
         let tool = GlobTool;
         let args = json!({"pattern": "*.rs", "path": external.as_str()});
-        let result = tool.execute(&args, cwd.as_str()).unwrap();
-        assert!(result.contains("match.rs"));
-        // External path is shown absolute.
-        assert!(result.contains(external.as_str()));
+        let result = tool.execute(&args, &cwd.scope()).unwrap();
+        assert!(result.contains("Error"));
+        assert!(result.contains("outside"));
     }
 
     #[test]
@@ -347,7 +375,7 @@ mod tests {
 
         let tool = GrepTool;
         let args = json!({"pattern": "handleIndex"});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("taskapp/tasks/handler.go:1:"));
         // The absolute path must NOT appear in the output.
         assert!(!result.contains(dir.as_str()));
@@ -361,7 +389,7 @@ mod tests {
 
         let tool = GlobTool;
         let args = json!({"pattern": "**/*.rs"});
-        let result = tool.execute(&args, dir.as_str()).unwrap();
+        let result = tool.execute(&args, &dir.scope()).unwrap();
         assert!(result.contains("src/nested/mod.rs"));
         assert!(!result.contains(dir.as_str()));
     }

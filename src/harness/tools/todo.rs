@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::Tool;
+use crate::core::scope::SessionScope;
 use crate::harness::todo::{TodoItem, TodoList, TodoStatus};
 
 pub struct TodoTool {
@@ -53,7 +54,7 @@ impl Tool for TodoTool {
         })
     }
 
-    fn execute(&self, args: &Value, _cwd: &str) -> Result<String> {
+    fn execute(&self, args: &Value, _scope: &SessionScope) -> Result<String> {
         let items = args["items"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("missing or invalid 'items' array argument"))?;
@@ -96,6 +97,11 @@ impl Tool for TodoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cwd-only session scope for tool tests.
+    fn scope(cwd: &str) -> crate::core::scope::SessionScope {
+        crate::core::scope::SessionScope::new(cwd, std::iter::empty::<std::path::PathBuf>())
+    }
     use crate::harness::todo::TodoList;
 
     #[test]
@@ -108,7 +114,7 @@ mod tests {
                 {"description": "task B", "status": "pending"}
             ]
         });
-        let result = tool.execute(&args, "/tmp").unwrap();
+        let result = tool.execute(&args, &scope("/tmp")).unwrap();
         assert!(result.starts_with("Todo list saved:\n\n"), "{result}");
         let rendered = todo.render().unwrap();
         assert_eq!(
@@ -127,7 +133,7 @@ mod tests {
                     {"description": "old task", "status": "in_progress"}
                 ]
             }),
-            "/tmp",
+            &scope("/tmp"),
         )
         .unwrap();
         let result = tool
@@ -138,7 +144,7 @@ mod tests {
                         {"description": "new task 2", "status": "pending"}
                     ]
                 }),
-                "/tmp",
+                &scope("/tmp"),
             )
             .unwrap();
         assert!(result.starts_with("Todo list saved:\n\n"), "{result}");
@@ -160,7 +166,7 @@ mod tests {
                     {"description": "task B", "status": "pending"}
                 ]
             }),
-            "/tmp",
+            &scope("/tmp"),
         )
         .unwrap();
         tool.execute(
@@ -170,7 +176,7 @@ mod tests {
                     {"description": "task B", "status": "in_progress"}
                 ]
             }),
-            "/tmp",
+            &scope("/tmp"),
         )
         .unwrap();
         let rendered = todo.render().unwrap();
@@ -196,7 +202,7 @@ mod tests {
                         {"description": "beta", "status": "in_progress"}
                     ]
                 }),
-                "/tmp",
+                &scope("/tmp"),
             )
             .unwrap();
 
@@ -217,7 +223,7 @@ mod tests {
                 {"description": "task A", "status": "done"}
             ]
         });
-        let result = tool.execute(&args, "/tmp");
+        let result = tool.execute(&args, &scope("/tmp"));
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -234,7 +240,7 @@ mod tests {
                 {"status": "pending"}
             ]
         });
-        let result = tool.execute(&args, "/tmp");
+        let result = tool.execute(&args, &scope("/tmp"));
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -247,7 +253,7 @@ mod tests {
         let todo = Arc::new(TodoList::new());
         let tool = TodoTool::new(Arc::clone(&todo));
         let args = json!({"items": []});
-        let result = tool.execute(&args, "/tmp");
+        let result = tool.execute(&args, &scope("/tmp"));
         assert!(result.is_err());
     }
 
@@ -256,7 +262,7 @@ mod tests {
         let todo = Arc::new(TodoList::new());
         let tool = TodoTool::new(Arc::clone(&todo));
         let args = json!({});
-        let result = tool.execute(&args, "/tmp");
+        let result = tool.execute(&args, &scope("/tmp"));
         assert!(result.is_err());
     }
 }
