@@ -11,7 +11,9 @@
 //! outside the list is rejected before any process is spawned.
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -20,7 +22,6 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use crate::core::bus::{AgentBus, AgentInbox, AgentToolDefinition};
-use crate::core::periodic::{JitterPolicy, PeriodicTaskSpec};
 use crate::core::ssh_util::validate_ssh_identity;
 use crate::util::dies_with_parent;
 
@@ -39,11 +40,6 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const TOOL_NAME: &str = "ssh";
 /// The bus operation one execution request carries.
 pub const OPERATION: &str = "ssh";
-
-/// The periodic task id a serving agent schedules the inbox drain under, and
-/// how long one drain blocks waiting for a proxied execution.
-pub const REQUESTS_TASK: &str = "ssh_requests";
-pub const INBOX_WAIT: Duration = Duration::from_millis(200);
 
 /// One configured SSH destination. Only `hostname` is required: without
 /// `user` ssh connects as its default, and without `identity_file` ssh's own
@@ -127,16 +123,22 @@ pub fn tool_definition(hosts: &[SshHost], agent_id: &str) -> AgentToolDefinition
     }
 }
 
-/// The adopted tool's serving state, held by an agent that registered it:
-/// the validated host list plus the bus inbox receiving proxied executions.
-/// Any fleet agent (worker, reviewer, pmo, qa, ...) adopts one in its
-/// `build` when its own block configures hosts, schedules [`Self::task`],
-/// and answers calls through [`Self::serve_once`] — the config is consumed
-/// and the command executed here, in the adopting agent's own process.
+/// The adopted tool's serving state. [`SshServer::adopt`] moves the bus
+/// inbox onto a **dedicated serving thread** that answers proxied
+/// executions as they arrive — deliberately independent of the adopting
+/// agent's own periodic cycles, which can block for the length of a whole
+/// model session (a drain riding the role's scheduler starved every call
+/// for as long as the session ran). Dropping the handle signals the thread
+/// to stop; it then drops the inbox, which unregisters the route, so a
+/// supervisor restart of the agent can adopt fresh.
 pub struct SshServer {
-    hosts: Vec<SshHost>,
-    inbox: AgentInbox,
+    stop: Arc<AtomicBool>,
 }
+
+/// How often the serving thread re-checks its stop flag between waits.
+/// Request latency is unaffected — `recv_timeout` wakes the moment a call
+/// arrives — only teardown lags by at most one window.
+const SERVE_POLL: Duration = Duration::from_secs(1);
 
 impl SshServer {
     /// Adopt the tool when the agent block configures hosts: check the
@@ -157,32 +159,45 @@ impl SshServer {
         let bus = bus.context("the `ssh` tool requires the cross-agent bus")?;
         let definition = tool_definition(&hosts, agent_id);
         let inbox = bus.register(agent_id, vec![definition])?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread_hosts = hosts.clone();
+        thread::Builder::new()
+            .name(format!("{agent_id}-ssh"))
+            .spawn(move || serve_inbox(inbox, thread_hosts, thread_stop))
+            .context("spawn the `ssh` serving thread")?;
         info!(
             "{agent_id}: adopted the `ssh` tool for {} configured host(s)",
             hosts.len()
         );
-        Ok(Some(Self { hosts, inbox }))
+        Ok(Some(Self { stop }))
     }
+}
 
-    /// The periodic task a serving agent adds to its scheduler: a fast-spin
-    /// cycle whose handler blocks on the inbox wait, not on the interval.
-    pub fn task() -> PeriodicTaskSpec {
-        PeriodicTaskSpec {
-            id: REQUESTS_TASK,
-            interval: Duration::ZERO,
-            jitter: JitterPolicy::BeforeEachCycle,
-            jitter_max_ms: 0,
-            autostart: true,
-        }
+impl Drop for SshServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
     }
+}
 
-    /// Drain and answer one proxied execution from the inbox, if any.
-    pub fn serve_once(&mut self) -> Result<()> {
-        if let Some(request) = self.inbox.recv_timeout(INBOX_WAIT)? {
-            let result = execute(&self.hosts, &request.payload);
-            request.respond(result.map(Value::String));
+/// The serving loop: answer proxied executions until stopped. The thread
+/// owns the inbox, so when it exits the inbox drops and the route
+/// unregisters itself.
+fn serve_inbox(inbox: AgentInbox, hosts: Vec<SshHost>, stop: Arc<AtomicBool>) {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
         }
-        Ok(())
+        match inbox.recv_timeout(SERVE_POLL) {
+            Ok(Some(request)) => {
+                let result = execute(&hosts, &request.payload);
+                request.respond(result.map(Value::String));
+            }
+            // Quiet window: loop and re-check the stop flag.
+            Ok(None) => {}
+            // The route is gone (process teardown).
+            Err(_) => break,
+        }
     }
 }
 /// The `hostname` field description: every configured host, so the model
@@ -530,7 +545,7 @@ mod tests {
                 .is_none()
         );
 
-        let server = SshServer::adopt(
+        let _server = SshServer::adopt(
             Some(&bus),
             "worker-0",
             &json!({
@@ -542,7 +557,6 @@ mod tests {
         )
         .unwrap()
         .expect("adoption for a configured block");
-        assert_eq!(server.hosts.len(), 2);
 
         let registered = bus.registered_tools(Duration::ZERO).unwrap();
         let definition = registered
@@ -562,6 +576,64 @@ mod tests {
         assert!(
             SshServer::adopt(Some(&bus), "worker-1", &json!({"ssh": [{"user": "ci"}]})).is_err()
         );
+    }
+
+    #[test]
+    fn the_detached_serving_thread_answers_proxied_executions() {
+        // The serving thread is independent of any role cycle: a request is
+        // answered (here, rejected by the allow-list before any process
+        // spawns) as soon as it arrives, even while the adopting agent is
+        // busy elsewhere.
+        let bus = AgentBus::new();
+        let _server = SshServer::adopt(
+            Some(&bus),
+            "worker-0",
+            &json!({"ssh": [{"hostname": "build.example"}]}),
+        )
+        .unwrap()
+        .expect("adoption for a configured block");
+
+        let response = bus
+            .request(
+                "worker-0",
+                OPERATION.to_string(),
+                json!({"hostname": "evil.example", "command": "echo hi"}),
+                None,
+                Duration::from_secs(10),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(response.contains("evil.example"), "{response}");
+    }
+
+    #[test]
+    fn dropping_the_handle_stops_the_serving_thread_and_unregisters_the_route() {
+        let bus = AgentBus::new();
+        let server = SshServer::adopt(
+            Some(&bus),
+            "worker-0",
+            &json!({"ssh": [{"hostname": "build.example"}]}),
+        )
+        .unwrap()
+        .expect("adoption for a configured block");
+        drop(server);
+
+        // The thread exits within one poll window and the inbox it owns
+        // unregisters the route — a supervisor restart of the same agent
+        // can then adopt fresh.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let still_registered = bus
+                .registered_tools(Duration::ZERO)
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == TOOL_NAME);
+            if !still_registered {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the ssh route outlived its serving handle");
     }
 
     #[test]
