@@ -120,6 +120,15 @@ impl AgentModel {
         &self.shutdown
     }
 
+    /// This model's endpoint label when the endpoint was given up on after
+    /// repeated failures (see the endpoint breaker): every run against it
+    /// fails fast until the process restarts. Agents check this before
+    /// claiming new work — a claim taken and dropped because the model is
+    /// gone is exactly the churn the breaker exists to prevent.
+    pub fn gave_up_endpoint(&self) -> Option<String> {
+        self.engine.gave_up_endpoint()
+    }
+
     /// Run a prompt and deserialize the role's required structured-output
     /// tool call into `T`. This is the only typed completion API — role cycle
     /// logic never reads `structured_outputs` JSON by hand.

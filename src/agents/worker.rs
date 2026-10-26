@@ -926,6 +926,11 @@ enum IssueClaimAttempt {
 /// The narrow, typed surface used by the worker routing workflows.
 trait WorkerRoutingPort {
     fn shutdown_requested(&self) -> bool;
+    /// This worker's model-endpoint label when the endpoint was given up on
+    /// after repeated failures (see the endpoint breaker): every model run
+    /// would fail fast, so no new work may be claimed — a claim taken and
+    /// dropped because the model is gone is pure label churn.
+    fn model_endpoint_gave_up(&self) -> Option<String>;
     fn issue(&self, issue_iid: u64) -> Result<IssueObservation>;
     fn merge_request_status(&self, mr_iid: u64) -> Result<MrStatusObservation>;
     fn issues(&self) -> Result<Vec<IssueObservation>>;
@@ -1365,6 +1370,17 @@ fn poll_for_work(
     if port.shutdown_requested() {
         return Ok(());
     }
+    if let Some(endpoint) = port.model_endpoint_gave_up() {
+        // Claiming an issue now would only add labels the run cannot justify:
+        // every model run fails fast, the claim is released, and the next
+        // cycle starts over. Idle until the process is restarted against a
+        // working endpoint.
+        warn!(
+            "{}: model endpoint {} gave up after repeated failures, idling until restart",
+            agent_id, endpoint
+        );
+        return Ok(());
+    }
     if active.is_none()
         && let Some(adopted) = port.adopt_orphaned_session()
     {
@@ -1571,6 +1587,10 @@ struct LiveWorkerRoutingPort<'a> {
 impl WorkerRoutingPort for LiveWorkerRoutingPort<'_> {
     fn shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    fn model_endpoint_gave_up(&self) -> Option<String> {
+        self.model.gave_up_endpoint()
     }
 
     fn issue(&self, issue_iid: u64) -> Result<IssueObservation> {
@@ -6325,6 +6345,7 @@ mod tests {
         failures: Vec<String>,
         issue_reads: std::cell::RefCell<std::collections::HashMap<u64, usize>>,
         fail_issue_read: Option<(u64, usize)>,
+        gave_up_endpoint: Option<String>,
     }
 
     impl FakeWorkerPort {
@@ -6350,6 +6371,7 @@ mod tests {
                 failures: vec![],
                 issue_reads: Default::default(),
                 fail_issue_read: None,
+                gave_up_endpoint: None,
             }
         }
 
@@ -6416,6 +6438,10 @@ mod tests {
             self.fail_issue_read = Some((iid, read));
             self
         }
+        fn with_gave_up_endpoint(mut self, endpoint: &str) -> Self {
+            self.gave_up_endpoint = Some(endpoint.to_string());
+            self
+        }
 
         fn record(&self, operation: impl Into<String>) {
             self.trace.borrow_mut().push(operation.into());
@@ -6437,6 +6463,10 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(false)
+        }
+        fn model_endpoint_gave_up(&self) -> Option<String> {
+            self.record("model_endpoint_gave_up");
+            self.gave_up_endpoint.clone()
         }
         fn issue(&self, issue_iid: u64) -> Result<IssueObservation> {
             let operation = format!("issue:{issue_iid}");
@@ -6632,6 +6662,7 @@ mod tests {
             "shutdown",
             "own_sessions",
             "shutdown",
+            "model_endpoint_gave_up",
             "adopt_orphan",
             "handle_labeled_mr",
             "issues",
@@ -6670,6 +6701,31 @@ mod tests {
         assert_eq!(
             port.implementation_payloads.borrow().as_slice(),
             &[candidate]
+        );
+    }
+
+    #[test]
+    fn worker_cycle_does_not_claim_when_the_model_endpoint_gave_up() {
+        let candidate = issue_observation(7, &[]);
+        let mut port = FakeWorkerPort::new()
+            .listing(std::slice::from_ref(&candidate))
+            .with_gave_up_endpoint("http://endpoint.example/v1");
+        let run = run_worker_routing(&mut port, None);
+
+        assert!(run.result.is_ok());
+        assert!(run.active.is_none());
+        // The cycle stops at the gate: no candidate scan, no claim, no
+        // session or label activity — a dead model endpoint cannot justify
+        // any of it, and churning labels on it is the failure mode the
+        // endpoint breaker exists to prevent.
+        assert_eq!(
+            run.trace,
+            strings(&[
+                "shutdown",
+                "own_sessions",
+                "shutdown",
+                "model_endpoint_gave_up",
+            ])
         );
     }
 
@@ -6856,7 +6912,13 @@ mod tests {
         let run = run_worker_routing(&mut adopting, None);
         assert_eq!(
             run.trace,
-            strings(&["shutdown", "own_sessions", "shutdown", "adopt_orphan"])
+            strings(&[
+                "shutdown",
+                "own_sessions",
+                "shutdown",
+                "model_endpoint_gave_up",
+                "adopt_orphan"
+            ])
         );
         assert_eq!(run.active, Some(active_with_mr(7, 12)));
 
@@ -6868,6 +6930,7 @@ mod tests {
                 "shutdown",
                 "own_sessions",
                 "shutdown",
+                "model_endpoint_gave_up",
                 "adopt_orphan",
                 "handle_labeled_mr"
             ])
@@ -6953,6 +7016,7 @@ mod tests {
                 "run_feedback:12:Some(7):false",
                 "own_sessions",
                 "shutdown",
+                "model_endpoint_gave_up",
                 "adopt_orphan",
                 "handle_labeled_mr",
                 "issues",
@@ -6981,13 +7045,14 @@ mod tests {
             .with_resumable(&[active_with_mr(7, 12), active_with_mr(9, 13)]);
         let run = run_worker_routing(&mut port, Some(active_with_mr(7, 12)));
         assert_eq!(
-            &run.trace[..8],
+            &run.trace[..9],
             &strings(&[
                 "issue:7",
                 "mr_status:12",
                 "run_feedback:12:Some(7):false",
                 "own_sessions",
                 "shutdown",
+                "model_endpoint_gave_up",
                 "handle_labeled_mr",
                 "issues",
                 "shutdown",
@@ -7001,13 +7066,14 @@ mod tests {
         let run = run_worker_routing(&mut port, Some(active_with_mr(9, 13)));
         let trace = run.trace.clone();
         assert_eq!(
-            &trace[trace.len() - 8..],
+            &trace[trace.len() - 9..],
             &strings(&[
                 "issue:9",
                 "mr_status:13",
                 "run_feedback:13:Some(9):false",
                 "own_sessions",
                 "shutdown",
+                "model_endpoint_gave_up",
                 "handle_labeled_mr",
                 "issues",
                 "shutdown",

@@ -375,6 +375,11 @@ enum ClaimAttempt {
 /// The narrow, typed surface needed by the reviewer workflows.
 trait ReviewerPort {
     fn shutdown_requested(&self) -> bool;
+    /// This reviewer's model-endpoint label when the endpoint was given up on
+    /// after repeated failures (see the endpoint breaker): every model run
+    /// would fail fast, so no MR may be claimed for review — a claim taken
+    /// and dropped because the model is gone is pure label churn.
+    fn model_endpoint_gave_up(&self) -> Option<String>;
     fn default_branch(&self) -> Result<String>;
     fn fetch_remote(&mut self) -> Result<()>;
     /// Best effort by contract.
@@ -583,6 +588,17 @@ fn run_reviewer_cycle(
     merge_when_approved: bool,
     port: &mut dyn ReviewerPort,
 ) -> Result<Option<u64>> {
+    if let Some(endpoint) = port.model_endpoint_gave_up() {
+        // Claiming an MR now would only add a label the review cannot
+        // justify: every model run fails fast, the claim is released, and
+        // the next cycle starts over. Idle until the process is restarted
+        // against a working endpoint.
+        warn!(
+            "{}: model endpoint {} gave up after repeated failures, idling until restart",
+            agent_id, endpoint
+        );
+        return Ok(None);
+    }
     let default_branch = port.default_branch()?;
     port.fetch_remote()?;
     // Shutdown boundary 1: after the remote refresh.
@@ -971,6 +987,9 @@ struct LiveReviewerPort<'a> {
 impl ReviewerPort for LiveReviewerPort<'_> {
     fn shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+    fn model_endpoint_gave_up(&self) -> Option<String> {
+        self.model.gave_up_endpoint()
     }
     fn default_branch(&self) -> Result<String> {
         self.git_repo.get_default_branch()
@@ -1670,6 +1689,7 @@ mod tests {
         reviewed_subjects: Vec<ReviewSubject>,
         created_issues: RefCell<Vec<(String, String)>>,
         linked_issues: Vec<(u64, u64)>,
+        gave_up_endpoint: Option<String>,
     }
 
     impl FakeReviewerPort {
@@ -1691,6 +1711,7 @@ mod tests {
                 reviewed_subjects: Vec::new(),
                 created_issues: RefCell::new(Vec::new()),
                 linked_issues: Vec::new(),
+                gave_up_endpoint: None,
             }
         }
 
@@ -1731,6 +1752,10 @@ mod tests {
             self.failures.push(operation.to_string());
             self
         }
+        fn with_gave_up_endpoint(mut self, endpoint: &str) -> Self {
+            self.gave_up_endpoint = Some(endpoint.to_string());
+            self
+        }
     }
 
     impl ReviewerPort for FakeReviewerPort {
@@ -1740,6 +1765,10 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(false)
+        }
+        fn model_endpoint_gave_up(&self) -> Option<String> {
+            self.trace("model_endpoint_gave_up");
+            self.gave_up_endpoint.clone()
         }
         fn default_branch(&self) -> Result<String> {
             self.trace("default_branch");
@@ -1894,6 +1923,7 @@ mod tests {
 
     fn startup() -> Vec<String> {
         [
+            "model_endpoint_gave_up",
             "default_branch",
             "fetch",
             "shutdown",
@@ -1926,6 +1956,21 @@ mod tests {
         .into_iter()
         .map(String::from)
         .collect()
+    }
+
+    #[test]
+    fn reviewer_cycle_does_not_claim_when_the_model_endpoint_gave_up() {
+        let mut port = FakeReviewerPort::new(vec![observation(7, None)])
+            .with_gave_up_endpoint("http://endpoint.example/v1");
+
+        let outcome = run(&mut port, true).unwrap();
+
+        assert_eq!(outcome, None);
+        // The cycle stops at the gate: no remote fetch, no candidate scan,
+        // no claim — a dead model endpoint cannot justify any of it, and
+        // churning claim labels on it is the failure mode the endpoint
+        // breaker exists to prevent.
+        assert_eq!(port.trace.borrow().as_slice(), &["model_endpoint_gave_up"]);
     }
 
     #[test]
@@ -2035,6 +2080,7 @@ mod tests {
         assert_eq!(
             *port.trace.borrow(),
             [
+                "model_endpoint_gave_up",
                 "default_branch",
                 "fetch",
                 "shutdown",

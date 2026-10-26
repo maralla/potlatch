@@ -44,6 +44,7 @@ use crate::core::agent::AgentHandoff;
 use crate::core::bus::AgentBus;
 use crate::core::config::build_acp_spawn_command;
 use crate::core::config::uri::ModelUri;
+use crate::core::model::breaker;
 use crate::paths::APP_NAME;
 use crate::util::dies_with_parent;
 
@@ -59,6 +60,10 @@ const MAX_TRANSPORT_RETRIES: u32 = 5;
 /// How long a disposed ACP child gets to exit on its own (stdin EOF → its
 /// shutdown path kills the session's background jobs) before it is killed.
 const DISPOSE_GRACE: Duration = Duration::from_secs(3);
+/// Granularity of the shutdown/cancel polls while a task waits out an
+/// endpoint-backoff delay, mirroring the prompt loop's 200 ms × 25 cadence.
+const BACKOFF_POLL_SLICE: Duration = Duration::from_millis(200);
+const BACKOFF_CANCEL_CHECK_POLLS: u32 = 25;
 
 struct AcpSession {
     client: Arc<AcpClient>,
@@ -127,6 +132,13 @@ pub(crate) struct AcpRuntime {
     agent_id: String,
     acp: Mutex<Option<AcpSession>>,
     unexpected_quits_count: Arc<AtomicU64>,
+    /// Breaker key of this runtime's model endpoint: the ACP child's full
+    /// spawn identity. All runtimes whose children would be configured
+    /// identically share one failure budget (see [`breaker`]).
+    endpoint_key: String,
+    /// Human-readable endpoint label for logs (base URL when known), never
+    /// containing secrets.
+    endpoint_label: String,
 }
 
 impl AcpRuntime {
@@ -148,6 +160,8 @@ impl AcpRuntime {
             super::backends::resolve_vendor_extension(model_uri.as_deref(), preferred_session_mode);
         let structured_output_backend =
             super::backends::resolve_structured_output_backend(model_uri.as_deref());
+        let (endpoint_key, endpoint_label) =
+            breaker::endpoint_identity(&acp_command, &acp_env, model_uri.as_deref());
         Self {
             working_dir,
             model_uri,
@@ -166,6 +180,8 @@ impl AcpRuntime {
             agent_bus,
             write_roots,
             agents_dir,
+            endpoint_key,
+            endpoint_label,
         }
     }
 
@@ -184,6 +200,12 @@ impl AcpRuntime {
     /// Retries after transport failures keep the same session while the child
     /// stays up; if the child exits, a new process and session are created and
     /// the same contract is registered again.
+    ///
+    /// When the *model endpoint* fails (the agent loop reported an error, or
+    /// the transport gave out repeatedly), the task is retried with
+    /// exponential backoff while the global per-endpoint failure budget (see
+    /// [`breaker`]) lasts; once that budget is spent process-wide, the
+    /// endpoint is given up on and this and every later run fails fast.
     pub fn run_task(
         &self,
         prompt: &str,
@@ -192,6 +214,9 @@ impl AcpRuntime {
         cancel_check: Option<&dyn Fn() -> bool>,
         follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
     ) -> Result<AgentHandoff> {
+        if let Some(error) = self.gave_up_error() {
+            return Err(error);
+        }
         self.register_task_contract(structured_output_tools);
         *self.current_task_scope.lock().unwrap() = task_scope.map(str::to_string);
         let prompt = self.prompt_with_structured_output(prompt);
@@ -213,8 +238,96 @@ impl AcpRuntime {
         }
         debug!("Agent task prompt: {}", prompt);
 
+        let mut retries: u32 = 0;
+        loop {
+            match self.run_task_attempt(&prompt, cancel_check, follow_up_poll) {
+                Ok(handoff) => {
+                    breaker::record_success(&self.endpoint_key);
+                    return Ok(handoff);
+                }
+                Err(error) if is_model_endpoint_failure(&error) => {
+                    if breaker::record_failure(
+                        &self.endpoint_key,
+                        &self.endpoint_label,
+                        &error.to_string(),
+                    ) {
+                        return Err(self
+                            .gave_up_error()
+                            .expect("failure just gave the endpoint up"));
+                    }
+                    retries += 1;
+                    if retries > breaker::MAX_ENDPOINT_RETRIES {
+                        // The global counter resets on any other task's
+                        // success; this task still must not spin forever.
+                        return Err(error);
+                    }
+                    let delay = breaker::backoff_delay(retries);
+                    warn!(
+                        "Model endpoint {} failed for {} ({error:#}); retry {retries}/{} in {delay:?}",
+                        self.endpoint_label,
+                        self.agent_id(),
+                        breaker::MAX_ENDPOINT_RETRIES,
+                    );
+                    self.wait_out_backoff(delay, cancel_check)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// One task attempt: a fresh session (spawning the child if needed) plus
+    /// the prompt with its own short transport-retry ladder.
+    fn run_task_attempt(
+        &self,
+        prompt: &str,
+        cancel_check: Option<&dyn Fn() -> bool>,
+        follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
+    ) -> Result<AgentHandoff> {
         self.rotate_acp_session_for_new_task()?;
-        self.run_prompt_with_transport_retry(&prompt, cancel_check, follow_up_poll)
+        self.run_prompt_with_transport_retry(prompt, cancel_check, follow_up_poll)
+    }
+
+    /// Wait out an endpoint-backoff delay, interruptible by shutdown and by
+    /// the caller's task-cancellation check at the same cadence the prompt
+    /// loop polls them, so a cancelled issue never sits through the full wait.
+    fn wait_out_backoff(
+        &self,
+        delay: Duration,
+        cancel_check: Option<&dyn Fn() -> bool>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let mut polls_since_cancel_check: u32 = 0;
+        while !self.shutdown.load(Ordering::SeqCst) {
+            let remaining = delay.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            polls_since_cancel_check += 1;
+            if polls_since_cancel_check >= BACKOFF_CANCEL_CHECK_POLLS {
+                polls_since_cancel_check = 0;
+                if let Some(check) = cancel_check
+                    && check()
+                {
+                    anyhow::bail!("Agent cancelled by external condition");
+                }
+            }
+            thread::sleep(remaining.min(BACKOFF_POLL_SLICE));
+        }
+        anyhow::bail!("Agent interrupted by shutdown");
+    }
+
+    /// The typed fail-fast error when this runtime's endpoint was given up on.
+    fn gave_up_error(&self) -> Option<anyhow::Error> {
+        breaker::gave_up(&self.endpoint_key, &self.endpoint_label).map(anyhow::Error::new)
+    }
+
+    /// This runtime's model endpoint label when it has been given up on after
+    /// repeated failures: every run against it fails fast until the process
+    /// restarts. Agents check this before claiming new work — a claim taken
+    /// and dropped because the model is gone is exactly the churn the
+    /// endpoint breaker exists to prevent.
+    pub fn gave_up_endpoint(&self) -> Option<String> {
+        breaker::gave_up(&self.endpoint_key, &self.endpoint_label).map(|g| g.endpoint)
     }
 
     /// Send a follow-up prompt into the session the current task is already
@@ -224,20 +337,39 @@ impl AcpRuntime {
     ///
     /// Transport failures are returned as-is rather than retried: a respawned
     /// child would have lost the task context this prompt depends on, which
-    /// makes a retry here worse than letting the caller fail the task.
+    /// makes a retry here worse than letting the caller fail the task. They
+    /// still count toward the endpoint's global failure budget — an endpoint
+    /// failing every repair prompt is the same dead endpoint.
     pub fn run_in_current_session(
         &self,
         prompt: &str,
         cancel_check: Option<&dyn Fn() -> bool>,
         follow_up_poll: Option<&dyn Fn() -> Vec<String>>,
     ) -> Result<AgentHandoff> {
+        if let Some(error) = self.gave_up_error() {
+            return Err(error);
+        }
         let prompt = self.prompt_with_structured_output(prompt);
         debug!(
             "Agent {} follow-up prompt in current session: {}",
             self.agent_id(),
             prompt
         );
-        self.run_prompt_once(&prompt, cancel_check, follow_up_poll)
+        match self.run_prompt_once(&prompt, cancel_check, follow_up_poll) {
+            Ok(handoff) => {
+                breaker::record_success(&self.endpoint_key);
+                Ok(handoff)
+            }
+            Err(error) if is_model_endpoint_failure(&error) => {
+                breaker::record_failure(
+                    &self.endpoint_key,
+                    &self.endpoint_label,
+                    &error.to_string(),
+                );
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Record the structured-output contract the task being started asks for.
@@ -787,6 +919,16 @@ fn is_transport_failure(error: &anyhow::Error) -> bool {
     message.contains("exited during prompt") || message.contains("ACP session/prompt")
 }
 
+/// Whether one failed task attempt is the *model endpoint* failing: the
+/// agent loop reported an error (the endpoint stayed unreachable even after
+/// the child's own in-process retries), or the transport gave out repeatedly
+/// (child exited mid-prompt, `session/prompt` failed). These feed the
+/// endpoint's global give-up counter; cancellation, shutdown, and child
+/// setup problems do not.
+fn is_model_endpoint_failure(error: &anyhow::Error) -> bool {
+    error.to_string().starts_with("ACP agent loop error") || is_transport_failure(error)
+}
+
 /// The error detail when a prompt result reports `stopReason: "error"` — the
 /// agent loop itself failed (e.g. the LLM endpoint stayed unavailable after
 /// the agent's own in-process retries) rather than completing a turn. No
@@ -935,6 +1077,7 @@ mod tests {
     use super::*;
     use crate::core::bus::AgentToolDefinition;
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn test_runtime_with_model(model_uri: Option<&str>) -> AcpRuntime {
         AcpRuntime::new(
@@ -954,6 +1097,27 @@ mod tests {
 
     fn test_runtime() -> AcpRuntime {
         test_runtime_with_model(None)
+    }
+
+    /// A runtime whose endpoint key is unique to `name`, so tests tripping
+    /// the process-global breaker never interfere.
+    fn test_runtime_with_unique_endpoint(name: &str) -> (AcpRuntime, String, String) {
+        let command = vec![format!("breaker-{name}")];
+        let runtime = AcpRuntime::new(
+            "/tmp/repo".into(),
+            None,
+            None,
+            command.clone(),
+            std::collections::HashMap::new(),
+            None,
+            None,
+            Vec::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            "worker-0".into(),
+        );
+        let (key, label) = breaker::endpoint_identity(&command, &HashMap::new(), None);
+        (runtime, key, label)
     }
 
     fn test_tool() -> AgentToolDefinition {
@@ -1086,6 +1250,58 @@ mod tests {
         assert!(!is_transport_failure(&anyhow::anyhow!(
             "ACP agent loop error: LLM request failed (503 Service Unavailable)"
         )));
+    }
+
+    #[test]
+    fn endpoint_failures_are_loop_errors_and_repeated_transport_failures() {
+        assert!(is_model_endpoint_failure(&anyhow::anyhow!(
+            "ACP agent loop error: LLM request failed (503 Service Unavailable)"
+        )));
+        assert!(is_model_endpoint_failure(&anyhow::anyhow!(
+            "agent worker-0 exited during prompt (signal: 9)"
+        )));
+        assert!(is_model_endpoint_failure(&anyhow::anyhow!(
+            "ACP session/prompt: broken pipe"
+        )));
+
+        // Cancellation, shutdown, and child setup problems are not the
+        // endpoint failing and must not burn its failure budget.
+        assert!(!is_model_endpoint_failure(&anyhow::anyhow!(
+            "Agent cancelled by external condition"
+        )));
+        assert!(!is_model_endpoint_failure(&anyhow::anyhow!(
+            "Agent interrupted by shutdown"
+        )));
+        assert!(!is_model_endpoint_failure(&anyhow::anyhow!(
+            "Failed to spawn `agent` ACP process"
+        )));
+    }
+
+    #[test]
+    fn a_runtime_its_endpoint_gave_up_on_reports_the_endpoint_and_fails_fast() {
+        let (runtime, key, label) = test_runtime_with_unique_endpoint("gave-up");
+        assert_eq!(runtime.gave_up_endpoint(), None);
+        assert!(runtime.gave_up_error().is_none());
+
+        // Burn the whole retry budget; the endpoint is still trusted. The
+        // next failure gives up on it.
+        for _ in 0..breaker::MAX_ENDPOINT_RETRIES {
+            assert!(!breaker::record_failure(&key, &label, "boom"));
+        }
+        assert!(breaker::record_failure(&key, &label, "boom"));
+        assert_eq!(runtime.gave_up_endpoint(), Some(label.clone()));
+
+        let error = runtime.gave_up_error().unwrap();
+        let gave_up = error
+            .downcast_ref::<breaker::ModelEndpointGaveUp>()
+            .expect("gave-up errors stay downcastable");
+        assert_eq!(gave_up.endpoint, label);
+        assert_eq!(gave_up.last_error, "boom");
+
+        // Another runtime on a different endpoint is unaffected.
+        let (other, other_key, _) = test_runtime_with_unique_endpoint("gave-up-other");
+        assert_eq!(other.gave_up_endpoint(), None);
+        assert_ne!(key, other_key);
     }
 
     #[test]

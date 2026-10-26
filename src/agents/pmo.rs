@@ -626,6 +626,11 @@ enum PmoClaimOutcome {
 trait PmoPort {
     fn default_branch(&self) -> Result<String>;
     fn shutdown_requested(&self) -> bool;
+    /// This PMO's model-endpoint label when the endpoint was given up on
+    /// after repeated failures (see the endpoint breaker): every model run
+    /// would fail fast, so no issue may be claimed for planning — a claim
+    /// taken and dropped because the model is gone is pure label churn.
+    fn model_endpoint_gave_up(&self) -> Option<String>;
     fn fetch_repository(&mut self) -> Result<()>;
     fn checkout_default_branch(&mut self, branch: &str) -> Result<()>;
     fn reset_worktree(&mut self) -> Result<()>;
@@ -984,6 +989,17 @@ fn run_pmo_cycle(
     held_issue_iid: Option<u64>,
     port: &mut dyn PmoPort,
 ) -> Result<()> {
+    if let Some(endpoint) = port.model_endpoint_gave_up() {
+        // Claiming an issue now would only add labels the planning cannot
+        // justify: every model run fails fast, the claim is released, and
+        // the next cycle starts over. Held claims stay in place; idle until
+        // the process is restarted against a working endpoint.
+        warn!(
+            "{}: model endpoint {} gave up after repeated failures, idling until restart",
+            agent_id, endpoint
+        );
+        return Ok(());
+    }
     let default_branch = port.default_branch()?;
     port.fetch_repository()?;
     if port.checkout_default_branch(&default_branch).is_err() {
@@ -1143,6 +1159,10 @@ struct LivePmoPort<'a> {
 impl PmoPort for LivePmoPort<'_> {
     fn default_branch(&self) -> Result<String> {
         self.git_repo.get_default_branch()
+    }
+
+    fn model_endpoint_gave_up(&self) -> Option<String> {
+        self.model.gave_up_endpoint()
     }
 
     fn shutdown_requested(&self) -> bool {
@@ -2568,6 +2588,7 @@ mod tests {
         descriptions: Vec<(u64, String)>,
         comments: Vec<(u64, String)>,
         children: Vec<(String, String)>,
+        gave_up_endpoint: Option<String>,
     }
 
     impl FakePmoPort {
@@ -2624,7 +2645,13 @@ mod tests {
                 descriptions: Vec::new(),
                 comments: Vec::new(),
                 children: Vec::new(),
+                gave_up_endpoint: None,
             }
+        }
+
+        fn with_gave_up_endpoint(mut self, endpoint: &str) -> Self {
+            self.gave_up_endpoint = Some(endpoint.to_string());
+            self
         }
 
         fn record(&self, event: impl Into<String>) {
@@ -2652,6 +2679,11 @@ mod tests {
         fn shutdown_requested(&self) -> bool {
             self.record("observe:shutdown");
             self.shutdown.borrow_mut().pop_front().unwrap_or(false)
+        }
+
+        fn model_endpoint_gave_up(&self) -> Option<String> {
+            self.record("observe:model_endpoint_gave_up");
+            self.gave_up_endpoint.clone()
         }
 
         fn fetch_repository(&mut self) -> Result<()> {
@@ -2828,12 +2860,27 @@ mod tests {
     }
 
     #[test]
+    fn pmo_cycle_does_not_claim_when_the_model_endpoint_gave_up() {
+        let mut port =
+            FakePmoPort::successful().with_gave_up_endpoint("http://endpoint.example/v1");
+
+        run_fake(&mut port, None).unwrap();
+
+        // The cycle stops at the gate: no repository work, no candidate
+        // scan, no claim — a dead model endpoint cannot justify any of it,
+        // and churning claim labels on it is the failure mode the endpoint
+        // breaker exists to prevent.
+        assert_eq!(*port.trace.borrow(), vec!["observe:model_endpoint_gave_up"]);
+    }
+
+    #[test]
     fn pmo_cycle_records_full_split_order_and_generated_iids() {
         let mut port = FakePmoPort::successful();
         run_fake(&mut port, None).unwrap();
         assert_eq!(
             *port.trace.borrow(),
             vec![
+                "observe:model_endpoint_gave_up",
                 "observe:default_branch",
                 "act:fetch",
                 "act:checkout:main",
@@ -3588,8 +3635,9 @@ mod tests {
         run_fake(&mut port, None).unwrap();
         let trace = port.trace.borrow();
         assert_eq!(
-            &trace[..5],
+            &trace[..6],
             [
+                "observe:model_endpoint_gave_up",
                 "observe:default_branch",
                 "act:fetch",
                 "act:checkout:main",

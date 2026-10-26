@@ -306,6 +306,13 @@ impl ModelEngine {
     pub fn set_capability_provider(&self, provider: Option<Arc<dyn CapabilityProvider>>) {
         self.inner.set_capability_provider(provider);
     }
+
+    /// This engine's model-endpoint label when the endpoint was given up on
+    /// after repeated failures (see the endpoint breaker): every run against
+    /// it fails fast until the process restarts.
+    pub fn gave_up_endpoint(&self) -> Option<String> {
+        self.inner.gave_up_endpoint()
+    }
 }
 
 #[cfg(test)]
