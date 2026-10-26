@@ -551,9 +551,13 @@ impl VmPool {
         }
         // The console: the keepalive only. The VM's life is the console
         // session's life; commands ride the vsock line, never the
-        // console.
-        let keepalive = format!("exec {CONSOLE_KEEPALIVE}");
-        cmd.arg("--").arg("sh").arg("-c").arg(&keepalive);
+        // console. ONE argument: the sandbox runs the `--` payload as a
+        // shell line under /bin/sh (the guest joins the argv with
+        // spaces), so `sh -c` here would flatten to the line
+        // `sh -c exec tail -f /dev/null` — whose inner shell runs just
+        // `exec` and exits 0, ending the session and the VM at boot
+        // (MEASURED). The line itself is the whole command.
+        cmd.arg("--").arg(format!("exec {CONSOLE_KEEPALIVE}"));
         // stderr is inherited, never piped: the boot log lands in this
         // process's own log (where it is greppable), and an unread pipe
         // could never fill and stall the VM mid-boot.
