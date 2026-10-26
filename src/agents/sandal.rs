@@ -43,7 +43,7 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::core::agent::CoreAgent;
 use crate::core::banner::Banner;
@@ -322,7 +322,8 @@ impl CoreAgent for SandalAgent {
             .context("[agent.sandal] settings are not usable")?;
         let bin =
             resolve_sandal_bin().context("[agent.sandal] requires the sandal sandbox binary")?;
-        let pool = Arc::new(VmPool::new(settings, bin));
+        let badge = ctx.runtime.agent_id().to_string();
+        let pool = Arc::new(VmPool::new(settings, bin, badge));
         let inbox = bus.register(
             AGENT_NAME,
             vec![AgentToolDefinition {
@@ -457,6 +458,14 @@ struct VmState {
     /// The sandbox process — the VM itself. Lives for the entry's whole
     /// life; killed in [`close_state`].
     vm: Child,
+    /// The sandbox's stderr, drained by [`VmState::stderr_reader`] into
+    /// this buffer as it arrives. The death/boot diagnostics read it:
+    /// the sandbox's own error lines ride the agent's error events
+    /// instead of the platform's raw stderr (the unprefixed pane glue).
+    stderr: Arc<Mutex<Vec<u8>>>,
+    /// The drain thread. Dies at the process's death (the stderr EOF);
+    /// joined on the diagnostic paths so the buffer is final.
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     /// Last shell call on this VM — stamped at each command's start AND
     /// end, under the state lock.
     last_used: Instant,
@@ -470,14 +479,18 @@ struct VmState {
 struct VmPool {
     settings: ResolvedSettings,
     bin: PathBuf,
+    /// The agent's badge id (`sandal-0`): the prefix every sandbox
+    /// diagnostic carries so the TUI renders it under this agent.
+    badge: String,
     entries: Mutex<HashMap<String, Arc<VmEntry>>>,
 }
 
 impl VmPool {
-    fn new(settings: ResolvedSettings, bin: PathBuf) -> Self {
+    fn new(settings: ResolvedSettings, bin: PathBuf, badge: String) -> Self {
         Self {
             settings,
             bin,
+            badge,
             entries: Mutex::new(HashMap::new()),
         }
     }
@@ -542,12 +555,16 @@ impl VmPool {
         }
         // stdin/stdout are nothing the daemon reads or writes (no
         // session line); null keeps the held-pipe discipline moot. stderr
-        // is inherited, never piped: the boot log lands in this
-        // process's own log (where it is greppable), and an unread pipe
-        // could never fill and stall the VM mid-boot.
-        cmd.stdin(Stdio::null()).stdout(Stdio::null());
+        // is PIPED, not inherited: the sandbox's own error lines (a boot
+        // refusal, a kernel problem) used to print raw into the
+        // platform's stderr — unprefixed, glued to the TUI spinner. The
+        // drain thread captures them and the failures surface as the
+        // agent's error events (the badge-prefixed TUI lines).
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         dies_with_parent(&mut cmd);
-        Self::spawn_vm(cmd, self.bin.clone(), scope, port)
+        Self::spawn_vm(cmd, self.bin.clone(), &self.badge, scope, port)
     }
 
     /// The rest of one session VM's spawn: the VM process, then the
@@ -558,16 +575,45 @@ impl VmPool {
     fn spawn_vm(
         mut cmd: Command,
         bin: PathBuf,
+        badge: &str,
         scope: &SessionScope,
         port: u16,
     ) -> Result<VmEntry> {
         let mut vm = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {}", bin.display()))?;
+        // The sandbox's stderr, drained as it arrives: the boot and death
+        // diagnostics read this buffer instead of racing the platform's
+        // raw stderr stream.
+        let stderr: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_reader = match vm.stderr.take() {
+            Some(mut err) => {
+                let sink = Arc::clone(&stderr);
+                Some(std::thread::spawn(move || {
+                    let mut collected = Vec::new();
+                    let _ = err.read_to_end(&mut collected);
+                    if let Ok(mut guard) = sink.lock() {
+                        *guard = collected;
+                    }
+                }))
+            }
+            None => None,
+        };
         if let Err(error) = probe_ready(&mut vm, port) {
             let _ = vm.kill();
             let _ = vm.wait();
-            return Err(error);
+            if let Some(reader) = stderr_reader {
+                let _ = reader.join();
+            }
+            let reported = stderr_tail(&stderr);
+            if reported.is_empty() {
+                return Err(error);
+            }
+            // The sandbox named its own failure: surface it under this
+            // agent's badge (the TUI's error line) and hand it to the
+            // session — the model sees the root cause, not just a status.
+            error!(target: "potlatch::sandal", "{badge}: sandbox boot failed: {reported}");
+            return Err(error.context(format!("the sandbox reported: {reported}")));
         }
         Ok(VmEntry {
             scope: scope.clone(),
@@ -575,6 +621,8 @@ impl VmPool {
             running: AtomicUsize::new(0),
             state: Mutex::new(VmState {
                 vm,
+                stderr,
+                stderr_reader,
                 last_used: Instant::now(),
             }),
         })
@@ -784,20 +832,33 @@ impl VmPool {
                 let mut state = lock_state(&entry.state);
                 let exited = state.vm.try_wait().ok().flatten();
                 close_state(&mut state);
+                // The sandbox's own stderr: what it printed before dying
+                // (an OOM kill, a kernel panic, a boot refusal) — joined
+                // here so the buffer is final, then surfaced under the
+                // agent's badge instead of the platform's raw stderr.
+                if let Some(reader) = state.stderr_reader.take() {
+                    let _ = reader.join();
+                }
+                let sandbox_err = stderr_tail(&state.stderr);
                 drop(state);
                 lock(&self.entries).remove(session_id);
+                let reported = if sandbox_err.is_empty() {
+                    String::new()
+                } else {
+                    format!("; the sandbox reported: {sandbox_err}")
+                };
                 let why = match exited {
                     Some(status) => format!(
-                        "the session's sandbox VM exited during the command (status {}); \
-                         see the platform log for the sandbox's own output; the session's \
-                         next call boots a fresh one",
+                        "the session's sandbox VM exited during the command (status {}){reported}; \
+                         the session's next call boots a fresh one",
                         status.code().unwrap_or(-1)
                     ),
                     None => format!(
                         "the sandbox command line broke before the command's status arrived \
-                         ({reason}); the session's next call boots a fresh one"
+                         ({reason}){reported}; the session's next call boots a fresh one"
                     ),
                 };
+                error!(target: "potlatch::sandal", "{}: {why}", self.badge);
                 Outcome::Closed(anyhow::anyhow!(why))
             }
         }
@@ -884,6 +945,20 @@ fn job_tag() -> String {
 /// sandal tears the VM down from the inside — its own teardown, the
 /// guest cleaning up after itself) and kill the process. The kills are
 /// the belt. The overlay dies with the process; nothing is persisted.
+/// The captured sandbox stderr's tail (the last ~300 bytes, trimmed) —
+/// the sandbox names its own failures there (`Error: kernel image not
+/// found`), and the diagnostics carry it verbatim.
+fn stderr_tail(stderr: &Mutex<Vec<u8>>) -> String {
+    let guard = stderr
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_empty() {
+        return String::new();
+    }
+    let start = guard.len().saturating_sub(300);
+    String::from_utf8_lossy(&guard[start..]).trim().to_string()
+}
+
 fn close_state(state: &mut VmState) {
     // The daemon holds its own life; the pool's close is the kill. The
     // overlay is ephemeral either way — nothing is flushed or kept.
@@ -1154,7 +1229,14 @@ fn probe_ready(vm: &mut Child, port: u16) -> Result<()> {
                  log for the sandbox's own output"
             );
         }
-        match vsockd_run(port, b":", deadline, true) {
+        // ONE short attempt per round: a per-attempt deadline keeps the
+        // loop's own liveness check (the try_wait above) in play — an
+        // attempt bounded by the whole boot deadline would sit inside
+        // vsockd_run's connect retry for the full window while a dead VM
+        // refused every connect (MEASURED: a broken sandbox burned the
+        // entire boot deadline before the exit was noticed).
+        let attempt_deadline = Instant::now() + Duration::from_millis(1000);
+        match vsockd_run(port, b":", attempt_deadline, true) {
             Run::Finished(_) => return Ok(()),
             Run::TimedOut => bail!(
                 "the session VM's command line never became ready; see the platform \
@@ -1323,6 +1405,20 @@ mod tests {
         path
     }
 
+    /// A broken sandbox: exits immediately with an error on stderr —
+    /// the shape of a bad deployment (a missing kernel, a refused
+    /// binary) that used to print raw into the platform's stderr.
+    fn fake_broken_sandal(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-broken-sandal");
+        fs::write(
+            &path,
+            "#!/bin/sh\necho 'Error: kernel image not found' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// A pool with the fake sandbox and the given idle timeout. The
     /// settings resolve through the real path, so the resolve path is
     /// under test too. The ssh era needed a key and a server layer
@@ -1332,7 +1428,11 @@ mod tests {
             "[agent.sandal]\nidle_timeout_secs = {idle_timeout_secs}\n"
         ));
         let resolved = raw.resolve(Some(dir)).unwrap();
-        Arc::new(VmPool::new(resolved, fake_sandal(dir)))
+        Arc::new(VmPool::new(
+            resolved,
+            fake_sandal(dir),
+            "sandal-0".to_string(),
+        ))
     }
 
     fn call(pool: &VmPool, session: &str, command: &str) -> Result<String> {
@@ -2030,6 +2130,35 @@ mod tests {
                 .unwrap()
                 .contains("fresh-vm")
         );
+    }
+
+    /// A broken sandbox (exits at boot with an error on stderr): the
+    /// boot fails and the sandbox's OWN error line rides the failure —
+    /// surfaced under the agent's badge in the TUI and handed to the
+    /// session — instead of printing raw into the platform's stderr.
+    #[test]
+    fn a_broken_sandbox_names_its_own_failure() {
+        let dir = unique_test_dir();
+        let raw = settings("[agent.sandal]\nidle_timeout_secs = 3600\n");
+        let resolved = raw.resolve(Some(dir.path())).unwrap();
+        let pool = Arc::new(VmPool::new(
+            resolved,
+            fake_broken_sandal(dir.path()),
+            "sandal-0".to_string(),
+        ));
+        let cwd = std::env::current_dir().unwrap();
+        // The boot happens on the run loop's half (ensure) — its error is
+        // what the session sees, and it carries the sandbox's own line.
+        let error = pool
+            .ensure("session-1", &test_scope(&cwd, &[]))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("the sandbox reported: Error: kernel image not found"),
+            "the boot failure did not carry the sandbox's own error: {message}"
+        );
+        // Nothing was booted: the session has no VM.
+        assert!(lock(&pool.entries).get("session-1").is_none());
     }
 
     /// The background-job path: a job that outlives any transport starts
