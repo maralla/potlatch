@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -101,13 +101,6 @@ const MAX_COMMAND_BYTES: usize = 65535;
 /// finished run.
 const TRAILER_MAGIC: &[u8; 16] = b"VSOCKD:EXIT:01\n\0";
 const TRAILER_LEN: usize = 17;
-
-/// The console command: a keepalive that holds the console session open
-/// for the VM's life — sandal tears the VM down when the console session
-/// dies, so the keepalive IS the VM's life from the console side. It
-/// produces nothing, so the held pipes never fill; commands no longer
-/// ride the console at all (they ride the vsock line).
-const CONSOLE_KEEPALIVE: &str = "tail -f /dev/null";
 
 /// Default VM memory cap (MB) when layers are configured without
 /// `memory`. The cap no longer sizes the footprint: the sandbox boots a
@@ -455,19 +448,15 @@ struct VmEntry {
     state: Mutex<VmState>,
 }
 
-/// The mutable state of one live session VM: the VM process and the
-/// console session that keeps it alive.
+/// The mutable state of one live session VM: the VM process itself.
+/// The VM is the pure command daemon (`--port`, no console command): it
+/// holds its own life — nothing the pool pins, no session to keep fed —
+/// and quits on the guest's native power commands or the kill in
+/// [`close_state`].
 struct VmState {
     /// The sandbox process — the VM itself. Lives for the entry's whole
     /// life; killed in [`close_state`].
     vm: Child,
-    /// The console pipes, held for the VM's life: dropping them closes
-    /// the console session (sandal tears the VM down with it), and the
-    /// keepalive holds it open. Taken and dropped in [`close_state`] —
-    /// the console session dies first, sandal's own teardown runs, and
-    /// the kill below is the belt. Commands never touch these: they
-    /// ride the vsock line.
-    console: Option<(ChildStdin, ChildStdout)>,
     /// Last shell call on this VM — stamped at each command's start AND
     /// end, under the state lock.
     last_used: Instant,
@@ -501,8 +490,10 @@ impl VmPool {
         // (a) The sandbox process: --port (the command line's listener —
         // every command connection lands here and the VMM bridges it
         // through vsock to the guest's /bin/vsockd), the layers, the
-        // shares, the sizing, and the console keepalive. Take the console
-        // pipes and hold them for the VM's life.
+        // shares, and the sizing. NO console command: with --port and no
+        // command the sandbox is the pure command daemon — it holds its
+        // own life and serves until the pool kills it (or the guest's
+        // native power commands quit it).
         let port = allocate_vsock_port()?;
         let mut cmd = Command::new(&self.bin);
         cmd.arg("run")
@@ -549,28 +540,21 @@ impl VmPool {
                 );
             }
         }
-        // The console: the keepalive only. The VM's life is the console
-        // session's life; commands ride the vsock line, never the
-        // console. ONE argument: the sandbox runs the `--` payload as a
-        // shell line under /bin/sh (the guest joins the argv with
-        // spaces), so `sh -c` here would flatten to the line
-        // `sh -c exec tail -f /dev/null` — whose inner shell runs just
-        // `exec` and exits 0, ending the session and the VM at boot
-        // (MEASURED). The line itself is the whole command.
-        cmd.arg("--").arg(format!("exec {CONSOLE_KEEPALIVE}"));
-        // stderr is inherited, never piped: the boot log lands in this
+        // stdin/stdout are nothing the daemon reads or writes (no
+        // session line); null keeps the held-pipe discipline moot. stderr
+        // is inherited, never piped: the boot log lands in this
         // process's own log (where it is greppable), and an unread pipe
         // could never fill and stall the VM mid-boot.
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        cmd.stdin(Stdio::null()).stdout(Stdio::null());
         dies_with_parent(&mut cmd);
         Self::spawn_vm(cmd, self.bin.clone(), scope, port)
     }
 
-    /// The rest of one session VM's spawn: the VM process and its console
-    /// pipes, then the readiness probe — one real command through the
-    /// line, so a broken deployment (a sandbox that dies at boot, a
-    /// guest whose vsockd never comes up) fails the boot loudly here,
-    /// never as a confusing timeout on the session's first command.
+    /// The rest of one session VM's spawn: the VM process, then the
+    /// readiness probe — one real command through the line, so a broken
+    /// deployment (a sandbox that dies at boot, a guest whose vsockd
+    /// never comes up) fails the boot loudly here, never as a confusing
+    /// timeout on the session's first command.
     fn spawn_vm(
         mut cmd: Command,
         bin: PathBuf,
@@ -580,10 +564,6 @@ impl VmPool {
         let mut vm = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {}", bin.display()))?;
-        let console = Some((
-            vm.stdin.take().context("sandbox stdin not piped")?,
-            vm.stdout.take().context("sandbox stdout not piped")?,
-        ));
         if let Err(error) = probe_ready(&mut vm, port) {
             let _ = vm.kill();
             let _ = vm.wait();
@@ -595,7 +575,6 @@ impl VmPool {
             running: AtomicUsize::new(0),
             state: Mutex::new(VmState {
                 vm,
-                console,
                 last_used: Instant::now(),
             }),
         })
@@ -906,7 +885,8 @@ fn job_tag() -> String {
 /// guest cleaning up after itself) and kill the process. The kills are
 /// the belt. The overlay dies with the process; nothing is persisted.
 fn close_state(state: &mut VmState) {
-    drop(state.console.take());
+    // The daemon holds its own life; the pool's close is the kill. The
+    // overlay is ephemeral either way — nothing is flushed or kept.
     let _ = state.vm.kill();
     let _ = state.vm.wait();
 }
