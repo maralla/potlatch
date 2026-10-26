@@ -13,7 +13,6 @@ use tracing::{info, warn};
 use super::state::StateStore;
 use crate::agents::artifact::write_task_context_file;
 use crate::agents::forge::{self, ForgeClient, scope_label_filter};
-use crate::agents::ssh_util::{shell_single_quote, validate_remote_path, validate_ssh_identity};
 use crate::agents::workspace::{AgentBootstrap, AgentWorkspace, repo_banner};
 use crate::core::agent::{AgentModel, CoreAgent, ModelPreferences};
 use crate::core::agent::{InvokeOptions, compat, structured_output};
@@ -23,6 +22,7 @@ use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::JitterPolicy;
 use crate::core::periodic::PeriodicTaskSpec;
 use crate::core::runtime::AgentRuntime;
+use crate::core::ssh_util::{shell_single_quote, validate_remote_path, validate_ssh_identity};
 use crate::core::workflow::AgentBuildContext;
 
 mod grafana;
@@ -457,6 +457,7 @@ pub(crate) fn grafana_query_tool_definition(
             "additionalProperties": false
         }),
         operation: "grafana_query".to_string(),
+        for_agent: None,
     }
 }
 

@@ -140,6 +140,19 @@ acp_command = ["agent", "acp"]
 model = "acp://cursor/claude-sonnet-4-5"
 poll_interval = "1m"
 instances = 1
+# Optional SSH hosts this agent may reach through its `ssh` tool (run a
+# command on a listed host). Any fleet agent (worker, reviewer, pmo, qa) can
+# configure its own hosts; the tool is offered only to that agent's own
+# sessions and executes in its own process. Only `hostname` is required;
+# without `user` ssh connects as its default, and without `identity_file`
+# ssh's own configuration authenticates. Omit entirely to not offer the
+# tool. Hostnames and users must not contain whitespace or start with '-';
+# `~/` in identity_file expands against $HOME.
+# ssh = [
+#   { hostname = "build.example.com", user = "ci", identity_file = "~/.ssh/ci_ed25519" },
+#   { hostname = "db.example.com", user = "admin" },
+#   { hostname = "cache.example.com" },
+# ]
 
 [agent.reviewer]
 model = "acp://cursor/claude-sonnet-4-5"

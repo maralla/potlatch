@@ -9,5 +9,7 @@ pub mod registry;
 pub mod retry;
 pub mod runtime;
 pub mod scope;
+pub(crate) mod ssh_util;
 pub(crate) mod supervisor;
+pub mod tools;
 pub mod workflow;

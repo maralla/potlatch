@@ -488,6 +488,7 @@ impl CoreAgent for SandalAgent {
                     "required": []
                 }),
                 operation: SHELL_TOOL.to_string(),
+                for_agent: None,
             }]
         )?;
         info!(

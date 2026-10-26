@@ -1,5 +1,6 @@
-//! Shared SSH command helpers used by agents that execute commands on remote
-//! servers (ops, qa).
+//! Shared SSH command helpers: config validation for remote-host settings,
+//! and safe interpolation for agents that execute commands on remote servers
+//! (ops, the harness `ssh` tool).
 
 use anyhow::{Result, ensure};
 

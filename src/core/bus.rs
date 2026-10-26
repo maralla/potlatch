@@ -92,6 +92,13 @@ pub(crate) struct AgentToolDefinition {
     pub description: String,
     pub parameters: Value,
     pub operation: String,
+    /// Extension for agent-provided tools whose execution is specific to the
+    /// providing agent: when set, the tool is offered only to that agent's
+    /// own sessions, and every call is proxied back into its process. `None`
+    /// means the route serves every session in the fleet (web search,
+    /// grafana, ...).
+    #[serde(default)]
+    pub for_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +109,10 @@ pub(crate) struct RemoteAgentToolDefinition {
     pub parameters: Value,
     pub target: String,
     pub operation: String,
+    /// Scope metadata carried through to session/new; the orchestrator
+    /// filters scoped tools to their agent before offering any set.
+    #[serde(default)]
+    pub for_agent: Option<String>,
 }
 
 impl AgentBus {
@@ -156,6 +167,13 @@ impl AgentBus {
                 "agent tool {:?} operation is empty or reserved",
                 tool.name
             );
+            ensure!(
+                tool.for_agent
+                    .as_deref()
+                    .is_none_or(|id| !id.trim().is_empty()),
+                "agent tool {:?} for_agent scope is empty",
+                tool.name
+            );
         }
 
         let (sender, receiver) = mpsc::channel();
@@ -170,11 +188,22 @@ impl AgentBus {
             "agent bus route {name:?} is already registered"
         );
         for tool in &tools {
+            // Extension for agent-provided tools whose execution is specific
+            // to the providing agent (for_agent): a scoped tool lives in its
+            // adopting agent's own session namespace, so several agents may
+            // adopt the same core definition side by side — a session is
+            // ever offered only its own agent's copy. Any other name overlap
+            // (unscoped vs anything, or two copies scoped to the same
+            // agent) would put duplicate tools into one schema and is
+            // rejected.
+            let overlaps = |registered: &AgentToolDefinition| {
+                registered.name == tool.name
+                    && (registered.for_agent.is_none()
+                        || tool.for_agent.is_none()
+                        || registered.for_agent == tool.for_agent)
+            };
             ensure!(
-                !routes
-                    .values()
-                    .flat_map(|route| &route.tools)
-                    .any(|registered| registered.name == tool.name),
+                !routes.values().flat_map(|route| &route.tools).any(overlaps),
                 "agent tool {:?} is already registered",
                 tool.name
             );
@@ -262,6 +291,7 @@ impl AgentBus {
                         parameters: tool.parameters.clone(),
                         target: target.clone(),
                         operation: tool.operation.clone(),
+                        for_agent: tool.for_agent.clone(),
                     })
             })
             .collect())
@@ -406,6 +436,15 @@ mod tests {
             description: "Search.".to_string(),
             parameters: serde_json::json!({"type": "object"}),
             operation: "run".to_string(),
+            for_agent: None,
+        }
+    }
+
+    fn scoped_ssh_tool(agent: &str) -> AgentToolDefinition {
+        AgentToolDefinition {
+            name: "ssh".to_string(),
+            for_agent: Some(agent.to_string()),
+            ..tool()
         }
     }
 
@@ -455,6 +494,74 @@ mod tests {
                 .unwrap(),
             "session-1"
         );
+    }
+
+    #[test]
+    fn scoped_tools_may_share_names_across_agents_but_not_with_global_routes() {
+        let bus = AgentBus::new();
+
+        // Several agents adopting the same core-defined tool coexist: each
+        // copy is scoped to its own agent and never meets the others.
+        let _first = bus
+            .register("worker-0", vec![scoped_ssh_tool("worker-0")])
+            .unwrap();
+        let _second = bus
+            .register("worker-1", vec![scoped_ssh_tool("worker-1")])
+            .unwrap();
+
+        // A global route claiming the same name would put two tools of the
+        // same name into the scoped agents' schemas.
+        let global_ssh = AgentToolDefinition {
+            name: "ssh".to_string(),
+            for_agent: None,
+            ..tool()
+        };
+        assert!(bus.register("web", vec![global_ssh]).is_err());
+
+        // A second copy scoped to the SAME agent is a duplicate for that
+        // agent's schema.
+        assert!(
+            bus.register("worker-0b", vec![scoped_ssh_tool("worker-0")])
+                .is_err()
+        );
+
+        // And the reverse order — scoped after global — collides too.
+        let other_bus = AgentBus::new();
+        let global_ssh = AgentToolDefinition {
+            name: "ssh".to_string(),
+            for_agent: None,
+            ..tool()
+        };
+        let _web = other_bus.register("web", vec![global_ssh]).unwrap();
+        assert!(
+            other_bus
+                .register("worker-0", vec![scoped_ssh_tool("worker-0")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scoped_tools_carry_their_scope_to_registered_tools() {
+        let bus = AgentBus::new();
+        let _global = bus.register("web", vec![tool()]).unwrap();
+        let _scoped = bus
+            .register("worker-0", vec![scoped_ssh_tool("worker-0")])
+            .unwrap();
+
+        let registered = bus.registered_tools(Duration::ZERO).unwrap();
+        let scope_of = |name: &str| {
+            registered
+                .iter()
+                .find(|tool| tool.name == name)
+                .map(|tool| tool.for_agent.clone())
+        };
+        assert_eq!(scope_of("web_search"), Some(None));
+        assert_eq!(scope_of("ssh"), Some(Some("worker-0".to_string())));
+        let scoped = registered
+            .iter()
+            .find(|tool| tool.name == "ssh")
+            .expect("scoped tool is registered");
+        assert_eq!(scoped.target, "worker-0");
     }
 
     #[test]

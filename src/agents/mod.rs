@@ -12,7 +12,6 @@ mod qa;
 mod reviewer;
 mod sandal;
 mod settings;
-mod ssh_util;
 mod state;
 mod subagent;
 mod web;

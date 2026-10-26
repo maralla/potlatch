@@ -280,6 +280,7 @@ fn subagent_tool_definition(
             "required": []
         }),
         operation: SUBAGENT_OPERATION.to_string(),
+        for_agent: None,
     }
 }
 

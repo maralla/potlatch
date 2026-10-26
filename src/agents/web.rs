@@ -377,6 +377,7 @@ fn web_search_tool_definition() -> AgentToolDefinition {
             "additionalProperties": false
         }),
         operation: WEB_SEARCH_OPERATION.to_string(),
+        for_agent: None,
     }
 }
 
@@ -398,6 +399,7 @@ fn web_fetch_tool_definition() -> AgentToolDefinition {
             "additionalProperties": false
         }),
         operation: WEB_FETCH_OPERATION.to_string(),
+        for_agent: None,
     }
 }
 

@@ -393,6 +393,10 @@ impl AcpRuntime {
         self.structured_output_backend.session_tools(&tools)
     }
 
+    /// Bus-registered agent tools for THIS runtime's sessions: fleet-global
+    /// routes (no `for_agent`) always apply; a tool scoped with `for_agent`
+    /// is agent-provided with execution specific to that agent and is
+    /// offered only to the scoping agent's own sessions.
     fn session_agent_tools(&self) -> Option<Vec<Value>> {
         let is_potlatch = self
             .model_uri
@@ -402,11 +406,19 @@ impl AcpRuntime {
         if !is_potlatch {
             return None;
         }
+        let agent_id = self.agent_id.clone();
         let tools = self
             .agent_bus
             .as_ref()?
             .registered_tools(Duration::from_millis(250))
-            .ok()?;
+            .ok()?
+            .into_iter()
+            .filter(|tool| {
+                tool.for_agent
+                    .as_deref()
+                    .is_none_or(|id| id == agent_id.as_str())
+            })
+            .collect::<Vec<_>>();
         (!tools.is_empty()).then(|| {
             tools
                 .into_iter()
@@ -1126,6 +1138,7 @@ mod tests {
             description: "Search.".to_string(),
             parameters: json!({"type": "object"}),
             operation: "run".to_string(),
+            for_agent: None,
         }
     }
 
@@ -1202,6 +1215,60 @@ mod tests {
                 .is_none()
         );
         assert!(runtime_for("model").session_agent_tools().is_none());
+    }
+
+    #[test]
+    fn agent_scoped_tools_are_offered_only_to_their_own_agent() {
+        // Agent-provided tools with agent-specific execution (for_agent) go
+        // to the scoping agent's sessions only; fleet-global routes apply
+        // everywhere.
+        let bus = AgentBus::new();
+        let _global = bus.register("web", vec![test_tool()]).unwrap();
+        let mut scoped = test_tool();
+        scoped.name = "ssh".to_string();
+        scoped.for_agent = Some("worker-0".to_string());
+        let _scoped = bus.register("worker-0", vec![scoped]).unwrap();
+
+        let runtime_for = |agent_id: &str| {
+            AcpRuntime::new(
+                "/tmp/repo".into(),
+                Some("acp://potlatch/model".to_string()),
+                None,
+                vec!["true".into()],
+                std::collections::HashMap::new(),
+                None,
+                Some(bus.clone()),
+                Vec::new(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                agent_id.into(),
+            )
+        };
+
+        let offered = |runtime: &AcpRuntime| {
+            runtime
+                .session_agent_tools()
+                .expect("potlatch sessions are offered the bus tools")[0]["name"]
+                .as_str()
+                .expect("tool name")
+                .to_string()
+        };
+        // worker-0 sees both its own scoped copy and the global route.
+        let names = {
+            let runtime = runtime_for("worker-0");
+            let tools = runtime.session_agent_tools().unwrap();
+            let mut names: Vec<String> = tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names, vec!["ssh", "web_search"]);
+        // Other agents see only the global route — worker-0's hosts are not
+        // theirs to call.
+        assert_eq!(offered(&runtime_for("worker-1")), "web_search");
+        assert_eq!(offered(&runtime_for("reviewer-0")), "web_search");
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::core::banner::Banner;
 use crate::core::config::{AgentSection, Config};
 use crate::core::periodic::{PeriodicTaskSpec, run_periodic_scheduler};
 use crate::core::runtime::AgentRuntime;
+use crate::core::tools::ssh;
 use crate::core::workflow::{AgentBuildContext, AgentSpawnContext};
 
 #[derive(Clone, Default)]
@@ -146,10 +147,21 @@ pub trait CoreAgent: Sized {
             instances,
         );
         let settings = prepare_agent_settings::<Self>(&ctx.workflow.config, section)?;
+        // The single adoption funnel: iff this agent block configures `ssh`,
+        // the core-defined ssh tool is adopted right here — registered on
+        // the bus as an agent-provided tool scoped to this instance
+        // (`for_agent`), offered only to its own sessions, executed in this
+        // process. Roles carry no facility code: the wrapper below adds the
+        // inbox-drain task and answers its cycles.
+        let ssh = ssh::SshServer::adopt(
+            ctx.workflow.bus.as_ref(),
+            ctx.runtime.agent_id(),
+            &section.raw,
+        )?;
         let agent_name = ctx.agent_name;
-        Self::build(AgentBuildContext::new(ctx, settings))
-            .with_context(|| format!("build [agent.{agent_name}]"))?
-            .run()
+        let agent = Self::build(AgentBuildContext::new(ctx, settings))
+            .with_context(|| format!("build [agent.{agent_name}]"))?;
+        CoreFacilities { agent, ssh }.run()
     }
 }
 
@@ -186,7 +198,6 @@ struct ShutdownGuard<'a, A: CoreAgent> {
     agent: &'a mut A,
     done: bool,
 }
-
 impl<'a, A: CoreAgent> ShutdownGuard<'a, A> {
     fn new(agent: &'a mut A) -> Self {
         Self { agent, done: false }
@@ -215,14 +226,201 @@ impl<'a, A: CoreAgent> Drop for ShutdownGuard<'a, A> {
     }
 }
 
+/// The core-facility wrapper every supervised instance is constructed with
+/// in [`CoreAgent::run_from`]: it carries the facilities the agent block
+/// adopted (currently the `ssh` tool) and, without any role involvement,
+/// adds their periodic tasks to the schedule and answers their cycles from
+/// the facility's own serving state. Everything else delegates — identity,
+/// health, shutdown guarantees, and every role-provided hook behave exactly
+/// as if the wrapper were not there.
+struct CoreFacilities<A: CoreAgent> {
+    agent: A,
+    ssh: Option<ssh::SshServer>,
+}
+
+impl<A: CoreAgent> CoreAgent for CoreFacilities<A> {
+    type Settings = A::Settings;
+
+    const FIXED_INSTANCES: Option<usize> = A::FIXED_INSTANCES;
+    const MAX_INSTANCES: Option<usize> = A::MAX_INSTANCES;
+
+    fn name() -> &'static str {
+        A::name()
+    }
+
+    fn parse_settings(config: &Config, section: &AgentSection) -> Result<Self::Settings> {
+        A::parse_settings(config, section)
+    }
+
+    fn validate_settings(
+        config: &Config,
+        section: &AgentSection,
+        settings: &Self::Settings,
+    ) -> Result<()> {
+        A::validate_settings(config, section, settings)
+    }
+
+    fn runtime(&self) -> &AgentRuntime {
+        self.agent.runtime()
+    }
+
+    fn banner(config: &Config, banner: &mut Banner) {
+        A::banner(config, banner);
+    }
+
+    fn periodic_tasks(&self) -> Vec<PeriodicTaskSpec> {
+        let mut tasks = self.agent.periodic_tasks();
+        if self.ssh.is_some() {
+            // Drain proxied `ssh` executions as fast as the scheduler
+            // allows; the handler blocks on the inbox wait, not on any
+            // interval.
+            tasks.push(ssh::SshServer::task());
+        }
+        tasks
+    }
+
+    fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
+        if task_id == ssh::REQUESTS_TASK {
+            return match self.ssh.as_mut() {
+                Some(server) => server.serve_once(),
+                None => Ok(()),
+            };
+        }
+        self.agent.run_periodic_task(task_id)
+    }
+
+    fn build(ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
+        Ok(Self {
+            agent: A::build(ctx)?,
+            ssh: None,
+        })
+    }
+
+    fn on_start(&mut self) -> Result<()> {
+        self.agent.on_start()
+    }
+
+    fn on_shutdown(&mut self) {
+        self.agent.on_shutdown()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use anyhow::{Result, anyhow};
+    use serde_json::json;
 
     use super::*;
+    use crate::core::bus::AgentBus;
     use crate::core::runtime::HealthState;
+
+    /// A role that records which periodic cycles reached it — the decorator
+    /// must route core-facility cycles away from it and pass everything
+    /// else through.
+    struct DispatchAgent {
+        runtime: AgentRuntime,
+        polled: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CoreAgent for DispatchAgent {
+        type Settings = toml::Value;
+
+        fn name() -> &'static str {
+            "dispatch-test"
+        }
+
+        fn runtime(&self) -> &AgentRuntime {
+            &self.runtime
+        }
+
+        fn run_periodic_task(&mut self, task_id: &str) -> Result<()> {
+            self.polled.lock().unwrap().push(task_id.to_string());
+            Ok(())
+        }
+
+        fn build(_ctx: AgentBuildContext<Self::Settings>) -> Result<Self> {
+            unreachable!("dispatch tests construct the agent directly")
+        }
+    }
+
+    #[test]
+    fn core_facilities_add_the_ssh_drain_without_role_code() {
+        let bus = AgentBus::new();
+        let server = ssh::SshServer::adopt(
+            Some(&bus),
+            "dispatch-test-0",
+            &json!({"ssh": [{"hostname": "build.example"}]}),
+        )
+        .unwrap()
+        .expect("adoption for a configured block");
+        let agent = DispatchAgent {
+            runtime: AgentRuntime::new("dispatch-test-0", Arc::new(AtomicBool::new(false))),
+            polled: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut facilities = CoreFacilities {
+            agent,
+            ssh: Some(server),
+        };
+
+        // The role's schedule gains the inbox drain; the role did nothing.
+        let ids: Vec<&str> = facilities
+            .periodic_tasks()
+            .iter()
+            .map(|task| task.id)
+            .collect();
+        assert!(ids.contains(&ssh::REQUESTS_TASK), "ids: {ids:?}");
+
+        // A proxied call is answered from the adopted config: an unknown
+        // host is rejected by the allow-list before any process spawns.
+        let caller = {
+            let bus = bus.clone();
+            std::thread::spawn(move || {
+                bus.request(
+                    "dispatch-test-0",
+                    ssh::OPERATION.to_string(),
+                    json!({"hostname": "unknown.example", "command": "echo hi"}),
+                    None,
+                    Duration::from_secs(5),
+                )
+            })
+        };
+        facilities.run_periodic_task(ssh::REQUESTS_TASK).unwrap();
+        let response = caller.join().unwrap();
+        assert!(
+            response.is_err(),
+            "allow-list rejection is an error response"
+        );
+
+        // Role cycles still reach the role untouched.
+        facilities.run_periodic_task("role_poll").unwrap();
+        assert_eq!(
+            *facilities.agent.polled.lock().unwrap(),
+            vec!["role_poll".to_string()]
+        );
+    }
+
+    #[test]
+    fn core_facilities_without_an_adoption_are_transparent() {
+        let agent = DispatchAgent {
+            runtime: AgentRuntime::new("dispatch-test-1", Arc::new(AtomicBool::new(false))),
+            polled: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut facilities = CoreFacilities { agent, ssh: None };
+
+        // No adoption: no extra task, and the facility cycle is a no-op.
+        let ids: Vec<&str> = facilities
+            .periodic_tasks()
+            .iter()
+            .map(|task| task.id)
+            .collect();
+        assert!(!ids.contains(&ssh::REQUESTS_TASK), "ids: {ids:?}");
+        facilities.run_periodic_task(ssh::REQUESTS_TASK).unwrap();
+        assert!(facilities.agent.polled.lock().unwrap().is_empty());
+    }
 
     struct LifecycleAgent {
         runtime: AgentRuntime,

@@ -290,6 +290,7 @@ fn memory_tool_definition() -> AgentToolDefinition {
             "additionalProperties": false
         }),
         operation: MEMORY_OPERATION.to_string(),
+        for_agent: None,
     }
 }
 

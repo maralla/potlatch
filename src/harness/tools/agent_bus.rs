@@ -122,6 +122,7 @@ mod tests {
                 }),
                 target: "provider".to_string(),
                 operation: "run".to_string(),
+                for_agent: None,
             },
             "caller-session-1",
         )
