@@ -938,7 +938,7 @@ fn job_tag() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("potlatch-job-{nanos:x}")
+    format!("job-{nanos:x}")
 }
 
 /// Close one VM: drop the console pipes (the console session dies, and
@@ -2184,10 +2184,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(
-            start.starts_with("Background job started: potlatch-job-"),
-            "{start}"
-        );
+        assert!(start.starts_with("Background job started: job-"), "{start}");
         let job = start
             .lines()
             .find_map(|l| l.strip_prefix("Background job started: "))
