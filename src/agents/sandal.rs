@@ -67,6 +67,20 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// (30 minutes — the bus deadline that carries the response). A request
 /// past it is capped, not honored.
 const MAX_TIMEOUT_SECS: u64 = 30 * 60;
+/// Slack between a monitor's in-VM wait budget and the harness deadline
+/// `run_command` gives it: the budget's own expiry — the graceful
+/// still-running report — must win over the deadline's kill, or a
+/// monitor on a slow job would surface as a timeout error.
+const MONITOR_MARGIN_SECS: u64 = 60;
+/// Default monitor wait (seconds): one `job_id + monitor` call blocks
+/// inside the VM this long for the job to finish before reporting it
+/// still running — the wait a model would otherwise spend on blind
+/// `sleep` commands and tight poll loops, each a wasted round trip.
+const MONITOR_WAIT_DEFAULT_SECS: u64 = 110;
+/// Maximum monitor wait (seconds): a bigger `wait` is capped so the
+/// harness deadline (wait + MONITOR_MARGIN_SECS) stays within the bus's
+/// own 30-minute request deadline.
+const MONITOR_WAIT_MAX_SECS: u64 = MAX_TIMEOUT_SECS - MONITOR_MARGIN_SECS;
 /// Output kept per command (the head); the rest is counted, not stored.
 /// The same cap the built-in shell tool carries.
 const MAX_OUTPUT: usize = 50_000;
@@ -125,7 +139,7 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// The `shell` tool this agent publishes — the override for the built-in
 /// shell tool while `[agent.sandal]` is configured.
-const SHELL_DESCRIPTION: &str = "Run a shell command inside the session's sandbox VM. You are already in the working directory (cwd) — no need to `cd` into it. The VM is reused across this session's calls: packages installed by an earlier call are still installed, and files written by an earlier call are still there. Calls run concurrently: a long-running command does not block the next call. Returns the command's output and exit code. Foreground commands have a timeout (default 120s, maximum 30 minutes); on timeout the command is killed and the VM stays up. Anything longer than a minute or two belongs in the background: set background: true, get a job id back immediately, and poll it with job_id (or kill it with job_id + kill: true). Poll a background job a couple of times, not forever: if a job has produced no new output after a few polls over several minutes, kill it (job_id + kill: true) and run a narrower command instead of sleeping and re-polling in a loop. Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `write` or `edit` instead.";
+const SHELL_DESCRIPTION: &str = "Run a shell command inside the session's sandbox VM. You are already in the working directory (cwd) — no need to `cd` into it. The VM is reused across this session's calls: packages installed by an earlier call are still installed, and files written by an earlier call are still there. Calls run concurrently: a long-running command does not block the next call. Returns the command's output and exit code. Foreground commands have a timeout (default 120s, maximum 30 minutes); on timeout the command is killed and the VM stays up. Anything longer than a minute or two belongs in the background: set background: true, get a job id back immediately, then monitor it with job_id + monitor: true — that call blocks for the job and returns the moment it finishes (or after its wait budget: about two minutes by default, `wait` to extend), so never pad with `sleep` and never poll job_id in a loop; when a monitor returns still-running, simply call it again (a longer `wait` for a long job). Kill a job with job_id + kill: true — if a monitored job has produced no output after a couple of waits over several minutes, kill it and run a narrower command instead. Do NOT use this tool to create or edit files (no `cat >`, `echo >`, `sed -i`, `tee`) — use `write` or `edit` instead.";
 
 /// `[agent.sandal]` settings as configured: paths still relative to the
 /// config file, share specs unresolved, sizing unset where absent.
@@ -334,7 +348,7 @@ impl CoreAgent for SandalAgent {
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The shell command to execute inside the session's sandbox VM. Required unless polling or killing a background job (job_id)."
+                            "description": "The shell command to execute inside the session's sandbox VM. Required unless monitoring, polling, or killing a background job (job_id)."
                         },
                         "timeout_secs": {
                             "type": "integer",
@@ -342,11 +356,19 @@ impl CoreAgent for SandalAgent {
                         },
                         "background": {
                             "type": "boolean",
-                            "description": "If true, start the command detached inside the session's VM and return a job id immediately instead of waiting — a call may not outlast the transport anyway. Poll with job_id at any time later in the session; the job's output and exit code are kept inside the VM and die with it. Or terminate it with job_id + kill: true."
+                            "description": "If true, start the command detached inside the session's VM and return a job id immediately instead of waiting — a call may not outlast the transport anyway. Check on it later in the session with job_id + monitor: true; the job's output and exit code are kept inside the VM and die with it. Or terminate it with job_id + kill: true."
                         },
                         "job_id": {
                             "type": "string",
-                            "description": "Poll or kill a background job. Returns the job's newest output and its status when it has one. Ignored unless polling or killing."
+                            "description": "Monitor, poll, or kill a background job. With monitor: true the call blocks inside the VM until the job exits (its exit code and output come back at once) or the wait budget runs out (it reports still running with the newest output) — prefer it over sleeping or polling in a loop. Ignored unless monitoring, polling, or killing."
+                        },
+                        "monitor": {
+                            "type": "boolean",
+                            "description": "When true with job_id, wait for the job instead of an instant poll: returns early the moment the job finishes, otherwise after `wait` seconds with its status so far."
+                        },
+                        "wait": {
+                            "type": "integer",
+                            "description": "Seconds for a monitor call to wait for the job. Default 110, maximum 1740 — a bigger ask is capped. Ignored without monitor."
                         },
                         "kill": {
                             "type": "boolean",
@@ -722,8 +744,9 @@ impl VmPool {
             .map(|raw| format_result(&raw.out, raw.code, raw.dropped))
     }
 
-    /// Poll or kill one background job. The job's state is the VM's (its
-    /// output file and its own exit code); this only reads what it left.
+    /// Monitor, poll, or kill one background job. The job's state is the
+    /// VM's (its output file and its own exit code); this only reads what
+    /// it left — a monitor by waiting on the marker inside the VM.
     fn execute_job_control(&self, session_id: &str, payload: &Value, job: &str) -> Result<String> {
         // The job tag is ours (hex from job_tag); never let a caller
         // inject one into a shell line.
@@ -735,13 +758,32 @@ impl VmPool {
             .get("kill")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS.max(1));
-        let entry = self.entry_for(session_id, payload)?;
-        let line = if kill {
-            job_kill_line(job)
+        let monitor = payload
+            .get("monitor")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let wait = monitor_wait_secs(payload);
+        let (line, timeout) = if kill {
+            (
+                job_kill_line(job),
+                Duration::from_secs(DEFAULT_TIMEOUT_SECS.max(1)),
+            )
+        } else if monitor {
+            // The monitor waits inside the VM (job_monitor_line); the
+            // harness deadline rides a margin above the budget so the
+            // budget's own expiry — the graceful still-running report —
+            // always wins over the deadline's kill.
+            (
+                job_monitor_line(job, wait),
+                Duration::from_secs(wait.saturating_add(MONITOR_MARGIN_SECS)),
+            )
         } else {
-            job_poll_line(job)
+            (
+                job_poll_line(job),
+                Duration::from_secs(DEFAULT_TIMEOUT_SECS.max(1)),
+            )
         };
+        let entry = self.entry_for(session_id, payload)?;
         let outcome = self.run_command(session_id, &entry, line, timeout);
         let raw = outcome.into_result()?;
         if kill {
@@ -757,13 +799,20 @@ impl VmPool {
             Some(code) => format!("exit code: {code}\n\n"),
             // The job's age is what tells a waiting model whether to keep
             // waiting or to kill the job and change course: without it,
-            // "(still running)" reads the same at 5s as at 5h.
-            None => match job_age_seconds(started_epoch) {
-                Some(age) => {
-                    format!("exit code: (still running, {})\n\n", format_job_age(age))
-                }
-                None => "exit code: (still running)\n\n".to_string(),
-            },
+            // "(still running)" reads the same at 5s as at 5h. A monitor
+            // adds the budget it burned waiting, so the model knows this
+            // call blocked rather than returned instantly.
+            None => {
+                let age = job_age_seconds(started_epoch)
+                    .map(|age| format!(", {}", format_job_age(age)))
+                    .unwrap_or_default();
+                let waited = if monitor {
+                    format!("; monitor waited {wait}s")
+                } else {
+                    String::new()
+                };
+                format!("exit code: (still running{age}{waited})\n\n")
+            }
         };
         // Strip the bookkeeping markers: the status is the header, not
         // output. JOB-EXIT rides the file's tail; JOB-START its head.
@@ -1071,6 +1120,32 @@ fn job_start_line(cwd: &str, command: &str, job: &str) -> String {
 fn job_poll_line(job: &str) -> String {
     let out = job_output_path(job);
     format!("tail -c 50000 {out} 2>/dev/null")
+}
+
+/// The job-monitor line: block inside the VM until the job's own
+/// JOB-EXIT marker lands in its output file (a finished job is reported
+/// the moment it finishes — the early return) or the wait budget runs
+/// out, then dump the output tail exactly as a poll would. The wait is
+/// the VM's, not the model's: one call replaces the blind-sleep and
+/// poll-loop shuffle, each of which costs a whole round trip.
+fn job_monitor_line(job: &str, wait_secs: u64) -> String {
+    let out = job_output_path(job);
+    format!(
+        "i=0; while [ \"$i\" -lt {wait_secs} ] && ! grep -q '^JOB-EXIT:' {out} 2>/dev/null; \
+         do sleep 1; i=$((i+1)); done; tail -c 50000 {out} 2>/dev/null"
+    )
+}
+
+/// A monitor call's wait budget from the request: `wait` seconds,
+/// defaulting to MONITOR_WAIT_DEFAULT_SECS and capped to
+/// MONITOR_WAIT_MAX_SECS — a bigger ask would push the harness deadline
+/// past the bus's own request deadline.
+fn monitor_wait_secs(payload: &Value) -> u64 {
+    payload
+        .get("wait")
+        .and_then(Value::as_u64)
+        .unwrap_or(MONITOR_WAIT_DEFAULT_SECS)
+        .clamp(1, MONITOR_WAIT_MAX_SECS)
 }
 
 /// The job-kill line: best-effort — the job tag rides the job's command
@@ -2243,6 +2318,113 @@ mod tests {
         // reflects elapsed time, it is not a constant zero.
         let secs = age.trim_end_matches('s').parse::<u64>().unwrap_or(0);
         assert!(secs >= 1, "age must reflect the wait: {running}");
+    }
+
+    /// Monitor mode: one call that waits for the job instead of the
+    /// sleep-then-poll shuffle. A finished job returns the moment it
+    /// finishes — the call must not burn its whole budget on a job that
+    /// exited in seconds.
+    #[test]
+    fn monitor_returns_when_the_job_finishes() {
+        let dir = unique_test_dir();
+        let pool = pool(dir.path(), 3600);
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        pool.ensure("session-1", &test_scope(Path::new(&cwd), &[]))
+            .unwrap();
+        let start = pool
+            .execute(
+                "session-1",
+                &json!({
+                    "command": "sleep 2; echo job-done",
+                    "background": true,
+                    "_session_cwd": cwd,
+                }),
+            )
+            .unwrap();
+        let job = start
+            .lines()
+            .find_map(|l| l.strip_prefix("Background job started: "))
+            .unwrap()
+            .to_string();
+        let began = Instant::now();
+        let monitored = pool
+            .execute(
+                "session-1",
+                &json!({"job_id": job, "monitor": true, "_session_cwd": cwd}),
+            )
+            .unwrap();
+        assert!(monitored.contains("exit code: 0"), "{monitored}");
+        assert!(monitored.contains("job-done"), "{monitored}");
+        let elapsed = began.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "a finished job must return early, not after the budget: {elapsed:?}"
+        );
+    }
+
+    /// A monitor on a job that outlasts its budget reports still running
+    /// — with the budget it burned waiting — and honors the request's
+    /// `wait` instead of the default (a default-budget test would sit
+    /// for two minutes).
+    #[test]
+    fn monitor_waits_its_budget_for_a_running_job() {
+        let dir = unique_test_dir();
+        let pool = pool(dir.path(), 3600);
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        pool.ensure("session-1", &test_scope(Path::new(&cwd), &[]))
+            .unwrap();
+        let start = pool
+            .execute(
+                "session-1",
+                &json!({"command": "sleep 30", "background": true, "_session_cwd": cwd}),
+            )
+            .unwrap();
+        let job = start
+            .lines()
+            .find_map(|l| l.strip_prefix("Background job started: "))
+            .unwrap()
+            .to_string();
+        let began = Instant::now();
+        let monitored = pool
+            .execute(
+                "session-1",
+                &json!({
+                    "job_id": job,
+                    "monitor": true,
+                    "wait": 3,
+                    "_session_cwd": cwd,
+                }),
+            )
+            .unwrap();
+        assert!(monitored.contains("(still running, "), "{monitored}");
+        assert!(monitored.contains("monitor waited 3s"), "{monitored}");
+        let elapsed = began.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "the monitor must block for its budget, not return instantly: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the monitor must not outwait its budget: {elapsed:?}"
+        );
+    }
+
+    /// The wait clamp, unit-sized: default when absent, honored in
+    /// range, capped past the maximum.
+    #[test]
+    fn monitor_wait_clamps_to_its_bounds() {
+        assert_eq!(monitor_wait_secs(&json!({})), MONITOR_WAIT_DEFAULT_SECS);
+        assert_eq!(monitor_wait_secs(&json!({"wait": 5})), 5);
+        assert_eq!(
+            monitor_wait_secs(&json!({"wait": 99_999})),
+            MONITOR_WAIT_MAX_SECS
+        );
     }
 
     /// A killed job is gone: best-effort kill (its own shell), then the
