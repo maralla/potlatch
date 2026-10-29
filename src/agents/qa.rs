@@ -496,11 +496,13 @@ fn run_qa_cycle(
     port.fetch_branches(branches)?;
     let mut history = port.sha_history();
 
-    // Observe every configured branch. A changed branch is the preferred
-    // work item (test the change), but an unchanged SHA is no longer a
-    // reason to idle: coverage gaps may remain, so the cycle still runs
-    // and the model decides — close gaps, or explicitly report nothing
-    // to do.
+    // Observe every configured branch. A commit that already completed a
+    // non-blocked QA run is not re-tested: the same tree yields the same
+    // analysis, and re-running it every poll burns a model session without
+    // new information. A changed commit, a never-tested branch, or a
+    // previously blocked run (the history only advances on success) all run
+    // here. To force a re-test of the current commit, delete the SHA
+    // history file.
     let mut selected = None;
     for branch in branches {
         let current = port.remote_branch_sha(branch)?;
@@ -512,6 +514,22 @@ fn run_qa_cycle(
     let Some((branch, prev_sha, cur_sha)) = selected else {
         return Ok(());
     };
+
+    if !prev_sha.is_empty() && prev_sha == cur_sha {
+        info!(
+            "{agent_id}: {branch} unchanged at {cur_sha} since the last QA run, idling until a new commit"
+        );
+        // Cheap maintenance still runs on idle cycles so a human reply to a
+        // clarification is never left hanging just because no commit landed.
+        let all_issues = port.open_issues()?;
+        let qa_issues: Vec<_> = all_issues
+            .iter()
+            .filter(|issue| issue.labels.iter().any(|label| label == QA_LABEL))
+            .cloned()
+            .collect();
+        close_answered_clarifications(port, &qa_issues);
+        return Ok(());
+    }
 
     port.checkout_remote_branch(&branch)?;
     if port.shutdown_requested() {
@@ -567,21 +585,7 @@ fn run_qa_cycle(
     if port.shutdown_requested() {
         return Ok(());
     } // Close answered clarification threads before creating any new issues.
-    for issue in qa_issues.iter().filter(|issue| {
-        issue
-            .labels
-            .iter()
-            .any(|label| label == DO_NOT_IMPLEMENT_LABEL)
-    }) {
-        let answered = port
-            .issue_comments(issue.iid)
-            .unwrap_or_default()
-            .iter()
-            .any(|comment| !is_potlatch_author(&comment.author));
-        if answered {
-            let _ = port.close_answered_clarification(issue.iid);
-        }
-    }
+    close_answered_clarifications(port, &qa_issues);
 
     for clarification in clarifications {
         let description = clarification_description(&clarification);
@@ -969,6 +973,27 @@ fn write_open_issues_context(state: &AgentState, issues: &[IssueObservation]) ->
     Ok(())
 }
 
+/// Close `do-not-implement` clarification threads a human has answered:
+/// a comment from anyone but a potlatch-owned bot means the question was
+/// picked up. Best effort — a failed close is retried next cycle.
+fn close_answered_clarifications(port: &mut dyn QaPort, qa_issues: &[IssueObservation]) {
+    for issue in qa_issues.iter().filter(|issue| {
+        issue
+            .labels
+            .iter()
+            .any(|label| label == DO_NOT_IMPLEMENT_LABEL)
+    }) {
+        let answered = port
+            .issue_comments(issue.iid)
+            .unwrap_or_default()
+            .iter()
+            .any(|comment| !is_potlatch_author(&comment.author));
+        if answered {
+            let _ = port.close_answered_clarification(issue.iid);
+        }
+    }
+}
+
 /// Whether a comment author is a potlatch-owned bot (potlatch-* or qa-* agents).
 fn is_potlatch_author(author: &str) -> bool {
     author.starts_with("potlatch") || author.starts_with("qa-")
@@ -1091,21 +1116,14 @@ fn build_qa_prompt(agent_id: &str, git: &GitContext, input: &AnalysisInput) -> S
     let knowledge_dir = input.knowledge_dir;
     let test_scripts_dir = input.test_scripts_dir;
 
-    // Same SHA as the last completed cycle: no new code to test, so the
-    // cycle's work is coverage gaps — or an explicit report that there is
-    // nothing to do. Different framing from a fresh commit.
-    let unchanged = git.prev_sha == git.cur_sha;
-    let (opening, changes_guidance) = if unchanged {
-        (
-            format!("You are a QA agent ({agent_id}) for this project. Branch {branch} is unchanged since your last completed cycle."),
-            "No new commit landed. Your work this cycle is **coverage, not change-testing**: align with every open QA-labeled issue (see task step 4), close coverage gaps — author missing scripts, deepen thin ones, run the scripts of functions still `unverified` in `Coverage status` — until every user-facing function is `tested`. If — and only if — every issue is aligned, every function is already `tested`, and you genuinely have no gap to close, do not invent work: report no findings, no clarifications, and do not set `blocked`; the harness will wait for the next commit.".to_string(),
-        )
-    } else {
-        (
-            format!("You are a QA agent ({agent_id}) for this project. A new commit landed on branch {branch}."),
-            "Use `git log --oneline -5` and the changed files **only to pick your starting functions** — which user-facing functions this commit touched. The commit does not define the whole of your work; it defines where testing starts. Look those functions up in your `functionality.md` map, and check `{qa_issues_path}` for acceptance criteria that apply to them.".to_string(),
-        )
-    };
+    // Dedup guarantees the prompt only ever runs for a commit that has not
+    // been tested yet (first run or a changed branch head).
+    let (opening, changes_guidance) = (
+        format!(
+            "You are a QA agent ({agent_id}) for this project. A new commit landed on branch {branch}."
+        ),
+        "Use `git log --oneline -5` and the changed files **only to pick your starting functions** — which user-facing functions this commit touched. The commit does not define the whole of your work; it defines where testing starts. Look those functions up in your `functionality.md` map, and check `{qa_issues_path}` for acceptance criteria that apply to them.".to_string(),
+    );
 
     format!(
         r##"{opening}
@@ -1436,6 +1454,10 @@ mod tests {
                 anyhow::bail!("injected save failure");
             }
             *self.saved.borrow_mut() = Some(history.clone());
+            // Faithful to the live port: the next cycle's `sha_history()`
+            // observes the advanced history (which round-trips through the
+            // history file there).
+            self.history = history.clone();
             Ok(())
         }
     }
@@ -1738,26 +1760,64 @@ mod tests {
     }
 
     #[test]
-    fn qa_cycle_still_runs_when_the_sha_is_unchanged() {
-        // No new commit: the cycle must still run so the model can close
-        // coverage gaps (or report that there is nothing to do). The model
-        // decides — the harness no longer idles on its behalf.
+    fn qa_cycle_skips_the_model_run_when_the_sha_is_unchanged() {
+        // A commit that already completed a non-blocked QA run is not
+        // re-tested: the same tree yields the same analysis, and re-running
+        // it every poll burns a model session without new information.
         let mut port = FakeQaPort::successful();
         port.history = ShaHistory(HashMap::from([("main".to_string(), "new123".to_string())]));
+        // Idle cycles still close answered clarification threads so a human
+        // reply is never left hanging just because no commit landed.
+        port.issues = vec![qa_issue(7, "Old question", true)];
+        port.comments.insert(
+            7,
+            Some(vec![CommentObservation {
+                author: "alice".into(),
+                body: "Use staging".into(),
+            }]),
+        );
         run_fake(&mut port).unwrap();
 
+        assert!(!port.trace.borrow().contains(&"act:model".to_string()));
+        assert!(port.prompts.is_empty());
+        // Not even a checkout: nothing to test.
+        assert!(
+            !port
+                .trace
+                .borrow()
+                .contains(&"act:checkout:main".to_string())
+        );
+        assert!(port.trace.borrow().contains(&"act:close:7".to_string()));
+        // The history is already at the tested commit; nothing to record.
+        assert!(port.saved.borrow().as_ref().is_none());
+    }
+
+    #[test]
+    fn qa_cycle_reruns_a_commit_after_a_blocked_run() {
+        // The history only advances on a successful run, so a blocked run
+        // (e.g. the environment was down) is re-tested on the next cycle
+        // even though the commit itself did not change.
+        let mut port = FakeQaPort::successful();
+        port.blocked = true;
+        port.history = ShaHistory(HashMap::from([("main".to_string(), "old123".to_string())]));
+
+        run_fake(&mut port).unwrap();
         assert!(port.trace.borrow().contains(&"act:model".to_string()));
-        assert_eq!(port.prompts.len(), 1);
-        // The prompt tells the model the branch is unchanged and its work
-        // is coverage.
-        assert!(port.prompts[0].1.contains("Branch main is unchanged"));
-        assert!(port.prompts[0].1.contains("coverage, not change-testing"));
-        // An idle report (no findings, no clarifications, not blocked)
-        // still records the SHA — idempotent, same value.
+        // A blocked cycle did not test: the history is not advanced.
+        assert!(port.saved.borrow().as_ref().is_none());
+
+        port.blocked = false;
+        run_fake(&mut port).unwrap();
+        assert_eq!(port.prompts.len(), 2, "the same commit is re-tested");
         assert_eq!(
             port.saved.borrow().as_ref().unwrap().0.get("main"),
             Some(&"new123".to_string())
         );
+
+        // And once it succeeded, the unchanged commit idles again.
+        let calls_before = port.prompts.len();
+        run_fake(&mut port).unwrap();
+        assert_eq!(port.prompts.len(), calls_before);
     }
 
     // --- Function index ---
