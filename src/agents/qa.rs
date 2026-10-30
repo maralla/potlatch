@@ -516,9 +516,8 @@ fn run_qa_cycle(
     };
 
     if !prev_sha.is_empty() && prev_sha == cur_sha {
-        info!(
-            "{agent_id}: {branch} unchanged at {cur_sha} since the last QA run, idling until a new commit"
-        );
+        // Nothing new to triage: no log — an always-on QA idles through
+        // most of its cycles, and the unchanged-sha line would be noise.
         // Cheap maintenance still runs on idle cycles so a human reply to a
         // clarification is never left hanging just because no commit landed.
         let all_issues = port.open_issues()?;
