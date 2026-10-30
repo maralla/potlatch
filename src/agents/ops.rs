@@ -1040,6 +1040,7 @@ Rules:
 - Do not propose issues for errors already represented in the history or context files.
 - Do not propose issues for errors that appear already fixed in the current codebase.
 - Do not propose issues to change behavior that a relevant code or doc comment explicitly identifies as intentional.
+- Do not propose issues whose remediation is an operator, deployment, or infrastructure action (configuration, capacity, environment, credentials, external services) rather than a change to this codebase. Log evidence of an operational condition is context, not a code issue.
 - Titles must be specific and actionable.
 - Descriptions must cite log evidence and relevant code context from the repository.
 "#,
