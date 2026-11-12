@@ -360,7 +360,7 @@ impl CoreAgent for SandalAgent {
                         },
                         "job_id": {
                             "type": "string",
-                            "description": "Monitor, poll, or kill a background job. With monitor: true the call blocks inside the VM until the job exits (its exit code and output come back at once) or the wait budget runs out (it reports still running with the newest output) — prefer it over sleeping or polling in a loop. Ignored unless monitoring, polling, or killing."
+                            "description": "Monitor, poll, or kill a background job — pass the job id exactly as the start returned it (including the job- prefix). With monitor: true the call blocks inside the VM until the job exits (its exit code and output come back at once) or the wait budget runs out (it reports still running with the newest output) — prefer it over sleeping or polling in a loop. Ignored unless monitoring, polling, or killing."
                         },
                         "monitor": {
                             "type": "boolean",
@@ -754,6 +754,18 @@ impl VmPool {
             job.len() <= 64 && job.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "invalid job id {job:?}"
         );
+        // The start hands back "job-<tag>"; a model that drops the prefix
+        // must still reach the job's output file (observed in the wild:
+        // three monitors and a kill against "/tmp/<tag>.out" — a file
+        // that never exists — read as "(still running; no output yet)"
+        // for minutes while the job had exited in its first second).
+        // Tags are `job-` + hex, so a bare id is unambiguous.
+        let job = if job.starts_with("job-") {
+            job.to_string()
+        } else {
+            format!("job-{job}")
+        };
+        let job = job.as_str();
         let kill = payload
             .get("kill")
             .and_then(Value::as_bool)
@@ -787,8 +799,34 @@ impl VmPool {
         let outcome = self.run_command(session_id, &entry, line, timeout);
         let raw = outcome.into_result()?;
         if kill {
-            return Ok(format!(
-                "Job {job} killed (best-effort: its own shell only)"
+            // The line says whether a process actually matched — a kill of
+            // a job that already exited (or never started) must not read
+            // as a successful kill.
+            return Ok(if raw.out.trim_ascii() == b"JOB-GONE" {
+                format!(
+                    "Job {job} was not running (no process matched — already exited \
+                     or never started); its output file was removed"
+                )
+            } else {
+                format!("Job {job} killed (best-effort: its own shell only)")
+            });
+        }
+        // A job whose output file is absent in the VM is a wrong id (or a
+        // job that never started): it must read as an error, never as
+        // "(still running)" — a silent empty tail would otherwise pin a
+        // monitor on a job that can never finish. The error says how the
+        // id is spelled and lists the jobs that do exist, so the caller
+        // corrects itself in one round trip.
+        if let Some(rest) = raw.out.strip_prefix(b"JOB-NOFILE") {
+            let listing = String::from_utf8_lossy(rest);
+            let known = match listing.trim() {
+                "" => "none — the job never started, or the VM was recreated".to_string(),
+                known => known.to_string(),
+            };
+            return Err(anyhow::anyhow!(
+                "no such job {job}: no output file in the session's VM. Pass the job id \
+                 exactly as the background start returned it (job-<id>, including the \
+                 job- prefix). Jobs with output files in the VM: {known}"
             ));
         }
         // The job's own exit code and start stamp ride its output file.
@@ -1117,9 +1155,15 @@ fn job_start_line(cwd: &str, command: &str, job: &str) -> String {
 
 /// The job-poll line: the job's own output tail (the newest bytes are
 /// what a poll must surface) plus its own exit code when it has one.
+/// A missing output file says so (JOB-NOFILE) and lists the job output
+/// files that do exist — an absent job must never read as a running
+/// one, and a wrong id must come back naming its candidates.
 fn job_poll_line(job: &str) -> String {
-    let out = job_output_path(job);
-    format!("tail -c 50000 {out} 2>/dev/null")
+    let glob = job_output_glob(job);
+    format!(
+        "if ls {glob} >/dev/null 2>&1; then tail -c 50000 {glob} 2>/dev/null; \
+         else echo JOB-NOFILE; ls /tmp/job-*.out 2>/dev/null; fi"
+    )
 }
 
 /// The job-monitor line: block inside the VM until the job's own
@@ -1129,10 +1173,13 @@ fn job_poll_line(job: &str) -> String {
 /// the VM's, not the model's: one call replaces the blind-sleep and
 /// poll-loop shuffle, each of which costs a whole round trip.
 fn job_monitor_line(job: &str, wait_secs: u64) -> String {
-    let out = job_output_path(job);
+    let glob = job_output_glob(job);
     format!(
-        "i=0; while [ \"$i\" -lt {wait_secs} ] && ! grep -q '^JOB-EXIT:' {out} 2>/dev/null; \
-         do sleep 1; i=$((i+1)); done; tail -c 50000 {out} 2>/dev/null"
+        "if ! ls {glob} >/dev/null 2>&1; then echo JOB-NOFILE; ls /tmp/job-*.out 2>/dev/null; \
+         else i=0; while [ \"$i\" -lt {wait_secs} ] && ! grep -q '^JOB-EXIT:' {glob} 2>/dev/null; \
+         do sleep 1; i=$((i+1)); done; \
+         if ls {glob} >/dev/null 2>&1; then tail -c 50000 {glob} 2>/dev/null; \
+         else echo JOB-NOFILE; ls /tmp/job-*.out 2>/dev/null; fi; fi"
     )
 }
 
@@ -1150,16 +1197,36 @@ fn monitor_wait_secs(payload: &Value) -> u64 {
 
 /// The job-kill line: best-effort — the job tag rides the job's command
 /// line, so pkill finds the job's shell; the children it spawned are
-/// orphans pkill cannot reach.
+/// orphans pkill cannot reach. The pattern is bracketed (`[j]ob-`) and
+/// the output path glob-spelled (`jo*b-`) so this line's own command
+/// line never matches the pattern — pkill -f scans full command lines,
+/// and a literal pattern or path here would SIGKILL this very shell
+/// before its rm runs (leaking the output file) and would sever any
+/// monitor of the same job running concurrently. The line reports
+/// whether a process actually matched (JOB-KILLED / JOB-GONE).
 fn job_kill_line(job: &str) -> String {
-    let out = job_output_path(job);
-    format!("pkill -9 -f '{job}' 2>/dev/null; rm -f {out}")
+    let glob = job_output_glob(job);
+    let pattern = format!("[j]{}", job.strip_prefix("j").unwrap_or(job));
+    format!(
+        "pkill -9 -f '{pattern}' 2>/dev/null; k=$?; rm -f {glob} 2>/dev/null; \
+         [ \"$k\" -eq 0 ] && echo JOB-KILLED || echo JOB-GONE"
+    )
 }
 
 /// Where a job's output (and its own exit code) lives: inside the VM,
 /// never on a share — the job state is the VM's, and it dies with the VM.
 fn job_output_path(job: &str) -> String {
     format!("/tmp/{job}.out")
+}
+
+/// The job's output path, glob-spelled (`jo*b-<tag>.out`): it expands to
+/// the same file, but a control line's command text then never carries
+/// the literal `job-<tag>` — which a kill's pkill pattern matches (the
+/// job's own shell carries it, by design) — so a kill cannot match a
+/// concurrently running monitor or poll of the same job, nor itself.
+fn job_output_glob(job: &str) -> String {
+    let tag = job.strip_prefix("job-").unwrap_or(job);
+    format!("/tmp/jo*b-{tag}.out")
 }
 
 /// Run one command through the line and collect its run: connect (one
