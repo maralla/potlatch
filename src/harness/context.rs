@@ -4,6 +4,7 @@
 //! with provenance, token accounting, and a tiered eviction policy that preserves
 //! the agent's decisions and edits while shedding exploration artifacts.
 
+use std::env;
 use std::sync::OnceLock;
 
 use serde_json::{Value, json};
@@ -20,11 +21,41 @@ const SNAPSHOT_VERSION: u32 = 1;
 /// ("Let me check...", "I'll now edit...") is low-value once the action is done.
 const KEEP_LAST_ASSISTANT_TEXT: usize = 3;
 
-/// Number of recent tool-call entries whose `reasoning_content` is preserved.
-/// Older tool-call entries have their reasoning stripped during budget
-/// pressure (the `tool_calls` JSON itself is always kept — only the thinking
-/// trace is dropped, since the tool result already reflects the outcome).
-const KEEP_LAST_REASONING: usize = 2;
+/// Default number of recent tool-call entries whose `reasoning_content` is
+/// preserved. Older tool-call entries have their reasoning stripped during
+/// budget pressure (the `tool_calls` JSON itself is always kept — only the
+/// thinking trace is dropped, since the tool result already reflects the
+/// outcome).
+const DEFAULT_KEEP_LAST_REASONING: usize = 2;
+
+/// Environment variable overriding [`DEFAULT_KEEP_LAST_REASONING`]: the number
+/// of recent tool-call turns whose `reasoning_content` survives budget
+/// pressure. Now that the client asks GLM/Qwen backends to preserve history
+/// thinking (instead of it being silently dropped server-side), this bound is
+/// the only limit on the replayed reasoning's token cost — set it lower to
+/// shed thinking sooner, higher to keep a longer chain of thought. Invalid or
+/// missing values fall back to the default.
+const KEEP_REASONING_TURNS_ENV: &str = "POTLATCH_KEEP_REASONING_TURNS";
+
+/// Number of recent tool-call entries whose `reasoning_content` is preserved
+/// when the budget is enforced. Read from [`KEEP_REASONING_TURNS_ENV`] once
+/// per process.
+fn keep_last_reasoning() -> usize {
+    static KEEP: OnceLock<usize> = OnceLock::new();
+    *KEEP.get_or_init(|| {
+        env::var(KEEP_REASONING_TURNS_ENV)
+            .ok()
+            .and_then(|raw| parse_keep_reasoning_turns(&raw))
+            .unwrap_or(DEFAULT_KEEP_LAST_REASONING)
+    })
+}
+
+/// Parse a [`KEEP_REASONING_TURNS_ENV`] value: a non-negative turn count.
+/// `None` for empty or non-numeric values — the caller falls back to the
+/// default. `0` is valid: strip the reasoning from every tool-call entry.
+fn parse_keep_reasoning_turns(raw: &str) -> Option<usize> {
+    raw.trim().parse().ok()
+}
 
 /// Categories of context entries. Drives the tiered retention policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +152,8 @@ pub enum BudgetAction {
     Evicted,
     /// `reasoning_content` was stripped from old tool-call entries to reclaim
     /// tokens without breaking the tool-call chain. The `tool_calls` JSON and
-    /// recent reasoning (last [`KEEP_LAST_REASONING`] turns) are preserved.
+    /// the most recent reasoning turns (see [`keep_last_reasoning`]) are
+    /// preserved.
     ReasoningStripped,
     /// The entire conversation was collapsed into a summary (non-evictable
     /// entries exceeded the threshold).
@@ -182,7 +214,7 @@ impl Context {
 
     /// Strip `reasoning_content` from old tool-call entries, preserving the
     /// `tool_calls` JSON and the reasoning on the most recent
-    /// [`KEEP_LAST_REASONING`] tool-call entries. Returns true if any entry
+    /// [`keep_last_reasoning`] tool-call entries. Returns true if any entry
     /// was modified. This reclaims tokens from stale reasoning without breaking
     /// the tool-call chain (which the OpenAI API requires to stay intact).
     fn strip_old_reasoning(&mut self) -> bool {
@@ -191,9 +223,10 @@ impl Context {
             // reasoning would make the next request unreadable to the API.
             return false;
         }
+        let keep_last = keep_last_reasoning();
         // Count tool-call entries from the end to find the cutoff: entries with
-        // fewer than KEEP_LAST_REASONING tool-call entries after them keep
-        // their reasoning.
+        // fewer than `keep_last` tool-call entries after them keep their
+        // reasoning.
         let mut tool_call_after: Vec<usize> = vec![0; self.entries.len()];
         let mut running = 0usize;
         for i in (0..self.entries.len()).rev() {
@@ -205,7 +238,7 @@ impl Context {
 
         let mut changed = false;
         for (i, entry) in self.entries.iter_mut().enumerate() {
-            if entry.kind != ContextKind::ToolCall || tool_call_after[i] < KEEP_LAST_REASONING {
+            if entry.kind != ContextKind::ToolCall || tool_call_after[i] < keep_last {
                 continue;
             }
             let Ok(mut msg) = serde_json::from_str::<Value>(&entry.content) else {
@@ -429,8 +462,9 @@ impl Context {
         // tool call is several turns old, its reasoning is dead weight — the
         // tool result already reflects the outcome. Stripping `reasoning_content`
         // reclaims 100-500 tokens per entry without breaking the tool-call
-        // chain (the `tool_calls` JSON stays intact). Recent reasoning (last
-        // KEEP_LAST_REASONING turns) is preserved for chain-of-thought continuity.
+        // chain (the `tool_calls` JSON stays intact). Recent reasoning (the
+        // last `keep_last_reasoning()` turns) is preserved for chain-of-thought
+        // continuity.
         if self.strip_old_reasoning() && self.total_tokens <= target {
             return BudgetAction::ReasoningStripped;
         }
@@ -965,6 +999,29 @@ fn truncate_lines(content: &str, keep: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_keep_reasoning_turns_accepts_turn_counts() {
+        // 0 is valid: strip the reasoning from every tool-call entry.
+        assert_eq!(parse_keep_reasoning_turns("0"), Some(0));
+        assert_eq!(parse_keep_reasoning_turns("4"), Some(4));
+        // Whitespace is tolerated.
+        assert_eq!(parse_keep_reasoning_turns(" 3 "), Some(3));
+        // Empty, non-numeric, and negative values fall back to the default.
+        assert_eq!(parse_keep_reasoning_turns(""), None);
+        assert_eq!(parse_keep_reasoning_turns("two"), None);
+        assert_eq!(parse_keep_reasoning_turns("-1"), None);
+    }
+
+    #[test]
+    fn keep_last_reasoning_defaults_to_two() {
+        // The process env is not mutated here: with the variable unset the
+        // default bound applies. (A set variable legitimately overrides it.)
+        if env::var(KEEP_REASONING_TURNS_ENV).is_err() {
+            assert_eq!(keep_last_reasoning(), DEFAULT_KEEP_LAST_REASONING);
+            assert_eq!(DEFAULT_KEEP_LAST_REASONING, 2);
+        }
+    }
 
     #[test]
     fn snapshot_roundtrip_preserves_conversation_and_tokens() {
@@ -1829,9 +1886,10 @@ mod tests {
 
     #[test]
     fn strip_old_reasoning_removes_stale_reasoning_keeps_recent() {
-        // With KEEP_LAST_REASONING=2, the last 2 tool-call entries keep their
-        // reasoning; older ones have it stripped. The tool_calls JSON itself
-        // must survive so the OpenAI conversation stays valid.
+        // With the default keep-last-reasoning bound of 2, the last 2
+        // tool-call entries keep their reasoning; older ones have it stripped.
+        // The tool_calls JSON itself must survive so the OpenAI conversation
+        // stays valid.
         // The trigger must be crossed by EVICTABLE bulk so the reduction
         // phases run, while the non-evictable tool-call chain stays under
         // the collapse threshold (collapse would replace the chain and
@@ -1944,8 +2002,8 @@ mod tests {
 
     #[test]
     fn strip_old_reasoning_keeps_recent_two_when_fewer_entries() {
-        // With only 2 tool-call entries (== KEEP_LAST_REASONING), nothing is
-        // stripped even if reasoning is present.
+        // With only 2 tool-call entries (== the default keep-last-reasoning
+        // bound), nothing is stripped even if reasoning is present.
         let mut ctx = Context::new(100_000);
         ctx.push(Role::System, ContextKind::System, "sys");
         ctx.push(Role::User, ContextKind::UserPrompt, "do task");

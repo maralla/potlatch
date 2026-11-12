@@ -143,6 +143,20 @@ impl ModelSpec {
     fn is_deepseek(&self) -> bool {
         self.model.to_lowercase().starts_with("deepseek")
     }
+
+    /// Whether this is a GLM/z.ai family model. GLM's API reads the `thinking`
+    /// object in the request body and defaults to `clear_thinking = true`,
+    /// i.e. dropping the previous rounds' thinking from the prompt.
+    fn is_glm(&self) -> bool {
+        let m = self.model.to_lowercase();
+        m.starts_with("glm") || m.starts_with("zai/")
+    }
+
+    /// Whether this is a Qwen family model (typically served through a chat
+    /// template on sglang/vLLM).
+    fn is_qwen(&self) -> bool {
+        self.model.to_lowercase().starts_with("qwen")
+    }
 }
 
 /// Parse a string query parameter from a query string like `effort=high`.
@@ -603,6 +617,13 @@ impl OpenAiClient {
 }
 
 /// Build the JSON request body for a chat-completion request.
+///
+/// History thinking — the `reasoning_content` the context re-injects into
+/// assistant messages — only reaches the model when the backend is told to
+/// keep it: GLM defaults to clearing earlier rounds' thinking, and Qwen's
+/// chat template only renders `reasoning_content` for assistant turns after
+/// the last real user message. The per-family fields below are what make the
+/// replayed thinking actually land in the prompt.
 fn build_chat_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
     let spec = ModelSpec::parse(model);
 
@@ -618,16 +639,32 @@ fn build_chat_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
         // The effort value is model-defined and forwarded verbatim in the
         // standard OpenAI-compatible field; backends that don't support it
         // ignore it.
-        Some(effort) => body["reasoning_effort"] = json!(effort),
+        Some(effort) => {
+            body["reasoning_effort"] = json!(effort);
+            // Reasoning enabled: families that discard the history thinking
+            // by default must be explicitly told to preserve it.
+            if spec.is_glm() {
+                // GLM/z.ai reads the `thinking` object; `clear_thinking: false`
+                // is what stops the server from dropping earlier rounds'
+                // thinking from the prompt.
+                body["thinking"] = json!({"type": "enabled", "clear_thinking": false});
+            } else if spec.is_qwen() {
+                // Qwen served through a chat template: `preserve_thinking`
+                // makes the template render `reasoning_content` for assistant
+                // turns. Merged with the enable flag into a single object.
+                body["chat_template_kwargs"] =
+                    json!({"enable_thinking": true, "preserve_thinking": true});
+            }
+        }
         // Reasoning disabled (effort absent) — each family has its own
         // off-switch.
-        None if spec.is_deepseek() => {
-            // DeepSeek uses `{"thinking": {"type": "disabled"}}` in the
-            // request body (OpenAI extra_body format).
+        None if spec.is_deepseek() || spec.is_glm() => {
+            // DeepSeek and GLM/z.ai use `{"thinking": {"type": "disabled"}}`
+            // in the request body (OpenAI extra_body format).
             body["thinking"] = json!({"type": "disabled"});
         }
         None => {
-            // Non-DeepSeek reasoning models (Model1, etc.) served via
+            // Non-DeepSeek reasoning models (Model1, Qwen, etc.) served via
             // sglang/vLLM honor this chat-template kwarg to skip the
             // reasoning phase entirely. Harmless on backends that don't
             // recognize it.
@@ -635,10 +672,35 @@ fn build_chat_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
         }
     }
 
+    // DeepSeek requires `reasoning_content` to be present on assistant
+    // messages; the value is ignored for context, but its absence can 400.
+    if spec.is_deepseek() {
+        body["messages"] = json!(deepseek_messages_with_reasoning(messages));
+    }
+
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
     body
+}
+
+/// Copy `messages`, giving every assistant message a `reasoning_content`
+/// field: turns that already carry one are kept verbatim, turns without one
+/// get `""`. DeepSeek rejects assistant messages that lack the field even
+/// though the thinking itself is discarded for context.
+fn deepseek_messages_with_reasoning(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|msg| {
+            let assistant = msg["role"].as_str() == Some("assistant");
+            if !assistant || msg.get("reasoning_content").is_some() {
+                return msg.clone();
+            }
+            let mut msg = msg.clone();
+            msg["reasoning_content"] = json!("");
+            msg
+        })
+        .collect()
 }
 
 /// Whether an LLM API error is worth retrying. Transient errors include
@@ -1013,6 +1075,28 @@ mod tests {
         assert!(!ModelSpec::parse("acp://cursor/gpt-4o").is_deepseek());
     }
 
+    #[test]
+    fn model_spec_detects_glm_family() {
+        assert!(ModelSpec::parse("glm-4.6").is_glm());
+        // Family detection is case-insensitive.
+        assert!(ModelSpec::parse("GLM-4.6").is_glm());
+        // The vendor prefix is stripped by parse; the model name decides.
+        assert!(ModelSpec::parse("acp://zai/glm-4.6").is_glm());
+        assert!(!ModelSpec::parse("model1").is_glm());
+        assert!(!ModelSpec::parse("acp://zai/qwen3").is_glm());
+    }
+
+    #[test]
+    fn model_spec_detects_qwen_family() {
+        assert!(ModelSpec::parse("qwen3-235b").is_qwen());
+        assert!(ModelSpec::parse("Qwen3-30B").is_qwen());
+        // Detection is on the model name (the last path segment), matching
+        // how the request body is built.
+        assert!(ModelSpec::parse("acp://hf/Qwen/qwen3-235b?effort=high").is_qwen());
+        assert!(!ModelSpec::parse("model1").is_qwen());
+        assert!(!ModelSpec::parse("glm-4.6").is_qwen());
+    }
+
     // --- build_chat_body effort format tests ---
 
     #[test]
@@ -1077,6 +1161,136 @@ mod tests {
         );
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("thinking").is_none());
+    }
+
+    // --- history-thinking preservation tests ---
+
+    #[test]
+    fn build_chat_body_glm_with_effort_preserves_history_thinking() {
+        // GLM defaults to clearing earlier rounds' thinking server-side; the
+        // `thinking` object with `clear_thinking: false` is what keeps the
+        // replayed `reasoning_content` in the prompt.
+        let body = build_chat_body(
+            "acp://zai/glm-4.6?effort=high",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+        );
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert_eq!(body["thinking"]["type"], json!("enabled"));
+        assert_eq!(body["thinking"]["clear_thinking"], json!(false));
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_glm_without_effort_disables_thinking() {
+        // GLM's off-switch is the same `thinking` object, not the generic
+        // chat-template kwarg.
+        let body = build_chat_body("glm-4.6", &[json!({"role": "user", "content": "hi"})], &[]);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_qwen_with_effort_asks_the_template_to_preserve_thinking() {
+        // Qwen through a chat template only renders `reasoning_content` for
+        // assistant turns when asked to preserve it; enable and preserve
+        // travel in a single merged object.
+        let body = build_chat_body(
+            "acp://hf/Qwen/qwen3-235b?effort=high",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+        );
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"enable_thinking": true, "preserve_thinking": true})
+        );
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_deepseek_emits_empty_reasoning_on_assistant_turns() {
+        // DeepSeek requires `reasoning_content` on assistant messages; an
+        // absent field can 400 even though the value is ignored for context.
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "do task"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "data"}),
+            json!({
+                "role": "assistant",
+                "content": "part way",
+                "reasoning_content": "kept verbatim"
+            }),
+        ];
+        let body = build_chat_body("acp://deepseek/deepseek-v4-pro?effort=high", &messages, &[]);
+        let sent = body["messages"].as_array().unwrap();
+        assert_eq!(sent.len(), messages.len());
+        // Every assistant turn carries the field; other roles don't gain it.
+        assert!(
+            sent[0].get("reasoning_content").is_none(),
+            "system untouched"
+        );
+        assert!(sent[1].get("reasoning_content").is_none(), "user untouched");
+        assert_eq!(
+            sent[2]["reasoning_content"],
+            json!(""),
+            "empty on tool-call turn"
+        );
+        assert!(
+            sent[3].get("reasoning_content").is_none(),
+            "tool role untouched"
+        );
+        assert_eq!(sent[4]["reasoning_content"], json!("kept verbatim"));
+        // The caller's messages are copied, not mutated.
+        assert!(messages[2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_deepseek_without_effort_still_emits_the_field() {
+        // The requirement is unconditional: thinking disabled does not make
+        // an absent `reasoning_content` acceptable to the API.
+        let body = build_chat_body(
+            "deepseek-v4-pro",
+            &[json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"}
+                }]
+            })],
+            &[],
+        );
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert_eq!(body["messages"][0]["reasoning_content"], json!(""));
+    }
+
+    #[test]
+    fn build_chat_body_non_deepseek_leaves_messages_unchanged() {
+        // A model with no history-thinking requirement must not gain an empty
+        // `reasoning_content` field.
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"}
+            }]
+        })];
+        let body = build_chat_body("model1?effort=high", &messages, &[]);
+        assert!(body["messages"][0].get("reasoning_content").is_none());
     }
 
     // --- is_transient_llm_error classifier tests ---
